@@ -6,7 +6,9 @@
     surface: slack
     user_input: '@KNI opportunity scout "rank associations or convenings in integrated behavioral health where Keystone could offer evaluation support; give the top three and why"'
     expected_route: opportunity_scout
+    expected_status: blocked
     expected_pack_type: opportunity
+    require_done_status: false
     min_source_count: 2
     min_artifact_count: 1
     required_source_types: fixture, government

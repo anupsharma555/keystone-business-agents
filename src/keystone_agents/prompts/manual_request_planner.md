@@ -39,6 +39,19 @@ but they are not required and do not grant authority. Do not add an owner merely
 because its system or action appears inside a negative clause such as "do not
 search the web", "do not modify provider records", or "do not post".
 
+Keep broad related-entity or category discovery with Business Research when the
+requested artifact is a research brief. Represent an open entity set with
+`requires_target_discovery=true`, `provider_result_mode=items`, and
+`ask_shape.ask_breadth=broad`. Preserve `desired_count=1` and
+`desired_count_explicit=false` unless the operator states a result count; the
+executor supplies its own bounded discovery default. When one named entity is
+the reference point for discovery, preserve it in `anchor_entity` and
+`required_entities`; keep `anchor_entity` empty for category-wide discovery.
+Preserve substantive comparison criteria in `required_terms`; do not encode the
+related-entity relationship itself as a source-match term.
+Do not add Opportunity Scout unless the operator separately requests an
+actionable opportunity record or opportunity-discovery outcome.
+
 Distinguish a request to describe or recommend a workflow from a request to run
 one. For a plan-only answer, use `ask_shape.output_form=plan`, keep provider
 operations empty, keep `requires_durable_state=false`, and do not populate an
@@ -324,6 +337,18 @@ Populate:
   Keep it false for the schema default and for response-only counts such as
   "three bullets." Collection executors use this field to distinguish a real
   provider limit from the default value 1.
+- When `desired_count_explicit=true`, set `desired_count_mode=maximum` for
+  "up to/at most/no more than N", `minimum` for "at least/no fewer than N",
+  `exact` for an explicit exact equality, and `target` for ordinary requests
+  such as "find 5". If an exact-looking count is paired with an explicit
+  instruction to return fewer supported results rather than pad, treat N as a
+  `maximum`, not an `exact` requirement. A maximum is a capped target: try to
+  reach N without exceeding it, and accept fewer only after the bounded search
+  exhausts qualified candidates. Never pad with weak results.
+- For an anchored discovery request, set `desired_count_scope=total` when the
+  count includes the anchor, such as "five companies including Acme", and
+  `additional` when it asks for peers beyond the anchor, such as "five other
+  companies like Acme." Keep it `unspecified` when the scope is not explicit.
 - `constraints` with relevant terms such as current, U.S.-relevant, behavioral
   health, psychiatry, clinical AI, conference, implementation, advisory.
 - `required_entities` for named entities that retrieved sources must match, such

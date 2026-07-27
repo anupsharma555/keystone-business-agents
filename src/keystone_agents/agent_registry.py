@@ -748,6 +748,7 @@ CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
         "tools.md",
         "chief_of_staff.md",
         "chief_of_staff_supplied_synthesis_compact.md",
+        "calendar_lookup_synthesizer.md",
     ),
     skills=AGENT_SKILL_NAMES["chief_of_staff"],
     tools=(

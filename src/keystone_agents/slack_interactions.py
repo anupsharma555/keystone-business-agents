@@ -14,8 +14,10 @@ from keystone_agents.agent_mentions import parse_agent_mention
 from keystone_agents.agents.orchestrator import (
     review_specialist_output,
     run_orchestrator_preflight,
+    run_orchestrator_preflight_from_plan,
 )
 from keystone_agents.agents.outreach_composer import build_outreach_composer_compact_synthesis_agent
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.automation_inventory import build_automation_inventory_report
 from keystone_agents.gmail_triage.draft_actions import (
     execute_approved_gmail_draft_action,
@@ -1135,29 +1137,39 @@ def _handle_chief_of_staff_action(
             and isinstance(existing_item.target.metadata.get("manual_request_plan"), dict)
             else None
         )
+        persisted_authority = ExecutionIntentAuthority.from_value(existing_manual_plan)
+        if persisted_authority.canonical and persisted_authority.plan is not None:
+            manual_plan = persisted_authority.plan.model_dump(mode="json")
+            orchestrator_preflight = run_orchestrator_preflight_from_plan(
+                "continue",
+                manual_request_plan=manual_plan,
+                database_url=database_url,
+            )
+        else:
+            orchestrator_preflight = run_orchestrator_preflight(
+                "continue",
+                requested_agent=requested_agent,
+                live_manual_plan=_slack_work_item_live_sdk_enabled(default=live_search),
+                database_url=database_url,
+            )
+            manual_plan = orchestrator_preflight.manual_request_plan.model_dump(mode="json")
         live_search = live_search_allowed_for_execution(
             live_search,
-            manual_plan=existing_manual_plan,
+            manual_plan=manual_plan,
             request_text=live_search_constraint_text,
         )
         live_sdk = _slack_work_item_live_sdk_enabled(default=live_search)
-        orchestrator_preflight = run_orchestrator_preflight(
-            "continue",
-            requested_agent=requested_agent,
-            live_manual_plan=live_sdk,
-            database_url=database_url,
-        )
         slack_query_prompt = _slack_query_prompt_for_work_item_action(
             request_text="continue",
             intent=intent,
             feedback="",
             work_item=existing_item,
             route=(
-                _route_for_steering_intent(intent, existing_item)
-                if existing_item is not None
+                WorkItemRoute(requested_agent)
+                if requested_agent != WorkItemRoute.ORCHESTRATOR.value
                 else WorkItemRoute.BUSINESS_RESEARCH_ANALYST
             ),
-            manual_plan=None,
+            manual_plan=manual_plan,
         )
         request_options = _slack_action_cost_conservation_request_options(intent)
         if (
@@ -1174,6 +1186,7 @@ def _handle_chief_of_staff_action(
                 database_url=database_url,
                 live_search=live_search,
                 live_sdk=live_sdk,
+                manual_request_plan=manual_plan,
                 orchestrator_preflight=compact_orchestrator_preflight_payload(
                     orchestrator_preflight
                 ),
@@ -1549,17 +1562,11 @@ def _advance_work_item_for_intent(
         manual_plan=orchestrator_preflight.manual_request_plan,
         request_text=request_text,
     )
-    manual_plan = {
-        "source": "slack_business_agent_action",
-        "requested_agent": resolved_route.value,
-        "target_agent": resolved_route.value,
-        "intent": intent,
-        "objective": request_text,
-        "constraints": [feedback] if feedback else [],
-        "requires_approved_context": True,
-        "side_effect_policy": "draft_only_no_send_no_publish_no_schedule",
-        "reviewer": reviewer,
-    }
+    manual_plan = _manual_plan_for_slack_action(
+        existing_work_item,
+        intent=intent,
+        orchestrator_preflight=orchestrator_preflight,
+    )
     slack_query_prompt = _slack_query_prompt_for_work_item_action(
         request_text=request_text,
         intent=intent,
@@ -1575,9 +1582,6 @@ def _advance_work_item_for_intent(
         and "cost_profile" not in request_options
     ):
         request_options["cost_profile"] = slack_query_prompt.cost_profile
-    manual_plan["slack_query_prompt"] = (
-        slack_query_prompt.metadata() if slack_query_prompt is not None else {}
-    )
     result = advance_work_item_manager_loop_with_optional_langgraph(
         WorkflowRunRequest(
             request_text=request_text,
@@ -1604,6 +1608,41 @@ def _advance_work_item_for_intent(
         intent=intent,
         database_url=database_url,
     )
+
+
+def _manual_plan_for_slack_action(
+    work_item: Any | None,
+    *,
+    intent: str,
+    orchestrator_preflight: Any,
+) -> dict[str, Any]:
+    """Select semantic authority without confusing action and task identity.
+
+    ``run_again`` repeats the same task, while ``more_research`` deepens its
+    evidence without changing target or completion requirements; both may reuse
+    the canonical plan. Revision and contact discovery change the requested
+    work, so their newly validated Orchestrator plan is authoritative. Slack
+    action labels themselves never become ``ManualRequestPlan.intent``.
+    """
+
+    persisted = None
+    if work_item is not None:
+        metadata = getattr(getattr(work_item, "target", None), "metadata", {})
+        if isinstance(metadata, dict):
+            persisted = metadata.get("manual_request_plan")
+    persisted_authority = ExecutionIntentAuthority.from_value(persisted)
+    if (
+        intent in {KBA_INTENT_RUN_AGAIN, KBA_INTENT_MORE_RESEARCH}
+        and persisted_authority.canonical
+        and persisted_authority.plan is not None
+    ):
+        return persisted_authority.plan.model_dump(mode="json")
+
+    preflight_plan = getattr(orchestrator_preflight, "manual_request_plan", None)
+    preflight_authority = ExecutionIntentAuthority.from_value(preflight_plan)
+    if preflight_authority.plan is None:
+        raise ValueError("Slack WorkItem action requires a valid semantic request plan.")
+    return preflight_authority.plan.model_dump(mode="json")
 
 
 def _record_slack_action_orchestrator_review(
@@ -1848,9 +1887,14 @@ def _request_text_for_intent(
     work_item: Any | None = None,
 ) -> str:
     if intent == KBA_INTENT_REVISE_DRAFT:
+        target = _work_item_research_target_for_retry(work_item)
+        if target:
+            return f"{target} outreach draft revision using this Slack feedback: {feedback}"
         return f"Revise the outreach draft using this Slack feedback: {feedback}"
     if intent == KBA_INTENT_FIND_CONTACT:
-        return "Find a better source-backed contact or destination for this outreach WorkItem."
+        target = _work_item_research_target_for_retry(work_item)
+        target_phrase = f" for {target}" if target else " for this outreach WorkItem"
+        return f"Find a better source-backed contact or destination{target_phrase}."
     if intent == KBA_INTENT_MORE_RESEARCH:
         target = _work_item_research_target_for_retry(work_item)
         target_phrase = f" for {target}" if target else " for this WorkItem"

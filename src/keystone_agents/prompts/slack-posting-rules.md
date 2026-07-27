@@ -195,6 +195,18 @@ sources, or off-focus source links as the basis for a detailed answer.
 Keep the `Terms` section short. Omit it only when no acronym, unfamiliar
 program, technical term, or provider shorthand needs explanation.
 
+Reader-facing research prose must describe the companies, claims, and sources
+directly. Never refer to "the payload," "the extracted source," "attached source
+refs," "the source packet," "the source set," or what "this run surfaced."
+Those are internal execution concepts. Translate them into natural statements
+about what a named source supports and what evidence remains missing.
+
+Partial research should still answer with the strongest defensible candidates
+or findings and label them as direct, adjacent, provisional, or unverified.
+Do not use an evidence disclaimer as the answer when usable evidence exists.
+Place missing official sources, uncertain product scope, thin corroboration,
+and other evidence gaps in a trailing `Limitations` section.
+
 ## Specialist Formatting Boundaries
 
 The shared Slack rules apply to Slack-visible summaries, review notes, and

@@ -18,7 +18,11 @@ class CalendarActionInterpretation(BaseModel):
     )
     read_selection: Literal["all", "next"] = "all"
     read_selection_source_text: str = ""
-    calendar_scope: Literal["configured", "selected_readable"] = "configured"
+    calendar_scope: Literal[
+        "configured",
+        "selected_readable",
+        "all_readable",
+    ] = "configured"
     calendar_scope_source_text: str = ""
     query: str = ""
     query_source_text: str = ""
@@ -126,5 +130,83 @@ class CalendarActionInterpretationInput(BaseModel):
                 json.dumps(self.deterministic_plan, ensure_ascii=True, sort_keys=True),
                 "",
                 "Return only a CalendarActionInterpretation.",
+            ]
+        )
+
+
+class CalendarLookupSynthesis(BaseModel):
+    """Semantic selection over one bounded, provider-verified event set."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["matched", "ambiguous", "no_match"]
+    selected_event_indexes: list[int] = Field(default_factory=list, max_length=3)
+    related_event_groups: list[list[int]] = Field(default_factory=list, max_length=3)
+    selection_reason: str = ""
+    limitations: list[str] = Field(default_factory=list)
+
+    @field_validator("selected_event_indexes", mode="before")
+    @classmethod
+    def _clean_indexes(cls, value: object) -> list[int]:
+        values = value if isinstance(value, list | tuple | set) else [value]
+        return list(dict.fromkeys(int(item) for item in values if item is not None))
+
+    @field_validator("related_event_groups", mode="before")
+    @classmethod
+    def _clean_related_event_groups(cls, value: object) -> list[list[int]]:
+        groups = value if isinstance(value, list | tuple) else []
+        cleaned: list[list[int]] = []
+        for group in groups:
+            values = group if isinstance(group, list | tuple | set) else [group]
+            indexes = list(
+                dict.fromkeys(int(item) for item in values if item is not None)
+            )
+            if len(indexes) >= 2 and indexes not in cleaned:
+                cleaned.append(indexes)
+        return cleaned
+
+    @field_validator("selection_reason", mode="before")
+    @classmethod
+    def _clean_reason(cls, value: object) -> str:
+        return " ".join(str(value or "").split()).strip()
+
+    @field_validator("limitations", mode="before")
+    @classmethod
+    def _clean_limitations(cls, value: object) -> list[str]:
+        values = value if isinstance(value, list | tuple | set) else [value]
+        return [
+            " ".join(str(item or "").split()).strip()
+            for item in values
+            if " ".join(str(item or "").split()).strip()
+        ]
+
+
+class CalendarLookupSynthesisInput(BaseModel):
+    """Prompt input containing only the request and bounded Calendar metadata."""
+
+    request_text: str
+    lookup_target: str = ""
+    response_scope: Literal[
+        "focused",
+        "full_window",
+        "full_window_with_focus",
+    ] = "focused"
+    events: list[dict[str, object]]
+
+    def to_prompt(self) -> str:
+        import json
+
+        return "\n".join(
+            [
+                "Select the Calendar event or events that answer the operator request.",
+                "",
+                f"Operator request: {self.request_text}",
+                f"Authoritative lookup target: {self.lookup_target or '(none)'}",
+                f"Authoritative response scope: {self.response_scope}",
+                "",
+                "Provider-verified candidate events JSON:",
+                json.dumps(self.events, ensure_ascii=True, sort_keys=True),
+                "",
+                "Return only a CalendarLookupSynthesis.",
             ]
         )

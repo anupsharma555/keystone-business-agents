@@ -285,3 +285,33 @@ def test_source_triage_thin_company_research_requires_more_evidence() -> None:
     assert result.deepen_source_ids == ["thin:homepage"]
     assert result.needs_broaden_or_deepen is True
     assert result.recommended_action == "broaden_or_deepen_before_final_synthesis"
+
+
+def test_source_triage_rejects_http_success_error_page_as_read_evidence() -> None:
+    result = triage_source_candidates(
+        agent_name="business_research_analyst",
+        request_text=(
+            "Deep source-backed comparison of multimodal behavioral-health AI companies."
+        ),
+        candidates=[
+            {
+                "source_id": "businesswire:error",
+                "title": "Page Unavailable",
+                "url": "https://www.businesswire.com/news/example",
+                "source_type": "press_news",
+                "extraction_status": "extracted",
+                "evidence_excerpt": (
+                    "Please be advised that this page is unavailable. Call web support "
+                    "or open a support ticket for assistance."
+                ),
+                "supported_claims": [
+                    "The page is unavailable and provides a support reference."
+                ],
+            }
+        ],
+    )
+
+    assert result.retained_source_ids == []
+    assert result.rejected_source_ids == ["businesswire:error"]
+    assert result.needs_broaden_or_deepen is True
+    assert "error, access, or challenge" in result.decisions[0].rationale

@@ -84,6 +84,32 @@ def test_search_plan_preserves_mixed_meeting_and_grant_lanes() -> None:
     )
 
 
+def test_search_plan_treats_accelerator_or_grant_as_one_strict_program_union() -> None:
+    topic = (
+        "Find current U.S. accelerator or grant programs for a behavioral-health "
+        "AI consultancy, with official application windows and eligibility."
+    )
+
+    plan = infer_opportunity_search_plan(topic, desired_count=3)
+    specs = _build_live_query_specs(topic, search_plan=plan)
+
+    assert plan.target_entity_types == ["grant_program"]
+    assert plan.objectives == ["funding"]
+    assert plan.strict_targeting is True
+    assert [lane.lane_type for lane in plan.lanes] == ["grant_funding"]
+    assert {"accelerator", "grant", "deadline", "eligibility"} <= {
+        term.lower() for term in plan.must_include_terms
+    }
+    assert specs
+    assert all(spec.entity_hint == "grant_program" for spec in specs)
+    assert any(
+        "accelerator program" in spec.query.lower()
+        or "incubator program" in spec.query.lower()
+        for spec in specs
+    )
+    assert any("site:grants.gov" in spec.query.lower() for spec in specs)
+
+
 def test_opportunity_scout_builds_mixed_meeting_and_grant_query_specs() -> None:
     topic = (
         "Find 1 meeting or conference opportunity and 1 grant or funding opportunity "
@@ -160,6 +186,28 @@ def test_search_plan_merge_preserves_strict_company_only_contract() -> None:
 
     assert merged.strict_targeting is True
     assert "institute" in merged.exclude_entity_types
+
+
+def test_search_plan_merge_cannot_widen_strict_program_union() -> None:
+    base = infer_opportunity_search_plan(
+        "Find current accelerator or grant programs with official deadlines.",
+        desired_count=3,
+    )
+    merged = merge_opportunity_search_plan(
+        base,
+        {
+            "source": "llm",
+            "desired_count": 3,
+            "target_entity_types": ["company", "researcher", "grant_program"],
+            "objectives": ["broad_discovery"],
+            "strict_targeting": False,
+        },
+    )
+
+    assert merged.target_entity_types == ["grant_program"]
+    assert merged.objectives == ["funding"]
+    assert merged.strict_targeting is True
+    assert [lane.lane_type for lane in merged.lanes] == ["grant_funding"]
 
 
 def test_search_plan_merge_preserves_typed_lanes() -> None:

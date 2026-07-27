@@ -411,6 +411,42 @@ def test_shared_extraction_ladder_preserves_best_result_when_fallback_fails() ->
     assert result.metadata["extraction_attempts"][-1]["status"] == "error"
 
 
+def test_shared_extraction_ladder_downgrades_http_success_error_page() -> None:
+    calls: list[str] = []
+
+    def fake_extract(*_args, **kwargs):
+        provider = str(kwargs["provider"])
+        calls.append(provider)
+        return WebsiteExtractionResult(
+            url="https://www.businesswire.com/news/example",
+            title="Page Unavailable",
+            provider=provider,
+            status="success",
+            text_or_markdown=(
+                "# Page Unavailable\n\nPlease be advised that this page is unavailable. "
+                "Call web support or open a support ticket for assistance. "
+            )
+            * 30,
+            claims=[
+                "The page is unavailable and directs readers to a support ticket."
+            ],
+        )
+
+    result = extract_website_content_with_fallbacks(
+        "https://www.businesswire.com/news/example",
+        company_name="Example",
+        primary_provider="trafilatura",
+        fallback_providers=("crawl4ai",),
+        live=True,
+        extractor=fake_extract,
+    )
+
+    assert result.status == "insufficient_content"
+    assert result.claims == []
+    assert calls == ["trafilatura"]
+    assert "error, access, or challenge" in result.metadata["quality_gate"]
+
+
 def test_default_company_page_urls_are_small_and_same_origin() -> None:
     urls = default_company_page_urls("https://mentavi.com/about-mentavi-health/")
 

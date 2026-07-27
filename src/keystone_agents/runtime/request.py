@@ -34,14 +34,19 @@ class RequestRuntime:
     def with_request(self, request: WorkflowRunRequest) -> RequestRuntime:
         """Retain services when normalization preserves their configuration."""
 
-        if (
-            request.save == self.request.save
-            and (request.database_url or database_url_from_env())
-            == (self.request.database_url or database_url_from_env())
-        ):
+        if self.matches_storage_scope(request):
             self.request = request
             return self
         return self.from_workflow_request(request)
+
+    def matches_storage_scope(self, request: WorkflowRunRequest) -> bool:
+        """Return whether a request can safely reuse this runtime's local services."""
+
+        return bool(
+            request.save == self.request.save
+            and (request.database_url or database_url_from_env())
+            == (self.request.database_url or database_url_from_env())
+        )
 
     def service(self, key: str, factory: Callable[[], T]) -> T:
         """Build one named request service at most once."""

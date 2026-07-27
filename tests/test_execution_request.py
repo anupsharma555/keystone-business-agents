@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+
+from keystone_agents.contracts.completion import build_count_request_coverage
 from keystone_agents.execution_request import (
     attach_execution_public_result,
     build_execution_request,
@@ -807,3 +810,169 @@ def test_clarification_route_with_missing_information_still_needs_input() -> Non
 
     assert result.status == "needs_input"
     assert result.completion_confirmed is False
+
+
+@pytest.mark.parametrize(
+    ("declared", "expected"),
+    [
+        ("verified", "verified"),
+        ("completed", "completed"),
+        ("recovered", "recovered"),
+        ("partial", "partial"),
+        ("needs_input", "needs_input"),
+        ("blocked", "blocked"),
+        ("failed", "failed"),
+        ("canceled", "canceled"),
+        ("cancelled", "canceled"),
+        ("in_progress", "blocked"),
+        ("unknown_terminal_state", "blocked"),
+    ],
+)
+def test_public_result_terminal_status_is_exhaustive_and_monotonic(
+    declared: str,
+    expected: str,
+) -> None:
+    payload = {
+        "status": declared,
+        "human_summary": "A reader-usable result exists.",
+        "completion_confirmed": True,
+    }
+
+    result = attach_execution_public_result(payload)
+
+    assert result.status == expected
+    assert result.completion_confirmed is (
+        expected in {"verified", "completed", "recovered"}
+    )
+
+
+@pytest.mark.parametrize("status", ["partial", "canceled"])
+def test_existing_non_success_public_result_cannot_be_upgraded_by_outer_done(
+    status: str,
+) -> None:
+    payload = {
+        "status": "done",
+        "public_result": {
+            "status": status,
+            "title": "Existing terminal result",
+            "text": "Usable partial evidence.",
+            "completion_confirmed": False,
+        },
+    }
+
+    result = attach_execution_public_result(payload)
+
+    assert result.status == status
+    assert result.completion_confirmed is False
+
+
+def test_non_success_public_result_precedence_is_monotonic() -> None:
+    priority = {
+        "partial": 1,
+        "needs_input": 2,
+        "blocked": 2,
+        "canceled": 3,
+        "failed": 4,
+    }
+    for existing_status, existing_priority in priority.items():
+        for declared_status, declared_priority in priority.items():
+            payload = {
+                "status": declared_status,
+                "public_result": {
+                    "status": existing_status,
+                    "title": "Existing terminal result",
+                    "text": "Reader-usable terminal evidence.",
+                    "completion_confirmed": False,
+                },
+            }
+
+            result = attach_execution_public_result(payload)
+            expected = (
+                existing_status
+                if existing_priority >= declared_priority
+                else declared_status
+            )
+
+            assert result.status == expected
+            assert result.completion_confirmed is False
+            if result.status != existing_status:
+                assert result.title != "Existing terminal result"
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["partial", "needs_input", "blocked", "failed", "canceled"],
+)
+def test_host_coverage_never_weakens_existing_non_success(
+    status: str,
+) -> None:
+    coverage = build_count_request_coverage(
+        interpreted_request="Return exactly five opportunities.",
+        expected_count=5,
+        observed_count=2,
+        item_label="opportunities",
+        next_safe_action="Continue bounded research.",
+        count_mode="exact",
+    )
+    payload = {
+        "status": status,
+        "request_coverage": coverage.model_dump(mode="json"),
+        "request_coverage_enforcement": "deterministic",
+        "public_result": {
+            "status": status,
+            "title": "Existing terminal result",
+            "text": "Reader-usable terminal evidence.",
+            "completion_confirmed": False,
+        },
+    }
+
+    result = attach_execution_public_result(payload)
+
+    assert result.status == status
+    assert result.title == "Existing terminal result"
+    assert result.completion_confirmed is False
+
+
+def test_host_owned_underfilled_count_forces_partial_public_result() -> None:
+    coverage = build_count_request_coverage(
+        interpreted_request="Return exactly five opportunities.",
+        expected_count=5,
+        observed_count=2,
+        item_label="opportunities",
+        next_safe_action="Continue bounded research.",
+        count_mode="exact",
+    )
+    payload = {
+        "status": "done",
+        "human_summary": "Two source-backed opportunities are ready.",
+        "request_coverage": coverage.model_dump(mode="json"),
+        "request_coverage_enforcement": "deterministic",
+    }
+
+    result = attach_execution_public_result(payload)
+
+    assert result.status == "partial"
+    assert result.title == "Business Agents Partially Completed"
+    assert result.completion_confirmed is False
+    assert result.failure_code == "request_contract_incomplete"
+
+
+def test_unmarked_nested_model_coverage_remains_advisory() -> None:
+    coverage = build_count_request_coverage(
+        interpreted_request="Return exactly five opportunities.",
+        expected_count=5,
+        observed_count=2,
+        item_label="opportunities",
+        next_safe_action="Continue bounded research.",
+        count_mode="exact",
+    )
+    payload = {
+        "status": "done",
+        "human_summary": "The typed result is reader-ready.",
+        "output": {"request_coverage": coverage.model_dump(mode="json")},
+    }
+
+    result = attach_execution_public_result(payload)
+
+    assert result.status == "completed"
+    assert result.completion_confirmed is True

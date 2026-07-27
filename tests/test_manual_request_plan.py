@@ -33,6 +33,7 @@ from keystone_agents.manual_request import (
     merge_manual_request_plan,
     positive_capability_text,
     reconcile_manual_request_followup,
+    request_forbids_response_composition,
     resolve_manual_request_owner,
 )
 from keystone_agents.outreach_composer.execution_plan import infer_outreach_execution_plan
@@ -1864,7 +1865,156 @@ def test_manual_plan_routes_conference_search_to_opportunity_scout() -> None:
     assert plan.expected_artifact_type == "opportunity_record"
     assert plan.desired_count == 5
     assert plan.desired_count_explicit is True
+    assert plan.desired_count_mode == "target"
     assert plan.requires_live_search is True
+
+
+@pytest.mark.parametrize(
+    ("request_text", "expected_mode"),
+    [
+        ("Find up to 3 source-backed opportunities.", "maximum"),
+        ("Find at least 3 source-backed opportunities.", "minimum"),
+        ("Find exactly 3 source-backed opportunities.", "exact"),
+        (
+            "Find exactly 3 source-backed opportunities. Return fewer than 3 "
+            "rather than pad weak matches.",
+            "maximum",
+        ),
+        ("Find 3 source-backed opportunities.", "target"),
+    ],
+)
+def test_manual_plan_preserves_explicit_count_semantics(
+    request_text: str,
+    expected_mode: str,
+) -> None:
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="opportunity_scout",
+    )
+
+    assert plan.desired_count == 3
+    assert plan.desired_count_explicit is True
+    assert plan.desired_count_mode == expected_mode
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Find exactly 3 current U.S. programs for behavioral-health startups.",
+        "Find exactly three current U.S. accelerators for clinical-AI startups.",
+        "List up to 3 incubators that accept behavioral-health companies.",
+    ],
+)
+def test_manual_plan_preserves_program_discovery_counts(request_text: str) -> None:
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="opportunity_scout",
+    )
+
+    assert plan.target_agent == "opportunity_scout"
+    assert plan.intent == "opportunity_search"
+    assert plan.desired_count == 3
+    assert plan.desired_count_explicit is True
+
+
+def test_manual_plan_preserves_count_for_accelerator_or_grant_program_union() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "Opportunity Scout: identify exactly 3 current U.S. accelerator or "
+            "grant programs relevant to an early-stage behavioral-health AI "
+            "company. Require at least one official program source for each."
+        ),
+        requested_agent="opportunity_scout",
+    )
+
+    assert plan.target_agent == "opportunity_scout"
+    assert plan.intent == "opportunity_search"
+    assert plan.desired_count == 3
+    assert plan.desired_count_explicit is True
+    assert plan.desired_count_mode == "exact"
+
+
+@pytest.mark.parametrize(
+    ("request_text", "expected_mode"),
+    [
+        (
+            "Identify exactly 3 companies and require at least one official source "
+            "per company.",
+            "exact",
+        ),
+        (
+            "Find up to 3 companies, each supported by at least 2 public sources.",
+            "maximum",
+        ),
+        (
+            "Find at least 3 companies, each with exactly 1 official product page.",
+            "minimum",
+        ),
+    ],
+)
+def test_count_mode_is_bound_to_the_domain_result_count(
+    request_text: str,
+    expected_mode: str,
+) -> None:
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="business_research_analyst",
+    )
+
+    assert plan.desired_count == 3
+    assert plan.desired_count_explicit is True
+    assert plan.desired_count_mode == expected_mode
+
+
+def test_llm_plan_cannot_rebind_a_later_source_count_to_the_result_count() -> None:
+    request_text = (
+        "Identify and compare exactly 3 additional companies, with at least one "
+        "official source per company."
+    )
+    base = infer_manual_request_plan(
+        request_text,
+        requested_agent="business_research_analyst",
+    )
+    candidate = base.model_copy(
+        update={
+            "source": "llm",
+            "desired_count": 1,
+            "desired_count_explicit": True,
+            "desired_count_mode": "minimum",
+            "desired_count_scope": "total",
+        }
+    )
+
+    merged = merge_manual_request_plan(base, candidate)
+
+    assert merged.desired_count == 3
+    assert merged.desired_count_explicit is True
+    assert merged.desired_count_mode == "exact"
+    assert merged.desired_count_scope == "additional"
+
+
+@pytest.mark.parametrize(
+    ("request_text", "expected_mode", "expected_scope"),
+    [
+        ("Find up to 3 other companies like Acme.", "maximum", "additional"),
+        ("Compare 3 companies including Acme.", "target", "total"),
+        ("Find 3 companies like Acme.", "target", "unspecified"),
+    ],
+)
+def test_compatibility_plan_preserves_anchor_relative_count_scope(
+    request_text: str,
+    expected_mode: str,
+    expected_scope: str,
+) -> None:
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="business_research_analyst",
+    )
+
+    assert plan.desired_count == 3
+    assert plan.desired_count_explicit is True
+    assert plan.desired_count_mode == expected_mode
+    assert plan.desired_count_scope == expected_scope
 
 
 def test_context_agent_external_send_request_is_blocked() -> None:
@@ -3164,7 +3314,14 @@ def test_llm_cannot_turn_negated_drafting_boundary_into_outreach_route() -> None
             "source": "llm",
             "target_agent": "outreach_composer",
             "intent": "outreach_draft",
+            "task_objective": "outreach_draft",
+            "expected_artifact_type": "outreach_draft",
             "requires_approved_context": True,
+            "recipient": "stale@example.test",
+            "outreach_channel": "email",
+            "tone": "warm",
+            "draft_policy": "draft_only",
+            "ask_shape": AskShapePolicy(permission_state="draft_only"),
         }
     )
 
@@ -3176,6 +3333,13 @@ def test_llm_cannot_turn_negated_drafting_boundary_into_outreach_route() -> None
 
     assert merged.target_agent == "chief_of_staff"
     assert merged.intent == "route_request"
+    assert merged.task_objective == "route_or_continue"
+    assert merged.expected_artifact_type == "none"
+    assert merged.ask_shape.permission_state == "read_only"
+    assert merged.recipient == ""
+    assert merged.outreach_channel == ""
+    assert merged.tone == ""
+    assert merged.draft_policy == "no_drafts_requested"
     assert any("Removed outreach drafting" in warning for warning in merged.planner_warnings)
 
 
@@ -5244,8 +5408,187 @@ def test_llm_internal_slack_copy_is_not_treated_as_external_outreach() -> None:
 
     assert is_internal_slack_composition_plan(merged) is True
     assert merged.requires_approved_context is False
+
+
+def test_executable_entity_set_research_reconciles_wrong_plan_shape_and_owner() -> None:
+    request = (
+        "CoS, determine whether any companies compete with Deliberate AI. Deeply "
+        "research the company, then identify similar multimodal approaches in "
+        "behavioral health."
+    )
+    fallback = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="business_research_analyst",
+        workflow=["business_research_analyst", "opportunity_scout"],
+        intent="company_research",
+        primary_target="Deliberate AI",
+        target_type="company",
+        provider_result_mode="items",
+        objective=(
+            "Deep research Deliberate AI and identify companies competing with it, "
+            "especially multimodal behavioral-health approaches."
+        ),
+        task_objective="entity_research",
+        expected_artifact_type="research_brief",
+        desired_count=5,
+        desired_count_explicit=False,
+        requires_target_discovery=False,
+        anchor_entity="Deliberate AI",
+        required_entities=["Deliberate AI"],
+        required_terms=["multimodal", "competitors"],
+        requires_live_search=True,
+        requires_durable_state=True,
+        ask_shape={
+            "ask_breadth": "broad",
+            "evidence_depth": "deep",
+            "output_form": "plan",
+            "permission_state": "read_only",
+            "stop_condition": (
+                "Stop after identifying a credible competitor set with evidence "
+                "of behavioral-health and multimodal overlap."
+            ),
+            "output_constraints": {
+                "interpretation": "Provide a research plan only, not the findings.",
+                "style_requirements": ["planning-only"],
+            },
+        },
+    )
+
+    merged = merge_manual_request_plan(fallback, candidate)
+
+    assert merged.target_agent == "business_research_analyst"
+    assert merged.workflow == []
+    assert merged.intent == "company_research"
+    assert merged.task_objective == "entity_research"
+    assert merged.expected_artifact_type == "research_brief"
+    assert merged.ask_shape.output_form == "unspecified"
+    assert merged.ask_shape.output_constraints.interpretation == ""
+    assert "planning-only" not in merged.ask_shape.output_constraints.style_requirements
+    assert merged.desired_count == 5
+    assert merged.desired_count_explicit is False
+    assert merged.requires_target_discovery is True
+    assert any(
+        "typed anchor-entity contract" in warning
+        for warning in merged.planner_warnings
+    )
+    assert any(
+        "single semantic owner" in warning for warning in merged.planner_warnings
+    )
+
+
+def test_explicit_opportunity_deliverable_retains_research_to_scout_workflow() -> None:
+    request = (
+        "Research Harbor Health, then assess whether it is a concrete KNI "
+        "partnership opportunity."
+    )
+    fallback = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        workflow=["business_research_analyst", "opportunity_scout"],
+        intent="opportunity_search",
+        primary_target="Harbor Health",
+        target_type="company",
+        objective=request,
+        task_objective="opportunity_discovery",
+        expected_artifact_type="opportunity_record",
+        requires_live_search=True,
+        requires_durable_state=True,
+    )
+
+    merged = merge_manual_request_plan(fallback, candidate)
+
+    assert merged.workflow == ["business_research_analyst", "opportunity_scout"]
+    assert merged.task_objective == "opportunity_discovery"
+    assert merged.expected_artifact_type == "opportunity_record"
     assert merged.provider_system == "unspecified"
     assert merged.provider_operations == []
+
+
+def test_chief_front_door_research_brief_normalizes_to_single_research_owner() -> None:
+    request = (
+        "CoS, identify companies related to Deliberate AI that use multimodal "
+        "behavioral-health approaches."
+    )
+    fallback = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        workflow=["business_research_analyst", "opportunity_scout"],
+        intent="company_research",
+        primary_target="Deliberate AI",
+        target_type="company",
+        task_objective="entity_research",
+        expected_artifact_type="research_brief",
+        requires_target_discovery=True,
+        anchor_entity="Deliberate AI",
+        requires_live_search=True,
+    )
+
+    merged = merge_manual_request_plan(fallback, candidate)
+
+    assert merged.requested_agent == "chief_of_staff"
+    assert merged.target_agent == "business_research_analyst"
+    assert merged.workflow == []
+    assert merged.requires_target_discovery is True
+    assert merged.anchor_entity == "Deliberate AI"
+
+
+def test_legacy_manual_plan_defaults_target_discovery_off() -> None:
+    plan = ManualRequestPlan.model_validate(
+        {
+            "source": "llm",
+            "target_agent": "business_research_analyst",
+            "intent": "company_research",
+            "primary_target": "OpenAI",
+            "task_objective": "entity_research",
+            "expected_artifact_type": "research_brief",
+        }
+    )
+
+    assert plan.requires_target_discovery is False
+    assert plan.anchor_entity == ""
+
+
+def test_explicit_plan_only_authority_blocks_malformed_research_execution() -> None:
+    request = "Give me a research plan only for studying competitors to Deliberate AI."
+    fallback = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="business_research_analyst",
+        workflow=["business_research_analyst"],
+        intent="company_research",
+        primary_target="Deliberate AI",
+        target_type="company",
+        provider_operations=["search"],
+        task_objective="entity_research",
+        expected_artifact_type="research_brief",
+        requires_target_discovery=True,
+        anchor_entity="Deliberate AI",
+        requires_live_search=True,
+        requires_durable_state=True,
+        ask_shape={"output_form": "brief"},
+    )
+
+    merged = merge_manual_request_plan(fallback, candidate)
+
+    assert merged.ask_shape.output_form == "plan"
+    assert merged.target_agent == "chief_of_staff"
+    assert merged.intent == "route_request"
+    assert merged.task_objective == "route_or_continue"
+    assert merged.expected_artifact_type == "none"
+    assert merged.workflow == []
+    assert merged.provider_operations == []
+    assert merged.requires_target_discovery is False
+    assert merged.anchor_entity == ""
+    assert merged.requires_live_search is False
+    assert merged.requires_durable_state is False
+    assert any("non-executing plan-only" in item for item in merged.planner_warnings)
 
 
 def test_llm_cannot_turn_incidental_email_context_into_forbidden_gmail_owner() -> None:
@@ -6240,3 +6583,552 @@ def test_explicit_zotero_agent_can_delegate_clear_web_research() -> None:
     assert plan.provider_system == "unspecified"
     assert plan.provider_operations == []
     assert plan.requires_live_search is True
+
+
+@pytest.mark.parametrize(
+    ("request_text", "expected"),
+    [
+        (
+            "Business Research Analyst: Deeply research Callyope, then identify "
+            "up to 3 additional companies with official-source evidence of "
+            "genuinely multimodal behavioral-health AI. Strict matches only; do "
+            "not pad the list. Compare modalities, clinical use, target users, "
+            "and evidence strength. Read-only; include visible URLs.",
+            {
+                "task_objective": "source_research",
+                "expected_artifact_type": "research_brief",
+                "primary_target": "Callyope",
+                "target_type": "company",
+                "desired_count": 3,
+                "desired_count_scope": "additional",
+                "requires_target_discovery": True,
+                "anchor_entity": "Callyope",
+                "required_entities": ["Callyope"],
+                "required_terms": [
+                    "modalities",
+                    "clinical use",
+                    "target users",
+                    "evidence strength",
+                ],
+            },
+        ),
+        (
+            "Business Research Analyst: Find up to 3 enterprise customer-service "
+            "AI platforms with official evidence of enterprise integrations and "
+            "independent evidence of adoption. Strict matches only; do not pad. "
+            "Compare target customer, integrations, adoption evidence, and source "
+            "quality. Read-only; include visible URLs.",
+            {
+                "task_objective": "source_research",
+                "expected_artifact_type": "source_summary",
+                "primary_target": "enterprise customer-service AI platforms",
+                "target_type": "topic",
+                "desired_count": 3,
+                "desired_count_scope": "total",
+                "requires_target_discovery": True,
+                "anchor_entity": "",
+                "required_entities": [],
+                "required_terms": [
+                    "target customer",
+                    "integrations",
+                    "adoption evidence",
+                    "source quality",
+                ],
+            },
+        ),
+        (
+            "Compare Callyope, Kintsugi, and Ellipsis Health on voice or language "
+            "modalities, behavioral-health use, target users, and clinical "
+            "validation. Use official and independent sources, identify evidence "
+            "gaps, and include visible URLs. Read-only.",
+            {
+                "task_objective": "source_research",
+                "expected_artifact_type": "research_brief",
+                "primary_target": "Callyope vs Kintsugi vs Ellipsis Health",
+                "target_type": "company",
+                "desired_count": 1,
+                "desired_count_scope": "unspecified",
+                "requires_target_discovery": False,
+                "anchor_entity": "",
+                "required_entities": [
+                    "Callyope",
+                    "Kintsugi",
+                    "Ellipsis Health",
+                ],
+                "required_terms": [
+                    "voice or language modalities",
+                    "behavioral-health use",
+                    "target users",
+                    "clinical validation",
+                ],
+            },
+        ),
+    ],
+)
+def test_business_research_target_set_topology_is_typed_from_novel_asks(
+    request_text: str,
+    expected: dict[str, object],
+) -> None:
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="business_research_analyst",
+    )
+
+    assert plan.intent == "company_research"
+    assert plan.provider_result_mode == "items"
+    assert plan.desired_count_explicit is (expected["desired_count"] == 3)
+    for field, value in expected.items():
+        assert getattr(plan, field) == value
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        (
+            "Business Research Analyst: Deeply research Callyope, then identify "
+            "up to 3 additional companies with official-source evidence of genuinely "
+            "multimodal behavioral-health AI. Strict matches only; do not pad the "
+            "list. Compare modalities, clinical use, target users, and evidence "
+            "strength. Read-only; include visible URLs."
+        ),
+        (
+            "Business Research Analyst: Find up to 3 enterprise customer-service AI "
+            "platforms with official evidence of enterprise integrations and "
+            "independent evidence of adoption. Strict matches only; do not pad. "
+            "Compare target customer, integrations, adoption evidence, and source "
+            "quality. Read-only; include visible URLs."
+        ),
+        (
+            "Compare Callyope, Kintsugi, and Ellipsis Health on voice or language "
+            "modalities, behavioral-health use, target users, and clinical validation. "
+            "Use official and independent sources, identify evidence gaps, and "
+            "include visible URLs. Read-only."
+        ),
+    ],
+)
+def test_llm_merge_preserves_agreed_current_turn_research_topology(
+    request_text: str,
+) -> None:
+    base = infer_manual_request_plan(
+        request_text,
+        requested_agent="business_research_analyst",
+    )
+    candidate = base.model_copy(
+        update={
+            "source": "llm",
+            "requires_target_discovery": False,
+            "anchor_entity": "",
+            "required_entities": [],
+            "required_terms": [],
+        }
+    )
+
+    merged = merge_manual_request_plan(base, candidate)
+
+    assert merged.target_agent == base.target_agent
+    assert merged.intent == base.intent
+    assert merged.expected_artifact_type == base.expected_artifact_type
+    assert merged.requires_target_discovery is base.requires_target_discovery
+    assert merged.anchor_entity == base.anchor_entity
+    assert merged.required_entities == base.required_entities
+    assert merged.required_terms == base.required_terms
+
+
+def test_llm_merge_restores_atomic_anchored_research_topology() -> None:
+    request_text = (
+        "Business Research Analyst: Deeply research Callyope, then identify up to "
+        "3 additional companies with official-source evidence of genuinely "
+        "multimodal behavioral-health AI. Compare modalities, target users, and "
+        "validation."
+    )
+    base = infer_manual_request_plan(
+        request_text,
+        requested_agent="business_research_analyst",
+    )
+    candidate = base.model_copy(
+        update={
+            "source": "llm",
+            "requires_target_discovery": False,
+            "anchor_entity": "",
+            "required_entities": ["Callyope"],
+        }
+    )
+
+    merged = merge_manual_request_plan(base, candidate)
+
+    assert merged.requires_target_discovery is True
+    assert merged.anchor_entity == "Callyope"
+    assert merged.required_entities == ["Callyope"]
+
+
+def test_llm_merge_repairs_contradictory_open_set_research_contract() -> None:
+    request_text = (
+        "CoS, research Ellipsis Health as the anchor. Identify up to 3 closest "
+        "evidence-backed competitors specifically in voice-based or multimodal "
+        "mental-health assessment. Characterize Ellipsis Health first. Require an "
+        "official product or research source for every named company. Distinguish "
+        "direct competitors from adjacent tools, include concise source URLs and "
+        "limitations, and make no changes, drafts, contacts, or writes."
+    )
+    base = infer_manual_request_plan(
+        request_text,
+        requested_agent="chief_of_staff",
+    )
+    assert base.desired_count_scope == "additional"
+    assert base.requires_target_discovery is True
+    assert base.anchor_entity == "Ellipsis Health"
+    candidate = base.model_copy(
+        update={
+            "source": "llm",
+            "intent": "context_lookup",
+            "task_objective": "entity_research",
+            "expected_artifact_type": "research_brief",
+            "primary_target": "Ellipsis Health",
+            "target_type": "company",
+            "provider_system": "unspecified",
+            "provider_operations": [],
+            "provider_action_steps": [],
+            "provider_result_mode": "items",
+            "requires_target_discovery": True,
+            "anchor_entity": "Ellipsis Health",
+            "required_entities": ["Ellipsis Health"],
+            "desired_count": 3,
+            "desired_count_explicit": True,
+            "desired_count_mode": "maximum",
+            "desired_count_scope": "total",
+        }
+    )
+
+    merged = merge_manual_request_plan(base, candidate)
+
+    assert merged.intent == "company_research"
+    assert merged.task_objective == "entity_research"
+    assert merged.expected_artifact_type == "research_brief"
+    assert merged.desired_count == 3
+    assert merged.desired_count_mode == "maximum"
+    assert merged.desired_count_scope == "additional"
+    assert merged.requires_target_discovery is True
+    assert merged.anchor_entity == "Ellipsis Health"
+    assert merged.primary_target == "Ellipsis Health"
+    assert merged.required_entities == ["Ellipsis Health"]
+
+
+def test_provider_bound_research_shaped_context_lookup_is_not_reclassified() -> None:
+    base = infer_manual_request_plan(
+        "Research the selected source and return a source summary.",
+        requested_agent="business_research_analyst",
+    )
+    candidate = base.model_copy(
+        update={
+            "source": "llm",
+            "target_agent": "business_research_analyst",
+            "intent": "context_lookup",
+            "task_objective": "source_research",
+            "expected_artifact_type": "source_summary",
+            "provider_system": "zotero",
+            "provider_operations": ["read"],
+            "provider_action_steps": [
+                ManualProviderActionStep(
+                    operation="read",
+                    resource_type="zotero_item",
+                )
+            ],
+        }
+    )
+
+    merged = merge_manual_request_plan(base, candidate)
+
+    assert merged.intent == "context_lookup"
+    assert merged.target_agent == "zotero_context_agent"
+    assert merged.task_objective == "source_research"
+    assert merged.expected_artifact_type == "source_summary"
+    assert merged.provider_system == "zotero"
+    assert merged.provider_operations == ["read"]
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Deeply research Callyope. Compare safety, privacy, and evidence.",
+        (
+            "Deeply research Callyope, then identify 3 additional companies. "
+            "Compare modalities, target users, and validation."
+        ),
+    ],
+)
+def test_comparison_rubric_words_are_not_inferred_as_fixed_company_targets(
+    request_text: str,
+) -> None:
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="business_research_analyst",
+    )
+
+    assert plan.required_entities in ([], ["Callyope"])
+    assert not {"safety", "privacy", "evidence", "modalities", "validation"}.intersection(
+        entity.lower() for entity in plan.required_entities
+    )
+
+
+def test_manager_named_open_set_research_keeps_anchor_and_delegates_to_research() -> None:
+    request = (
+        "CoS, determine if there are any companies that are competitors to "
+        "Deliberate AI? For this, deeply research the company and then search for "
+        "competitors focusing on multimodal approaches in behavioral health."
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+
+    assert plan.requested_agent == "chief_of_staff"
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.intent == "company_research"
+    assert plan.task_objective == "source_research"
+    assert plan.expected_artifact_type == "research_brief"
+    assert plan.requires_target_discovery is True
+    assert plan.anchor_entity == "Deliberate AI"
+    assert plan.required_entities == ["Deliberate AI"]
+    assert plan.desired_count_explicit is False
+    assert plan.ask_shape.ask_breadth == "broad"
+
+
+def test_category_source_research_without_count_uses_open_set_research_contract() -> None:
+    request = (
+        "Find companies providing enterprise customer-service AI with official "
+        "evidence of integrations and independent evidence of adoption. Compare "
+        "target customer, integrations, adoption evidence, and source quality. "
+        "Strict matches only; do not pad."
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+
+    assert plan.requested_agent == "chief_of_staff"
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.intent == "company_research"
+    assert plan.task_objective == "source_research"
+    assert plan.expected_artifact_type == "source_summary"
+    assert plan.requires_target_discovery is True
+    assert plan.anchor_entity == ""
+    assert plan.required_entities == []
+    assert plan.desired_count_explicit is False
+    assert plan.provider_result_mode == "items"
+    assert plan.ask_shape.ask_breadth == "broad"
+
+
+def test_lowercase_fixed_company_set_is_not_lost_to_rubric_filtering() -> None:
+    request = (
+        "compare spring health, lyra health, and modern health on modalities, "
+        "evidence strength, safety, and privacy"
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.requires_target_discovery is False
+    assert plan.required_entities == [
+        "spring health",
+        "lyra health",
+        "modern health",
+    ]
+    assert plan.required_terms == [
+        "modalities",
+        "evidence strength",
+        "safety",
+        "privacy",
+    ]
+
+
+def test_lowercase_comparison_dimensions_are_not_treated_as_company_names() -> None:
+    request = (
+        "Compare product safety, data privacy, and evidence strength for the "
+        "selected company."
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+
+    assert plan.required_entities == []
+    assert not plan.requires_target_discovery
+
+
+@pytest.mark.parametrize(
+    ("case_text", "expected_anchor", "expected_discovery"),
+    [
+        (
+            "Business Research Analyst: Deeply research Callyope. Compare safety, "
+            "privacy, and evidence.",
+            "",
+            False,
+        ),
+        (
+            "Business Research Analyst: Study Callyope first, then find three more "
+            "multimodal behavioral-health AI companies.",
+            "Callyope",
+            True,
+        ),
+    ],
+)
+def test_research_action_modifiers_do_not_replace_the_company_target(
+    case_text: str,
+    expected_anchor: str,
+    expected_discovery: bool,
+) -> None:
+    plan = infer_manual_request_plan(
+        case_text,
+        requested_agent="business_research_analyst",
+    )
+
+    assert plan.primary_target == "Callyope"
+    assert plan.anchor_entity == expected_anchor
+    assert plan.requires_target_discovery is expected_discovery
+    if expected_anchor:
+        assert plan.required_entities == ["Callyope"]
+    else:
+        assert "Deeply" not in plan.required_entities
+
+
+@pytest.mark.parametrize("count_token", ["three", "3"])
+def test_gmail_thread_collection_count_uses_common_mailbox_nouns(
+    count_token: str,
+) -> None:
+    request = (
+        f"Review the {count_token} newest Gmail partnership threads, then write "
+        "one internal Slack update summarizing what needs attention."
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+
+    assert plan.desired_count == 3
+    assert plan.desired_count_explicit is True
+    assert "gmail_triage" in (plan.workflow or [plan.target_agent])
+    assert plan.provider_read_scope == "bounded_collection"
+
+
+@pytest.mark.parametrize(
+    "case_text",
+    [
+        (
+            "Opportunity Scout: Assess whether Callyope is a credible opportunity "
+            "using the supplied research only."
+        ),
+        (
+            "Opportunity Scout: Based only on the supplied company profile, assess "
+            "whether Callyope is a credible opportunity."
+        ),
+    ],
+)
+def test_selected_research_artifacts_do_not_authorize_live_search(
+    case_text: str,
+) -> None:
+    plan = infer_manual_request_plan(
+        case_text,
+        requested_agent="opportunity_scout",
+    )
+
+    assert plan.target_agent == "opportunity_scout"
+    assert plan.requires_live_search is False
+    assert plan.ask_shape.prior_context_dependency == "selected_context"
+    assert plan.intent == "opportunity_search"
+    assert plan.task_objective == "opportunity_discovery"
+    assert plan.expected_artifact_type == "opportunity_record"
+    assert plan.primary_target == "Callyope"
+    assert plan.target_type == "company"
+
+
+@pytest.mark.parametrize(
+    "case_text",
+    [
+        "Research Callyope's pricing plan and compare competitors.",
+        "Plan and execute research on Callyope using official sources.",
+    ],
+)
+def test_incidental_plan_word_does_not_suppress_research_execution(
+    case_text: str,
+) -> None:
+    base = infer_manual_request_plan(
+        case_text,
+        requested_agent="business_research_analyst",
+    )
+    candidate = base.model_copy(
+        update={
+            "source": "llm",
+            "target_agent": "business_research_analyst",
+            "intent": "company_research",
+            "task_objective": "entity_research",
+            "expected_artifact_type": "research_brief",
+            "requires_live_search": True,
+        }
+    )
+
+    merged = merge_manual_request_plan(base, candidate)
+
+    assert merged.target_agent == "business_research_analyst"
+    assert merged.intent == "company_research"
+    assert merged.expected_artifact_type == "research_brief"
+    assert merged.requires_live_search is True
+
+
+@pytest.mark.parametrize(
+    "case_text",
+    [
+        "Compare reliability, explainability, and governance for the selected company.",
+        "Compare Reliability, Explainability, and Governance for the selected company.",
+        (
+            "Compare accessibility, interoperability, and clinical validity for "
+            "selected vendors."
+        ),
+    ],
+)
+def test_comparison_dimensions_are_not_promoted_to_company_identities(
+    case_text: str,
+) -> None:
+    plan = infer_manual_request_plan(
+        case_text,
+        requested_agent="business_research_analyst",
+    )
+
+    assert plan.required_entities == []
+    assert " vs " not in plan.primary_target
+
+
+@pytest.mark.parametrize(
+    "case_text",
+    [
+        "Research the digital health market, then find three companies with evidence.",
+        "Research voice biomarkers, then find three companies using them.",
+    ],
+)
+def test_category_first_discovery_does_not_invent_a_company_anchor(
+    case_text: str,
+) -> None:
+    plan = infer_manual_request_plan(
+        case_text,
+        requested_agent="business_research_analyst",
+    )
+
+    assert plan.anchor_entity == ""
+    assert plan.required_entities == []
+
+
+def test_opportunity_deliverable_preserves_explicit_scout_ownership() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "Opportunity Scout: Find three behavioral-health AI companies with "
+            "official validation evidence and rank their KNI advisory fit."
+        ),
+        requested_agent="opportunity_scout",
+    )
+
+    assert plan.target_agent == "opportunity_scout"
+    assert plan.intent == "opportunity_search"
+    assert plan.task_objective == "opportunity_discovery"
+    assert plan.expected_artifact_type == "opportunity_record"
+
+
+def test_provider_draft_negation_preserves_local_reply_composition() -> None:
+    request = "Do not draft a Gmail reply; write the reply copy here for review."
+
+    plan = infer_manual_request_plan(request, requested_agent="gmail_triage")
+
+    assert request_forbids_response_composition(request) is False
+    assert plan.ask_shape.output_form == "draft"
+    assert plan.ask_shape.permission_state == "draft_only"
+    assert plan.draft_policy != "no_drafts_requested"

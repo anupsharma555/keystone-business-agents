@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from keystone_agents.agent_tool_policy import filter_tools_for_tier
 from keystone_agents.guardrails import keystone_guardrails, keystone_tool_guardrail_kwargs
@@ -428,6 +428,7 @@ ACTIVE_OPPORTUNITY_MARKERS = (
     "solicitation",
     "sources sought",
     "applications open",
+    "accepting applications",
     "registration open",
     "enrollment open",
     "now enrolling",
@@ -1996,6 +1997,22 @@ def _build_live_query_specs(
                 entity_hint="grant_program",
             ),
         ]
+        if any(
+            marker in str(topic or "").lower()
+            for marker in ("accelerator", "accelerators", "incubator", "incubators")
+        ):
+            specs.append(
+                _OpportunityQuerySpec(
+                    lane="grant",
+                    time_window="current",
+                    query=(
+                        f'{context} ("accelerator program" OR "incubator program") '
+                        '("applications open" OR "accepting applications" OR eligibility '
+                        "OR deadline) 2026 -news"
+                    ),
+                    entity_hint="grant_program",
+                )
+            )
     elif _plan_is_formal_opportunity_request(plan):
         specs = [
             _OpportunityQuerySpec(
@@ -3674,6 +3691,14 @@ def _entity_kind_from_lane(
     if lane == "role" or _looks_like_job_posting(title=title, url=url, snippet=snippet):
         return "role"
     if lane == "grant":
+        if _looks_like_typed_accelerator_program(
+            lane=lane,
+            entity_hint=entity_hint,
+            title=title,
+            url=url,
+            snippet=snippet,
+        ):
+            return "grant_program"
         if any(
             marker in haystack
             for marker in ("grants.gov", "reporter.nih.gov", "nih", "sbir", "grant")
@@ -3720,6 +3745,35 @@ def _entity_kind_from_lane(
     if _contains_any_marker(haystack, INSTITUTE_MARKERS):
         return "institute"
     return "company"
+
+
+def _looks_like_typed_accelerator_program(
+    *,
+    lane: str,
+    entity_hint: str,
+    title: str,
+    url: str,
+    snippet: str,
+) -> bool:
+    """Recognize program pages only inside an already typed funding lane."""
+
+    if lane != "grant" or entity_hint != "grant_program":
+        return False
+    haystack = f" {title} {url} {snippet} ".lower()
+    return any(
+        marker in haystack
+        for marker in ("accelerator", "incubator")
+    ) and any(
+        marker in haystack
+        for marker in (
+            "program",
+            "cohort",
+            "apply",
+            "application",
+            "eligibility",
+            "deadline",
+        )
+    )
 
 
 def _extract_candidate_name(
@@ -4393,11 +4447,61 @@ def _active_opportunity_reasons(*, title: str, url: str, snippet: str) -> list[s
     haystack = f" {title} {url} {snippet} ".lower()
     active_haystack = haystack.replace("raises red flags", "")
     reasons: list[str] = []
-    if any(marker in active_haystack for marker in ACTIVE_OPPORTUNITY_MARKERS):
+    closed_markers = (
+        "applications closed",
+        "application closed",
+        "submissions closed",
+        "registration closed",
+        "no longer accepting",
+        "deadline has passed",
+        "expired opportunity",
+        "archived opportunity",
+        "will be announced later",
+        "to be announced",
+        "before the next cycle",
+        "not yet open",
+    )
+    has_closed_evidence = any(marker in active_haystack for marker in closed_markers)
+    if not has_closed_evidence and (
+        any(marker in active_haystack for marker in ACTIVE_OPPORTUNITY_MARKERS)
+        or _has_current_application_window_evidence(active_haystack)
+    ):
         reasons.append("source text includes active opportunity evidence")
     if _looks_like_job_posting(title=title, url=url, snippet=snippet):
         reasons.append("source is a verifiable role or careers posting")
     return list(dict.fromkeys(reasons))
+
+
+def _has_current_application_window_evidence(text: str) -> bool:
+    """Require present-tense or date-bounded evidence for application windows."""
+
+    if re.search(
+        r"\b(?:now\s+)?accepting applications\b|\bapplications?\s+(?:are\s+)?open\b",
+        text,
+        flags=re.I,
+    ):
+        return True
+    if not re.search(
+        r"\b(?:application (?:window|period)\s+(?:opens?|will open)|"
+        r"applications?\s+(?:are\s+)?accepted through|applications?\s+will open)\b",
+        text,
+        flags=re.I,
+    ):
+        return False
+    candidate_dates: list[date] = []
+    for match in re.finditer(
+        r"\b([A-Z][a-z]+\s+\d{1,2},?\s+20\d{2}|20\d{2}-\d{2}-\d{2})\b",
+        text,
+        flags=re.I,
+    ):
+        value = match.group(1).replace(",", "")
+        for fmt in ("%B %d %Y", "%b %d %Y", "%Y-%m-%d"):
+            try:
+                candidate_dates.append(datetime.strptime(value, fmt).date())
+                break
+            except ValueError:
+                continue
+    return any(candidate >= date.today() for candidate in candidate_dates)
 
 
 def _contextual_activity_reasons(
@@ -5387,6 +5491,25 @@ def _search_result_to_hit(
         snippet=snippet,
         entity_kind=entity_kind,
     )
+    if _looks_like_typed_accelerator_program(
+        lane=lane,
+        entity_hint=entity_hint,
+        title=title,
+        url=url,
+        snippet=snippet,
+    ):
+        source_category = "grant"
+        explicit_source_type = str(result.get("source_type") or "").strip()
+        if explicit_source_type and explicit_source_type not in {
+            "search",
+            "google_search",
+            "metasearch",
+        }:
+            source_type = explicit_source_type
+        elif ".gov/" in url.lower():
+            source_type = "government"
+        elif _source_url_matches_entity_name(url, entity_name):
+            source_type = "company_site"
     role = _role_evidence_from_hit(
         {
             "source_title": title,
@@ -5434,6 +5557,34 @@ def _search_result_to_hit(
         "role_active": role.role_active,
         "role_filter_notes": list(role.filter_notes),
     }
+
+
+def _source_url_matches_entity_name(url: str, entity_name: str) -> bool:
+    """Recognize an official-looking program domain without trusting query semantics."""
+
+    hostname = str(urlparse(url).hostname or "").lower().removeprefix("www.")
+    entity_key = re.sub(r"[^a-z0-9]+", "", entity_name.lower())
+    if not hostname or len(entity_key) < 5:
+        return False
+    generic_labels = {
+        "apply",
+        "blog",
+        "careers",
+        "events",
+        "funding",
+        "news",
+        "program",
+        "programs",
+    }
+    domain_labels = [
+        re.sub(r"[^a-z0-9]+", "", label)
+        for label in hostname.split(".")[:-1]
+        if label and label not in generic_labels
+    ]
+    return any(
+        len(label) >= 5 and (label in entity_key or entity_key in label)
+        for label in domain_labels
+    )
 
 
 def _source_category_from_search_result(*, title: str, url: str, snippet: str) -> str:
@@ -5730,9 +5881,35 @@ def _search_provider_label(search_provider: Any) -> str:
 
 
 def _source_hit_key(hit: dict[str, Any]) -> str:
-    url = str(hit.get("source_url") or hit.get("url") or hit.get("link") or "").strip().lower()
+    url = str(hit.get("source_url") or hit.get("url") or hit.get("link") or "").strip()
     if url:
-        return url.rstrip("/")
+        parsed = urlparse(url)
+        if parsed.scheme and parsed.netloc:
+            tracking_keys = {
+                "fbclid",
+                "gclid",
+                "igshid",
+                "mc_cid",
+                "mc_eid",
+                "msclkid",
+            }
+            query_pairs = [
+                (key, value)
+                for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+                if not key.lower().startswith("utm_")
+                and key.lower() not in tracking_keys
+            ]
+            normalized_path = parsed.path.rstrip("/") or "/"
+            return urlunparse(
+                (
+                    parsed.scheme.lower(),
+                    parsed.netloc.lower(),
+                    normalized_path,
+                    "",
+                    urlencode(sorted(query_pairs)),
+                    "",
+                )
+            )
     title = str(hit.get("source_title") or hit.get("title") or "").strip().lower()
     signal = str(hit.get("signal") or hit.get("snippet") or "").strip().lower()
     return f"{title}|{signal}"
@@ -5756,6 +5933,8 @@ def _verify_source_hits(
     *,
     verify_source_pages: bool | None = None,
     verification_cache: dict[str, dict[str, Any]] | None = None,
+    search_plan: OpportunitySearchPlan | None = None,
+    extraction_budget: WebsiteExtractionBudget | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Optionally verify top candidate pages with capped clean-text extraction."""
 
@@ -5767,13 +5946,37 @@ def _verify_source_hits(
     verified: list[dict[str, Any]] = []
     notes: list[str] = [f"Verified up to {cap} unique source page(s) with capped extraction."]
     fallback_providers = _opportunity_verification_fallback_providers()
-    extraction_budget = website_extraction_budget()
+    extraction_budget = extraction_budget or website_extraction_budget()
     attempts = 0
     html_review_attempts = 0
+    verification_candidates = [
+        hit
+        for hit in hits
+        if _source_hit_key(hit)
+        and str(hit.get("source_url") or "").strip().startswith(("http://", "https://"))
+    ]
+    verification_keys = {
+        _source_hit_key(hit)
+        for hit in sorted(
+            verification_candidates,
+            key=lambda hit: _opportunity_verification_priority(
+                hit,
+                search_plan=search_plan,
+            ),
+            reverse=True,
+        )[:cap]
+    }
     for hit in hits:
         enriched = dict(hit)
         url = str(hit.get("source_url") or "").strip()
         hit_key = _source_hit_key(hit)
+        verification_base = {
+            "url": url[:500],
+            "title": str(hit.get("source_title") or "")[:240],
+            "entity_kind": str(hit.get("entity_kind") or "")[:80],
+            "source_type": str(hit.get("source_type") or "")[:80],
+            "source_category": str(hit.get("source_category") or "")[:80],
+        }
         cached = cache.get(hit_key) if hit_key else None
         if cached is not None:
             enriched.update(cached)
@@ -5782,6 +5985,7 @@ def _verify_source_hits(
             len(cache) < cap
             and attempts < cap
             and hit_key
+            and hit_key in verification_keys
             and url.startswith(("http://", "https://"))
         ):
             attempts += 1
@@ -5795,7 +5999,13 @@ def _verify_source_hits(
                 )
             except WebsiteExtractionError as exc:
                 notes.append(f"Verification failed for {hit.get('company_name') or url}: {exc}")
-                cache[hit_key] = {}
+                cache[hit_key] = {
+                    "_verification_diagnostic": {
+                        **verification_base,
+                        "status": "failed",
+                        "error_type": type(exc).__name__,
+                    }
+                }
             else:
                 if extraction.provider != os.getenv("KEYSTONE_WEBSITE_EXTRACTOR", "trafilatura"):
                     notes.append(
@@ -5870,9 +6080,183 @@ def _verify_source_hits(
                         )
                         if key in enriched
                     }
+                    cache[hit_key]["_verification_diagnostic"] = {
+                        **verification_base,
+                        "status": "verified",
+                        "provider": extraction.provider,
+                    }
                     notes.append(f"Verified source page for {hit.get('company_name') or url}.")
+                else:
+                    cache[hit_key] = {
+                        "_verification_diagnostic": {
+                            **verification_base,
+                            "status": "empty",
+                            "provider": extraction.provider,
+                        }
+                    }
         verified.append(enriched)
     return verified, list(dict.fromkeys(note for note in notes if note))
+
+
+def _opportunity_verification_priority(
+    hit: dict[str, Any],
+    *,
+    search_plan: OpportunitySearchPlan | None,
+) -> int:
+    """Prioritize scarce page reads using provider-neutral source evidence."""
+
+    source_type = str(hit.get("source_type") or "").strip().lower()
+    source_category = _source_category_from_hit(hit)
+    entity_kind = str(hit.get("entity_kind") or "").strip().lower()
+    title = str(hit.get("source_title") or "")
+    url = str(hit.get("source_url") or "")
+    snippet = str(hit.get("signal") or "")
+    haystack = f" {title} {url} {snippet} ".lower()
+    score = 0
+
+    if search_plan is not None and entity_kind in search_plan.target_entity_types:
+        score += 50
+    if source_type in {"government", "company_site", "conference", "publication"}:
+        score += 25
+    if source_category in {"grant", "contract_rfp", "conference", "journal_call"}:
+        score += 20
+    if ".gov/" in haystack or ".gov " in haystack:
+        score += 20
+    if any(
+        marker in haystack
+        for marker in (
+            "accelerator",
+            "incubator",
+            "funding opportunity",
+            "grant program",
+            "nofo",
+            "foa",
+            "rfa",
+            "sbir",
+            "sttr",
+            "apply",
+            "application",
+            "eligibility",
+            "deadline",
+        )
+    ):
+        score += 15
+    specific_application_evidence = any(
+        marker in haystack
+        for marker in (
+            "/apply",
+            " apply ",
+            "application",
+            "eligibility",
+            "deadline",
+            "accepting applications",
+            "applications open",
+        )
+    )
+    if specific_application_evidence:
+        score += 50
+    if (
+        any(marker in haystack for marker in ("funding opportunities", "grant programs"))
+        and not specific_application_evidence
+    ):
+        score -= 25
+    if _active_opportunity_reasons(title=title, url=url, snippet=snippet):
+        score += 10
+    if source_category in {"news", "search", "publication"}:
+        score -= 20
+    if _title_noise_rejection_reasons(title=title, url=url, snippet=snippet):
+        score -= 30
+    return score
+
+
+def _verification_diagnostics_from_cache(
+    cache: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    attempts: list[dict[str, Any]] = []
+    status_counts: dict[str, int] = {}
+    for cached in cache.values():
+        diagnostic = cached.get("_verification_diagnostic")
+        if not isinstance(diagnostic, Mapping):
+            continue
+        field_limits = {
+            "url": 500,
+            "title": 240,
+            "entity_kind": 80,
+            "source_type": 80,
+            "source_category": 80,
+            "status": 80,
+            "provider": 80,
+            "error_type": 120,
+        }
+        compact = {
+            key: str(diagnostic.get(key) or "")[:limit]
+            for key, limit in field_limits.items()
+            if str(diagnostic.get(key) or "").strip()
+        }
+        status = str(compact.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if len(attempts) < 8:
+            attempts.append(compact)
+    return {
+        "attempt_count": sum(status_counts.values()),
+        "status_counts": status_counts,
+        "attempts": attempts,
+    }
+
+
+def _candidate_admission_diagnostics(
+    *,
+    filtered_candidates: list[dict[str, Any]],
+    review_candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    reason_counts_by_disposition: dict[str, dict[str, int]] = {
+        "filtered": {},
+        "review": {},
+    }
+    samples: list[dict[str, Any]] = []
+    for disposition, candidates in (
+        ("filtered", filtered_candidates),
+        ("review", review_candidates),
+    ):
+        for candidate in candidates:
+            reasons = [
+                str(reason).strip()
+                for reason in candidate.get("reasons", [])
+                if str(reason).strip()
+            ]
+            for reason in reasons:
+                disposition_counts = reason_counts_by_disposition[disposition]
+                disposition_counts[reason] = disposition_counts.get(reason, 0) + 1
+            disposition_sample_count = sum(
+                1 for sample in samples if sample["disposition"] == disposition
+            )
+            if disposition_sample_count < 6:
+                samples.append(
+                    {
+                        "disposition": disposition,
+                        "company_name": str(candidate.get("company_name") or "Unknown company")[
+                            :160
+                        ],
+                        "entity_kind": str(candidate.get("entity_kind") or ""),
+                        "source_category": str(candidate.get("source_category") or ""),
+                        "source_url": str(candidate.get("source_url") or "")[:500],
+                        "reasons": reasons[:4],
+                    }
+                )
+    ordered_reason_counts = {
+        disposition: dict(
+            sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:12]
+        )
+        for disposition, counts in reason_counts_by_disposition.items()
+    }
+    return {
+        "filtered_count": len(filtered_candidates),
+        "review_count": len(review_candidates),
+        "reason_counts": ordered_reason_counts["filtered"],
+        "filtered_reason_counts": ordered_reason_counts["filtered"],
+        "review_reason_counts": ordered_reason_counts["review"],
+        "samples": samples,
+    }
 
 
 def _opportunity_verification_fallback_providers() -> tuple[str, ...]:
@@ -5977,6 +6361,7 @@ def _process_candidate_hits(
     search_plan: OpportunitySearchPlan | None = None,
     verify_source_pages: bool | None = None,
     verification_cache: dict[str, dict[str, Any]] | None = None,
+    extraction_budget: WebsiteExtractionBudget | None = None,
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -5990,6 +6375,8 @@ def _process_candidate_hits(
         deduped_hits,
         verify_source_pages=verify_source_pages,
         verification_cache=verification_cache,
+        search_plan=search_plan,
+        extraction_budget=extraction_budget,
     )
     (
         deduped,
@@ -7068,6 +7455,7 @@ def scout_opportunities_live_search(
         verify_source_pages = True
     query_specs = _build_live_query_specs(topic, search_plan=resolved_search_plan)
     verification_cache: dict[str, dict[str, Any]] = {}
+    verification_extraction_budget = website_extraction_budget()
     queries = [spec.query for spec in query_specs]
     hits = _search_query_specs_with_provider(
         search_provider=provider,
@@ -7088,6 +7476,7 @@ def scout_opportunities_live_search(
         search_plan=resolved_search_plan,
         verify_source_pages=verify_source_pages,
         verification_cache=verification_cache,
+        extraction_budget=verification_extraction_budget,
     )
 
     coverage_audit_notes: list[str] = []
@@ -7118,6 +7507,7 @@ def scout_opportunities_live_search(
             search_plan=resolved_search_plan,
             verify_source_pages=verify_source_pages,
             verification_cache=verification_cache,
+            extraction_budget=verification_extraction_budget,
         )
         query_specs = [*query_specs, *coverage_specs]
         queries = [spec.query for spec in query_specs]
@@ -7166,6 +7556,7 @@ def scout_opportunities_live_search(
             search_plan=resolved_search_plan,
             verify_source_pages=verify_source_pages,
             verification_cache=verification_cache,
+            extraction_budget=verification_extraction_budget,
         )
         query_specs = [*query_specs, *adaptive_specs]
         queries = [spec.query for spec in query_specs]
@@ -7218,6 +7609,7 @@ def scout_opportunities_live_search(
             search_plan=resolved_search_plan,
             verify_source_pages=verify_source_pages,
             verification_cache=verification_cache,
+            extraction_budget=verification_extraction_budget,
         )
         query_specs = [*query_specs, *deepening_specs]
         queries = [spec.query for spec in query_specs]
@@ -7266,6 +7658,7 @@ def scout_opportunities_live_search(
             search_plan=resolved_search_plan,
             verify_source_pages=verify_source_pages,
             verification_cache=verification_cache,
+            extraction_budget=verification_extraction_budget,
         )
         query_specs = [*query_specs, *underfill_specs]
         queries = [spec.query for spec in query_specs]
@@ -7286,6 +7679,11 @@ def scout_opportunities_live_search(
         topic=topic,
         records_found=bool(deduped),
     )
+    candidate_admission = _candidate_admission_diagnostics(
+        filtered_candidates=filtered_candidates,
+        review_candidates=acceptance_review_candidates,
+    )
+    verification_diagnostics = _verification_diagnostics_from_cache(verification_cache)
     search_lanes_covered = list(dict.fromkeys(spec.lane for spec in query_specs))
     time_windows_covered = list(dict.fromkeys(spec.time_window for spec in query_specs))
     result = _records_from_hits(
@@ -7317,7 +7715,16 @@ def scout_opportunities_live_search(
             "elapsed_seconds": round(retrieval_budget.elapsed_seconds, 3),
             "stopped_before_stage": retrieval_budget.stopped_before_stage or None,
             "query_count": len(queries),
+            "raw_search_result_count": raw_hit_count,
             "unique_pages_cached": len(verification_cache),
+            "candidate_admission": candidate_admission,
+            "verification": verification_diagnostics,
+            "resolved_search_plan": {
+                "target_entity_types": list(resolved_search_plan.target_entity_types),
+                "objectives": list(resolved_search_plan.objectives),
+                "strict_targeting": resolved_search_plan.strict_targeting,
+                "lane_types": [lane.lane_type for lane in resolved_search_plan.lanes],
+            },
         },
         "audit_notes": [
             "Live search provider was used.",

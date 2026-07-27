@@ -526,8 +526,33 @@ def _canonical_chief_of_staff_tools(
     if provider == "google_workspace":
         workspace_tools = google_workspace_tools()
         include_names = set(GOOGLE_WORKSPACE_READ_TOOLS)
-        if operations.intersection({"create", "update", "delete", "attach"}):
-            include_names.update(GOOGLE_WORKSPACE_WRITE_TOOLS)
+        workspace_write_names = {
+            "create": {
+                "google_doc_write",
+                "google_drive_create_folder",
+                "google_sheet_create",
+                "google_sheet_create_tab",
+                "presentation_extract_slide_copy_local",
+            },
+            "update": {
+                "google_doc_write",
+                "google_drive_rename_folder",
+                "google_sheet_append_rows",
+                "google_sheet_update_row",
+                "google_sheet_update_tab",
+            },
+            "delete": {
+                "google_doc_trash",
+                "google_drive_remove_folder",
+                "google_sheet_delete_rows",
+                "google_sheet_remove_tab",
+                "google_sheet_trash",
+                "presentation_delete_test_artifact_local",
+            },
+            "attach": set(),
+        }
+        for operation in operations:
+            include_names.update(workspace_write_names.get(operation, set()))
         tools.extend(
             tool
             for tool in workspace_tools
@@ -851,6 +876,8 @@ def chief_slack_command_resolution_is_applicable(request_text: str) -> bool:
     if infer_calendar_action_plan(text) is not None:
         return False
     plan = infer_manual_request_plan(text, requested_agent="chief_of_staff")
+    if plan.provider_system == "google_calendar":
+        return False
     if plan.intent == "business_system_write":
         return False
     if plan.target_agent in {
@@ -6333,6 +6360,14 @@ def run_chief_of_staff_sdk(
         live_sdk=live,
         manual_request_plan=request_plan,
     )
+    execution_authority = ExecutionIntentAuthority.from_value(request_plan)
+    provider_operations = (
+        execution_authority.effective_provider_operations(
+            request_plan.provider_system
+        )
+        if execution_authority.canonical
+        else None
+    )
     result = run_typed_sdk_agent(
         agent=build_chief_of_staff_agent(
             model=model,
@@ -6350,6 +6385,13 @@ def run_chief_of_staff_sdk(
         live=live,
         session=session,
         max_turns=budget.max_turns,
+        provider_operations=(
+            None if execution_authority.canonical else provider_operations
+        ),
+        provider_system="",
+        capability_authority=(
+            execution_authority if execution_authority.canonical else None
+        ),
         trace_metadata={
             "quality_mode": budget.mode.value,
             "quality_max_turns": budget.max_turns,

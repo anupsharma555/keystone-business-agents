@@ -1593,6 +1593,12 @@ def test_typed_specialist_runtime_harness_uses_fake_model_without_openai_key(
     assert result.request_cache["session_attached"] is False
     assert result.request_cache["session_history_mode"] == ""
     assert result.request_cache["session_history_limit"] == 0
+    capability_profile = result.request_cache["capability_profile"]
+    assert capability_profile["agent_name"] == result.agent_name
+    assert capability_profile["tool_count"] == len(
+        capability_profile["tool_names"]
+    )
+    assert capability_profile["profile_fingerprint"]
     assert result.request_cache["session_truncation_configured"] is False
     assert model.calls
 
@@ -3647,6 +3653,11 @@ def test_high_confidence_manifest_match_resolves_preprints_without_model() -> No
         "update that same Airtable expense record",
         "create a Google Doc in Drive and verify it",
         "create a Gmail draft to myself and do not send it",
+        (
+            "list all events tomorrow from every Google Calendar I can read, "
+            "including selected shared calendars"
+        ),
+        "what is on my Google Calendar tomorrow?",
     ],
 )
 def test_chief_native_command_resolver_does_not_intercept_provider_actions(

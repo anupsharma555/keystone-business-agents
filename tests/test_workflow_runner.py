@@ -15,6 +15,7 @@ from keystone_agents.agents.orchestrator import run_orchestrator_preflight
 from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.multi_target_research import (
+    MultiTargetReadiness,
     MultiTargetResearchPlan,
     MultiTargetResearchResult,
     PerTargetResearchPacket,
@@ -739,6 +740,496 @@ def test_chief_write_request_metadata_preserves_json_objects() -> None:
 
 def _database_url(tmp_path: Path) -> str:
     return f"sqlite:///{tmp_path / 'workflow_runner.db'}"
+
+
+def test_provider_result_budget_uses_only_authoritative_count_scope() -> None:
+    canonical_nonexplicit = WorkflowRunRequest(
+        request_text="Research the selected company.",
+        max_results=3,
+        manual_request_plan={
+            "source": "llm",
+            "target_agent": "business_research_analyst",
+            "intent": "company_research",
+            "target_type": "company",
+            "task_objective": "entity_research",
+            "expected_artifact_type": "research_brief",
+            "desired_count": 10,
+            "desired_count_explicit": False,
+        },
+    )
+    canonical_explicit = canonical_nonexplicit.model_copy(
+        update={
+            "manual_request_plan": {
+                **canonical_nonexplicit.manual_request_plan,
+                "desired_count_explicit": True,
+            }
+        }
+    )
+    invalid_canonical = canonical_nonexplicit.model_copy(
+        update={
+            "manual_request_plan": {
+                **canonical_nonexplicit.manual_request_plan,
+                "expected_artifact_type": "invalid_artifact",
+                "desired_count": 99,
+                "desired_count_explicit": True,
+            }
+        }
+    )
+    compatibility = canonical_nonexplicit.model_copy(
+        update={
+            "manual_request_plan": {
+                **canonical_nonexplicit.manual_request_plan,
+                "source": "test",
+                "desired_count": 5,
+            }
+        }
+    )
+
+    assert workflow_runner._effective_max_results(canonical_nonexplicit) == 3
+    assert workflow_runner._effective_max_results(canonical_explicit) == 10
+    assert workflow_runner._effective_max_results(invalid_canonical) == 3
+    assert workflow_runner._effective_max_results(compatibility) == 5
+
+    budget = workflow_runner.AgentQualityBudget(
+        agent_name="business_research_analyst",
+        mode="deep",
+        retrieval_max_results=8,
+    )
+    assert (
+        workflow_runner._quality_budgeted_max_results(
+            canonical_nonexplicit,
+            budget,
+            preserve_requested_count=True,
+        )
+        == 8
+    )
+    assert (
+        workflow_runner._quality_budgeted_max_results(
+            canonical_explicit,
+            budget,
+            preserve_requested_count=True,
+        )
+        == 10
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider_count", "expected_status"),
+    [
+        (3, WorkItemStatus.DONE),
+        (2, WorkItemStatus.BLOCKED),
+    ],
+)
+def test_live_gmail_collection_renders_every_requested_item_and_blocks_underfill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_count: int,
+    expected_status: WorkItemStatus,
+) -> None:
+    class FakeGmail:
+        def __init__(self, *, live: bool) -> None:
+            assert live is True
+
+        def list_recent_messages(
+            self,
+            *,
+            label: str | None,
+            max_results: int,
+            query: str,
+        ) -> list[dict[str, str]]:
+            assert label is None
+            assert max_results >= 3
+            assert query
+            return [
+                {"id": f"message-{index}", "threadId": f"thread-{index}"}
+                for index in range(1, provider_count + 1)
+            ]
+
+        def get_message(self, message_id: str) -> dict[str, object]:
+            index = message_id.rsplit("-", maxsplit=1)[-1]
+            return {
+                "id": message_id,
+                "threadId": f"thread-{index}",
+                "from": f"Sender {index} <sender{index}@example.test>",
+                "subject": f"Message subject {index}",
+                "snippet": f"Bounded snippet {index}.",
+                "thread_context": f"Bounded context for message {index}.",
+                "thread_summary": f"Bounded summary for message {index}.",
+                "received_at": f"2026-07-2{index}T12:00:00Z",
+            }
+
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="gmail_triage",
+        intent="gmail_triage",
+        target_type="gmail_message_collection",
+        provider_system="gmail",
+        provider_operations=["read"],
+        provider_read_scope="bounded_collection",
+        provider_result_mode="items",
+        task_objective="gmail_triage",
+        expected_artifact_type="gmail_triage_report",
+        desired_count=3,
+        desired_count_explicit=True,
+        gmail_query="in:inbox newer_than:7d",
+    )
+    monkeypatch.setattr(workflow_runner, "GmailTool", FakeGmail)
+    monkeypatch.setattr(
+        workflow_runner,
+        "_live_gmail_retrieval_enabled",
+        lambda _request: True,
+    )
+    store = SQLiteStore(_database_url(tmp_path))
+    work_item = WorkItem(
+        id=f"wi_gmail_collection_{provider_count}",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Summarize recent inbox threads",
+        request_text="Summarize three recent inbox threads.",
+        current_route=WorkItemRoute.GMAIL_TRIAGE,
+        target=WorkItemTarget(
+            name="recent inbox threads",
+            object_type="gmail_message_collection",
+        ),
+    )
+    store.save_work_item(work_item)
+    request = WorkflowRunRequest(
+        request_text=work_item.request_text,
+        max_results=3,
+        manual_request_plan=plan.model_dump(mode="json"),
+    )
+
+    result = workflow_runner._try_live_gmail_thread_retrieval(
+        work_item,
+        request=request,
+        store=store,
+        gmail_plan=workflow_runner.resolve_gmail_execution_plan(
+            request.request_text,
+            manual_plan=request.manual_request_plan,
+        ),
+    )
+
+    assert result is not None
+    assert result.status == expected_status
+    artifact = result.artifact_refs[0]
+    assert artifact.metadata["covered_thread_count"] == provider_count
+    assert artifact.metadata["collection_result"] is True
+    for index in range(1, provider_count + 1):
+        assert f"Message subject {index}" in result.human_summary
+    if provider_count < 3:
+        assert artifact.metadata["request_coverage"]["status"] == "partial"
+        assert result.next_action is not None
+        assert result.next_action.action == "complete_request_contract"
+    else:
+        assert artifact.metadata["request_coverage"]["status"] == "complete"
+
+
+def test_typed_unnumbered_gmail_collection_retains_every_bounded_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeGmail:
+        def __init__(self, *, live: bool) -> None:
+            assert live is True
+
+        def list_recent_messages(self, **_kwargs: object) -> list[dict[str, str]]:
+            return [
+                {"id": f"message-{index}", "threadId": f"thread-{index}"}
+                for index in range(1, 4)
+            ]
+
+        def get_message(self, message_id: str) -> dict[str, object]:
+            index = message_id[-1]
+            return {
+                "id": message_id,
+                "threadId": f"thread-{index}",
+                "from": f"Sender {index} <sender{index}@example.test>",
+                "subject": f"Recent subject {index}",
+                "snippet": f"Sanitized evidence {index}.",
+                "thread_summary": f"Recent summary {index}.",
+            }
+
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="gmail_triage",
+        intent="gmail_triage",
+        target_type="gmail_message_collection",
+        provider_system="gmail",
+        provider_operations=["read"],
+        provider_read_scope="bounded_collection",
+        provider_result_mode="items",
+        task_objective="gmail_triage",
+        expected_artifact_type="gmail_triage_report",
+        desired_count_explicit=False,
+        gmail_query="in:inbox newer_than:7d",
+    )
+    monkeypatch.setattr(workflow_runner, "GmailTool", FakeGmail)
+    monkeypatch.setattr(
+        workflow_runner,
+        "_live_gmail_retrieval_enabled",
+        lambda _request: True,
+    )
+    store = SQLiteStore(_database_url(tmp_path))
+    work_item = WorkItem(
+        id="wi_gmail_unnumbered_collection",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Summarize recent inbox threads",
+        request_text="Summarize recent inbox threads.",
+        current_route=WorkItemRoute.GMAIL_TRIAGE,
+    )
+    store.save_work_item(work_item)
+    request = WorkflowRunRequest(
+        request_text=work_item.request_text,
+        max_results=3,
+        manual_request_plan=plan.model_dump(mode="json"),
+    )
+
+    result = workflow_runner._try_live_gmail_thread_retrieval(
+        work_item,
+        request=request,
+        store=store,
+        gmail_plan=workflow_runner.resolve_gmail_execution_plan(
+            request.request_text,
+            manual_plan=request.manual_request_plan,
+        ),
+    )
+
+    assert result is not None
+    assert result.status == WorkItemStatus.DONE
+    artifact = result.artifact_refs[0]
+    assert artifact.metadata["collection_result"] is True
+    assert artifact.metadata["matched_thread_ids"] == [
+        "thread-1",
+        "thread-2",
+        "thread-3",
+    ]
+    assert artifact.metadata["covered_thread_count"] == 3
+    assert "Recent subject 1" in result.human_summary
+    assert "Recent subject 2" in result.human_summary
+    assert "Recent subject 3" in result.human_summary
+
+
+def test_live_gmail_up_to_count_tries_target_and_accepts_provider_exhaustion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeGmail:
+        def __init__(self, *, live: bool) -> None:
+            assert live is True
+
+        def list_recent_messages(self, **_kwargs: object) -> list[dict[str, str]]:
+            return [
+                {"id": "message-1", "threadId": "thread-1"},
+                {"id": "message-2", "threadId": "thread-2"},
+            ]
+
+        def get_message(self, message_id: str) -> dict[str, object]:
+            index = message_id[-1]
+            return {
+                "id": message_id,
+                "threadId": f"thread-{index}",
+                "from": f"Sender {index} <sender{index}@example.test>",
+                "subject": f"Subject {index}",
+                "snippet": f"Sanitized evidence {index}.",
+                "thread_summary": f"Summary {index}.",
+            }
+
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="gmail_triage",
+        intent="gmail_triage",
+        target_type="gmail_message_collection",
+        provider_system="gmail",
+        provider_operations=["read"],
+        provider_read_scope="bounded_collection",
+        provider_result_mode="items",
+        task_objective="gmail_triage",
+        expected_artifact_type="gmail_triage_report",
+        desired_count=3,
+        desired_count_explicit=True,
+        desired_count_mode="maximum",
+        gmail_query="in:inbox newer_than:7d",
+    )
+    monkeypatch.setattr(workflow_runner, "GmailTool", FakeGmail)
+    monkeypatch.setattr(
+        workflow_runner,
+        "_live_gmail_retrieval_enabled",
+        lambda _request: True,
+    )
+    store = SQLiteStore(_database_url(tmp_path))
+    work_item = WorkItem(
+        id="wi_gmail_up_to_three",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Summarize up to three",
+        request_text="Summarize up to three recent inbox threads.",
+        current_route=WorkItemRoute.GMAIL_TRIAGE,
+    )
+    store.save_work_item(work_item)
+    request = WorkflowRunRequest(
+        request_text=work_item.request_text,
+        max_results=3,
+        manual_request_plan=plan.model_dump(mode="json"),
+    )
+
+    result = workflow_runner._try_live_gmail_thread_retrieval(
+        work_item,
+        request=request,
+        store=store,
+        gmail_plan=workflow_runner.resolve_gmail_execution_plan(
+            request.request_text,
+            manual_plan=request.manual_request_plan,
+        ),
+    )
+
+    assert result is not None
+    assert result.status == WorkItemStatus.DONE
+    coverage = result.artifact_refs[0].metadata["request_coverage"]
+    assert coverage["status"] == "complete"
+    assert "exhausted qualified results" in coverage["satisfied_dimensions"][0]
+
+
+def test_composed_plural_gmail_research_retains_collection_and_blocks_first_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeGmail:
+        def __init__(self, *, live: bool) -> None:
+            assert live is True
+
+        def list_recent_messages(self, **_kwargs: object) -> list[dict[str, str]]:
+            return [
+                {"id": f"message-{index}", "threadId": f"thread-{index}"}
+                for index in range(1, 4)
+            ]
+
+        def get_message(self, message_id: str) -> dict[str, object]:
+            index = message_id[-1]
+            return {
+                "id": message_id,
+                "threadId": f"thread-{index}",
+                "from": f"Sender {index} <sender{index}@company{index}.test>",
+                "subject": f"Research request {index}",
+                "snippet": f"Sanitized company evidence {index}.",
+                "thread_summary": f"Summary for company {index}.",
+            }
+
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="business_research_analyst",
+        workflow=["gmail_triage", "business_research_analyst"],
+        intent="company_research",
+        target_type="gmail_message_collection",
+        provider_system="gmail",
+        provider_operations=["read"],
+        provider_read_scope="bounded_collection",
+        provider_result_mode="items",
+        task_objective="entity_research",
+        expected_artifact_type="research_brief",
+        desired_count=3,
+        desired_count_explicit=True,
+        gmail_query="in:inbox newer_than:7d",
+    )
+    monkeypatch.setattr(workflow_runner, "GmailTool", FakeGmail)
+    monkeypatch.setattr(
+        workflow_runner,
+        "_live_gmail_retrieval_enabled",
+        lambda _request: True,
+    )
+    store = SQLiteStore(_database_url(tmp_path))
+    work_item = WorkItem(
+        id="wi_gmail_plural_research",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Research three sender companies",
+        request_text="Read three messages and research each sender company.",
+        current_route=WorkItemRoute.GMAIL_TRIAGE,
+    )
+    store.save_work_item(work_item)
+    request = WorkflowRunRequest(
+        request_text=work_item.request_text,
+        max_results=3,
+        manual_request_plan=plan.model_dump(mode="json"),
+    )
+
+    result = workflow_runner._try_live_gmail_thread_retrieval(
+        work_item,
+        request=request,
+        store=store,
+        gmail_plan=workflow_runner.resolve_gmail_execution_plan(
+            request.request_text,
+            manual_plan=request.manual_request_plan,
+        ),
+    )
+
+    assert result is not None
+    assert result.status == WorkItemStatus.BLOCKED
+    assert result.blockers[0].code == "gmail_collection_downstream_batch_required"
+    assert result.next_action is not None
+    assert result.next_action.action == "prepare_bounded_gmail_downstream_batch"
+    artifact = result.artifact_refs[0]
+    assert artifact.metadata["matched_thread_ids"] == [
+        "thread-1",
+        "thread-2",
+        "thread-3",
+    ]
+    assert artifact.metadata["covered_thread_count"] == 3
+    assert result.work_item.target.name != "Sender 1"
+
+
+def test_gmail_collection_over_supported_bound_blocks_before_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ProviderMustNotConstruct:
+        def __init__(self, **_kwargs: object) -> None:
+            raise AssertionError("provider must not be constructed")
+
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="gmail_triage",
+        intent="gmail_triage",
+        target_type="gmail_message_collection",
+        provider_system="gmail",
+        provider_operations=["read"],
+        provider_read_scope="bounded_collection",
+        provider_result_mode="items",
+        task_objective="gmail_triage",
+        expected_artifact_type="gmail_triage_report",
+        desired_count=9,
+        desired_count_explicit=True,
+        gmail_query="in:inbox newer_than:7d",
+    )
+    monkeypatch.setattr(workflow_runner, "GmailTool", ProviderMustNotConstruct)
+    monkeypatch.setattr(
+        workflow_runner,
+        "_live_gmail_retrieval_enabled",
+        lambda _request: True,
+    )
+    store = SQLiteStore(_database_url(tmp_path))
+    work_item = WorkItem(
+        id="wi_gmail_nine",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Summarize nine",
+        request_text="Summarize nine recent inbox threads.",
+        current_route=WorkItemRoute.GMAIL_TRIAGE,
+    )
+    store.save_work_item(work_item)
+
+    request = WorkflowRunRequest(
+        request_text=work_item.request_text,
+        manual_request_plan=plan.model_dump(mode="json"),
+    )
+    result = workflow_runner._try_live_gmail_thread_retrieval(
+        work_item,
+        request=request,
+        store=store,
+        gmail_plan=workflow_runner.resolve_gmail_execution_plan(
+            request.request_text,
+            manual_plan=request.manual_request_plan,
+        ),
+    )
+
+    assert result is not None
+    assert result.status == WorkItemStatus.BLOCKED
+    assert result.blockers[0].code == "gmail_collection_count_exceeds_supported_bound"
 
 
 def test_live_gmail_retrieval_promotes_selected_thread_without_raw_body(
@@ -1800,6 +2291,17 @@ def test_slack_runtime_request_auto_attaches_reusable_query_prompt(
         ),
         requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
         cost_profile="slack_research_deep",
+        manual_request_plan={
+            "source": "llm",
+            "target_agent": "business_research_analyst",
+            "intent": "company_research",
+            "task_objective": "entity_research",
+            "primary_target": "public AI companion or chatbot products",
+            "desired_count": 3,
+            "desired_count_explicit": True,
+            "requires_target_discovery": True,
+            "required_terms": ["AI companion or chatbot", "teen safety"],
+        },
     )
     work_item = WorkItem(
         id="wi_test",
@@ -1832,6 +2334,17 @@ def test_reusable_slack_query_prompt_task_brief_reaches_specialist_context(
         ),
         requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
         cost_profile="slack_research_deep",
+        manual_request_plan={
+            "source": "llm",
+            "target_agent": "business_research_analyst",
+            "intent": "company_research",
+            "task_objective": "entity_research",
+            "primary_target": "public AI companion or chatbot products",
+            "desired_count": 3,
+            "desired_count_explicit": True,
+            "requires_target_discovery": True,
+            "required_terms": ["AI companion or chatbot", "teen safety"],
+        },
     )
     work_item = WorkItem(
         id="wi_test",
@@ -1850,7 +2363,7 @@ def test_reusable_slack_query_prompt_task_brief_reaches_specialist_context(
 
     assert prompt["kind"] == "research_summary"
     assert "task_brief" in prompt
-    assert "Resolve three named products" in prompt["task_brief"]
+    assert "Resolve the requested 3 qualified targets" in prompt["task_brief"]
     assert "does not grant tool access" in prompt["specialist_use"]
     assert prompt["context_flags"]["needs_source_triage"] is True
 
@@ -1998,10 +2511,227 @@ def test_business_research_category_comparison_dispatches_multi_target_branch(
     assert "The comparison is supported for Replika, Character.AI, Nomi" in result.human_summary
     assert "Synthesis:" not in result.human_summary
     assert "no clean source list" not in result.human_summary
-    assert result.human_summary.index("Source-backed comparison table") < result.human_summary.index(
-        "Metadata"
+    assert "What looks real vs marketing language" in result.human_summary
+    assert "Keystone product/design implications" in result.human_summary
+    assert "\nMetadata\n" not in result.human_summary
+    assert "Multi-target pass types" not in result.human_summary
+
+
+def test_open_competitor_set_dispatches_multi_target_without_scout_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_retrieve_company_profile_live(**_kwargs: object):
+        raise AssertionError("single-company retrieval should not run")
+
+    def fake_multi_target_research(plan: MultiTargetResearchPlan, **_kwargs: object):
+        calls.append(plan.topic)
+        packets = [
+            PerTargetResearchPacket(
+                target_name=name,
+                source_refs=[
+                    {
+                        "source_id": f"{name}:product",
+                        "title": f"{name} product",
+                        "url": f"https://{name.lower().replace(' ', '')}.example/product",
+                        "source_type": "company_site",
+                        "supported_claims": [
+                            f"{name} describes multimodal behavioral-health capabilities."
+                        ],
+                    }
+                ],
+                extraction_status="extracted",
+                source_sufficient=True,
+            )
+            for name in ("Limbic", "Affectiva Health", "Ellipsis Health")
+        ]
+        return MultiTargetResearchResult(
+            plan=plan,
+            selected_targets=[packet.target_name for packet in packets],
+            anchor_packet=PerTargetResearchPacket(
+                target_name="Deliberate AI",
+                source_refs=[
+                    {
+                        "source_id": "deliberate:product",
+                        "title": "Deliberate AI product",
+                        "url": "https://deliberateai.example/product",
+                        "source_type": "company_site",
+                        "supported_claims": [
+                            "Deliberate AI describes multimodal behavioral-health capabilities."
+                        ],
+                    }
+                ],
+                extraction_status="extracted",
+                source_sufficient=True,
+            ),
+            packets=packets,
+            comparison_ready=True,
+            readiness=MultiTargetReadiness(
+                assessed=True,
+                rubric_dimensions=["multimodal", "behavioral health"],
+                anchor_required=True,
+                anchor_ready=True,
+                peer_goal=3,
+                ready_peer_count=3,
+                rubric_ready_peer_count=3,
+                peer_comparison_ready=True,
+                whole_request_ready=True,
+            ),
+            diagnostics={"ready_packet_count": 3},
+            pass_types=["candidate_discovery", "target_selection", "per_target_depth"],
+        )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "retrieve_company_profile_live",
+        fake_retrieve_company_profile_live,
     )
-    assert "Multi-target pass types" in result.human_summary
+    monkeypatch.setattr(workflow_runner, "run_multi_target_research", fake_multi_target_research)
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "Review the requested company landscape using deep source-backed research."
+            ),
+            requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            manual_request_plan={
+                "source": "llm",
+                "requested_agent": "chief_of_staff",
+                "target_agent": "business_research_analyst",
+                "workflow": [],
+                "intent": "company_research",
+                "primary_target": "Deliberate AI",
+                "target_type": "company",
+                "provider_result_mode": "items",
+                "task_objective": "entity_research",
+                "expected_artifact_type": "research_brief",
+                "desired_count": 5,
+                "desired_count_explicit": False,
+                "requires_target_discovery": True,
+                "anchor_entity": "Deliberate AI",
+                "required_entities": ["Deliberate AI", "behavioral health"],
+                "required_terms": ["competitor", "multimodal", "behavioral health"],
+                "requires_live_search": True,
+                "ask_shape": {
+                    "ask_breadth": "broad",
+                    "evidence_depth": "deep",
+                    "stop_condition": "Stop after a credible source-backed entity set.",
+                },
+            },
+        )
+    )
+
+    assert calls == ["Deliberate AI"]
+    assert result.status == WorkItemStatus.DONE
+    assert [artifact.artifact_type for artifact in result.artifact_refs] == [
+        "multi_target_research"
+    ]
+    assert result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    assert any(
+        source.url == "https://deliberateai.example/product"
+        for source in result.work_item.sources
+    )
+    assert "Opportunity Scout" not in result.human_summary
+    assert "Page Unavailable" not in result.human_summary
+    assert "provider_summary" not in result.human_summary
+    stored_plan = result.work_item.target.metadata["manual_request_plan"]
+    assert stored_plan["requires_target_discovery"] is True
+    assert stored_plan["desired_count_explicit"] is False
+
+
+def test_open_competitor_set_blocks_when_anchor_is_not_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_multi_target_research(
+        plan: MultiTargetResearchPlan,
+        **_kwargs: object,
+    ) -> MultiTargetResearchResult:
+        packets = [
+            PerTargetResearchPacket(
+                target_name=name,
+                source_sufficient=True,
+            )
+            for name in ("Ellipsis Health", "BlueSkeye AI", "Kintsugi")
+        ]
+        return MultiTargetResearchResult(
+            plan=plan,
+            selected_targets=[packet.target_name for packet in packets],
+            anchor_packet=PerTargetResearchPacket(
+                target_name="Deliberate AI",
+                source_sufficient=False,
+                gaps=["missing public source evidence"],
+            ),
+            packets=packets,
+            comparison_ready=True,
+            readiness=MultiTargetReadiness(
+                assessed=True,
+                rubric_dimensions=["multimodal", "behavioral health"],
+                anchor_required=True,
+                anchor_ready=False,
+                peer_goal=3,
+                ready_peer_count=3,
+                rubric_ready_peer_count=3,
+                peer_comparison_ready=True,
+                whole_request_ready=False,
+                gaps=["anchor gap for Deliberate AI: missing public source evidence"],
+            ),
+            blockers=["anchor gap for Deliberate AI: missing public source evidence"],
+            diagnostics={"ready_packet_count": 3},
+            pass_types=[
+                "candidate_discovery",
+                "target_selection",
+                "anchor_depth",
+                "per_target_depth",
+            ],
+        )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "run_multi_target_research",
+        fake_multi_target_research,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "Deeply research Deliberate AI, then identify similar multimodal "
+                "behavioral-health companies."
+            ),
+            requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            manual_request_plan={
+                "source": "llm",
+                "target_agent": "business_research_analyst",
+                "intent": "company_research",
+                "primary_target": "Deliberate AI",
+                "target_type": "company",
+                "task_objective": "entity_research",
+                "expected_artifact_type": "research_brief",
+                "requires_target_discovery": True,
+                "anchor_entity": "Deliberate AI",
+                "required_entities": ["Deliberate AI"],
+                "required_terms": ["multimodal", "behavioral health"],
+            },
+        )
+    )
+
+    assert result.status == WorkItemStatus.BLOCKED
+    assert result.next_action is not None
+    assert result.next_action.action == "repair_anchor_research"
+    assert result.artifact_refs[0].metadata["comparison_ready"] is True
+    assert result.artifact_refs[0].metadata["whole_request_ready"] is False
+    assert any(
+        "anchor gap for Deliberate AI" in blocker.message
+        for blocker in result.blockers
+    )
 
 
 def test_single_company_comparison_smoke_does_not_dispatch_multi_target_branch() -> None:
@@ -2530,6 +3260,21 @@ def test_opportunity_live_sdk_artifact_only_output_uses_source_backed_fallback(
     assert "Business Agents WorkItem Advanced" not in updated.human_summary
     assert "Deterministic user-facing response fallback executed." in updated.audit_notes
     assert "Live user-facing response synthesis executed." not in updated.audit_notes
+
+
+@pytest.mark.parametrize(
+    "reader_text",
+    [
+        "The other extracted source is a vendor profile.",
+        "The payload does not provide a direct product comparison.",
+        "The attached source refs point to two adjacent companies.",
+        "The source-backed match surfaced in this run.",
+    ],
+)
+def test_source_backed_reader_copy_rejects_internal_pipeline_terms(
+    reader_text: str,
+) -> None:
+    assert workflow_runner._source_backed_section_is_metadata_like(reader_text)
 
 
 def test_opportunity_live_sdk_metadata_like_synthesis_uses_source_backed_fallback(
@@ -8738,6 +9483,60 @@ def test_orchestrator_plan_missing_draft_is_limited_not_blocked(tmp_path: Path) 
     }
 
 
+def test_canonical_plan_round_trips_through_real_continue_without_compaction(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="business_research_analyst",
+        target_agent="business_research_analyst",
+        workflow=["business_research_analyst"],
+        intent="company_research",
+        primary_target="NeuroFlow",
+        target_type="company",
+        task_objective="entity_research",
+        expected_artifact_type="research_brief",
+        desired_count=2,
+        desired_count_explicit=True,
+        provider_selection_order="latest",
+        gmail_exclude_threads_with_operator_reply=True,
+        ask_shape=AskShapePolicy(
+            permission_state="read_only",
+            stop_condition="Stop after exactly two verified dimensions.",
+        ),
+    ).model_dump(mode="json")
+    item = WorkItem(
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        status=WorkItemStatus.IN_PROGRESS,
+        title="Research NeuroFlow",
+        request_text="research NeuroFlow",
+        target=WorkItemTarget(
+            name="NeuroFlow",
+            object_type="company",
+            metadata={"manual_request_plan": plan},
+        ),
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+    )
+    store.save_work_item(item)
+
+    advance_work_item(
+        WorkflowRunRequest(
+            request_text="continue",
+            work_item_id=item.id,
+            database_url=database_url,
+            save=True,
+            manual_request_plan=plan,
+        )
+    )
+
+    reloaded = store.get_work_item(item.id)
+    assert reloaded is not None
+    assert reloaded.target.name == "NeuroFlow"
+    assert reloaded.target.metadata["manual_request_plan"] == plan
+
+
 def test_manager_loop_answers_state_followup_without_rerunning(tmp_path: Path) -> None:
     database_url = _database_url(tmp_path)
     prompt = (
@@ -9291,10 +10090,84 @@ def test_formal_opportunity_gates_filter_adjacent_or_untimed_records(
         "deadline_or_timing_evidence",
         "source_url",
         "sponsor",
+        "official_extracted_source_evidence",
         "keystone_applicability_evidence",
     ]
     assert result.next_action is not None
-    assert result.next_action.agent == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    assert result.next_action.agent == WorkItemRoute.OPPORTUNITY_SCOUT
+    assert "1/3 requested records" in result.next_action.description
+    assert result.artifact_refs[0].metadata["request_coverage"]["status"] == "partial"
+    assert result.artifact_refs[0].metadata["bounded_search_receipt"]["exhausted"] is False
+
+
+def test_formal_opportunity_gate_requires_read_official_source_and_supports_accelerator_union() -> None:
+    requested_kinds = workflow_runner._requested_formal_opportunity_kinds(
+        "Find accelerator or grant programs with an official program source."
+    )
+    assert requested_kinds == {"accelerator", "grant"}
+
+    record = OpportunityRecord(
+        company_name="Example Accelerator",
+        opportunity_kind="accelerator_or_challenge",
+        opportunity_type="hackathon or challenge opportunity",
+        priority_score=88,
+        why_now_signal=(
+            "Applications for the accelerator cohort are due June 20, 2026 "
+            "and are open to early-stage companies."
+        ),
+        recommended_next_step="Review program eligibility before applying.",
+        keystone_fit_reason=(
+            "Keystone is an early-stage behavioral-health AI company applicant."
+        ),
+        outside_consulting_likelihood=60,
+        handoff_to_business_research_analyst=True,
+        sources=[
+            OpportunitySource(
+                title="Example Accelerator rankings profile",
+                url="https://rankings.example/example-accelerator",
+                source_type="news",
+                supported_signal=(
+                    "The accelerator cohort is due June 20, 2026 for companies."
+                ),
+                evidence_excerpt="",
+            )
+        ],
+    )
+
+    failures = workflow_runner._formal_opportunity_record_gate_failures(
+        record,
+        requested_kinds,
+        official_source_required=True,
+    )
+    assert "missing official source with extracted page evidence" in failures
+    assert not any("requested grant/RFP" in failure for failure in failures)
+
+    verified = record.model_copy(
+        update={
+            "detail_verification_status": "page_verified",
+            "sources": [
+                OpportunitySource(
+                    title="Example Accelerator official program",
+                    url="https://exampleaccelerator.org/program",
+                    source_type="company_site",
+                    supported_signal=(
+                        "The accelerator cohort is due June 20, 2026 for "
+                        "early-stage companies."
+                    ),
+                    evidence_excerpt=(
+                        "Applications are open to early-stage companies and are "
+                        "due June 20, 2026."
+                    ),
+                )
+            ],
+        }
+    )
+    verified_failures = workflow_runner._formal_opportunity_record_gate_failures(
+        verified,
+        requested_kinds,
+        official_source_required=True,
+    )
+    assert verified_failures == []
 
 
 def test_formal_opportunity_gates_filter_explicit_non_nofo_topic_page(
@@ -10026,7 +10899,7 @@ def test_outreach_variants_from_existing_research_brief_do_not_request_new_resea
     assert "manager_loop_research_not_completed" not in blocker_codes
 
 
-def test_company_comparison_workitem_creates_comparison_not_fake_profile(
+def test_company_comparison_workitem_uses_shared_multi_target_kernel(
     tmp_path: Path,
 ) -> None:
     database_url = _database_url(tmp_path)
@@ -10047,8 +10920,12 @@ def test_company_comparison_workitem_creates_comparison_not_fake_profile(
     assert manual_plan.primary_target == "Lindus Health vs Holmusk"
     assert result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
     assert result.advanced is True
-    assert [artifact.artifact_type for artifact in result.artifact_refs] == ["company_comparison"]
-    assert result.artifact_refs[0].title == "Lindus Health vs Holmusk"
+    assert [artifact.artifact_type for artifact in result.artifact_refs] == [
+        "multi_target_research"
+    ]
+    assert result.artifact_refs[0].title == (
+        "Multi-target research: Lindus Health vs Holmusk"
+    )
     assert result.work_item.target.name == "Lindus Health vs Holmusk"
     assert "Compare Lindus Health and Holmusk" not in result.work_item.target.name
 
@@ -10102,6 +10979,26 @@ def test_canonical_two_company_plan_does_not_need_comparison_trigger_words() -> 
             "expected_artifact_type": "research_brief",
         },
     ) == ("Lindus Health", "Holmusk")
+
+
+def test_canonical_target_discovery_plan_is_not_reduced_to_two_company_comparison() -> None:
+    assert (
+        workflow_runner._comparison_company_names(
+            "Review the selected market scope.",
+            manual_plan={
+                "source": "llm",
+                "target_agent": "business_research_analyst",
+                "intent": "company_research",
+                "primary_target": "Deliberate AI",
+                "target_type": "company",
+                "required_entities": ["Deliberate AI", "behavioral health"],
+                "task_objective": "entity_research",
+                "expected_artifact_type": "research_brief",
+                "requires_target_discovery": True,
+            },
+        )
+        is None
+    )
 
 
 def test_canonical_company_plan_is_not_reclassified_by_zotero_prose() -> None:
@@ -10927,6 +11824,65 @@ def test_no_external_opportunity_scout_honors_two_directions_request_when_plan_u
     assert "Pilot readiness scoping" in result.human_summary
 
 
+def test_canonical_opportunity_count_controls_rendering_over_quoted_prose() -> None:
+    artifacts = [
+        WorkItemArtifactRef(
+            artifact_type="opportunity",
+            artifact_id=f"opportunity-{index}",
+            source_agent=WorkItemRoute.OPPORTUNITY_SCOUT.value,
+            title="Anchor Health",
+            summary=f"Direction {index}",
+            metadata={
+                "source_signals": [f"Direction {index}"],
+                "keystone_fit_reason": f"Fit {index}",
+                "source_refs": [
+                    {
+                        "title": f"Source {index}",
+                        "url": f"https://example.test/{index}",
+                        "supported_claim": f"Evidence {index}",
+                    }
+                ],
+            },
+        )
+        for index in range(1, 4)
+    ]
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="opportunity_scout",
+        intent="opportunity_search",
+        target_type="topic",
+        task_objective="opportunity_discovery",
+        expected_artifact_type="opportunity_record",
+        desired_count=3,
+        desired_count_explicit=True,
+    )
+    work_item = WorkItem(
+        kind=WorkItemKind.OPPORTUNITY,
+        title="Three opportunity directions",
+        status=WorkItemStatus.DONE,
+        current_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        artifact_refs=artifacts,
+    )
+    result = WorkflowRunResult(
+        work_item=work_item,
+        route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        artifact_refs=artifacts,
+        manual_request_plan=plan.model_dump(mode="json"),
+    )
+
+    summary = workflow_runner._source_provided_opportunity_user_facing_summary(
+        result,
+        request_text='The prior note said "one direction"; use the current plan.',
+    )
+
+    assert "3 practical directions stand out" in summary
+    assert "Direction 1" in summary
+    assert "Direction 2" in summary
+    assert "Direction 3" in summary
+
+
 def test_source_provided_opportunity_table_preserves_rows_for_review(
     tmp_path: Path,
 ) -> None:
@@ -11119,6 +12075,159 @@ def test_strict_opportunity_no_match_is_limited_done_not_blocked(
     assert "no strong exact matches" in result.human_summary.lower()
     assert "Adjacent but not exact matches" in result.human_summary
     assert "Relax role title" in result.human_summary
+
+
+def test_formal_zero_result_requires_truthful_bounded_exhaustion(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def fake_run_live(**_: object):
+        return (
+            OpportunityScoutResult(
+                topic="formal behavioral-health grants",
+                dry_run=False,
+                retrieval_diagnostics={
+                    "bounded_search_receipt": {
+                        "provider_attempt_count": 1,
+                        "planned_attempt_count": 3,
+                        "provider_completed": False,
+                        "budget_or_deadline_stopped": True,
+                        "discovered_candidate_count": 0,
+                        "processed_candidate_count": 0,
+                        "exhausted": False,
+                    }
+                },
+            ),
+            {"debug_notes": ["fake capped retrieval"]},
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.run_opportunity_scout_live",
+        fake_run_live,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "Opportunity Scout: Find up to 3 formal behavioral-health grants "
+                "with official sponsor and deadline evidence. Strict matches only; "
+                "do not pad."
+            ),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            max_results=3,
+        )
+    )
+
+    assert result.advanced is False
+    assert result.status == WorkItemStatus.BLOCKED
+    assert result.artifact_refs == []
+    assert any(
+        blocker.code == "opportunity_count_underfilled"
+        for blocker in result.blockers
+    )
+
+
+def test_formal_program_underfill_is_accepted_after_truthful_exhaustion(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def fake_run_live(**_: object):
+        return (
+            OpportunityScoutResult(
+                topic="current U.S. accelerator or grant programs",
+                dry_run=False,
+                filtered_candidates=[
+                    FilteredOpportunityCandidate(
+                        company_name="Example Accelerator",
+                        entity_kind="grant_program",
+                        source_category="grant",
+                        source_url="https://program.example.org/apply",
+                        reasons=["applicant eligibility was not verified"],
+                    )
+                ],
+                retrieval_diagnostics={
+                    "bounded_search_receipt": {
+                        "provider_attempt_count": 3,
+                        "planned_attempt_count": 3,
+                        "provider_completed": True,
+                        "budget_or_deadline_stopped": False,
+                        "discovered_candidate_count": 1,
+                        "processed_candidate_count": 1,
+                        "exhausted": True,
+                    },
+                    "candidate_admission": {
+                        "filtered_count": 1,
+                        "review_count": 0,
+                        "reason_counts": {
+                            "applicant eligibility was not verified": 1
+                        },
+                        "samples": [],
+                    },
+                    "verification": {
+                        "attempt_count": 1,
+                        "status_counts": {"verified": 1},
+                        "attempts": [
+                            {
+                                "url": "https://program.example.org/apply",
+                                "status": "verified",
+                            }
+                        ],
+                    },
+                    "resolved_search_plan": {
+                        "target_entity_types": ["grant_program"],
+                        "objectives": ["funding"],
+                        "strict_targeting": True,
+                        "lane_types": ["grant_funding"],
+                    },
+                },
+            ),
+            {"debug_notes": ["fake completed retrieval"]},
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.run_opportunity_scout_live",
+        fake_run_live,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "Opportunity Scout: identify exactly 3 current U.S. accelerator "
+                "or grant programs for a behavioral-health AI company. Use official "
+                "program sources and return fewer than 3 rather than pad weak matches."
+            ),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            max_results=3,
+        )
+    )
+
+    assert result.advanced is True
+    assert result.status == WorkItemStatus.DONE
+    assert result.blockers == []
+    assert result.artifact_refs == []
+    assert "no strong exact matches" in result.human_summary.lower()
+    events = SQLiteStore(_database_url(tmp_path)).list_work_item_events(
+        result.work_item.id
+    )
+    gate_event = next(
+        event
+        for event in events
+        if event.event_type == "opportunity_candidate_gates_applied"
+    )
+    limited_event = next(
+        event for event in events if event.event_type == "advance_limited"
+    )
+    assert gate_event.metadata["candidate_admission"]["reason_counts"] == {
+        "applicant eligibility was not verified": 1
+    }
+    assert gate_event.metadata["verification"]["attempts"][0]["status"] == "verified"
+    assert limited_event.metadata["resolved_search_plan"]["target_entity_types"] == [
+        "grant_program"
+    ]
 
 
 def test_strict_opportunity_no_match_handles_posted_or_refreshed_one_week_phrase(
@@ -11711,6 +12820,7 @@ def test_live_sdk_opportunity_work_item_prefers_manual_primary_target(
                     "to Keystone"
                 ),
                 "desired_count": 3,
+                "desired_count_explicit": True,
             },
         )
     )
@@ -11724,6 +12834,137 @@ def test_live_sdk_opportunity_work_item_prefers_manual_primary_target(
     assert captured["planner_live"] is True
     assert "Orchestrator memo for this specialist WorkItem run" in captured["planner_context"]
     assert '"target_agent": "opportunity_scout"' in captured["planner_context"]
+
+
+def test_opportunity_work_item_blocks_when_explicit_count_is_underfilled(
+    tmp_path: Path,
+) -> None:
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text="Find 5 behavioral health AI opportunities.",
+            requested_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+            database_url=_database_url(tmp_path),
+            save=True,
+            max_results=5,
+            manual_request_plan={
+                "source": "llm",
+                "requested_agent": "opportunity_scout",
+                "target_agent": "opportunity_scout",
+                "intent": "opportunity_search",
+                "primary_target": "behavioral health AI opportunities",
+                "target_type": "opportunity",
+                "task_objective": "opportunity_discovery",
+                "expected_artifact_type": "opportunity_record",
+                "desired_count": 5,
+                "desired_count_explicit": True,
+            },
+        )
+    )
+
+    assert len(result.artifact_refs) == 2
+    assert result.status == WorkItemStatus.BLOCKED
+    assert result.next_action is not None
+    assert result.next_action.action == "deepen_opportunity_count"
+    assert any(
+        blocker.code == "opportunity_count_underfilled"
+        for blocker in result.blockers
+    )
+    coverage = result.artifact_refs[0].metadata["request_coverage"]
+    assert coverage["status"] == "partial"
+    assert coverage["stop_condition_status"] == "blocked"
+    assert "requested 5 opportunity records" in coverage["unmet_dimensions"][0]
+
+
+def test_zero_record_exact_company_search_persists_retrieval_diagnostics(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def fake_run_live(**_: object):
+        return (
+            OpportunityScoutResult(
+                topic="behavioral health AI companies",
+                dry_run=False,
+                search_queries=["behavioral health AI companies"],
+                raw_search_result_count=4,
+                deduped_candidate_count=0,
+                retrieval_diagnostics={
+                    "bounded_search_receipt": {
+                        "provider_attempt_count": 1,
+                        "planned_attempt_count": 2,
+                        "provider_completed": False,
+                        "budget_or_deadline_stopped": True,
+                        "discovered_candidate_count": 0,
+                        "processed_candidate_count": 0,
+                        "exhausted": False,
+                    },
+                    "candidate_admission": {
+                        "filtered_count": 2,
+                        "review_count": 1,
+                        "reason_counts": {"candidate lacked exact target evidence": 2},
+                        "filtered_reason_counts": {
+                            "candidate lacked exact target evidence": 2
+                        },
+                        "review_reason_counts": {
+                            "official source requires review": 1
+                        },
+                        "samples": [],
+                    },
+                    "verification": {
+                        "attempt_count": 1,
+                        "status_counts": {"empty": 1},
+                        "attempts": [
+                            {
+                                "url": "https://example.test/company",
+                                "status": "empty",
+                            }
+                        ],
+                    },
+                    "resolved_search_plan": {
+                        "target_entity_types": ["company"],
+                        "objectives": ["company_discovery"],
+                        "strict_targeting": True,
+                        "lane_types": ["company_growth"],
+                    },
+                },
+            ),
+            {"debug_notes": ["fake bounded retrieval"]},
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.run_opportunity_scout_live",
+        fake_run_live,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "Opportunity Scout: find exactly 2 behavioral health AI companies. "
+                "Use live search and do not pad weak matches."
+            ),
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            max_results=2,
+        )
+    )
+
+    assert result.status == WorkItemStatus.BLOCKED
+    events = SQLiteStore(_database_url(tmp_path)).list_work_item_events(
+        result.work_item.id
+    )
+    retrieval_event = next(
+        event
+        for event in events
+        if event.event_type == "opportunity_retrieval_completed"
+    )
+    assert retrieval_event.metadata["formal_opportunity_request"] is False
+    assert retrieval_event.metadata["raw_search_result_count"] == 4
+    assert retrieval_event.metadata["candidate_admission"][
+        "filtered_reason_counts"
+    ] == {"candidate lacked exact target evidence": 2}
+    assert retrieval_event.metadata["verification"]["status_counts"] == {
+        "empty": 1
+    }
 
 
 def test_opportunity_source_summary_request_creates_source_summary_artifact(
@@ -12378,6 +13619,53 @@ def test_canonical_plan_controls_current_research_depth_review_not_raw_prose() -
             WorkflowRunRequest(
                 request_text="Summarize the supplied company profile.",
                 manual_request_plan=live_plan.model_dump(mode="json"),
+            ),
+            result,
+        )
+    )
+
+
+def test_compatibility_depth_review_ignores_negated_update_clause() -> None:
+    artifact = WorkItemArtifactRef(
+        artifact_type="company_profile",
+        artifact_id="profile-compat",
+        source_agent="business_research_analyst",
+        metadata={
+            "source_refs": [
+                {
+                    "url": "https://example.test/about",
+                    "source_type": "company_site",
+                }
+            ]
+        },
+    )
+    result = WorkflowRunResult(
+        work_item=WorkItem(
+            kind=WorkItemKind.COMPANY_RESEARCH,
+            title="Company profile",
+            artifact_refs=[artifact],
+        ),
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.DONE,
+        advanced=True,
+        artifact_refs=[artifact],
+    )
+
+    assert (
+        workflow_runner._manager_loop_business_research_depth_gap(
+            WorkflowRunRequest(
+                request_text=(
+                    "Use supplied context only. Do not update Airtable or write externally."
+                )
+            ),
+            result,
+        )
+        == ""
+    )
+    assert "Limited independent evidence" in (
+        workflow_runner._manager_loop_business_research_depth_gap(
+            WorkflowRunRequest(
+                request_text="Review current product activity and the latest roadmap."
             ),
             result,
         )
@@ -13264,6 +14552,264 @@ def test_advance_work_item_outreach_blocks_without_approved_context(tmp_path: Pa
     assert result.context_pack is not None
     assert result.context_pack["can_synthesize"] is False
     assert result.context_pack["missing_requirements"]
+
+
+def test_plural_outreach_contract_never_silently_drafts_only_first_target(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text="Prepare three distinct draft-only outreach emails.",
+            requested_route=WorkItemRoute.OUTREACH_COMPOSER,
+            database_url=database_url,
+            save=True,
+            manual_request_plan={
+                "source": "llm",
+                "target_agent": "outreach_composer",
+                "intent": "outreach_draft",
+                "target_type": "company",
+                "task_objective": "outreach_draft",
+                "expected_artifact_type": "outreach_draft",
+                "desired_count": 3,
+                "desired_count_explicit": True,
+            },
+        )
+    )
+
+    assert result.status == WorkItemStatus.BLOCKED
+    assert result.blockers[0].code == "outreach_batch_requires_bounded_execution"
+    assert result.next_action is not None
+    assert result.next_action.action == "prepare_bounded_outreach_batch"
+    assert SQLiteStore(database_url).count("outreach_drafts") == 0
+
+
+def test_named_plural_outreach_contract_blocks_without_explicit_count(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text="Prepare draft-only outreach for both selected organizations.",
+            requested_route=WorkItemRoute.OUTREACH_COMPOSER,
+            database_url=database_url,
+            save=True,
+            manual_request_plan={
+                "source": "llm",
+                "target_agent": "outreach_composer",
+                "intent": "outreach_draft",
+                "target_type": "company",
+                "task_objective": "outreach_draft",
+                "expected_artifact_type": "outreach_draft",
+                "required_entities": ["Northstar Health", "Riverbend Care"],
+            },
+        )
+    )
+
+    assert result.status == WorkItemStatus.BLOCKED
+    assert result.blockers[0].code == "outreach_batch_requires_bounded_execution"
+    assert result.next_action is not None
+    assert result.next_action.action == "prepare_bounded_outreach_batch"
+    assert SQLiteStore(database_url).count("outreach_drafts") == 0
+
+
+def test_selected_plural_outreach_context_never_defaults_to_first_profile(
+    tmp_path: Path,
+) -> None:
+    work_item = WorkItem(
+        kind=WorkItemKind.OUTREACH,
+        title="Prepare selected outreach",
+        request_text="Prepare the requested outreach.",
+        current_route=WorkItemRoute.OUTREACH_COMPOSER,
+        target=WorkItemTarget(name="selected organizations"),
+        artifact_refs=[
+            WorkItemArtifactRef(
+                artifact_type="company_profile",
+                artifact_id="profile-alpha",
+                source_agent="business_research_analyst",
+                title="Alpha Health",
+                selected=True,
+            ),
+            WorkItemArtifactRef(
+                artifact_type="company_profile",
+                artifact_id="profile-beta",
+                source_agent="business_research_analyst",
+                title="Beta Care",
+                selected=True,
+            ),
+        ],
+    )
+    request = WorkflowRunRequest(
+        request_text="Prepare the requested outreach.",
+        requested_route=WorkItemRoute.OUTREACH_COMPOSER,
+        manual_request_plan={
+            "source": "llm",
+            "target_agent": "outreach_composer",
+            "intent": "outreach_draft",
+            "task_objective": "outreach_draft",
+            "expected_artifact_type": "outreach_draft",
+        },
+    )
+
+    scope = workflow_runner._resolve_outreach_target_scope(
+        request,
+        work_item=work_item,
+        store=SQLiteStore(_database_url(tmp_path)),
+    )
+    assert scope.selected_ref is None
+    assert scope.ambiguous is True
+    assert scope.selected_targets == ("Alpha Health", "Beta Care")
+
+
+def test_named_outreach_target_selects_matching_profile_not_first_position(
+    tmp_path: Path,
+) -> None:
+    work_item = WorkItem(
+        kind=WorkItemKind.OUTREACH,
+        title="Prepare outreach",
+        request_text="Prepare outreach to Beta Care.",
+        current_route=WorkItemRoute.OUTREACH_COMPOSER,
+        target=WorkItemTarget(name="Beta Care"),
+        artifact_refs=[
+            WorkItemArtifactRef(
+                artifact_type="company_profile",
+                artifact_id="profile-alpha",
+                source_agent="business_research_analyst",
+                title="Alpha Health",
+                selected=True,
+            ),
+            WorkItemArtifactRef(
+                artifact_type="company_profile",
+                artifact_id="profile-beta",
+                source_agent="business_research_analyst",
+                title="Beta Care",
+                selected=True,
+            ),
+        ],
+    )
+    request = WorkflowRunRequest(
+        request_text="Prepare outreach to Beta Care.",
+        requested_route=WorkItemRoute.OUTREACH_COMPOSER,
+        manual_request_plan={
+            "source": "llm",
+            "target_agent": "outreach_composer",
+            "intent": "outreach_draft",
+            "task_objective": "outreach_draft",
+            "expected_artifact_type": "outreach_draft",
+            "required_entities": ["Beta Care"],
+        },
+    )
+
+    scope = workflow_runner._resolve_outreach_target_scope(
+        request,
+        work_item=work_item,
+        store=SQLiteStore(_database_url(tmp_path)),
+    )
+    assert scope.selected_ref is not None
+    assert scope.selected_ref.artifact_id == "profile-beta"
+    assert scope.missing_targets == ()
+    assert scope.extra_targets == ("Alpha Health",)
+
+
+def test_opportunity_handoff_scope_selects_named_profile_and_flags_plural_batch() -> None:
+    work_item = WorkItem(
+        kind=WorkItemKind.OPPORTUNITY,
+        title="Assess selected profiles",
+        current_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        artifact_refs=[
+            WorkItemArtifactRef(
+                artifact_type="company_profile",
+                artifact_id="profile-alpha",
+                source_agent="business_research_analyst",
+                title="Alpha Health",
+                selected=True,
+            ),
+            WorkItemArtifactRef(
+                artifact_type="company_profile",
+                artifact_id="profile-beta",
+                source_agent="business_research_analyst",
+                title="Beta Care",
+                selected=True,
+            ),
+        ],
+    )
+    named_scope = workflow_runner._resolve_company_profile_handoff_scope(
+        WorkflowRunRequest(
+            request_text="Assess Beta Care.",
+            manual_request_plan={
+                "source": "llm",
+                "target_agent": "opportunity_scout",
+                "intent": "opportunity_search",
+                "expected_artifact_type": "opportunity_record",
+                "required_entities": ["Beta Care"],
+            },
+        ),
+        work_item=work_item,
+        store=None,
+    )
+    plural_scope = workflow_runner._resolve_company_profile_handoff_scope(
+        WorkflowRunRequest(
+            request_text="Assess both selected companies.",
+            manual_request_plan={
+                "source": "llm",
+                "target_agent": "opportunity_scout",
+                "intent": "opportunity_search",
+                "expected_artifact_type": "opportunity_record",
+                "required_entities": ["Alpha Health", "Beta Care"],
+                "desired_count": 2,
+                "desired_count_explicit": True,
+            },
+        ),
+        work_item=work_item,
+        store=None,
+    )
+
+    assert named_scope.selected_item is not None
+    assert named_scope.selected_item.artifact_id == "profile-beta"
+    assert plural_scope.selected_item is None
+    assert plural_scope.requires_batch is True
+
+
+def test_duplicate_normalized_target_profiles_block_positional_selection() -> None:
+    work_item = WorkItem(
+        kind=WorkItemKind.OPPORTUNITY,
+        title="Assess selected profile",
+        current_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        artifact_refs=[
+            WorkItemArtifactRef(
+                artifact_type="company_profile",
+                artifact_id="profile-beta-old",
+                source_agent="business_research_analyst",
+                title="Beta Care",
+                selected=True,
+            ),
+            WorkItemArtifactRef(
+                artifact_type="company_profile",
+                artifact_id="profile-beta-new",
+                source_agent="business_research_analyst",
+                title="Beta  Care",
+                selected=True,
+            ),
+        ],
+    )
+    scope = workflow_runner._resolve_company_profile_handoff_scope(
+        WorkflowRunRequest(
+            request_text="Assess Beta Care.",
+            manual_request_plan={
+                "source": "llm",
+                "target_agent": "opportunity_scout",
+                "intent": "opportunity_search",
+                "expected_artifact_type": "opportunity_record",
+                "required_entities": ["Beta Care"],
+            },
+        ),
+        work_item=work_item,
+        store=None,
+    )
+
+    assert scope.selected_item is None
+    assert scope.ambiguous is True
+    assert scope.duplicate_targets == ("Beta Care",)
 
 
 def test_thread_local_sample_reply_without_context_asks_for_context(tmp_path: Path) -> None:

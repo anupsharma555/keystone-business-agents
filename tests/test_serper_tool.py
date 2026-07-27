@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextvars
+
 import pytest
 import requests
 
@@ -512,6 +514,64 @@ def test_search_web_enforces_optional_provider_caps_across_sdk_run(
     assert len(exa_calls) == 2
     assert diagnostics["provider_usage"]["exa"]["requests_attempted"] == 2
     assert diagnostics["provider_usage"]["exa"]["requests_succeeded"] == 2
+    assert any(
+        error.get("provider") == "exa" and error.get("error_type") == "ProviderRequestCapExceeded"
+        for error in diagnostics["search_provider_errors"]
+    )
+
+
+def test_search_web_enforces_optional_provider_caps_across_copied_tool_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class FakeProvider:
+        def __init__(self, provider_name: str) -> None:
+            self.provider_name = provider_name
+
+        def search_structured(self, request):
+            calls.append(f"{self.provider_name}:{request.query}:{request.num_results}")
+            return [
+                SearchResult(
+                    title=f"{self.provider_name} result",
+                    link=f"https://example.com/{self.provider_name}",
+                    snippet="Source-backed search result.",
+                    source=self.provider_name,
+                )
+            ]
+
+    def fake_build_search_provider(provider=None, *, live=False, **_kwargs):
+        assert live is True
+        return FakeProvider(str(provider))
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setenv("KEYSTONE_ENABLE_LIVE_RESEARCH", "true")
+    monkeypatch.delenv("SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", "false")
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_FALLBACK", "true")
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN", "2")
+    monkeypatch.setattr(
+        "keystone_agents.tools.serper_tool.build_search_provider",
+        fake_build_search_provider,
+    )
+
+    reset_sdk_search_telemetry()
+    set_sdk_search_request_context("Run a deepened search beyond a first pass.")
+    parent_context = contextvars.copy_context()
+    for index in range(3):
+        tool_context = parent_context.copy()
+        tool_context.run(
+            search_web,
+            f"OpenAI mental health official {index}",
+            2,
+        )
+
+    diagnostics = sdk_search_diagnostics_from_telemetry(consume_sdk_search_telemetry())
+
+    exa_calls = [call for call in calls if call.startswith("exa:")]
+    assert len(exa_calls) == 2
+    assert diagnostics["provider_usage"]["exa"]["requests_attempted"] == 2
     assert any(
         error.get("provider") == "exa" and error.get("error_type") == "ProviderRequestCapExceeded"
         for error in diagnostics["search_provider_errors"]

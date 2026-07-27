@@ -96,6 +96,22 @@ def test_slack_query_prompt_allows_negated_side_effect_constraints() -> None:
                 "features. Do not draft, send, publish, schedule, write files, or post elsewhere."
             ),
             target_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            manual_plan={
+                "source": "llm",
+                "target_agent": "business_research_analyst",
+                "intent": "company_research",
+                "task_objective": "entity_research",
+                "primary_target": "public AI companion or chatbot products",
+                "desired_count": 3,
+                "desired_count_explicit": True,
+                "requires_target_discovery": True,
+                "required_terms": [
+                    "AI companion or chatbot",
+                    "teen safety",
+                    "escalation",
+                    "trusted contact",
+                ],
+            },
         )
     )
 
@@ -103,11 +119,11 @@ def test_slack_query_prompt_allows_negated_side_effect_constraints() -> None:
     assert selection.kind == SlackQueryPromptKind.RESEARCH_SUMMARY
     assert selection.target_route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
     assert selection.context_flags["needs_source_triage"]
-    assert "Resolve three named products" in selection.task_brief
+    assert "Resolve the requested 3 qualified targets" in selection.task_brief
     assert "source organizations, news articles, policy reports" in selection.task_brief
     assert "evidence only" in selection.task_brief
-    assert "AI companions or chatbots" in selection.task_brief
-    assert "media outlets, regulators, or research organizations" in selection.task_brief
+    assert "AI companion or chatbot, teen safety" in selection.task_brief
+    assert "media outlets, regulators, or research organizations" not in selection.task_brief
     assert (
         "Do not collapse a category request into one generic company profile"
         in selection.task_brief

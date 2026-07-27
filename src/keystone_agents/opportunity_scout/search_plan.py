@@ -340,6 +340,8 @@ def _grant_only_search_plan(plan: OpportunitySearchPlan) -> OpportunitySearchPla
     plan.must_include_terms = [
         "grant",
         "funding opportunity",
+        "accelerator",
+        "incubator",
         "deadline",
         "eligibility",
         "open",
@@ -367,7 +369,8 @@ def _grant_only_search_plan(plan: OpportunitySearchPlan) -> OpportunitySearchPla
                 "source_url",
             ],
             acceptance_criteria=[
-                "specific active grant, NOFO, FOA, RFA, SBIR/STTR, or funding program",
+                "specific active grant, accelerator, incubator, NOFO, FOA, RFA, "
+                "SBIR/STTR, or funding program",
                 "must verify current status or cycle timing",
                 "must preserve business eligibility gaps instead of assuming qualification",
             ],
@@ -530,6 +533,12 @@ def merge_opportunity_search_plan(
         and plan_targets_only(merged, "company")
     ):
         _apply_company_only_targeting(merged)
+    if base.strict_targeting and plan_targets_only(base, "grant_program"):
+        merged.target_entity_types = list(base.target_entity_types)
+        merged.objectives = list(base.objectives)
+        merged.exclude_entity_types = list(base.exclude_entity_types)
+        merged.strict_targeting = True
+        merged.lanes = list(base.lanes)
     merged.desired_count = max(1, min(10, merged.desired_count or base.desired_count))
     return merged
 
@@ -628,7 +637,18 @@ def _industry_services_intent(lowered: str) -> bool:
 
 
 def _grant_only_intent(lowered: str) -> bool:
-    if not any(marker in lowered for marker in ("grant", "grants", "funding opportunity")):
+    if not any(
+        marker in lowered
+        for marker in (
+            "grant",
+            "grants",
+            "funding opportunity",
+            "accelerator",
+            "accelerators",
+            "incubator",
+            "incubators",
+        )
+    ):
         return False
     other_lane_markers = (
         "conference",

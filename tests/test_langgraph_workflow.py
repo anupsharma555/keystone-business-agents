@@ -26,7 +26,14 @@ from keystone_agents.langgraph_workflow import (
 )
 from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.models import TypedAgentRunResult
+from keystone_agents.multi_target_research import (
+    MultiTargetReadiness,
+    MultiTargetResearchPlan,
+    MultiTargetResearchResult,
+    PerTargetResearchPacket,
+)
 from keystone_agents.reporting import render_work_item_graph_report
+from keystone_agents.runtime import RequestRuntime
 from keystone_agents.schemas.announcement_feed import AnnouncementFeedEvidence, AnnouncementFeedItem
 from keystone_agents.schemas.approval import ApprovalQueueStatus, ApprovalState
 from keystone_agents.schemas.chief_of_staff import (
@@ -177,6 +184,81 @@ def test_manager_loop_continue_keeps_cursor_and_original_objective() -> None:
     assert updated["request"]["request_text"] == "continue"
     assert updated["request"]["work_item_id"] == result.work_item.id
     assert updated["request"]["manual_request_plan"]["objective"] == request.request_text
+
+
+def test_langgraph_finalize_applies_same_blocking_semantic_review_as_direct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailedReview:
+        status = "fail"
+        overall_score = 40
+        approval_boundary_ok = True
+        observed_gaps = ["Output did not answer the request."]
+        recommended_next_step = "Repair the output before presenting it."
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "review_specialist_output",
+        lambda **_kwargs: FailedReview(),
+    )
+    monkeypatch.setattr(
+        langgraph_workflow,
+        "finalize_prepared_work_item_step",
+        lambda _prepared, result, **_kwargs: result,
+    )
+    monkeypatch.setattr(
+        langgraph_workflow,
+        "apply_planned_workflow_continuation",
+        lambda result, **_kwargs: result,
+    )
+    request = WorkflowRunRequest(
+        request_text="Assess the supplied evidence.",
+        save=False,
+    )
+    work_item = WorkItem(
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        title="Evidence assessment",
+        request_text=request.request_text,
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.IN_PROGRESS,
+    )
+    prepared = workflow_runner.PreparedWorkItemStep(
+        request=request,
+        work_item=work_item,
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        input_text=request.request_text,
+        context_pack={},
+    )
+    result = WorkflowRunResult(
+        work_item=work_item,
+        route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        status=WorkItemStatus.IN_PROGRESS,
+        advanced=True,
+        human_summary="Unrelated output.",
+    )
+
+    updated = langgraph_workflow._finalize_step_node(
+        {
+            "request": request.model_dump(mode="json"),
+            "original_request": request.model_dump(mode="json"),
+            "prepared_step": langgraph_workflow._prepared_step_payload(prepared),
+            "result": result.model_dump(mode="json"),
+            "manager_loop": True,
+            "loop_steps": [],
+            "node_path": ["run_business_research"],
+        }
+    )
+    reconciled = WorkflowRunResult.model_validate(updated["result"])
+
+    assert reconciled.status == WorkItemStatus.BLOCKED
+    assert any(
+        blocker.code == "manager_loop_review_failed"
+        for blocker in reconciled.blockers
+    )
+    assert reconciled.next_action is not None
+    assert reconciled.next_action.action == "repair_or_deepen_specialist_output"
+    assert updated["status"] == WorkItemStatus.BLOCKED.value
+    assert updated["loop_steps"][0]["status"] == WorkItemStatus.BLOCKED.value
 
 
 def test_llm_plan_not_context_keywords_owns_graph_context_edge() -> None:
@@ -657,6 +739,215 @@ def test_canonical_graph_route_survives_incidental_words_after_context_stage(
     )
 
 
+@pytest.mark.parametrize(
+    ("comparison_ready", "expected_status"),
+    [
+        (True, WorkItemStatus.DONE),
+        (False, WorkItemStatus.BLOCKED),
+    ],
+)
+def test_graph_multi_target_research_preserves_semantic_completion_truth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    comparison_ready: bool,
+    expected_status: WorkItemStatus,
+) -> None:
+    def fake_multi_target(
+        plan: MultiTargetResearchPlan,
+        **_kwargs: object,
+    ) -> MultiTargetResearchResult:
+        packets = (
+            [
+                PerTargetResearchPacket(
+                    target_name=name,
+                    source_refs=[
+                        {
+                            "source_id": f"{name}:source",
+                            "title": f"{name} source",
+                            "url": f"https://{name.lower().replace(' ', '')}.example/",
+                            "source_type": "company_site",
+                            "supported_claims": [
+                                f"{name} has source-backed multimodal behavioral-health evidence."
+                            ],
+                            "evidence_excerpt": (
+                                f"{name} has source-backed multimodal behavioral-health evidence."
+                            ),
+                        }
+                    ],
+                    extraction_status="extracted",
+                    source_sufficient=True,
+                )
+                for name in ("Limbic", "Ellipsis Health", "Affectiva Health")
+            ]
+            if comparison_ready
+            else []
+        )
+        return MultiTargetResearchResult(
+            plan=plan,
+            selected_targets=[packet.target_name for packet in packets],
+            packets=packets,
+            comparison_ready=comparison_ready,
+            blockers=[] if comparison_ready else ["No candidate had reader-usable evidence."],
+            diagnostics={"ready_packet_count": len(packets)},
+            pass_types=["candidate_discovery", "target_selection", "per_target_depth"],
+        )
+
+    monkeypatch.setattr(workflow_runner, "run_multi_target_research", fake_multi_target)
+    monkeypatch.setattr(
+        workflow_runner,
+        "retrieve_company_profile_live",
+        lambda **_kwargs: pytest.fail("graph must not enter single-company retrieval"),
+    )
+    outcome = run_work_item_langgraph(
+        WorkflowRunRequest(
+            request_text="Review the requested competitor landscape.",
+            requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            manual_request_plan={
+                "source": "llm",
+                "target_agent": "business_research_analyst",
+                "intent": "company_research",
+                "primary_target": "Deliberate AI",
+                "target_type": "company",
+                "task_objective": "entity_research",
+                "expected_artifact_type": "research_brief",
+                "requires_target_discovery": True,
+                "requires_live_search": True,
+            },
+        )
+    )
+
+    assert outcome.result.status == expected_status
+    assert outcome.result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    assert [artifact.artifact_type for artifact in outcome.result.artifact_refs] == [
+        "multi_target_research"
+    ]
+    if comparison_ready:
+        assert "Page Unavailable" not in outcome.result.human_summary
+    else:
+        assert any(
+            blocker.code == "multi_target_research_insufficient"
+            for blocker in outcome.result.blockers
+        )
+
+
+@pytest.mark.parametrize(
+    ("bounded_search_exhausted", "expected_status"),
+    [
+        (False, WorkItemStatus.BLOCKED),
+        (True, WorkItemStatus.DONE),
+    ],
+)
+def test_direct_and_graph_share_assessed_maximum_count_completion_truth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bounded_search_exhausted: bool,
+    expected_status: WorkItemStatus,
+) -> None:
+    def fake_multi_target(
+        plan: MultiTargetResearchPlan,
+        **_kwargs: object,
+    ) -> MultiTargetResearchResult:
+        packets = [
+            PerTargetResearchPacket(
+                target_name=name,
+                source_refs=[
+                    {
+                        "source_id": f"{name}:source",
+                        "title": f"{name} source",
+                        "url": f"https://{name.lower()}.example/",
+                        "source_type": "company_site",
+                        "supported_claims": [f"{name} matches the requested rubric."],
+                    }
+                ],
+                extraction_status="extracted",
+                source_sufficient=True,
+            )
+            for name in ("Alpha", "Beta")
+        ]
+        count_satisfied = bounded_search_exhausted
+        gaps = [] if count_satisfied else ["one additional qualified target remains"]
+        return MultiTargetResearchResult(
+            plan=plan,
+            selected_targets=[packet.target_name for packet in packets],
+            packets=packets,
+            comparison_ready=True,
+            readiness=MultiTargetReadiness(
+                assessed=True,
+                rubric_dimensions=["enterprise integration"],
+                peer_goal=3,
+                ready_peer_count=2,
+                rubric_ready_peer_count=2,
+                peer_comparison_ready=False,
+                bounded_search_exhausted=bounded_search_exhausted,
+                count_contract_satisfied=count_satisfied,
+                whole_request_ready=count_satisfied,
+                gaps=gaps,
+            ),
+            blockers=gaps,
+            diagnostics={"ready_packet_count": 2},
+            pass_types=["candidate_discovery", "target_selection", "per_target_depth"],
+        )
+
+    monkeypatch.setattr(workflow_runner, "run_multi_target_research", fake_multi_target)
+    plan = {
+        "source": "llm",
+        "target_agent": "business_research_analyst",
+        "intent": "company_research",
+        "task_objective": "entity_research",
+        "primary_target": "Anchor Health",
+        "target_type": "company",
+        "expected_artifact_type": "research_brief",
+        "desired_count": 3,
+        "desired_count_explicit": True,
+        "desired_count_mode": "maximum",
+        "desired_count_scope": "additional",
+        "requires_target_discovery": True,
+        "requires_live_search": True,
+        "required_terms": ["enterprise integration"],
+    }
+    direct = workflow_runner.advance_work_item(
+        WorkflowRunRequest(
+            request_text="Review the typed competitor set.",
+            requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            database_url=f"sqlite:///{tmp_path / 'direct.db'}",
+            save=True,
+            live_search=True,
+            manual_request_plan=plan,
+        )
+    )
+    graph = run_work_item_langgraph(
+        WorkflowRunRequest(
+            request_text="Review the typed competitor set.",
+            requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            database_url=f"sqlite:///{tmp_path / 'graph.db'}",
+            save=True,
+            live_search=True,
+            manual_request_plan=plan,
+        )
+    ).result
+
+    assert direct.status == graph.status == expected_status, {
+        "direct_status": direct.status,
+        "direct_route": direct.route,
+        "direct_artifacts": [artifact.artifact_type for artifact in direct.artifact_refs],
+        "graph_status": graph.status,
+        "graph_route": graph.route,
+        "graph_artifacts": [artifact.artifact_type for artifact in graph.artifact_refs],
+    }
+    assert [blocker.code for blocker in direct.blockers] == [
+        blocker.code for blocker in graph.blockers
+    ]
+    if expected_status == WorkItemStatus.BLOCKED:
+        assert [blocker.code for blocker in direct.blockers] == [
+            "multi_target_research_insufficient"
+        ]
+    else:
+        assert direct.blockers == graph.blockers == []
+
+
 def test_graph_terminal_summary_integrates_decision_evidence_and_draft() -> None:
     work_item = WorkItem(
         kind=WorkItemKind.OUTREACH,
@@ -910,6 +1201,120 @@ def test_optional_langgraph_workflow_advances_existing_work_item_runner(tmp_path
     assert "run_business_research" in outcome.node_path
     assert any(event.event_type == "langgraph_orchestration" for event in events)
     assert any("explicit graph nodes" in item for item in outcome.improvements)
+
+
+def test_langgraph_reuses_one_request_runtime_across_graph_nodes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    original = RequestRuntime.from_workflow_request.__func__
+
+    def tracked_runtime(cls, request):
+        calls.append(request.database_url or "")
+        return original(cls, request)
+
+    monkeypatch.setattr(
+        RequestRuntime,
+        "from_workflow_request",
+        classmethod(tracked_runtime),
+    )
+
+    outcome = run_work_item_langgraph(
+        WorkflowRunRequest(
+            request_text="research NeuroFlow",
+            database_url=_database_url(tmp_path),
+            save=True,
+        )
+    )
+
+    assert outcome.result.advanced is True
+    assert calls == [_database_url(tmp_path)]
+
+
+def test_langgraph_in_memory_store_survives_checkpoint_recording(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stores: list[SQLiteStore] = []
+    original = langgraph_workflow._record_langgraph_checkpoint_event
+
+    def capture_store(**kwargs):
+        stores.append(kwargs["store"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        langgraph_workflow,
+        "_record_langgraph_checkpoint_event",
+        capture_store,
+    )
+
+    outcome = run_work_item_langgraph(
+        WorkflowRunRequest(
+            request_text="research NeuroFlow",
+            database_url="sqlite:///:memory:",
+            save=True,
+        )
+    )
+
+    assert outcome.result.advanced is True
+    events = stores[0].list_work_item_events(outcome.result.work_item.id)
+    assert any(event.event_type == "langgraph_orchestration" for event in events)
+
+
+def test_langgraph_request_runtime_context_resets_after_invoke_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingGraph:
+        def invoke(self, *_args, **_kwargs):
+            raise RuntimeError("graph failed")
+
+    monkeypatch.setattr(langgraph_workflow, "langgraph_available", lambda: True)
+    monkeypatch.setattr(
+        langgraph_workflow,
+        "build_work_item_langgraph",
+        lambda **_kwargs: FailingGraph(),
+    )
+
+    with pytest.raises(RuntimeError, match="graph failed"):
+        run_work_item_langgraph(
+            WorkflowRunRequest(request_text="research NeuroFlow", save=False)
+        )
+
+    assert langgraph_workflow._ACTIVE_REQUEST_RUNTIME.get() is None
+
+
+def test_langgraph_restores_outer_request_runtime_after_nested_invoke() -> None:
+    outer_request = WorkflowRunRequest(request_text="outer", save=False)
+    outer_runtime = RequestRuntime.from_workflow_request(outer_request)
+    token = langgraph_workflow._ACTIVE_REQUEST_RUNTIME.set(outer_runtime)
+    try:
+        outcome = run_work_item_langgraph(
+            WorkflowRunRequest(request_text="research NeuroFlow", save=False)
+        )
+
+        assert outcome.result.advanced is True
+        assert langgraph_workflow._ACTIVE_REQUEST_RUNTIME.get() is outer_runtime
+    finally:
+        langgraph_workflow._ACTIVE_REQUEST_RUNTIME.reset(token)
+
+
+def test_langgraph_rejects_storage_scope_drift_without_rebinding() -> None:
+    outer_request = WorkflowRunRequest(request_text="outer", save=False)
+    outer_runtime = RequestRuntime.from_workflow_request(outer_request)
+    token = langgraph_workflow._ACTIVE_REQUEST_RUNTIME.set(outer_runtime)
+    try:
+        restored_request = WorkflowRunRequest(
+            request_text="resume",
+            save=True,
+            database_url="sqlite:///:memory:",
+        )
+
+        with pytest.raises(RuntimeError, match="storage scope changed"):
+            langgraph_workflow._request_runtime(restored_request)
+
+        assert langgraph_workflow._ACTIVE_REQUEST_RUNTIME.get() is outer_runtime
+    finally:
+        langgraph_workflow._ACTIVE_REQUEST_RUNTIME.reset(token)
 
 
 def test_langgraph_quality_comparison_requires_route_and_safety_fidelity() -> None:
@@ -7245,9 +7650,36 @@ def test_langgraph_stages_preprints_context_before_business_research(
 
 def test_langgraph_stages_feed_and_zotero_context_before_business_research(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database_url = _database_url(tmp_path)
     store = SQLiteStore(database_url)
+    runtime_calls: list[str] = []
+    store_calls: list[str] = []
+    original_runtime = RequestRuntime.from_workflow_request.__func__
+    original_store = SQLiteStore
+
+    def tracked_runtime(cls, request):
+        runtime_calls.append(request.database_url or "")
+        return original_runtime(cls, request)
+
+    def tracked_store(database_url: str):
+        store_calls.append(database_url)
+        return original_store(database_url)
+
+    monkeypatch.setattr(
+        RequestRuntime,
+        "from_workflow_request",
+        classmethod(tracked_runtime),
+    )
+    monkeypatch.setattr(
+        "keystone_agents.runtime.request.SQLiteStore",
+        tracked_store,
+    )
+    monkeypatch.setattr(
+        "keystone_agents.tools.announcement_context_tools.SQLiteStore",
+        tracked_store,
+    )
     store.save_announcement_feed_item(
         AnnouncementFeedItem(
             title="Preprint on depression evidence workflows",
@@ -7336,6 +7768,8 @@ def test_langgraph_stages_feed_and_zotero_context_before_business_research(
         for artifact in outcome.result.work_item.artifact_refs
         if artifact.source_agent in {"preprints_context_agent", "zotero_context_agent"}
     )
+    assert runtime_calls == [database_url]
+    assert store_calls == [database_url]
 
 
 def test_langgraph_stages_google_workspace_artifact_plan_before_approval_checkpoint(

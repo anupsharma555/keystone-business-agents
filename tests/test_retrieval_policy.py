@@ -389,6 +389,10 @@ def test_hybrid_search_provider_escalates_when_quality_is_weak() -> None:
     value_summary = {row["provider"]: row for row in telemetry["provider_value_summary"]}
     assert value_summary["serper"]["results_per_success"] == 1.0
     assert value_summary["searxng"]["requests_succeeded"] == 1
+    assert value_summary["searxng"]["requests_completed_with_results"] == 1
+    assert value_summary["searxng"]["requests_completed_empty"] == 0
+    assert telemetry["query_result_count"] == 1
+    assert telemetry["query_empty_count"] == 0
     assert provider.collected_results() == results
 
 
@@ -474,6 +478,15 @@ def test_hybrid_search_provider_keeps_parallel_optional_errors_nonfatal() -> Non
     assert telemetry["search_providers_attempted"] == ["searxng", "agents-web-search"]
     assert telemetry["search_providers_used"] == ["searxng"]
     assert telemetry["search_provider_errors"][0]["provider"] == "agents-web-search"
+    assert telemetry["query_attempt_count"] == 1
+    assert telemetry["query_completed_count"] == 1
+    assert telemetry["query_result_count"] == 0
+    assert telemetry["query_empty_count"] == 1
+    assert telemetry["query_uncovered_count"] == 0
+    assert telemetry["provider_usage"]["searxng"][
+        "requests_completed_with_results"
+    ] == 0
+    assert telemetry["provider_usage"]["searxng"]["requests_completed_empty"] == 1
 
 
 def test_hybrid_search_provider_degrades_when_all_parallel_providers_timeout() -> None:
@@ -509,6 +522,11 @@ def test_hybrid_search_provider_degrades_when_all_parallel_providers_timeout() -
         "SearchProviderError",
         "TimeoutError",
     ]
+    assert telemetry["query_attempt_count"] == 1
+    assert telemetry["query_completed_count"] == 0
+    assert telemetry["query_result_count"] == 0
+    assert telemetry["query_empty_count"] == 0
+    assert telemetry["query_uncovered_count"] == 1
 
 
 def test_hybrid_search_provider_degrades_when_all_sequential_providers_fail() -> None:

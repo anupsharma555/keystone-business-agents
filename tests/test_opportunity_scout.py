@@ -49,6 +49,7 @@ from keystone_agents.tools.search_provider import (
 )
 from keystone_agents.tools.serper_tool import SearchResult, SerperTool
 from keystone_agents.tools.website_extraction_tool import (
+    WebsiteExtractionBudget,
     WebsiteExtractionError,
     WebsiteExtractionResult,
 )
@@ -1779,6 +1780,378 @@ def test_source_verification_cache_reuses_unique_page_across_search_rounds(
     assert calls == ["https://example.test/grant"]
     assert first[0]["verified_excerpt"] == second[0]["verified_excerpt"]
     assert any("Reused verified source page" in note for note in second_notes)
+
+
+def test_source_verification_cache_canonicalizes_tracking_url_variants() -> None:
+    first = {
+        "source_url": "https://program.example.org/apply",
+        "source_title": "Program application",
+    }
+    tracked = {
+        "source_url": (
+            "https://program.example.org/apply?utm_source=followup#deadline"
+        ),
+        "source_title": "Program application",
+    }
+    semantic = {
+        "source_url": "https://program.example.org/apply?cycle=2027",
+        "source_title": "Program application",
+    }
+
+    assert scout_module._source_hit_key(first) == scout_module._source_hit_key(
+        tracked
+    )
+    assert scout_module._source_hit_key(first) != scout_module._source_hit_key(
+        semantic
+    )
+
+
+def test_source_verification_reuses_one_managed_extraction_budget_across_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KEYSTONE_OPPORTUNITY_VERIFY_CAP", "4")
+    external_calls: list[str] = []
+    budget = WebsiteExtractionBudget(firecrawl_max_calls=1)
+
+    def fake_extract(
+        url: str,
+        *,
+        budget: WebsiteExtractionBudget,
+        **_kwargs,
+    ) -> WebsiteExtractionResult:
+        if not budget.reserve("firecrawl"):
+            raise WebsiteExtractionError("Firecrawl extraction budget exhausted")
+        external_calls.append(url)
+        return WebsiteExtractionResult(
+            url=url,
+            title="Official program",
+            provider="firecrawl",
+            status="success",
+            text_or_markdown=(
+                "Official accelerator program now accepting applications. "
+                "Small businesses are eligible through December 15, 2026."
+            ),
+            claims=["Official accelerator program now accepting applications."],
+        )
+
+    monkeypatch.setattr(
+        scout_module,
+        "_extract_opportunity_verification_page",
+        fake_extract,
+    )
+    cache: dict[str, dict[str, object]] = {}
+    first_hit = {
+        "company_name": "Program One",
+        "source_title": "Program One application",
+        "source_url": "https://program-one.example.org/apply",
+        "entity_kind": "grant_program",
+        "source_type": "company_site",
+        "source_category": "grant",
+        "signal": "Official application page.",
+    }
+    second_hit = {
+        **first_hit,
+        "company_name": "Program Two",
+        "source_title": "Program Two application",
+        "source_url": "https://program-two.example.org/apply",
+    }
+
+    scout_module._verify_source_hits(
+        [first_hit],
+        verify_source_pages=True,
+        verification_cache=cache,
+        extraction_budget=budget,
+    )
+    scout_module._verify_source_hits(
+        [second_hit],
+        verify_source_pages=True,
+        verification_cache=cache,
+        extraction_budget=budget,
+    )
+
+    assert external_calls == ["https://program-one.example.org/apply"]
+    assert budget.firecrawl_calls_attempted == 1
+    diagnostics = scout_module._verification_diagnostics_from_cache(cache)
+    assert diagnostics["status_counts"] == {"verified": 1, "failed": 1}
+
+
+def test_source_verification_diagnostics_bound_every_persisted_field() -> None:
+    oversized = "x" * 20_000
+    diagnostics = scout_module._verification_diagnostics_from_cache(
+        {
+            "candidate": {
+                "_verification_diagnostic": {
+                    "url": f"https://example.org/{oversized}",
+                    "title": oversized,
+                    "entity_kind": oversized,
+                    "source_type": oversized,
+                    "source_category": oversized,
+                    "status": oversized,
+                    "provider": oversized,
+                    "error_type": oversized,
+                }
+            }
+        }
+    )
+    attempt = diagnostics["attempts"][0]
+
+    assert len(attempt["url"]) == 500
+    assert len(attempt["title"]) == 240
+    assert len(attempt["entity_kind"]) == 80
+    assert len(attempt["error_type"]) == 120
+
+
+def test_source_verification_prioritizes_official_program_over_earlier_news(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KEYSTONE_OPPORTUNITY_VERIFY_CAP", "1")
+    calls: list[str] = []
+
+    def fake_extract(url: str, **_kwargs) -> WebsiteExtractionResult:
+        calls.append(url)
+        return WebsiteExtractionResult(
+            url=url,
+            title="Behavioral Health AI Accelerator",
+            provider="trafilatura",
+            status="success",
+            text_or_markdown=(
+                "Behavioral Health AI Accelerator is now accepting applications. "
+                "For-profit U.S. small businesses are eligible. "
+                "Applications are accepted through December 15, 2026."
+            ),
+            claims=[],
+        )
+
+    monkeypatch.setattr(scout_module, "_extract_opportunity_verification_page", fake_extract)
+    plan = scout_module.infer_opportunity_search_plan(
+        "Find current U.S. accelerator or grant programs with official eligibility.",
+        desired_count=3,
+    )
+    hits = [
+        {
+            "company_name": "Behavioral Health Funding News",
+            "entity_kind": "grant_program",
+            "source_title": "Five accelerators healthcare startups should watch",
+            "source_url": "https://news.example.test/accelerator-list",
+            "source_type": "news",
+            "source_category": "news",
+            "signal": "A roundup of accelerator and funding announcements.",
+        },
+        {
+            "company_name": "Behavioral Health AI Accelerator",
+            "entity_kind": "grant_program",
+            "source_title": "Behavioral Health AI Accelerator | Apply",
+            "source_url": "https://program.example.org/apply",
+            "source_type": "company_site",
+            "source_category": "grant",
+            "signal": "Official program eligibility and application page.",
+        },
+    ]
+
+    verification_cache: dict[str, dict[str, object]] = {}
+    (
+        accepted,
+        _filtered_hits,
+        filtered_candidates,
+        _review_candidates,
+        _audit_notes,
+        _verification_notes,
+    ) = scout_module._process_candidate_hits(
+        hits,
+        topic=(
+            "Find current U.S. accelerator or grant programs for a behavioral-health "
+            "AI company with official eligibility."
+        ),
+        search_plan=plan,
+        verify_source_pages=True,
+        verification_cache=verification_cache,
+    )
+
+    assert calls == ["https://program.example.org/apply"]
+    assert [hit["company_name"] for hit in accepted] == [
+        "Behavioral Health AI Accelerator"
+    ]
+    assert any(
+        candidate["company_name"] == "Behavioral Health Funding News"
+        for candidate in filtered_candidates
+    )
+    diagnostics = scout_module._verification_diagnostics_from_cache(
+        verification_cache
+    )
+    assert diagnostics["status_counts"] == {"verified": 1}
+    assert diagnostics["attempts"][0]["url"] == "https://program.example.org/apply"
+
+
+def test_raw_accelerator_search_result_is_typed_and_prioritized_as_program() -> None:
+    plan = scout_module.infer_opportunity_search_plan(
+        "Find current U.S. accelerator or grant programs with official eligibility.",
+        desired_count=3,
+    )
+    spec = scout_module._OpportunityQuerySpec(
+        lane="grant",
+        time_window="current",
+        query="behavioral health AI accelerator or grant programs",
+        entity_hint="grant_program",
+    )
+    accelerator = scout_module._search_result_to_hit(
+        spec,
+        {
+            "title": "One Mind Accelerator Applications",
+            "url": "https://onemindaccelerator.org/apply",
+            "snippet": (
+                "Official accelerator program eligibility and applications open "
+                "through December 15, 2026."
+            ),
+            "source_type": "google_search",
+        },
+    )
+    generic_index = scout_module._search_result_to_hit(
+        spec,
+        {
+            "title": "NIMH Funding Opportunities",
+            "url": "https://www.nimh.nih.gov/funding/opportunities-announcements",
+            "snippet": "General index of NIMH funding opportunities and notices.",
+            "source_type": "google_search",
+        },
+    )
+    aggregator = scout_module._search_result_to_hit(
+        spec,
+        {
+            "title": "Acme Accelerator Applications Announced",
+            "url": "https://news.example/articles/acme-accelerator",
+            "snippet": (
+                "News coverage says the accelerator is accepting applications "
+                "through December 15, 2026."
+            ),
+            "source_type": "google_search",
+        },
+    )
+
+    assert accelerator["entity_kind"] == "grant_program"
+    assert accelerator["source_category"] == "grant"
+    assert accelerator["source_type"] == "company_site"
+    assert aggregator["entity_kind"] == "grant_program"
+    assert aggregator["source_category"] == "grant"
+    assert aggregator["source_type"] == "google_search"
+    assert scout_module._opportunity_verification_priority(
+        accelerator,
+        search_plan=plan,
+    ) > scout_module._opportunity_verification_priority(
+        generic_index,
+        search_plan=plan,
+    )
+    assert scout_module._opportunity_verification_priority(
+        accelerator,
+        search_plan=plan,
+    ) > scout_module._opportunity_verification_priority(
+        aggregator,
+        search_plan=plan,
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Now accepting applications for the 2026 accelerator cohort.",
+        "The upcoming application window opens October 1, 2026.",
+        "Applications accepted through December 15, 2026.",
+    ],
+)
+def test_current_application_window_phrases_are_active(text: str) -> None:
+    reasons = scout_module._active_opportunity_reasons(
+        title="Behavioral Health AI Accelerator",
+        url="https://program.example.org/apply",
+        snippet=text,
+    )
+    details = scout_module._opportunity_detail_fields(
+        {
+            "source_title": "Behavioral Health AI Accelerator",
+            "source_url": "https://program.example.org/apply",
+            "signal": text,
+            "verified_excerpt": text,
+        }
+    )
+
+    assert reasons
+    assert details["opportunity_status"] == "open"
+
+
+def test_closed_application_window_overrides_active_wording() -> None:
+    details = scout_module._opportunity_detail_fields(
+        {
+            "source_title": "Behavioral Health AI Accelerator",
+            "source_url": "https://program.example.org/apply",
+            "signal": (
+                "The application window is closed and the program is no longer "
+                "accepting applications."
+            ),
+            "verified_excerpt": "Applications were accepted through January 15, 2026.",
+        }
+    )
+
+    assert details["opportunity_status"] == "closed_or_expired"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "The application window for the 2025 cohort ran January through March 2025.",
+        "Application period details will be announced later.",
+        "Review application window requirements before the next cycle is announced.",
+        "Archived opportunity: the application window is no longer active.",
+    ],
+)
+def test_historical_or_unannounced_application_windows_are_not_active(
+    text: str,
+) -> None:
+    reasons = scout_module._active_opportunity_reasons(
+        title="Behavioral Health AI Accelerator",
+        url="https://program.example.org/archive",
+        snippet=text,
+    )
+
+    assert "source text includes active opportunity evidence" not in reasons
+
+
+def test_candidate_admission_diagnostics_separate_filtered_and_review_reasons() -> None:
+    filtered = [
+        {
+            "company_name": "Example Program",
+            "entity_kind": "grant_program",
+            "source_category": "grant",
+            "source_url": "https://program.example.org/apply",
+            "reasons": ["applicant eligibility was not verified"],
+        }
+    ]
+    review = [
+        {
+            **filtered[0],
+            "reasons": [
+                "applicant eligibility was not verified",
+                "official source requires review",
+            ],
+        }
+    ]
+
+    diagnostics = scout_module._candidate_admission_diagnostics(
+        filtered_candidates=filtered,
+        review_candidates=review,
+    )
+
+    assert diagnostics["reason_counts"] == {
+        "applicant eligibility was not verified": 1
+    }
+    assert diagnostics["filtered_reason_counts"] == {
+        "applicant eligibility was not verified": 1
+    }
+    assert diagnostics["review_reason_counts"] == {
+        "applicant eligibility was not verified": 1,
+        "official source requires review": 1,
+    }
+    assert {sample["disposition"] for sample in diagnostics["samples"]} == {
+        "filtered",
+        "review",
+    }
 
 
 def test_verification_excerpt_retains_late_formal_opportunity_details() -> None:
@@ -3589,14 +3962,19 @@ def test_live_search_deadline_returns_initial_partial_evidence_without_followups
         clock=lambda: 0.0,
     )
 
-    assert result.retrieval_diagnostics == {
-        "status": "partial",
-        "deadline_seconds": 0.0,
-        "elapsed_seconds": 0.0,
-        "stopped_before_stage": "coverage_followup",
-        "query_count": len(result.search_queries),
-        "unique_pages_cached": 1,
-    }
+    diagnostics = result.retrieval_diagnostics
+    assert diagnostics["status"] == "partial"
+    assert diagnostics["deadline_seconds"] == 0.0
+    assert diagnostics["elapsed_seconds"] == 0.0
+    assert diagnostics["stopped_before_stage"] == "coverage_followup"
+    assert diagnostics["query_count"] == len(result.search_queries)
+    assert diagnostics["raw_search_result_count"] == result.raw_search_result_count
+    assert diagnostics["unique_pages_cached"] == 1
+    assert diagnostics["candidate_admission"]["filtered_count"] >= 1
+    assert diagnostics["verification"]["attempt_count"] == 1
+    assert diagnostics["resolved_search_plan"]["target_entity_types"] == [
+        "grant_program"
+    ]
     assert not any("site:reporter.nih.gov" in query for query in provider.queries)
     assert any("returning bounded partial evidence" in note for note in result.audit_notes)
 

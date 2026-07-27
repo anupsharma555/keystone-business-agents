@@ -30,6 +30,12 @@ Rules:
 - If the user asks for RFPs, contracts, solicitations, procurement, SAM.gov, or
   request-for-proposal opportunities, target `contract_rfp` and use
   `contract_opportunity`.
+- If the user asks for grants, funding programs, accelerators, incubators,
+  SBIR/STTR programs, NOFOs, FOAs, or RFAs as the final records, target
+  `grant_program`, use `funding`, and preserve required application-window,
+  deadline, sponsor, and eligibility fields. A request that says
+  "accelerator or grant programs" is one bounded formal-program union, not a
+  broad company/researcher search.
 - If the user asks for GitHub repositories, open-source repos, libraries,
   packages, frameworks, templates, or developer tooling, target
   `github_repository` and use `open_source_tooling`.

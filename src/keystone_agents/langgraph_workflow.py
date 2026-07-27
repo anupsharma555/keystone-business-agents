@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Mapping
+from contextvars import ContextVar
 from importlib.util import find_spec
 from typing import Any, Literal, TypedDict
 from uuid import uuid4
@@ -23,13 +24,19 @@ from keystone_agents.orchestration.stages import (
     advance_work_item_manager_loop,
     answer_work_item_state_followup,
     apply_planned_workflow_continuation,
+    attempt_manager_loop_repair,
     finalize_manager_loop_result,
     finalize_prepared_work_item_step,
+    manager_loop_can_consider_repair,
+    manager_loop_latest_review,
+    manager_loop_repair_failed_result,
     manager_loop_request_is_planning_only,
+    manager_loop_review_requested_repair,
     manual_plan_requests_manager_continuation,
     normalize_workflow_request_for_graph,
     operator_requested_manager_continuation,
     prepare_work_item_step,
+    review_and_reconcile_manager_step,
     run_prepared_work_item_specialist,
     synthesize_terminal_work_item_response,
 )
@@ -37,6 +44,7 @@ from keystone_agents.planning.compatibility import (
     positive_capability_text,
     request_forbids_response_composition,
 )
+from keystone_agents.runtime.request import RequestRuntime
 from keystone_agents.schemas.approval import ApprovalState
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.work_item import (
@@ -51,7 +59,7 @@ from keystone_agents.schemas.work_item import (
     WorkItemSourceRef,
     WorkItemStatus,
 )
-from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
+from keystone_agents.storage.sqlite_store import SQLiteStore
 from keystone_agents.tools.announcement_context_tools import (
     retrieve_preprint_announcement_history_impl,
     retrieve_rss_announcement_history_impl,
@@ -70,6 +78,10 @@ LANGGRAPH_WORKITEM_ENV_KEYS = (
     "KEYSTONE_WORKITEM_LANGGRAPH",
 )
 FALSE_VALUES = {"", "0", "false", "no", "off"}
+_ACTIVE_REQUEST_RUNTIME: ContextVar[RequestRuntime | None] = ContextVar(
+    "keystone_langgraph_request_runtime",
+    default=None,
+)
 
 
 class LangGraphUnavailableError(RuntimeError):
@@ -98,6 +110,7 @@ class WorkItemGraphState(TypedDict, total=False):
     max_manager_steps: int
     terminal: bool
     graph_stop_reason: str
+    repair_attempts_by_route: dict[str, int]
 
 
 class LangGraphWorkflowOutcome(BaseModel):
@@ -529,6 +542,7 @@ def run_work_item_langgraph(
         "loop_steps": [],
         "manager_loop": bool(manager_loop),
         "max_manager_steps": bounded_max_steps,
+        "repair_attempts_by_route": {},
     }
     checkpoint_key = thread_id or f"work-item-graph-{uuid4().hex}"
     if manager_loop:
@@ -543,21 +557,26 @@ def run_work_item_langgraph(
                 "send_enabled": False,
             },
         )
-    if langgraph_available():
-        graph = build_work_item_langgraph(checkpointer=checkpointer)
-        final_state = graph.invoke(
-            initial_state,
-            config={"configurable": {"thread_id": checkpoint_key}},
-        )
-        runtime: Literal["langgraph", "dependency_free_fallback"] = "langgraph"
-    else:
-        if require_langgraph:
-            raise LangGraphUnavailableError(
-                "LangGraph is not installed. Install the optional `orchestration` extra "
-                "to require compiled graph execution."
+    request_runtime = RequestRuntime.from_workflow_request(request)
+    runtime_token = _ACTIVE_REQUEST_RUNTIME.set(request_runtime)
+    try:
+        if langgraph_available():
+            graph = build_work_item_langgraph(checkpointer=checkpointer)
+            final_state = graph.invoke(
+                initial_state,
+                config={"configurable": {"thread_id": checkpoint_key}},
             )
-        final_state = _run_dependency_free_graph(initial_state)
-        runtime = "dependency_free_fallback"
+            runtime: Literal["langgraph", "dependency_free_fallback"] = "langgraph"
+        else:
+            if require_langgraph:
+                raise LangGraphUnavailableError(
+                    "LangGraph is not installed. Install the optional `orchestration` "
+                    "extra to require compiled graph execution."
+                )
+            final_state = _run_dependency_free_graph(initial_state)
+            runtime = "dependency_free_fallback"
+    finally:
+        _ACTIVE_REQUEST_RUNTIME.reset(runtime_token)
 
     result = WorkflowRunResult.model_validate(final_state["result"])
     checkpoint_required = bool(final_state.get("checkpoint_required", False))
@@ -618,6 +637,7 @@ def run_work_item_langgraph(
     _record_langgraph_checkpoint_event(
         request=request,
         result=result,
+        store=request_runtime.store,
         runtime=runtime,
         checkpoint_required=checkpoint_required,
         checkpoint_reason=checkpoint_reason,
@@ -1643,11 +1663,7 @@ def _manager_loop_finalize_node(state: WorkItemGraphState) -> WorkItemGraphState
         or "stopped because no next graph edge was available"
     )
     loop_steps = list(state.get("loop_steps") or [])
-    store = (
-        SQLiteStore(original_request.database_url or database_url_from_env())
-        if original_request.save
-        else None
-    )
+    store = _request_store(original_request)
     result = finalize_manager_loop_result(
         result,
         original_request=original_request,
@@ -1658,7 +1674,7 @@ def _manager_loop_finalize_node(state: WorkItemGraphState) -> WorkItemGraphState
     )
     if original_request.save:
         if store is None:
-            store = SQLiteStore(original_request.database_url or database_url_from_env())
+            raise RuntimeError("Saved graph requests require a request-owned store.")
         node_path = [*state.get("node_path", []), "manager_loop_finalize"]
         graph_completion_review = _graph_completion_review(
             original_request=original_request,
@@ -1705,9 +1721,32 @@ def _run_legacy_single_pass_tail(state: WorkItemGraphState) -> WorkItemGraphStat
     return state
 
 
+def _request_runtime(request: WorkflowRunRequest) -> RequestRuntime:
+    """Return the one local-service owner bound to this graph invocation."""
+
+    runtime = _ACTIVE_REQUEST_RUNTIME.get()
+    if runtime is None:
+        return RequestRuntime.from_workflow_request(request)
+    if not runtime.matches_storage_scope(request):
+        raise RuntimeError(
+            "LangGraph request storage scope changed during one invocation; "
+            "resume with the original save and database settings."
+        )
+    return runtime.with_request(request)
+
+
+def _request_store(request: WorkflowRunRequest) -> SQLiteStore | None:
+    """Return the request-owned store without constructing a node-local copy."""
+
+    return _request_runtime(request).store
+
+
 def _normalize_request_node(state: WorkItemGraphState) -> WorkItemGraphState:
     request = WorkflowRunRequest.model_validate(state.get("request") or {})
-    normalized = normalize_workflow_request_for_graph(request)
+    normalized = normalize_workflow_request_for_graph(
+        request,
+        runtime=_request_runtime(request),
+    )
     return {
         **state,
         "request": normalized.model_dump(mode="json"),
@@ -1736,7 +1775,10 @@ def _orchestrator_preflight_node(state: WorkItemGraphState) -> WorkItemGraphStat
 
 def _state_followup_node(state: WorkItemGraphState) -> WorkItemGraphState:
     request = WorkflowRunRequest.model_validate(state.get("request") or {})
-    result = answer_work_item_state_followup(request)
+    result = answer_work_item_state_followup(
+        request,
+        runtime=_request_runtime(request),
+    )
     if result is None:
         return {
             **state,
@@ -1756,7 +1798,10 @@ def _state_followup_node(state: WorkItemGraphState) -> WorkItemGraphState:
 
 def _prepare_work_item_node(state: WorkItemGraphState) -> WorkItemGraphState:
     request = WorkflowRunRequest.model_validate(state.get("request") or {})
-    prepared = prepare_work_item_step(request)
+    prepared = prepare_work_item_step(
+        request,
+        runtime=_request_runtime(request),
+    )
     return {
         **state,
         "request": prepared.request.model_dump(mode="json"),
@@ -1777,6 +1822,7 @@ def _stage_feed_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
         kind=kind,
         request_text=request_text,
         database_url=prepared.request.database_url,
+        store=_request_store(prepared.request),
     )
     source_refs = _feed_context_source_refs(
         work_item_id=work_item.id,
@@ -1824,9 +1870,8 @@ def _stage_feed_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
         ),
         artifact,
     )
-    store = None
-    if prepared.request.save:
-        store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+    store = _request_store(prepared.request)
+    if store is not None:
         store.save_work_item(work_item)
     prepared = PreparedWorkItemStep(
         request=prepared.request,
@@ -1837,7 +1882,7 @@ def _stage_feed_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
     )
     if prepared.request.save:
         if store is None:
-            store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+            raise RuntimeError("Saved graph requests require a request-owned store.")
         record_event(
             work_item,
             event_type="context_evidence_staged",
@@ -1930,9 +1975,8 @@ def _stage_zotero_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
         request_text,
         prepared=prepared,
     )
-    store = None
-    if prepared.request.save:
-        store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+    store = _request_store(prepared.request)
+    if store is not None:
         store.save_work_item(work_item)
     prepared = PreparedWorkItemStep(
         request=prepared.request,
@@ -1943,7 +1987,7 @@ def _stage_zotero_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
     )
     if prepared.request.save:
         if store is None:
-            store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+            raise RuntimeError("Saved graph requests require a request-owned store.")
         record_event(
             work_item,
             event_type="context_evidence_staged",
@@ -2038,9 +2082,8 @@ def _stage_airtable_context_node(state: WorkItemGraphState) -> WorkItemGraphStat
             ),
             artifact,
         )
-        store = None
-        if prepared.request.save:
-            store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+        store = _request_store(prepared.request)
+        if store is not None:
             store.save_work_item(work_item)
         prepared = PreparedWorkItemStep(
             request=prepared.request,
@@ -2051,7 +2094,7 @@ def _stage_airtable_context_node(state: WorkItemGraphState) -> WorkItemGraphStat
         )
         if prepared.request.save:
             if store is None:
-                store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+                raise RuntimeError("Saved graph requests require a request-owned store.")
             record_event(
                 work_item,
                 event_type="context_evidence_staged",
@@ -2136,11 +2179,8 @@ def _stage_airtable_context_node(state: WorkItemGraphState) -> WorkItemGraphStat
             ),
             artifact,
         ).touch()
-        store = None
-        if prepared.request.save:
-            store = SQLiteStore(
-                prepared.request.database_url or database_url_from_env()
-            )
+        store = _request_store(prepared.request)
+        if store is not None:
             store.save_work_item(work_item)
             record_event(
                 work_item,
@@ -2217,9 +2257,8 @@ def _stage_airtable_context_node(state: WorkItemGraphState) -> WorkItemGraphStat
         ),
         artifact,
     ).touch()
-    store = None
-    if prepared.request.save:
-        store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+    store = _request_store(prepared.request)
+    if store is not None:
         store.save_work_item(work_item)
         record_event(
             work_item,
@@ -2333,9 +2372,8 @@ def _stage_google_workspace_context_node(state: WorkItemGraphState) -> WorkItemG
             ),
             artifact,
         )
-        store = None
-        if prepared.request.save:
-            store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+        store = _request_store(prepared.request)
+        if store is not None:
             store.save_work_item(work_item)
         prepared = PreparedWorkItemStep(
             request=prepared.request,
@@ -2346,7 +2384,7 @@ def _stage_google_workspace_context_node(state: WorkItemGraphState) -> WorkItemG
         )
         if prepared.request.save:
             if store is None:
-                store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+                raise RuntimeError("Saved graph requests require a request-owned store.")
             record_event(
                 work_item,
                 event_type="context_evidence_staged",
@@ -2432,9 +2470,8 @@ def _stage_google_workspace_context_node(state: WorkItemGraphState) -> WorkItemG
         ),
         artifact,
     ).touch()
-    store = None
-    if prepared.request.save:
-        store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+    store = _request_store(prepared.request)
+    if store is not None:
         store.save_work_item(work_item)
         record_event(
             work_item,
@@ -2546,18 +2583,49 @@ def _finalize_step_node(state: WorkItemGraphState) -> WorkItemGraphState:
         result,
         synthesize_user_response=not manager_loop,
     )
-    checkpoint_reason = _approval_checkpoint_reason(result)
     loop_steps = list(state.get("loop_steps") or [])
+    repair_attempts_by_route = dict(state.get("repair_attempts_by_route") or {})
     if manager_loop:
-        loop_steps.append(_graph_step_summary(result, len(loop_steps) + 1))
         original_request = WorkflowRunRequest.model_validate(
             state.get("original_request") or state.get("request") or {}
         )
-        store = (
-            SQLiteStore(original_request.database_url or database_url_from_env())
-            if original_request.save
-            else None
+        store = _request_store(original_request)
+        step_index = len(loop_steps) + 1
+        result = review_and_reconcile_manager_step(
+            result,
+            original_request=original_request,
+            step_index=step_index,
+            store=store,
+            feedback_callback=None,
+            defer_block_for_repair=manager_loop_can_consider_repair(
+                result,
+                original_request=original_request,
+                repair_attempts_by_route=repair_attempts_by_route,
+            ),
         )
+        latest_review = manager_loop_latest_review(result.work_item)
+        if manager_loop_review_requested_repair(latest_review):
+            repair_attempts_by_route[result.route.value] = (
+                repair_attempts_by_route.get(result.route.value, 0) + 1
+            )
+            try:
+                result = attempt_manager_loop_repair(
+                    result,
+                    original_request=original_request,
+                    step_index=step_index,
+                    store=store,
+                    feedback_callback=None,
+                )
+            except Exception as exc:
+                result = manager_loop_repair_failed_result(
+                    result,
+                    original_request=original_request,
+                    step_index=step_index,
+                    error=exc,
+                    store=store,
+                    feedback_callback=None,
+                )
+        loop_steps.append(_graph_step_summary(result, step_index))
         result = apply_planned_workflow_continuation(
             result,
             original_request=original_request,
@@ -2565,6 +2633,7 @@ def _finalize_step_node(state: WorkItemGraphState) -> WorkItemGraphState:
             store=store,
         )
         loop_steps[-1] = _graph_step_summary(result, len(loop_steps))
+    checkpoint_reason = _approval_checkpoint_reason(result)
     updated = _state_with_result(
         {
             **state,
@@ -2572,6 +2641,7 @@ def _finalize_step_node(state: WorkItemGraphState) -> WorkItemGraphState:
             "checkpoint_required": bool(checkpoint_reason),
             "checkpoint_reason": checkpoint_reason,
             "loop_steps": loop_steps,
+            "repair_attempts_by_route": repair_attempts_by_route,
             "graph_stop_reason": "approval_checkpoint_required" if checkpoint_reason else "",
         },
         result,
@@ -3302,7 +3372,9 @@ def _airtable_context_after_specialist_requested(state: WorkItemGraphState) -> b
         WorkItemRoute.GMAIL_TRIAGE,
     }:
         return False
-    if result.status in {WorkItemStatus.NEEDS_APPROVAL, WorkItemStatus.BLOCKED}:
+    if result.status == WorkItemStatus.NEEDS_APPROVAL:
+        return False
+    if result.status == WorkItemStatus.BLOCKED and not _only_manager_review_failed(result):
         return False
     prepared = _prepared_step_from_state(state)
     prepared = PreparedWorkItemStep(
@@ -3518,7 +3590,9 @@ def _google_workspace_context_after_specialist_requested(state: WorkItemGraphSta
         WorkItemRoute.GMAIL_TRIAGE,
     }:
         return False
-    if result.status in {WorkItemStatus.NEEDS_APPROVAL, WorkItemStatus.BLOCKED}:
+    if result.status == WorkItemStatus.NEEDS_APPROVAL:
+        return False
+    if result.status == WorkItemStatus.BLOCKED and not _only_manager_review_failed(result):
         return False
     prepared = _prepared_step_from_state(state)
     prepared = PreparedWorkItemStep(
@@ -3543,6 +3617,17 @@ def _google_workspace_context_after_specialist_requested(state: WorkItemGraphSta
         or _google_workspace_context_summary_artifact_exists(prepared)
         or _context_backed_internal_artifact_plan_requested(request_text, prepared)
     )
+
+
+def _only_manager_review_failed(result: WorkflowRunResult) -> bool:
+    """Allow requested read-only planning stages while preserving a failed review."""
+
+    blocker_codes = {
+        str(blocker.code or "").strip()
+        for blocker in result.blockers
+        if not blocker.resolved and str(blocker.code or "").strip()
+    }
+    return blocker_codes == {"manager_loop_review_failed"}
 
 
 def _feed_context_edge_kind(
@@ -3692,6 +3777,7 @@ def _retrieve_feed_context_history(
     kind: Literal["rss", "preprints"],
     request_text: str,
     database_url: str | None,
+    store: SQLiteStore | None,
 ) -> dict[str, Any]:
     query = _compact_context_edge_text(request_text, 240)
     if kind == "preprints":
@@ -3700,12 +3786,14 @@ def _retrieve_feed_context_history(
             selected_only=True,
             limit=5,
             database_url=database_url,
+            store=store,
         )
     return retrieve_rss_announcement_history_impl(
         query=query,
         selected_only=True,
         limit=5,
         database_url=database_url,
+        store=store,
     )
 
 
@@ -4255,12 +4343,14 @@ def _prepared_step_from_state(state: WorkItemGraphState) -> PreparedWorkItemStep
     payload = state.get("prepared_step")
     if not isinstance(payload, dict):
         raise ValueError("LangGraph WorkItem state is missing prepared_step.")
+    request = WorkflowRunRequest.model_validate(payload.get("request") or {})
     return PreparedWorkItemStep(
-        request=WorkflowRunRequest.model_validate(payload.get("request") or {}),
+        request=request,
         work_item=WorkItem.model_validate(payload.get("work_item") or {}),
         route=WorkItemRoute(str(payload.get("route") or WorkItemRoute.ORCHESTRATOR.value)),
         input_text=str(payload.get("input_text") or ""),
         context_pack=dict(payload.get("context_pack") or {}),
+        runtime=_request_runtime(request),
     )
 
 
@@ -4359,6 +4449,7 @@ def _record_langgraph_checkpoint_event(
     *,
     request: WorkflowRunRequest,
     result: WorkflowRunResult,
+    store: SQLiteStore | None,
     runtime: str,
     checkpoint_required: bool,
     checkpoint_reason: str,
@@ -4369,7 +4460,8 @@ def _record_langgraph_checkpoint_event(
 ) -> None:
     if not request.save:
         return
-    store = SQLiteStore(request.database_url or database_url_from_env())
+    if store is None:
+        raise ValueError("Saved LangGraph execution requires a request-scoped store.")
     record_event(
         result.work_item,
         event_type="langgraph_orchestration",

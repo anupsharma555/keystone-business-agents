@@ -12,7 +12,7 @@ services:
     environment:
       SEARXNG_SETTINGS_PATH: /etc/searxng/settings.yml
     volumes:
-      - ./core-config/settings.yml:/etc/searxng/settings.yml:ro
+      - ./core-config:/etc/searxng:ro
       - searxng-cache:/var/cache/searxng
 
   valkey:

@@ -73,6 +73,54 @@ def test_response_synthesis_receives_manual_plan_ask_shape() -> None:
     assert synthesis_input.request_coverage_required is True
 
 
+def test_response_synthesis_prompt_keeps_pipeline_terms_out_of_reader_copy() -> None:
+    synthesis_input = UserFacingResponseSynthesisInput(
+        user_request="Find competitors.",
+        agent_name="business_research_analyst",
+        route="business_research_analyst",
+        status="blocked",
+        advanced=False,
+        deterministic_summary="Two provisional candidates have bounded evidence.",
+    )
+
+    prompt = synthesis_input.to_prompt()
+
+    assert "Never refer to the payload" in prompt
+    assert "partial or blocked research result must still answer" in prompt
+    assert "Put missing official sources" in prompt
+
+
+def test_reader_summary_prefers_bounded_claim_over_raw_page_navigation() -> None:
+    rendered = format_user_response_synthesis(
+        UserFacingResponseSynthesis(
+            title="Callyope review",
+            answer="Callyope is a plausible multimodal behavioral-health competitor.",
+            synthesis="",
+        ),
+        sources=[
+            {
+                "title": "Callyope FAQ",
+                "url": "https://www.callyope.com/faq",
+                "supported_claim": (
+                    "Callyope combines voice, language, clinical history, sleep, "
+                    "and activity signals."
+                ),
+                "evidence_excerpt": (
+                    "## FAQs How is Callyope different from general-purpose AI tools? "
+                    "Sign in. Open a support ticket."
+                ),
+                "extraction_status": "extracted",
+            }
+        ],
+        show_metadata=False,
+    )
+
+    assert "combines voice, language, clinical history" in rendered
+    assert "## FAQs" not in rendered
+    assert "Sign in" not in rendered
+    assert "support ticket" not in rendered
+
+
 def test_response_synthesis_receives_validated_partial_request_coverage() -> None:
     artifact = WorkItemArtifactRef(
         artifact_type="company_profile",
@@ -359,6 +407,58 @@ def test_format_user_response_synthesis_renders_answer_and_synthesis_sections() 
     assert "provider-lane candidates" in text
     assert text.index("*Answer:*") < text.index("*Detailed Summary:*")
     assert text.index("*Detailed Summary:*") < text.index("Run notes")
+
+
+def test_source_backed_caveats_render_as_limitations_after_answer() -> None:
+    synthesis = UserFacingResponseSynthesis(
+        title="Deliberate AI competitor research",
+        answer="The strongest provisional candidates are Limbic and Ksana Health.",
+        synthesis=(
+            "Limbic overlaps in behavioral-health AI, while Ksana Health combines "
+            "smartphone, wearable, and EHR signals for behavioral-health modeling."
+        ),
+        caveats=[
+            "Deliberate AI's target users and explicit modality mix need stronger "
+            "official-source confirmation."
+        ],
+    )
+
+    text = format_user_response_synthesis(
+        synthesis,
+        sources=[
+            {
+                "title": "Limbic",
+                "url": "https://limbic.ai/",
+                "supported_claim": "Limbic provides behavioral-health AI.",
+            }
+        ],
+    )
+
+    assert "Limitations" in text
+    assert "Run notes" not in text
+    assert text.index("*Answer:*") < text.index("Limitations")
+    assert "target users and explicit modality mix" in text
+
+
+def test_reader_response_can_keep_diagnostics_internal() -> None:
+    synthesis = UserFacingResponseSynthesis(
+        title="Competitor review",
+        answer="Ellipsis Health is a provisional candidate.",
+        synthesis="The available source evidence supports a bounded comparison.",
+        caveats=["Direct product validation is still limited."],
+    )
+
+    text = format_user_response_synthesis(
+        synthesis,
+        sources=[{"title": "Ellipsis Health", "url": "https://example.com/ellipsis"}],
+        metadata_lines=["Source context: 1/1 selected URL extracted/read"],
+        show_metadata=False,
+    )
+
+    assert "Ellipsis Health is a provisional candidate." in text
+    assert "Limitations" in text
+    assert "\nMetadata\n" not in text
+    assert "Source context:" not in text
 
 
 def test_format_user_response_synthesis_renders_source_terms_and_actions() -> None:
@@ -1554,7 +1654,7 @@ def test_format_user_response_synthesis_demotes_detailed_claims_from_snippet_onl
     assert "snippet-only source" in rendered
     assert "OpenAI describes mental-health-related safety work" in rendered
     assert "Source evidence" in rendered
-    assert "Run notes" in rendered
+    assert "Limitations" in rendered
     assert "Source extraction limitation" in rendered
 
 

@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from keystone_agents.source_quality import has_unusable_page_content
 from keystone_agents.source_registry import (
     classify_source_lanes,
     required_source_lanes_for_company,
@@ -389,6 +390,7 @@ def _triage_one_candidate(
 
     reasons: list[str] = []
     contradiction = bool(_SOURCE_CONTRADICTION_RE.search(haystack))
+    unusable_content = _candidate_has_unusable_content(candidate)
     if not candidate.url:
         reasons.append("missing source URL")
     if matched_terms:
@@ -401,6 +403,8 @@ def _triage_one_candidate(
         reasons.append("strong request match despite incomplete source-lane classification")
     if contradiction:
         reasons.append("source text contradicts the requested source type or actionability")
+    if unusable_content:
+        reasons.append("page content is an error, access, or challenge response")
     formal_actionability = bool(_FORMAL_ACTIONABILITY_RE.search(haystack))
     recognition_only = bool(_FORMAL_RECOGNITION_ONLY_RE.search(haystack))
     if formal_request and recognition_only:
@@ -415,7 +419,9 @@ def _triage_one_candidate(
         reasons.append("source is not yet read/extracted for detailed synthesis")
 
     decision: SourceTriageDecision
-    if formal_request and recognition_only:
+    if unusable_content:
+        decision = "reject"
+    elif formal_request and recognition_only:
         decision = "reject"
     elif contradiction and formal_request:
         decision = "reject"
@@ -497,6 +503,8 @@ def _string_list(value: Any) -> list[str]:
 
 
 def _candidate_has_read_evidence(candidate: SourceTriageCandidate) -> bool:
+    if _candidate_has_unusable_content(candidate):
+        return False
     status = candidate.extraction_status.strip().lower()
     if status in {
         "article_read",
@@ -524,6 +532,19 @@ def _candidate_has_read_evidence(candidate: SourceTriageCandidate) -> bool:
     return bool(
         candidate.evidence_excerpt.strip() or candidate.key_facts or candidate.supported_claims
     )
+
+
+def _candidate_has_unusable_content(candidate: SourceTriageCandidate) -> bool:
+    haystack = " ".join(
+        [
+            candidate.title,
+            candidate.snippet,
+            candidate.evidence_excerpt,
+            *candidate.key_facts[:3],
+            *candidate.supported_claims[:3],
+        ]
+    )
+    return has_unusable_page_content([haystack])
 
 
 def _expected_lanes(*, request_text: str, agent_name: str) -> tuple[str, ...]:

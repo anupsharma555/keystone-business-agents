@@ -403,6 +403,7 @@ def test_calendar_window_read_splits_one_time_and_recurring_without_private_bodi
             "status": "confirmed",
             "summary": "Client review",
             "description": "private notes must not leave the provider boundary",
+            "location": "123 Main St, Philadelphia, PA",
             "attendees": [{"email": "private@example.com"}],
             "start": {"dateTime": "2026-07-06T10:00:00-04:00"},
             "end": {"dateTime": "2026-07-06T11:00:00-04:00"},
@@ -444,10 +445,41 @@ def test_calendar_window_read_splits_one_time_and_recurring_without_private_bodi
     assert result["events"][0]["start_time"] == "10:00"
     assert result["events"][0]["end_time"] == "11:00"
     assert result["events"][0]["all_day"] is False
+    assert result["events"][0]["location"] == "123 Main St, Philadelphia, PA"
     assert "description" not in result["events"][0]
     assert "attendees" not in result["events"][0]
     assert result["external_writes_enabled"] is False
     assert result["send_enabled"] is False
+
+
+def test_calendar_window_converts_utc_to_local_display_and_preserves_raw() -> None:
+    tool = FakeCalendarTool()
+    tool.events = {
+        "utc-appointment": {
+            "id": "utc-appointment",
+            "status": "confirmed",
+            "summary": "Established Client Visit",
+            "location": "100 Example Avenue, Exampleville, PA 19000",
+            "start": {"dateTime": "2026-07-28T14:25:00Z", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-07-28T15:00:00Z", "timeZone": "UTC"},
+        }
+    }
+
+    result = read_google_calendar_window_impl(
+        "2026-07-28T00:00:00-04:00",
+        "2026-07-29T00:00:00-04:00",
+        display_timezone="America/New_York",
+        live=True,
+        tool=tool,  # type: ignore[arg-type]
+    )
+
+    event = result["events"][0]
+    assert event["start"] == "2026-07-28T14:25:00Z"
+    assert event["start_time"] == "14:25"
+    assert event["display_start_time"] == "10:25"
+    assert event["display_end_time"] == "11:00"
+    assert event["display_timezone"] == "America/New_York"
+    assert event["location"] == "100 Example Avenue, Exampleville, PA 19000"
 
 
 def test_calendar_window_read_requires_ordered_timezone_bounds() -> None:
@@ -514,6 +546,96 @@ def test_filtered_calendar_window_reads_selected_shared_calendars() -> None:
     assert tool.calls == [
         ("list_window", "primary|flight"),
         ("list_window", "shared@example.com|flight"),
+    ]
+
+
+def test_all_readable_calendar_window_includes_unselected_and_names_source() -> None:
+    class AllReadableCalendarTool(FakeCalendarTool):
+        def list_all_readable_calendars(self) -> list[dict[str, Any]]:
+            return [
+                {
+                    "id": "primary",
+                    "primary": True,
+                    "selected": True,
+                    "summary": "Operator",
+                },
+                {
+                    "id": "care-calendar@example.test",
+                    "selected": True,
+                    "summary": "Care Appointments",
+                },
+                {
+                    "id": "other@example.com",
+                    "selected": False,
+                    "hidden": True,
+                    "summary": "Other readable",
+                },
+            ]
+
+        def list_events_window(
+            self,
+            calendar_id: str,
+            *,
+            time_min: str,
+            time_max: str,
+            max_results: int = 100,
+            query: str = "",
+        ) -> list[dict[str, Any]]:
+            self.calls.append(("list_window", calendar_id))
+            if calendar_id != "care-calendar@example.test":
+                return []
+            return [
+                {
+                    "id": "example-clinic-appointment",
+                    "status": "confirmed",
+                    "summary": "Example Medical Clinic",
+                    "start": {"dateTime": "2026-07-28T10:40:00-04:00"},
+                    "end": {"dateTime": "2026-07-28T11:40:00-04:00"},
+                }
+            ]
+
+    tool = AllReadableCalendarTool()
+
+    result = read_google_calendar_window_impl(
+        "2026-07-28T00:00:00-04:00",
+        "2026-07-29T00:00:00-04:00",
+        calendar_scope="all_readable",
+        live=True,
+        tool=tool,  # type: ignore[arg-type]
+    )
+
+    assert result["calendar_scope"] == "all_readable"
+    assert result["calendar_count"] == 3
+    assert result["events"] == [
+        {
+            "event_id": "example-clinic-appointment",
+            "title": "Example Medical Clinic",
+            "status": "confirmed",
+                "start_date": "2026-07-28",
+                "start": "2026-07-28T10:40:00-04:00",
+                "end": "2026-07-28T11:40:00-04:00",
+                "end_date": "2026-07-28",
+                "start_time": "10:40",
+                "end_time": "11:40",
+                "display_start_date": "2026-07-28",
+                "display_end_date": "2026-07-28",
+                "display_start_time": "10:40",
+                "display_end_time": "11:40",
+                "all_day": False,
+                "timezone": "",
+                "display_timezone": "America/New_York",
+            "html_link": "",
+            "is_recurring": False,
+            "recurring_event_id": "",
+            "source_calendar_id": "care-calendar@example.test",
+            "source_calendar_name": "Care Appointments",
+            "source_calendar_primary": False,
+        }
+    ]
+    assert tool.calls == [
+        ("list_window", "primary"),
+        ("list_window", "care-calendar@example.test"),
+        ("list_window", "other@example.com"),
     ]
 
 

@@ -1,6 +1,6 @@
 <!--
 prompt_name: calendar_action_interpreter
-prompt_version: 2026-07-21.2
+prompt_version: 2026-07-27.2
 prompt_purpose: Interpret one live Calendar read, create, update, or delete request into source-grounded structured fields before deterministic validation and provider access.
 prompt_safety_notes: No tools or provider access; one model turn; Python validates read/write scope and exact provider identity after interpretation; interpretation never grants approval.
 prompt_eval_datasets: tests/test_calendar_action_interpreter.py, tests/test_cli.py
@@ -47,11 +47,16 @@ Rules:
   selection for a new current subject.
 - Calendar result quantity and Calendar account scope are independent. Words
   such as `all`, `every`, `list`, or `show` that modify events affect the result
-  selection only; they do not authorize reading additional calendars. Set
-  `calendar_scope=selected_readable` only when the current directive explicitly
-  asks for selected, shared, or every readable Calendar, and copy the exact
-  Calendar-scope phrase into `calendar_scope_source_text`. Otherwise set
-  `calendar_scope=configured` and leave `calendar_scope_source_text` empty.
+  selection only. Read-only lookups search every readable Calendar by default
+  so events on shared or unselected Calendars are not silently missed. Set
+  `calendar_scope=all_readable` when the current directive explicitly asks for
+  all/every readable, accessible, or available Calendar, or when it does not
+  explicitly narrow the read to one configured Calendar. Set
+  `calendar_scope=selected_readable` when it explicitly asks for selected or
+  shared calendars without requesting every readable Calendar. Set
+  `calendar_scope=configured` only when the directive explicitly says primary,
+  configured, or default Calendar. Copy an explicit Calendar-scope phrase into
+  `calendar_scope_source_text`; otherwise leave that source field empty.
 - Do not use generic object phrases such as `events`, `all events`, `my events`,
   or `calendar events` as a provider query. An unfiltered request for those
   objects is a `time_window` read. Use `filtered_window` only when the current

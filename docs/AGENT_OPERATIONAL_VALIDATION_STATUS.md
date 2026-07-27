@@ -14,6 +14,58 @@ Status vocabulary:
 - **Blocked:** the required context/provider state is currently absent.
 - **N/A:** the dimension does not apply to that control-plane or read-only agent.
 
+## 2026-07-27 Calendar Timezone And Related-Record Repair
+
+The Calendar/Chief repair is **Proven live**. Provider RFC3339 timestamps are
+now preserved as raw receipt fields
+and separately normalized into configured display-date, display-time, and
+display-timezone fields before semantic selection or reader-facing rendering.
+The focused selector can also identify multiple Calendar records as evidence
+for one real-world event. The renderer keeps both records visible, includes
+available location details, and calls out conflicting times or locations
+instead of choosing one silently or returning the complete agenda.
+
+The development checkout passed 900 tests across Calendar, Chief, CLI, SDK,
+acceptance, and Gmail boundaries. The Slack runtime checkout passed 140
+Calendar-focused tests. Its broader selected gate passed 904 of 905 tests; the
+single failure reproduces independently in the unrelated eval-score-template
+dashboard URL assertion. Gmail Triage required no behavior change: it shares
+the Google OAuth credential/scope boundary, while Calendar retrieval,
+relationship interpretation, and answer synthesis remain Chief/Calendar
+owned. The Slack Socket Mode worker was restarted after runtime synchronization.
+
+The operator's live Slack retest asked for the next day's appointment(s), time,
+location, and known details. The result correctly focused on one
+provider-verified visit, rendered its local time in America/New_York, included
+the available Calendar location, and omitted unrelated agenda items. The Slack
+bridge completed the run in 24 seconds. The persisted KBA receipt records two
+model requests and no Calendar write.
+
+### Calendar Read Latency Follow-Up
+
+Recent Slack receipts showed focused Calendar reads taking roughly 22 to 35
+seconds. The newest focused path used three model requests: Orchestrator
+planning, Calendar action interpretation, and post-read event selection. The
+middle interpretation was redundant when the canonical Orchestrator plan
+already specified one read-only bounded Calendar collection with an item
+result and an explicit day window.
+
+Complete canonical Calendar reads now reuse that typed plan directly. Ambiguous
+or incomplete plans still enter the Calendar interpreter, and writes retain the
+interpreter and all existing deterministic gates. Focused lookups keep the
+post-read selector so the model still identifies relevant events and related
+records from provider-verified metadata. Broad full-window agenda asks continue
+to skip post-read selection.
+
+The direct Calendar payload records provider-action, lookup-synthesis,
+Orchestrator-preflight, pre-Calendar overhead, direct-total, and ask-total
+timing separately. The proven live focused run used two model requests:
+Calendar provider retrieval took 2.207 seconds and lookup synthesis took 2.809
+seconds, for 5.016 seconds in the direct Calendar path. The remaining Slack
+elapsed time is now attributable on the next authorized run through the added
+Orchestrator and pre-Calendar timing fields rather than being conflated with
+provider latency.
+
 ## 2026-07-25 Zotero Latest-Abstract Natural Ask
 
 The final serialized row in the authorized live window is **Proven**. A normal

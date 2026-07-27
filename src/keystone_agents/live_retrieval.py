@@ -10,11 +10,12 @@ import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from inspect import Parameter, signature
 from pathlib import Path
+from threading import BoundedSemaphore
 from time import perf_counter
 from typing import Any
 from urllib.parse import urlparse
@@ -26,6 +27,9 @@ from keystone_agents.agents.business_research_analyst import (
 )
 from keystone_agents.agents.opportunity_scout import scout_opportunities_live_search
 from keystone_agents.config import load_settings
+from keystone_agents.contracts.completion import (
+    bounded_search_receipt_from_provider_telemetry,
+)
 from keystone_agents.retrieval_policy import (
     HybridSearchProvider,
     ProviderRequestBudget,
@@ -36,6 +40,7 @@ from keystone_agents.retrieval_policy import (
     derive_request_autonomy_hint,
     provider_value_summary,
 )
+from keystone_agents.runtime.provider_context import ProviderExecutionContext
 from keystone_agents.sandboxing import (
     SandboxAgentsUnavailable,
     SandboxHostedWebSearchConfig,
@@ -47,6 +52,7 @@ from keystone_agents.schemas.company_profile import CompanyProfile
 from keystone_agents.schemas.opportunity import OpportunityScoutResult
 from keystone_agents.schemas.opportunity_search_plan import OpportunitySearchPlan
 from keystone_agents.schemas.retrieval import RetrievalHint
+from keystone_agents.source_quality import has_unusable_page_content
 from keystone_agents.source_triage import triage_source_candidates
 from keystone_agents.tools.html_review_tool import (
     HtmlReviewError,
@@ -72,6 +78,7 @@ MAX_SANDBOX_SEARCH_REVIEW_SOURCE_LIMIT = 12
 DEFAULT_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN = 2
 DEFAULT_EXA_SEARCH_MAX_CALLS_PER_RUN = 10
 DEFAULT_TAVILY_SEARCH_MAX_CALLS_PER_RUN = 2
+DEFAULT_TOTAL_SEARCH_MAX_CALLS_PER_RUN = 20
 DEFAULT_SEARXNG_TRANSIENT_TIMEOUT_SECONDS = 2.0
 
 
@@ -135,6 +142,11 @@ def retrieval_diagnostics_from_metadata(metadata: Mapping[str, Any]) -> dict[str
         "provider_policy": _compact_provider_policy(providers_used),
         "provider_use_ladder": _compact_provider_use_ladder(metadata, source_coverage, quality),
         "search_queries": _compact_search_queries(metadata.get("search_queries")),
+        "query_count": int(
+            metadata.get("query_count")
+            or len(_compact_search_queries(metadata.get("search_queries")))
+        ),
+        "raw_search_result_count": int(metadata.get("raw_search_result_count") or 0),
         "provider_queries": _compact_provider_queries(metadata.get("provider_queries")),
         "provider_usage": _compact_provider_usage(provider_usage),
         "provider_result_samples": _compact_provider_result_samples(
@@ -146,6 +158,15 @@ def retrieval_diagnostics_from_metadata(metadata: Mapping[str, Any]) -> dict[str
         "search_quality_summary": _compact_quality_summary(quality),
         "source_coverage_summary": _compact_source_coverage(source_coverage),
         "source_limits": _compact_source_limits(source_coverage, quality),
+        "candidate_admission": _compact_candidate_admission(
+            metadata.get("opportunity_candidate_admission")
+        ),
+        "opportunity_verification": _compact_opportunity_verification(
+            metadata.get("opportunity_verification")
+        ),
+        "opportunity_search_plan": _compact_opportunity_search_plan(
+            metadata.get("opportunity_search_plan_summary")
+        ),
         "fallback_used": bool(
             metadata.get("search_provider_fallback_used")
             or metadata.get("provider_error_fallback_used")
@@ -169,6 +190,120 @@ def retrieval_diagnostics_from_metadata(metadata: Mapping[str, Any]) -> dict[str
             "reason": str(searxng.get("reason") or ""),
         }
     return diagnostics
+
+
+def _compact_candidate_admission(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+
+    def _compact_reason_counts(key: str) -> dict[str, int]:
+        reason_counts = value.get(key)
+        return (
+            {
+                str(reason)[:240]: int(count or 0)
+                for reason, count in list(reason_counts.items())[:12]
+                if str(reason).strip()
+            }
+            if isinstance(reason_counts, Mapping)
+            else {}
+        )
+
+    compact_reason_counts = _compact_reason_counts("reason_counts")
+    compact_filtered_reason_counts = _compact_reason_counts(
+        "filtered_reason_counts"
+    )
+    compact_review_reason_counts = _compact_reason_counts("review_reason_counts")
+    samples: list[dict[str, Any]] = []
+    raw_samples = value.get("samples")
+    if isinstance(raw_samples, Sequence) and not isinstance(raw_samples, (str, bytes)):
+        for sample in raw_samples[:12]:
+            if not isinstance(sample, Mapping):
+                continue
+            reasons = sample.get("reasons")
+            samples.append(
+                {
+                    "disposition": str(sample.get("disposition") or ""),
+                    "company_name": str(sample.get("company_name") or "")[:160],
+                    "entity_kind": str(sample.get("entity_kind") or ""),
+                    "source_category": str(sample.get("source_category") or ""),
+                    "source_url": str(sample.get("source_url") or "")[:500],
+                    "reasons": [
+                        str(reason)[:240]
+                        for reason in (
+                            reasons
+                            if isinstance(reasons, Sequence)
+                            and not isinstance(reasons, (str, bytes))
+                            else []
+                        )[:4]
+                        if str(reason).strip()
+                    ],
+                }
+            )
+    return {
+        "filtered_count": int(value.get("filtered_count") or 0),
+        "review_count": int(value.get("review_count") or 0),
+        "reason_counts": compact_reason_counts,
+        "filtered_reason_counts": (
+            compact_filtered_reason_counts or compact_reason_counts
+        ),
+        "review_reason_counts": compact_review_reason_counts,
+        "samples": samples,
+    }
+
+
+def _compact_opportunity_verification(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    status_counts = value.get("status_counts")
+    compact_status_counts = (
+        {
+            str(status)[:80]: int(count or 0)
+            for status, count in list(status_counts.items())[:8]
+            if str(status).strip()
+        }
+        if isinstance(status_counts, Mapping)
+        else {}
+    )
+    attempts: list[dict[str, str]] = []
+    raw_attempts = value.get("attempts")
+    if isinstance(raw_attempts, Sequence) and not isinstance(raw_attempts, (str, bytes)):
+        for attempt in raw_attempts[:8]:
+            if not isinstance(attempt, Mapping):
+                continue
+            attempts.append(
+                {
+                    key: str(attempt.get(key) or "")[:500]
+                    for key in (
+                        "url",
+                        "title",
+                        "entity_kind",
+                        "source_type",
+                        "source_category",
+                        "status",
+                        "provider",
+                        "error_type",
+                    )
+                    if str(attempt.get(key) or "").strip()
+                }
+            )
+    return {
+        "attempt_count": int(value.get("attempt_count") or 0),
+        "status_counts": compact_status_counts,
+        "attempts": attempts,
+    }
+
+
+def _compact_opportunity_search_plan(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        "target_entity_types": _compact_search_queries(
+            value.get("target_entity_types")
+        )[:8],
+        "objectives": _compact_search_queries(value.get("objectives"))[:8],
+        "strict_targeting": bool(value.get("strict_targeting")),
+        "lane_types": _compact_search_queries(value.get("lane_types"))[:8],
+    }
 
 
 def _split_provider_summary(value: str) -> list[str]:
@@ -379,6 +514,12 @@ def _compact_provider_usage(provider_usage: Mapping[str, Any]) -> dict[str, dict
         compact[str(name)] = {
             "requests_attempted": int(_safe_float(usage.get("requests_attempted"))),
             "requests_succeeded": int(_safe_float(usage.get("requests_succeeded"))),
+            "requests_completed_with_results": int(
+                _safe_float(usage.get("requests_completed_with_results"))
+            ),
+            "requests_completed_empty": int(
+                _safe_float(usage.get("requests_completed_empty"))
+            ),
             "requests_failed": int(_safe_float(usage.get("requests_failed"))),
             "credits_used": int(_safe_float(usage.get("credits_used"))),
             "input_tokens": int(_safe_float(usage.get("input_tokens"))),
@@ -968,6 +1109,7 @@ def retrieve_company_profile_live(
     query_builder: Callable[[str, str | None], list[str]] | None = None,
     search_provider_builder: Callable[..., Any] | None = None,
     profile_builder: Callable[..., CompanyProfile] | None = None,
+    execution_context: ProviderExecutionContext | None = None,
 ) -> tuple[CompanyProfile, dict[str, Any]]:
     """Run the hybrid live-search ladder for company research."""
 
@@ -984,15 +1126,19 @@ def retrieve_company_profile_live(
         request_text=request_text,
         agent_hint=retrieval_hint,
     )
-    settings = settings_loader()
-    search_config = build_shared_search_provider_config(
-        requested_provider=requested_provider,
-        configured_provider=settings.search_provider,
-        serper_enabled=bool(getattr(settings, "serper_enabled", False)),
-        agents_web_search_max_calls=agents_web_search_max_calls,
-        agents_web_search_parallel=agents_web_search_parallel,
-        tavily_search_fallback=tavily_search_fallback,
-        exa_search_fallback=exa_search_fallback,
+    settings = execution_context.settings if execution_context is not None else settings_loader()
+    search_config = (
+        execution_context.provider_config
+        if execution_context is not None
+        else build_shared_search_provider_config(
+            requested_provider=requested_provider,
+            configured_provider=settings.search_provider,
+            serper_enabled=bool(getattr(settings, "serper_enabled", False)),
+            agents_web_search_max_calls=agents_web_search_max_calls,
+            agents_web_search_parallel=agents_web_search_parallel,
+            tavily_search_fallback=tavily_search_fallback,
+            exa_search_fallback=exa_search_fallback,
+        )
     )
 
     def build_client() -> HybridSearchProvider:
@@ -1013,6 +1159,16 @@ def retrieve_company_profile_live(
             ),
             parallel_provider_fanout=search_config.parallel_provider_fanout,
             provider_request_budget=search_config.provider_request_budget,
+            provider_call_scope=(
+                execution_context.network_slot
+                if execution_context is not None
+                else None
+            ),
+            provider_call_runner=(
+                execution_context.run_provider_call
+                if execution_context is not None
+                else None
+            ),
         )
 
     client = build_client()
@@ -1034,11 +1190,16 @@ def retrieve_company_profile_live(
     search_results: list[Any] = []
     query_timings: list[dict[str, Any]] = []
     telemetry_packets: list[dict[str, Any]] = []
-    with _maybe_transient_searxng_runtime(
-        provider_sequence=search_config.provider_sequence,
-        settings=settings,
-        enabled=search_provider_builder is build_search_provider,
-    ) as searxng_runtime:
+    runtime_scope = (
+        nullcontext(dict(execution_context.runtime_metadata))
+        if execution_context is not None
+        else _maybe_transient_searxng_runtime(
+            provider_sequence=search_config.provider_sequence,
+            settings=settings,
+            enabled=search_provider_builder is build_search_provider,
+        )
+    )
+    with runtime_scope as searxng_runtime:
         search_started_at = perf_counter()
         search_concurrency = min(_company_search_concurrency(), max(1, len(queries)))
         if search_concurrency <= 1 or len(queries) <= 1:
@@ -1291,7 +1452,14 @@ def _extract_company_website_inputs(
     extraction_started_at = perf_counter()
     extraction_timed_out = False
     extraction_budget = website_extraction_budget()
+    terminal_error_hosts: set[str] = set()
     for index, url in enumerate(urls, start=1):
+        host = urlparse(url).netloc.lower().removeprefix("www.")
+        if host and host in terminal_error_hosts:
+            errors.append(
+                f"{url}: skipped after a confirmed error or challenge page from {host}"
+            )
+            continue
         if perf_counter() - extraction_started_at >= _website_extraction_total_timeout_seconds():
             extraction_timed_out = True
             errors.append(
@@ -1313,8 +1481,16 @@ def _extract_company_website_inputs(
         except Exception as exc:
             errors.append(f"{url}: {exc}")
             continue
+        if has_unusable_page_content(
+            [result.title, result.text_or_markdown[:1200], *result.claims[:3]]
+        ):
+            if host:
+                terminal_error_hosts.add(host)
+            errors.append(f"{url}: error or challenge page was excluded from research evidence")
+            continue
         if (
-            agent_html_review_enabled()
+            result.status == "success"
+            and agent_html_review_enabled()
             and html_review_attempts < agent_html_review_max_pages()
             and len(result.claims) <= agent_html_review_min_claims()
             and result.text_or_markdown.strip()
@@ -1348,7 +1524,7 @@ def _extract_company_website_inputs(
                         }
                     )
                     html_review_claim_count += len(review_claims)
-        if not result.claims:
+        if result.status != "success" or not result.claims:
             continue
         website_inputs.append(
             {
@@ -1378,6 +1554,7 @@ def _extract_company_website_inputs(
         "total_timeout_seconds": _website_extraction_total_timeout_seconds(),
         "firecrawl_call_cap": extraction_budget.firecrawl_max_calls,
         "firecrawl_calls_attempted": extraction_budget.firecrawl_calls_attempted,
+        "terminal_error_hosts": sorted(terminal_error_hosts),
     }
     return website_inputs, errors, stats
 
@@ -1657,6 +1834,59 @@ def build_shared_search_provider_config(
     )
 
 
+@contextmanager
+def live_retrieval_request_context(
+    *,
+    requested_provider: str | None = None,
+    agents_web_search_max_calls: int | None = None,
+    agents_web_search_parallel: bool | None = None,
+    tavily_search_fallback: bool | None = None,
+    exa_search_fallback: bool | None = None,
+    settings_loader: Callable[[], Any] | None = None,
+    manage_searxng_runtime: bool = True,
+    network_concurrency: int | None = None,
+    deadline_seconds: float | None = None,
+) -> Any:
+    """Yield one budget/semaphore/runtime lease for a logical research request."""
+
+    settings = (settings_loader or load_settings)()
+    search_config = build_shared_search_provider_config(
+        requested_provider=requested_provider,
+        configured_provider=settings.search_provider,
+        serper_enabled=bool(getattr(settings, "serper_enabled", False)),
+        agents_web_search_max_calls=agents_web_search_max_calls,
+        agents_web_search_parallel=agents_web_search_parallel,
+        tavily_search_fallback=tavily_search_fallback,
+        exa_search_fallback=exa_search_fallback,
+    )
+    concurrency = (
+        _company_search_concurrency()
+        if network_concurrency is None
+        else max(1, min(8, int(network_concurrency)))
+    )
+    if deadline_seconds is None:
+        deadline_seconds = _company_search_total_timeout_seconds() * 3
+    started_at = perf_counter()
+    provider_executor = ThreadPoolExecutor(max_workers=concurrency)
+    try:
+        with _maybe_transient_searxng_runtime(
+            provider_sequence=search_config.provider_sequence,
+            settings=settings,
+            enabled=manage_searxng_runtime,
+        ) as runtime_metadata:
+            yield ProviderExecutionContext(
+                settings=settings,
+                provider_config=search_config,
+                network_semaphore=BoundedSemaphore(concurrency),
+                provider_executor=provider_executor,
+                started_at=started_at,
+                deadline_at=started_at + max(0.001, float(deadline_seconds)),
+                runtime_metadata=dict(runtime_metadata),
+            )
+    finally:
+        provider_executor.shutdown(wait=False, cancel_futures=True)
+
+
 def _parallel_provider_fanout_enabled(
     *,
     requested_provider: str | None,
@@ -1732,7 +1962,7 @@ def _optional_search_request_budget(
     exa_enabled: bool | None = None,
     exa_max_calls: int | None = None,
 ) -> ProviderRequestBudget | None:
-    limits: dict[str, int] = {}
+    limits: dict[str, int] = {"*": _total_search_max_calls()}
     if agents_enabled:
         limits["agents-web-search"] = _agents_web_search_max_calls(agents_max_calls)
     use_tavily = (
@@ -1793,6 +2023,15 @@ def _tavily_search_max_calls() -> int:
     except ValueError:
         cap = DEFAULT_TAVILY_SEARCH_MAX_CALLS_PER_RUN
     return max(0, cap)
+
+
+def _total_search_max_calls() -> int:
+    raw = os.getenv("KEYSTONE_TOTAL_SEARCH_MAX_CALLS_PER_RUN", "").strip()
+    try:
+        cap = int(raw) if raw else DEFAULT_TOTAL_SEARCH_MAX_CALLS_PER_RUN
+    except ValueError:
+        cap = DEFAULT_TOTAL_SEARCH_MAX_CALLS_PER_RUN
+    return max(1, cap)
 
 
 @contextmanager
@@ -1941,8 +2180,18 @@ def _merge_company_search_telemetry(
     tavily_credits = 0
     agents_web_search_credits = 0
     autonomy_hint: dict[str, Any] = {}
+    query_attempt_count = 0
+    query_completed_count = 0
+    query_result_count = 0
+    query_empty_count = 0
+    query_uncovered_count = 0
 
     for packet in telemetry_packets:
+        query_attempt_count += int(packet.get("query_attempt_count") or 0)
+        query_completed_count += int(packet.get("query_completed_count") or 0)
+        query_result_count += int(packet.get("query_result_count") or 0)
+        query_empty_count += int(packet.get("query_empty_count") or 0)
+        query_uncovered_count += int(packet.get("query_uncovered_count") or 0)
         for provider_name in packet.get("search_providers_attempted") or []:
             name = str(provider_name)
             if name and name not in providers_attempted:
@@ -1965,6 +2214,8 @@ def _merge_company_search_telemetry(
                     {
                         "requests_attempted": 0,
                         "requests_succeeded": 0,
+                        "requests_completed_with_results": 0,
+                        "requests_completed_empty": 0,
                         "raw_result_count": 0,
                         "credits_used": 0,
                         "input_tokens": 0,
@@ -1978,6 +2229,8 @@ def _merge_company_search_telemetry(
                 for key in (
                     "requests_attempted",
                     "requests_succeeded",
+                    "requests_completed_with_results",
+                    "requests_completed_empty",
                     "raw_result_count",
                     "credits_used",
                     "input_tokens",
@@ -2041,6 +2294,11 @@ def _merge_company_search_telemetry(
         "deepening_search_used": deepening_search_used,
         "provider_error_fallback_used": provider_error_fallback_used,
         "search_provider_errors": provider_errors,
+        "query_attempt_count": query_attempt_count,
+        "query_completed_count": query_completed_count,
+        "query_result_count": query_result_count,
+        "query_empty_count": query_empty_count,
+        "query_uncovered_count": query_uncovered_count,
         "provider_usage": provider_usage,
         "provider_queries": provider_queries,
         "provider_value_summary": provider_value_summary(provider_usage),
@@ -2314,6 +2572,55 @@ def run_opportunity_scout_live(
         )
         collected_results = provider.collected_results()
         metadata = provider.telemetry()
+    opportunity_diagnostics = (
+        result.retrieval_diagnostics
+        if isinstance(result.retrieval_diagnostics, dict)
+        else {}
+    )
+    metadata.update(
+        {
+            "search_queries": list(result.search_queries),
+            "raw_search_result_count": result.raw_search_result_count,
+            "deduped_candidate_count": result.deduped_candidate_count,
+            "opportunity_candidate_admission": opportunity_diagnostics.get(
+                "candidate_admission",
+                {},
+            ),
+            "opportunity_verification": opportunity_diagnostics.get(
+                "verification",
+                {},
+            ),
+            "opportunity_search_plan_summary": opportunity_diagnostics.get(
+                "resolved_search_plan",
+                {},
+            ),
+        }
+    )
+    opportunity_stopped = bool(
+        result.retrieval_diagnostics.get("stopped_before_stage")
+        or str(result.retrieval_diagnostics.get("status") or "").strip().lower()
+        != "complete"
+    )
+    bounded_search_receipt = bounded_search_receipt_from_provider_telemetry(
+        metadata,
+        planned_attempt_count=len(result.search_queries),
+        discovered_candidate_count=result.deduped_candidate_count,
+        processed_candidate_count=(
+            len(result.records)
+            + len(result.filtered_candidates)
+            + len(result.review_candidates)
+        ),
+        budget_or_deadline_stopped=opportunity_stopped,
+    )
+    metadata["bounded_search_receipt"] = bounded_search_receipt.receipt()
+    result = result.model_copy(
+        update={
+            "retrieval_diagnostics": {
+                **result.retrieval_diagnostics,
+                "bounded_search_receipt": bounded_search_receipt.receipt(),
+            }
+        }
+    )
     retrieved_source_candidates = _compact_search_candidates(
         collected_results,
         limit=_sandbox_search_review_source_limit(max_results),

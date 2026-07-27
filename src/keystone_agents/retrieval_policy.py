@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
-from threading import RLock
+from threading import RLock, local
 from time import perf_counter
 from typing import Any
 from urllib.parse import urlparse
@@ -264,6 +265,8 @@ class RetrievalProviderUsage:
 
     requests_attempted: int = 0
     requests_succeeded: int = 0
+    requests_completed_with_results: int = 0
+    requests_completed_empty: int = 0
     raw_result_count: int = 0
     credits_used: int = 0
     input_tokens: int = 0
@@ -365,6 +368,12 @@ def provider_value_summary(
                 "provider": str(provider_name),
                 "requests_attempted": attempted,
                 "requests_succeeded": succeeded,
+                "requests_completed_with_results": int(
+                    float(usage.get("requests_completed_with_results") or 0)
+                ),
+                "requests_completed_empty": int(
+                    float(usage.get("requests_completed_empty") or 0)
+                ),
                 "raw_result_count": raw_results,
                 "credits_used": credits_used,
                 "results_per_success": round(raw_results / succeeded, 2) if succeeded else 0.0,
@@ -1087,6 +1096,8 @@ class HybridSearchProvider:
         parallel_provider_fanout: bool = False,
         deepening_provider_sequence: Sequence[str] = (),
         provider_request_budget: ProviderRequestBudget | None = None,
+        provider_call_scope: Callable[[], Any] | None = None,
+        provider_call_runner: Callable[[Callable[[], list[Any]]], list[Any]] | None = None,
     ) -> None:
         resolved_sequence = tuple(_dedupe_sequence(provider_sequence))
         if not resolved_sequence:
@@ -1105,6 +1116,8 @@ class HybridSearchProvider:
         )
         self._parallel_provider_fanout = parallel_provider_fanout
         self._provider_request_budget = provider_request_budget
+        self._provider_call_scope = provider_call_scope or nullcontext
+        self._provider_call_runner = provider_call_runner
         self._lock = RLock()
         self._providers: dict[str, Any] = {}
         self._provider_usage = {
@@ -1126,6 +1139,11 @@ class HybridSearchProvider:
         self._structured_enrichment_recommended = False
         self._search_review_recommended = False
         self._quality_reasons: list[str] = []
+        self._query_attempt_count = 0
+        self._query_completed_count = 0
+        self._query_result_count = 0
+        self._query_empty_count = 0
+        self._query_local = local()
 
     @property
     def provider_sequence(self) -> tuple[str, ...]:
@@ -1154,6 +1172,30 @@ class HybridSearchProvider:
     def search_structured(self, request: SearchRequest) -> list[Any]:
         """Run the retrieval ladder for one provider-aware query request."""
 
+        self._record_query_attempt()
+        previous_success = getattr(
+            self._query_local,
+            "provider_succeeded",
+            None,
+        )
+        self._query_local.provider_succeeded = False
+        results: list[Any] = []
+        try:
+            results = self._search_structured_impl(request)
+            return results
+        finally:
+            self._record_query_outcome(
+                bool(getattr(self._query_local, "provider_succeeded", False)),
+                had_results=bool(results),
+            )
+            if previous_success is None:
+                del self._query_local.provider_succeeded
+            else:
+                self._query_local.provider_succeeded = previous_success
+
+    def _search_structured_impl(self, request: SearchRequest) -> list[Any]:
+        """Implement one query while the public wrapper records query coverage."""
+
         self._record_search_query(request.query)
         if self._parallel_provider_fanout and len(self._provider_sequence) > 1:
             return self._search_structured_parallel_provider_fanout(request)
@@ -1170,7 +1212,7 @@ class HybridSearchProvider:
             self._record_provider_query(provider_name, request.query)
             started_at = perf_counter()
             try:
-                results = self._provider_search(provider, request)
+                results = self._run_provider_search(provider, request)
             except _RECOVERABLE_PROVIDER_EXCEPTIONS as exc:
                 self._record_provider_elapsed(provider_name, perf_counter() - started_at)
                 self._provider_errors.append(
@@ -1187,6 +1229,15 @@ class HybridSearchProvider:
 
             self._record_provider_elapsed(provider_name, perf_counter() - started_at)
             self._increment_usage(provider_name, "requests_succeeded")
+            self._increment_usage(
+                provider_name,
+                (
+                    "requests_completed_with_results"
+                    if results
+                    else "requests_completed_empty"
+                ),
+            )
+            self._mark_current_query_provider_success()
             self._increment_usage(provider_name, "raw_result_count", amount=len(results))
             self._record_provider_result_samples(provider_name, results)
             self._record_provider_credit_usage(provider_name, provider)
@@ -1218,9 +1269,7 @@ class HybridSearchProvider:
     def _search_web_parallel_provider_fanout(self, query: str, num_results: int = 5) -> list[Any]:
         """Run all configured providers for one query and merge in configured order."""
 
-        return self._search_structured_parallel_provider_fanout(
-            SearchRequest(query=query, num_results=num_results)
-        )
+        return self.search_structured(SearchRequest(query=query, num_results=num_results))
 
     def _search_structured_parallel_provider_fanout(self, request: SearchRequest) -> list[Any]:
         """Run all configured providers for one provider-aware query and merge in order."""
@@ -1235,7 +1284,7 @@ class HybridSearchProvider:
             self._record_provider_query(provider_name, request.query)
             started_at = perf_counter()
             try:
-                results = self._provider_search(provider, request)
+                results = self._run_provider_search(provider, request)
                 return (
                     provider_name,
                     results,
@@ -1277,6 +1326,15 @@ class HybridSearchProvider:
                         )
                     continue
                 self._increment_usage(provider_name, "requests_succeeded")
+                self._increment_usage(
+                    provider_name,
+                    (
+                        "requests_completed_with_results"
+                        if results
+                        else "requests_completed_empty"
+                    ),
+                )
+                self._mark_current_query_provider_success()
                 self._increment_usage(provider_name, "raw_result_count", amount=len(results))
                 self._record_provider_result_samples(provider_name, results)
                 self._record_provider_credit_usage(provider_name, credit_usage=credit_usage)
@@ -1310,6 +1368,15 @@ class HybridSearchProvider:
             return list(structured(request))
         return list(provider.search_web(request.query, num_results=request.num_results))
 
+    def _run_provider_search(self, provider: Any, request: SearchRequest) -> list[Any]:
+        def callback() -> list[Any]:
+            return self._provider_search(provider, request)
+
+        if self._provider_call_runner is not None:
+            return self._provider_call_runner(callback)
+        with self._provider_call_scope():
+            return callback()
+
     def _run_deepening_providers_if_needed(
         self,
         merged: list[Any],
@@ -1339,7 +1406,7 @@ class HybridSearchProvider:
             self._record_provider_query(provider_name, provider_request.query)
             started_at = perf_counter()
             try:
-                results = self._provider_search(provider, provider_request)
+                results = self._run_provider_search(provider, provider_request)
             except _RECOVERABLE_PROVIDER_EXCEPTIONS as exc:
                 self._record_provider_elapsed(provider_name, perf_counter() - started_at)
                 with self._lock:
@@ -1354,6 +1421,15 @@ class HybridSearchProvider:
 
             self._record_provider_elapsed(provider_name, perf_counter() - started_at)
             self._increment_usage(provider_name, "requests_succeeded")
+            self._increment_usage(
+                provider_name,
+                (
+                    "requests_completed_with_results"
+                    if results
+                    else "requests_completed_empty"
+                ),
+            )
+            self._mark_current_query_provider_success()
             self._increment_usage(provider_name, "raw_result_count", amount=len(results))
             self._record_provider_result_samples(provider_name, results)
             self._record_provider_credit_usage(provider_name, provider)
@@ -1414,6 +1490,14 @@ class HybridSearchProvider:
             "deepening_search_used": self._deepening_search_used,
             "provider_error_fallback_used": self._provider_error_fallback_used,
             "search_provider_errors": list(self._provider_errors),
+            "query_attempt_count": self._query_attempt_count,
+            "query_completed_count": self._query_completed_count,
+            "query_result_count": self._query_result_count,
+            "query_empty_count": self._query_empty_count,
+            "query_uncovered_count": max(
+                0,
+                self._query_attempt_count - self._query_completed_count,
+            ),
             "provider_usage": provider_usage,
             "provider_queries": {
                 provider_name: list(queries)
@@ -1491,6 +1575,16 @@ class HybridSearchProvider:
                     if field_name == "requests_succeeded"
                     else usage.requests_succeeded
                 ),
+                requests_completed_with_results=(
+                    usage.requests_completed_with_results + amount
+                    if field_name == "requests_completed_with_results"
+                    else usage.requests_completed_with_results
+                ),
+                requests_completed_empty=(
+                    usage.requests_completed_empty + amount
+                    if field_name == "requests_completed_empty"
+                    else usage.requests_completed_empty
+                ),
                 raw_result_count=(
                     usage.raw_result_count + amount
                     if field_name == "raw_result_count"
@@ -1508,6 +1602,23 @@ class HybridSearchProvider:
                 estimated_usd=usage.estimated_usd,
                 total_seconds=usage.total_seconds,
             )
+
+    def _record_query_attempt(self) -> None:
+        with self._lock:
+            self._query_attempt_count += 1
+
+    def _mark_current_query_provider_success(self) -> None:
+        self._query_local.provider_succeeded = True
+
+    def _record_query_outcome(self, completed: bool, *, had_results: bool) -> None:
+        if not completed:
+            return
+        with self._lock:
+            self._query_completed_count += 1
+            if had_results:
+                self._query_result_count += 1
+            else:
+                self._query_empty_count += 1
 
     def _record_search_query(self, query: str) -> None:
         cleaned = " ".join(str(query or "").strip().split())
@@ -1562,6 +1673,8 @@ class HybridSearchProvider:
             self._provider_usage[provider_name] = RetrievalProviderUsage(
                 requests_attempted=usage.requests_attempted,
                 requests_succeeded=usage.requests_succeeded,
+                requests_completed_with_results=usage.requests_completed_with_results,
+                requests_completed_empty=usage.requests_completed_empty,
                 raw_result_count=usage.raw_result_count,
                 credits_used=usage.credits_used,
                 input_tokens=usage.input_tokens,
@@ -1599,6 +1712,8 @@ class HybridSearchProvider:
                 self._provider_usage[provider_name] = RetrievalProviderUsage(
                     requests_attempted=usage.requests_attempted,
                     requests_succeeded=usage.requests_succeeded,
+                    requests_completed_with_results=usage.requests_completed_with_results,
+                    requests_completed_empty=usage.requests_completed_empty,
                     raw_result_count=usage.raw_result_count,
                     credits_used=usage.credits_used + credits,
                     input_tokens=usage.input_tokens
@@ -1671,16 +1786,20 @@ class ProviderRequestBudget:
 
     def try_acquire(self, provider_name: str) -> bool:
         normalized = _dedupe_sequence([provider_name])[0] if provider_name else provider_name
-        limit = self.limit_for(normalized)
-        if limit is None:
-            return True
-        if limit <= 0:
-            return False
+        provider_limit = self.limit_for(normalized)
+        total_limit = self.limits.get("*")
         with self._lock:
+            total_used = self._used.get("*", 0)
+            if total_limit is not None and total_used >= int(total_limit):
+                return False
             used = self._used.get(normalized, 0)
-            if used >= limit:
+            if provider_limit is not None and (
+                provider_limit <= 0 or used >= provider_limit
+            ):
                 return False
             self._used[normalized] = used + 1
+            if total_limit is not None:
+                self._used["*"] = total_used + 1
             return True
 
 

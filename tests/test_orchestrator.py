@@ -18,6 +18,7 @@ from keystone_agents.agents.orchestrator import (
     review_specialist_output,
     route_request,
     run_orchestrator_preflight,
+    run_orchestrator_preflight_from_plan,
 )
 from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.models import AgentRunRequest, RunMode, TypedAgentRunResult
@@ -1161,6 +1162,35 @@ def test_orchestrator_preflight_hard_safety_summary_preserves_execution_gate() -
     assert "*Detailed Summary:*" in preflight.route_result.clarification_request
     assert "*Next step:*" in preflight.route_result.clarification_request
     assert "No draft, send, post" in preflight.route_result.clarification_request
+
+
+def test_orchestrator_preflight_from_plan_requires_canonical_authority() -> None:
+    canonical_plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="business_research_analyst",
+        target_agent="business_research_analyst",
+        workflow=["business_research_analyst"],
+        intent="company_research",
+        primary_target="NeuroFlow",
+        provider_operations=["read"],
+    )
+
+    preflight = run_orchestrator_preflight_from_plan(
+        "continue",
+        manual_request_plan=canonical_plan,
+    )
+
+    assert preflight.manual_request_plan == canonical_plan
+    assert preflight.route_result.route == "business_research_analyst"
+    assert preflight.sdk_usage_events == []
+
+    with pytest.raises(ValueError, match="not canonical"):
+        run_orchestrator_preflight_from_plan(
+            "continue",
+            manual_request_plan=canonical_plan.model_copy(
+                update={"source": "deterministic"}
+            ),
+        )
 
 
 def test_generic_outreach_to_this_company_blocks_for_missing_context() -> None:

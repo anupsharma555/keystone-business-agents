@@ -14,7 +14,10 @@ from keystone_agents.calendar_actions import (
     infer_calendar_action_plan,
     is_calendar_action_candidate,
 )
-from keystone_agents.schemas.calendar_action import CalendarActionInterpretation
+from keystone_agents.schemas.calendar_action import (
+    CalendarActionInterpretation,
+    CalendarLookupSynthesis,
+)
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 
 REQUEST = (
@@ -1080,6 +1083,106 @@ def test_canonical_bounded_calendar_read_uses_current_window_not_prior_event(
     assert resolution.plan.complete is True
 
 
+@pytest.mark.parametrize(
+    ("primary_target", "expected_query"),
+    [
+        ("medical appointment", "medical appointment"),
+        ("my medical appointments for tomorrow", "medical appointments"),
+        ("Google Calendar events tomorrow", ""),
+    ],
+)
+def test_complete_canonical_calendar_read_reuses_planner_without_second_model_call(
+    monkeypatch: pytest.MonkeyPatch,
+    primary_target: str,
+    expected_query: str,
+) -> None:
+    request = (
+        "Find my medical appointment tomorrow."
+        if expected_query
+        else "List all Google Calendar events tomorrow."
+    )
+    monkeypatch.setattr(
+        interpreter,
+        "run_typed_sdk_agent",
+        lambda **kwargs: pytest.fail(f"unexpected model call: {kwargs}"),
+    )
+
+    resolution = interpreter.resolve_calendar_action_plan(
+        request,
+        None,
+        manual_plan=ManualRequestPlan(
+            source="llm",
+            target_agent="chief_of_staff",
+            intent="context_lookup",
+            task_objective="context_lookup",
+            provider_system="google_calendar",
+            provider_operations=["read"],
+            provider_read_scope="bounded_collection",
+            provider_result_mode="items",
+            primary_target=primary_target,
+            ask_shape={
+                "ask_breadth": "narrow" if expected_query else "broad",
+                "permission_state": "read_only",
+            },
+        ),
+        live=True,
+        today=date(2026, 7, 27),
+    )
+
+    assert resolution.plan is not None
+    assert resolution.plan.read_scope == (
+        "filtered_window" if expected_query else "time_window"
+    )
+    assert resolution.plan.query == expected_query
+    assert resolution.plan.start_date == "2026-07-28"
+    assert resolution.plan.calendar_scope == "all_readable"
+    assert resolution.interpreter_used is False
+    assert resolution.openai_requests == 0
+
+
+def test_canonical_calendar_read_keeps_interpreter_for_incomplete_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_run_typed_sdk_agent(**kwargs: object) -> SimpleNamespace:
+        calls.append(kwargs)
+        return SimpleNamespace(
+            output=CalendarActionInterpretation(
+                operation="read",
+                read_scope="filtered_window",
+                query="medical appointment",
+                query_source_text="medical appointment",
+                date_scope="tomorrow",
+                date_source_text="tomorrow",
+            )
+        )
+
+    monkeypatch.setattr(interpreter, "run_typed_sdk_agent", fake_run_typed_sdk_agent)
+    resolution = interpreter.resolve_calendar_action_plan(
+        "Find my medical appointment tomorrow.",
+        None,
+        manual_plan=ManualRequestPlan(
+            source="llm",
+            target_agent="chief_of_staff",
+            intent="context_lookup",
+            task_objective="context_lookup",
+            provider_system="google_calendar",
+            provider_operations=["read"],
+            provider_read_scope="bounded_collection",
+            provider_result_mode="items",
+            primary_target="medical appointment",
+        ),
+        live=True,
+        today=date(2026, 7, 27),
+    )
+
+    assert resolution.plan is not None
+    assert resolution.interpreter_used is True
+    assert resolution.openai_requests == 1
+    assert len(calls) == 1
+
+
 def test_current_filtered_calendar_followup_discards_prior_next_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1140,12 +1243,12 @@ def test_current_filtered_calendar_followup_discards_prior_next_selection(
     assert resolution.plan.read_selection == "all"
     assert resolution.plan.date_scope == "tomorrow"
     assert resolution.plan.start_date == "2026-07-22"
-    assert resolution.plan.calendar_scope == "selected_readable"
+    assert resolution.plan.calendar_scope == "all_readable"
     assert resolution.plan.event_reference == ""
     assert resolution.plan.complete is True
 
 
-def test_all_events_does_not_expand_calendar_account_scope(
+def test_all_events_uses_all_readable_calendar_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = (
@@ -1195,7 +1298,7 @@ def test_all_events_does_not_expand_calendar_account_scope(
     assert resolution.plan.read_scope == "time_window"
     assert resolution.plan.read_selection == "all"
     assert resolution.plan.query == ""
-    assert resolution.plan.calendar_scope == "configured"
+    assert resolution.plan.calendar_scope == "all_readable"
     assert resolution.plan.start_date == "2026-07-22"
     assert resolution.plan.complete is True
 
@@ -1241,8 +1344,7 @@ def test_explicit_every_readable_calendar_scope_is_preserved(
                 operation_source_text=request,
                 read_scope="time_window",
                 read_selection="all",
-                calendar_scope="selected_readable",
-                calendar_scope_source_text="every Google Calendar I can read",
+                calendar_scope="configured",
                 date_scope="tomorrow",
                 date_source_text="tomorrow",
             )
@@ -1270,6 +1372,324 @@ def test_explicit_every_readable_calendar_scope_is_preserved(
     assert resolution.plan is not None
     assert resolution.plan.read_scope == "time_window"
     assert resolution.plan.query == ""
-    assert resolution.plan.calendar_scope == "selected_readable"
+    assert resolution.plan.calendar_scope == "all_readable"
     assert resolution.plan.start_date == "2026-07-22"
     assert resolution.plan.complete is True
+
+
+def test_explicit_selected_shared_calendar_scope_remains_selected_readable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "List tomorrow's events from my selected shared calendars."
+    monkeypatch.setattr(
+        interpreter,
+        "run_typed_sdk_agent",
+        lambda **_kwargs: SimpleNamespace(
+            output=CalendarActionInterpretation(
+                operation="read",
+                operation_source_text=request,
+                read_scope="time_window",
+                read_selection="all",
+                calendar_scope="configured",
+                date_scope="tomorrow",
+                date_source_text="tomorrow",
+            )
+        ),
+    )
+
+    resolution = interpreter.resolve_calendar_action_plan(
+        request,
+        None,
+        manual_plan=ManualRequestPlan(
+            source="llm",
+            target_agent="chief_of_staff",
+            intent="context_lookup",
+            task_objective="context_lookup",
+            provider_system="google_calendar",
+            provider_operations=["read"],
+            provider_read_scope="bounded_collection",
+            provider_result_mode="items",
+            primary_target="events tomorrow",
+        ),
+        live=True,
+        today=date(2026, 7, 21),
+    )
+
+    assert resolution.plan is not None
+    assert resolution.plan.calendar_scope == "selected_readable"
+    assert resolution.plan.complete is True
+
+
+def test_unspecified_calendar_read_scope_defaults_to_all_readable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Find my medical appointment tomorrow."
+    monkeypatch.setattr(
+        interpreter,
+        "run_typed_sdk_agent",
+        lambda **_kwargs: SimpleNamespace(
+            output=CalendarActionInterpretation(
+                operation="read",
+                operation_source_text=request,
+                read_scope="filtered_window",
+                query="medical appointment",
+                query_source_text="medical appointment",
+                calendar_scope="configured",
+                date_scope="tomorrow",
+                date_source_text="tomorrow",
+            )
+        ),
+    )
+
+    resolution = interpreter.resolve_calendar_action_plan(
+        request,
+        None,
+        manual_plan=ManualRequestPlan(
+            source="llm",
+            target_agent="chief_of_staff",
+            intent="context_lookup",
+            task_objective="context_lookup",
+            provider_system="google_calendar",
+            provider_operations=["read"],
+            provider_read_scope="bounded_collection",
+            provider_result_mode="items",
+            primary_target="medical appointment tomorrow",
+        ),
+        live=True,
+        today=date(2026, 7, 27),
+    )
+
+    assert resolution.plan is not None
+    assert resolution.plan.calendar_scope == "all_readable"
+    assert resolution.plan.query == "medical appointment"
+    assert resolution.plan.start_date == "2026-07-28"
+
+
+def test_calendar_lookup_synthesis_selects_only_bounded_event_indexes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_input: dict[str, object] = {}
+
+    def _run_typed_sdk_agent(**kwargs: object) -> SimpleNamespace:
+        typed_input = kwargs["typed_input"]
+        captured_input["lookup_target"] = typed_input.lookup_target
+        captured_input["response_scope"] = typed_input.response_scope
+        captured_input["events"] = typed_input.events
+        return SimpleNamespace(
+            output=CalendarLookupSynthesis(
+                status="matched",
+                selected_event_indexes=[1],
+                selection_reason=(
+                    "The event is on the Care Appointments calendar and is the only "
+                    "medical-domain candidate."
+                ),
+            )
+        )
+
+    monkeypatch.setattr(
+        interpreter,
+        "run_typed_sdk_agent",
+        _run_typed_sdk_agent,
+    )
+
+    resolution = interpreter.resolve_calendar_lookup_synthesis(
+        "Find my medical appointment tomorrow.",
+        [
+            {
+                "title": "Window Washing",
+                "start_date": "2026-07-28",
+                "start_time": "08:30",
+                "end_time": "09:30",
+                "source_calendar_name": "",
+            },
+            {
+                "title": "Example Medical Clinic",
+                "start_date": "2026-07-28",
+                "start_time": "10:40",
+                "end_time": "11:40",
+                "location": "Example Medical Center",
+                "source_calendar_name": "Care Appointments",
+                "description": "Private event notes must not reach synthesis.",
+                "attendees": [{"email": "private@example.test"}],
+                "event_id": "provider-private-id",
+            },
+        ],
+        lookup_target="medical appointment tomorrow",
+        response_scope="focused",
+        live=True,
+    )
+
+    assert resolution.synthesis is not None
+    assert resolution.synthesis.selected_event_indexes == [1]
+    assert resolution.openai_requests == 1
+    assert captured_input["lookup_target"] == "medical appointment tomorrow"
+    assert captured_input["response_scope"] == "focused"
+    bounded_events = captured_input["events"]
+    assert isinstance(bounded_events, list)
+    assert bounded_events[1]["location"] == "Example Medical Center"
+    assert bounded_events[1]["source_calendar_name"] == "Care Appointments"
+    assert "description" not in bounded_events[1]
+    assert "attendees" not in bounded_events[1]
+    assert "event_id" not in bounded_events[1]
+
+
+def test_calendar_lookup_answer_renders_one_model_selected_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        interpreter,
+        "resolve_calendar_lookup_synthesis",
+        lambda *_args, **_kwargs: interpreter.CalendarLookupSynthesisResolution(
+            synthesis=CalendarLookupSynthesis(
+                status="matched",
+                selected_event_indexes=[1],
+                selection_reason=(
+                    "The Care Appointments calendar supplies the strongest match."
+                ),
+            ),
+            openai_requests=1,
+        ),
+    )
+    events = [
+        {
+            "title": "Window Washing",
+            "start_date": "2026-07-28",
+            "start_time": "08:30",
+            "end_time": "09:30",
+        },
+        {
+            "title": "Example Family Medicine",
+            "start_date": "2026-07-28",
+            "start_time": "10:40",
+            "end_time": "11:40",
+            "source_calendar_name": "Care Appointments",
+            "source_calendar_primary": False,
+        },
+    ]
+
+    resolution = interpreter.resolve_calendar_lookup_answer(
+        "Find my medical appointment tomorrow.",
+        events,
+        lookup_target="medical appointment tomorrow",
+        response_scope="focused",
+        fallback="Raw full-day agenda",
+        live=True,
+    )
+
+    assert resolution.text == (
+        'I found one matching event: "Example Family Medicine" on the Care Appointments '
+        "calendar on 2026-07-28, from 10:40 AM to 11:40 AM. "
+        "No location is listed in the Calendar event."
+    )
+    assert resolution.status == "matched"
+    assert resolution.selected_event_indexes == (1,)
+    assert resolution.openai_requests == 1
+    assert "Window Washing" not in resolution.text
+
+
+def test_focused_calendar_lookup_does_not_fall_back_to_raw_agenda(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        interpreter,
+        "resolve_calendar_lookup_synthesis",
+        lambda *_args, **_kwargs: interpreter.CalendarLookupSynthesisResolution(
+            synthesis=None,
+            openai_requests=0,
+            warnings=("Synthetic selector unavailable.",),
+        ),
+    )
+
+    resolution = interpreter.resolve_calendar_lookup_answer(
+        "Find one appointment.",
+        [{"title": "Unrelated event"}],
+        lookup_target="appointment",
+        response_scope="focused",
+        fallback="Raw agenda that must not be returned",
+        live=True,
+    )
+
+    assert resolution.status == "fallback"
+    assert "could not confidently identify one matching event" in resolution.text
+    assert "Raw agenda" not in resolution.text
+    assert resolution.warnings == ("Synthetic selector unavailable.",)
+
+
+def test_full_window_calendar_lookup_skips_model_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        interpreter,
+        "resolve_calendar_lookup_synthesis",
+        lambda *_args, **_kwargs: pytest.fail(
+            "A full-window Calendar request must not spend a selector call."
+        ),
+    )
+
+    resolution = interpreter.resolve_calendar_lookup_answer(
+        "List every event tomorrow.",
+        [{"title": "Morning review"}],
+        lookup_target="events tomorrow",
+        response_scope="full_window",
+        fallback="Complete provider agenda",
+        live=True,
+    )
+
+    assert resolution.text == "Complete provider agenda"
+    assert resolution.openai_requests == 0
+
+
+def test_calendar_lookup_groups_two_records_for_one_appointment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        interpreter,
+        "resolve_calendar_lookup_synthesis",
+        lambda *_args, **_kwargs: interpreter.CalendarLookupSynthesisResolution(
+            synthesis=CalendarLookupSynthesis(
+                status="matched",
+                selected_event_indexes=[0, 1],
+                related_event_groups=[[0, 1]],
+                selection_reason="Overlapping medical records describe one visit.",
+            ),
+            openai_requests=1,
+        ),
+    )
+
+    resolution = interpreter.resolve_calendar_lookup_answer(
+        "Find my medical appointment tomorrow. What is its time and location?",
+        [
+            {
+            "title": "Example Medical Clinic",
+                "display_start_date": "2026-07-28",
+                "display_start_time": "10:40",
+                "display_end_date": "2026-07-28",
+                "display_end_time": "11:40",
+                "display_timezone": "America/New_York",
+            "source_calendar_name": "Care Appointments",
+            },
+            {
+            "title": "Established Client Visit",
+                "start_time": "14:25",
+                "display_start_date": "2026-07-28",
+                "display_start_time": "10:25",
+                "display_end_date": "2026-07-28",
+                "display_end_time": "11:00",
+                "display_timezone": "America/New_York",
+            "location": "100 Example Avenue, Exampleville, PA 19000",
+            "source_calendar_name": "Appointments",
+            },
+        ],
+        lookup_target="medical appointment tomorrow",
+        response_scope="focused",
+        fallback="Raw agenda",
+        live=True,
+    )
+
+    assert resolution.related_event_groups == ((0, 1),)
+    assert "one likely event represented by 2 Calendar entries" in resolution.text
+    assert "10:25 AM to 11:00 AM" in resolution.text
+    assert "10:40 AM to 11:40 AM" in resolution.text
+    assert "100 Example Avenue" in resolution.text
+    assert "different times" in resolution.text
+    assert "2:25 PM" not in resolution.text

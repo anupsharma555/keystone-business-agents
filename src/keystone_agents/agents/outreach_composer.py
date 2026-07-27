@@ -1830,6 +1830,11 @@ def run_outreach_composer_sdk(
         context_flags=context_flags,
         compact_instructions=resolved_compact_instructions,
     )
+    capability_model_provider, capability_model_name = _outreach_model_identity(
+        run_config=run_config,
+        agent=agent,
+        model=model,
+    )
     capability_profile = compile_request_capability_profile(
         entrypoint=entrypoint,
         agent=agent,
@@ -1848,6 +1853,8 @@ def run_outreach_composer_sdk(
         provider_operations=(),
         write_enabled=False,
         send_enabled=False,
+        model_provider=capability_model_provider,
+        model_name=capability_model_name,
     )
     result = run_typed_sdk_agent(
         agent=agent,
@@ -1856,9 +1863,10 @@ def run_outreach_composer_sdk(
         run_config=run_config,
         live=live,
         session=session,
-        trace_metadata={
-            "capability_profile": capability_profile.receipt(),
-        },
+        capability_profile=capability_profile,
+        entrypoint=entrypoint,
+        execution_shape=capability_profile.execution_shape,
+        prompt_profile=capability_profile.prompt_profile,
         max_turns=turn_policy.max_turns,
     )
     # TypedAgentRunResult is frozen, but its audit metadata mapping is
@@ -1866,8 +1874,41 @@ def run_outreach_composer_sdk(
     # compatibility with lightweight test doubles that return another shape.
     request_cache = getattr(result, "request_cache", None)
     if isinstance(request_cache, dict):
-        request_cache["capability_profile"] = capability_profile.receipt()
+        request_cache.setdefault("capability_profile", capability_profile.receipt())
     return result
+
+
+def _outreach_model_identity(
+    *,
+    run_config: Any | None,
+    agent: Any,
+    model: str | None,
+) -> tuple[str, str]:
+    if run_config is not None:
+        provider = getattr(run_config, "model_provider", None)
+        provider_name = (
+            str(
+                getattr(provider, "provider_name", "")
+                or getattr(provider, "name", "")
+                or type(provider).__name__
+            ).strip()
+            if provider is not None
+            else "local"
+        )
+        model_name = str(
+            getattr(run_config, "model", "")
+            or getattr(agent, "model", "")
+            or "sdk-local"
+        ).strip()
+        return provider_name, model_name
+
+    from keystone_agents.model_provider import get_runtime_agent_model_config
+
+    config = get_runtime_agent_model_config(
+        "outreach_composer",
+        model_override=model,
+    )
+    return config.provider, config.model
 
 
 def compile_outreach_request_capability_profile(
@@ -1890,6 +1931,11 @@ def compile_outreach_request_capability_profile(
         request_text=skill_request_text(typed_input),
         compact_instructions=True,
     )
+    model_provider, model_name = _outreach_model_identity(
+        run_config=None,
+        agent=agent,
+        model=model,
+    )
     return compile_request_capability_profile(
         entrypoint=entrypoint,
         agent=agent,
@@ -1900,6 +1946,8 @@ def compile_outreach_request_capability_profile(
         provider_operations=(),
         write_enabled=False,
         send_enabled=False,
+        model_provider=model_provider,
+        model_name=model_name,
     )
 
 

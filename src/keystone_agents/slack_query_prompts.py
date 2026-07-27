@@ -70,6 +70,15 @@ _SEMANTIC_KIND_BY_ARTIFACT = {
     "outreach_draft": SlackQueryPromptKind.OUTREACH_DRAFT,
 }
 
+_TYPED_ACTION_KIND = {
+    "continue_work_item": SlackQueryPromptKind.CONTINUE_OR_REVISE,
+    "find_contact": SlackQueryPromptKind.DEEPER_RESEARCH,
+    "more_research": SlackQueryPromptKind.DEEPER_RESEARCH,
+    "research_all_candidates": SlackQueryPromptKind.DEEPER_RESEARCH,
+    "revise_draft": SlackQueryPromptKind.CONTINUE_OR_REVISE,
+    "run_again": SlackQueryPromptKind.CONTINUE_OR_REVISE,
+}
+
 
 class SlackQueryPromptInput(BaseModel):
     """Bounded input used to select and render a reusable Slack prompt."""
@@ -254,6 +263,9 @@ def slack_query_prompt_external_context(
 
 
 def _detect_prompt_kind(prompt_input: SlackQueryPromptInput) -> SlackQueryPromptKind | None:
+    typed_action_kind = _TYPED_ACTION_KIND.get(prompt_input.intent)
+    if typed_action_kind is not None:
+        return typed_action_kind
     authority = ExecutionIntentAuthority.from_value(prompt_input.manual_plan)
     if authority.invalid:
         return None
@@ -397,7 +409,7 @@ def _render_task_brief(
         lines.extend(["", "Operator feedback:", _clean_text(prompt_input.feedback, max_chars=600)])
     if prompt_input.work_item_id:
         lines.extend(["", "WorkItem reference:", prompt_input.work_item_id])
-    comparison_instruction = _comparison_instruction(prompt_input.raw_request)
+    comparison_instruction = _comparison_instruction(_semantic_manual_plan(prompt_input))
     if comparison_instruction:
         lines.extend(["", "Comparison handling:", comparison_instruction])
     if prompt_input.channel_name:
@@ -478,22 +490,40 @@ def _agent_task_for_kind(kind: SlackQueryPromptKind) -> str:
     return tasks[kind]
 
 
-def _comparison_instruction(raw_request: str) -> str:
-    text = str(raw_request or "")
-    if not re.search(r"\b(?:compare|comparison|table|versus|vs\.?)\b", text, flags=re.I):
+def _comparison_instruction(plan: dict[str, Any] | None) -> str:
+    """Render comparison guidance only from the canonical semantic plan."""
+
+    if not plan:
         return ""
-    target_count = "the requested number of"
-    count_match = re.search(
-        r"\b(?:two|three|four|five|six|seven|eight|nine|ten|\d{1,2})\b",
-        text,
-        flags=re.I,
+    required_entities = [
+        " ".join(str(item or "").split())
+        for item in list(plan.get("required_entities") or [])
+        if " ".join(str(item or "").split())
+    ]
+    desired_count = int(plan.get("desired_count") or 0)
+    multi_target = bool(
+        len(required_entities) > 1
+        or plan.get("requires_target_discovery")
+        or (plan.get("desired_count_explicit") is True and desired_count > 1)
     )
-    if count_match:
-        target_count = count_match.group(0).lower()
+    if not multi_target:
+        return ""
+    if required_entities:
+        target_scope = (
+            "the exact named targets: " + ", ".join(required_entities)
+        )
+    elif desired_count > 1:
+        target_scope = f"the requested {desired_count} qualified targets"
+    else:
+        target_scope = "the requested qualified targets"
+    dimensions = [
+        " ".join(str(item or "").split())
+        for item in list(plan.get("required_terms") or [])
+        if " ".join(str(item or "").split())
+    ]
     lines = [
         (
-            f"Resolve {target_count} named products or companies as separate comparison "
-            "targets before synthesis."
+            f"Resolve {target_scope} as separate comparison targets before synthesis."
         ),
         (
             "Use source organizations, news articles, policy reports, blogs, and listicles as "
@@ -505,15 +535,17 @@ def _comparison_instruction(raw_request: str) -> str:
             "official/product/help/policy/safety-page retrieval for each selected target."
         ),
         (
-            "For AI companion or chatbot product comparisons, keep targets anchored to products "
-            "that are themselves AI companions or chatbots; do not substitute adjacent teen-safety "
-            "vendors, media outlets, regulators, or research organizations."
-        ),
-        (
             "Do not collapse a category request into one generic company profile; if separate "
             "current public product sources cannot be found, return exact source gaps."
         ),
     ]
+    if dimensions:
+        lines.insert(
+            1,
+            "Evaluate every target against the typed dimensions: "
+            + ", ".join(dimensions)
+            + ".",
+        )
     return "\n".join(f"- {line}" for line in lines)
 
 

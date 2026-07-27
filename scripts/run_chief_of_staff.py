@@ -13,7 +13,10 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from keystone_agents.agents.calendar_action_interpreter import (
+    calendar_lookup_response_scope,
     calendar_lookup_target_from_plan,
+    resolve_calendar_action_plan,
+    resolve_calendar_lookup_answer,
 )
 from keystone_agents.agents.chief_of_staff import (
     chief_of_staff_should_use_specialist_tools,
@@ -24,6 +27,7 @@ from keystone_agents.agents.chief_of_staff import (
 from keystone_agents.agents.manual_request_planner import resolve_manual_request_plan
 from keystone_agents.agents.orchestrator import review_specialist_output, run_orchestrator_preflight
 from keystone_agents.agents.web_query_planner import resolve_web_query_plan
+from keystone_agents.calendar_actions import infer_calendar_action_plan
 from keystone_agents.cli import execute_direct_calendar_action
 from keystone_agents.cli_sdk import add_sdk_session_arguments, sdk_session_from_args
 from keystone_agents.config import load_settings
@@ -221,6 +225,8 @@ def _run_interpreted_calendar_action(
     plan: object,
     json_output: bool,
     openai_requests: int,
+    model_override: str | None = None,
+    manual_plan: ManualRequestPlan | None = None,
 ) -> int:
     """Execute a bounded Calendar action and keep the Chief Slack wire contract."""
 
@@ -239,6 +245,7 @@ def _run_interpreted_calendar_action(
         return 1
 
     operation = str(getattr(plan, "operation", "") or receipt.get("operation") or "action")
+    direct_summary = str(direct.get("human_summary") or "").strip()
     title = str(
         receipt.get("title")
         or (direct.get("calendar_lookup") or {}).get("title")
@@ -261,7 +268,18 @@ def _run_interpreted_calendar_action(
         )
         if part
     )
-    if operation == "delete":
+    synthesis_requests = 0
+    synthesis_warnings: tuple[str, ...] = ()
+    if operation == "read":
+        summary, synthesis_requests, synthesis_warnings = _calendar_lookup_answer(
+            input_text=input_text,
+            plan=plan,
+            manual_plan=manual_plan,
+            receipt=receipt,
+            fallback=direct_summary,
+            model_override=model_override,
+        )
+    elif operation == "delete":
         summary = (
             f"{verb} {title}; Google Calendar read-back confirmed the exact event "
             "is no longer active."
@@ -273,7 +291,7 @@ def _run_interpreted_calendar_action(
         )
     actions: list[str] = []
     description = str(getattr(plan, "description", "") or "").strip()
-    if description:
+    if description and operation != "read":
         actions.append(f'Calendar note verified from the requested update: "{description}".')
     if operation == "update":
         actions.append("The existing event was modified; no duplicate event was created.")
@@ -288,12 +306,16 @@ def _run_interpreted_calendar_action(
             "synthesis": "",
             "recommended_actions": actions,
             "recommended_route": {
-                "workflow_type": "calendar-action-complete",
+                "workflow_type": (
+                    "calendar-read-complete"
+                    if operation == "read"
+                    else "calendar-action-complete"
+                ),
                 "command_text": "",
                 "target_channel": "",
                 "rationale": "Chief of Staff executed the exact provider-owned Calendar action.",
             },
-            "approval_required": True,
+            "approval_required": operation != "read",
             "slack_post_allowed": False,
             "send_enabled": False,
             "audit_notes": [
@@ -302,13 +324,22 @@ def _run_interpreted_calendar_action(
         },
         "calendar_action": direct.get("calendar_action"),
         "calendar_lookup": direct.get("calendar_lookup"),
+        "calendar_lookup_synthesis_warnings": list(synthesis_warnings),
         "tool_receipt": receipt,
         "usage": {
             "available": True,
-            "requests": openai_requests,
+            "requests": openai_requests + synthesis_requests,
         },
         "side_effects": direct.get("side_effects"),
+        "human_summary": summary,
+        "display_text": summary,
+        "slack_display_text": summary,
     }
+    if isinstance(direct.get("public_result"), dict):
+        payload["public_result"] = {
+            **direct["public_result"],
+            "text": summary,
+        }
     if json_output:
         print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
     else:
@@ -316,6 +347,42 @@ def _run_interpreted_calendar_action(
         for action in actions:
             print(f"- {action}")
     return 0 if passed else 1
+
+
+def _calendar_lookup_answer(
+    *,
+    input_text: str,
+    plan: object,
+    manual_plan: ManualRequestPlan | None,
+    receipt: dict[str, object],
+    fallback: str,
+    model_override: str | None,
+) -> tuple[str, int, tuple[str, ...]]:
+    """Resolve one reader-ready Calendar answer through the shared direct contract."""
+
+    events = [
+        event
+        for event in receipt.get("events", [])
+        if isinstance(event, dict)
+    ]
+    response_scope = calendar_lookup_response_scope(
+        manual_plan,
+        plan,
+    )
+    resolution = resolve_calendar_lookup_answer(
+        input_text,
+        events,
+        lookup_target=calendar_lookup_target_from_plan(manual_plan),
+        response_scope=response_scope,
+        fallback=fallback,
+        live=True,
+        model=model_override,
+    )
+    return (
+        resolution.text,
+        resolution.openai_requests,
+        resolution.warnings,
+    )
 
 
 def _run_interpreted_gmail_contact_lookup(
@@ -740,7 +807,23 @@ def _calendar_title_tokens(value: object) -> set[str]:
 
 
 def _calendar_event_when(event: dict[str, object]) -> str:
-    start = str(event.get("start") or event.get("start_date") or "").strip()
+    display_date = str(
+        event.get("display_start_date") or event.get("start_date") or ""
+    ).strip()
+    display_time = str(event.get("display_start_time") or "").strip()
+    if display_date:
+        if not display_time:
+            return f" on {display_date}"
+        try:
+            time_text = datetime.strptime(display_time[:5], "%H:%M").strftime(
+                "%-I:%M %p"
+            )
+        except ValueError:
+            time_text = display_time
+        timezone = " ".join(str(event.get("display_timezone") or "").split())
+        timezone_suffix = f" ({timezone})" if timezone else ""
+        return f" on {display_date} at {time_text}{timezone_suffix}"
+    start = str(event.get("start") or "").strip()
     if not start:
         return ""
     date_text = start[:10]
@@ -752,6 +835,11 @@ def _calendar_event_when(event: dict[str, object]) -> str:
     except ValueError:
         time_text = start[11:16]
     return f" on {date_text} at {time_text}"
+
+
+def _calendar_event_location(event: dict[str, object]) -> str:
+    location = " ".join(str(event.get("location") or "").split())
+    return f" Location: {location}." if location else ""
 
 
 def _calendar_provider_human_summary(
@@ -823,7 +911,11 @@ def _calendar_provider_human_summary(
                 "Give me a date or one more title detail and I can identify the right one."
             )
         title = str(receipt.get("title") or target).strip()
-        return f'Yes - "{title}" is on your Google Calendar{_calendar_event_when(receipt)}.'
+        return (
+            f'Yes - "{title}" is on your Google Calendar'
+            f"{_calendar_event_when(receipt)}."
+            f"{_calendar_event_location(receipt)}"
+        )
 
     reads = [
         receipt
@@ -878,7 +970,11 @@ def _calendar_provider_human_summary(
         return fallback
     event = matches[0]
     title = str(event.get("title") or target).strip()
-    return f'Yes - "{title}" is on your Google Calendar{_calendar_event_when(event)}.'
+    return (
+        f'Yes - "{title}" is on your Google Calendar'
+        f"{_calendar_event_when(event)}."
+        f"{_calendar_event_location(event)}"
+    )
 
 
 def _calendar_context_lookup_target(manual_request_plan: object) -> str:
@@ -1964,6 +2060,31 @@ def main(argv: list[str] | None = None) -> int:
             live_sdk=True,
             manual_request_plan=manual_plan,
         )
+        if (
+            ExecutionIntentAuthority.from_value(manual_plan).canonical
+            and manual_plan.provider_system == "google_calendar"
+            and manual_plan.intent == "context_lookup"
+        ):
+            calendar_resolution = resolve_calendar_action_plan(
+                input_text,
+                infer_calendar_action_plan(input_text),
+                manual_plan=manual_plan,
+                semantic_candidate=True,
+                live=True,
+                model=args.model,
+            )
+            if calendar_resolution.plan is not None:
+                return _run_interpreted_calendar_action(
+                    input_text=input_text,
+                    plan=calendar_resolution.plan,
+                    json_output=args.json,
+                    openai_requests=(
+                        (0 if parent_manual_plan is not None else 1)
+                        + calendar_resolution.openai_requests
+                    ),
+                    model_override=args.model,
+                    manual_plan=manual_plan,
+                )
         gmail_plan = resolve_gmail_execution_plan(
             input_text,
             manual_plan=manual_plan,

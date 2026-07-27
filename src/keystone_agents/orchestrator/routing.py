@@ -280,10 +280,13 @@ def looks_like_gmail_collection_read(text: str) -> bool:
     if not lower:
         return False
     collection_selection = bool(
-        re.search(r"\b(?:inbox|mailbox|emails|messages)\b", lower)
+        re.search(
+            r"\b(?:inbox|mailbox|emails|messages|threads|conversations)\b",
+            lower,
+        )
         and re.search(
             r"\b(?:today|yesterday|this\s+morning|this\s+afternoon|recent|"
-            r"unread)\b",
+            r"latest|newest|unread)\b",
             lower,
         )
         and re.search(
@@ -311,7 +314,10 @@ def looks_like_gmail_collection_read(text: str) -> bool:
     if exact_single_item and not collection_selection:
         return False
     has_mail_collection = bool(
-        re.search(r"\b(?:gmail|inbox|mailbox|emails|mail|messages)\b", lower)
+        re.search(
+            r"\b(?:gmail|inbox|mailbox|emails|mail|messages|threads|conversations)\b",
+            lower,
+        )
         or re.search(
             r"\bemail\b[\s\S]{0,80}\b(?:arrived|came\s+in|received|sent\s+to\s+me|unread)\b",
             lower,
@@ -319,8 +325,9 @@ def looks_like_gmail_collection_read(text: str) -> bool:
     )
     has_collection_scope = bool(
         re.search(
-            r"\b(?:today|yesterday|this\s+morning|this\s+afternoon|recent|latest|new|"
-            r"unread|arrived|came\s+in|received|sent\s+to\s+me|inbox|mailbox|emails)\b",
+            r"\b(?:today|yesterday|this\s+morning|this\s+afternoon|recent|latest|"
+            r"newest|new|unread|arrived|came\s+in|received|sent\s+to\s+me|"
+            r"inbox|mailbox|emails|threads|conversations)\b",
             lower,
         )
     )

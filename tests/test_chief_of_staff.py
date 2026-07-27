@@ -1812,6 +1812,107 @@ def test_run_script_live_sdk_runs_orchestrator_preflight_when_parent_absent(
     assert payload["orchestrator_preflight"]["selected_agent"] == "chief_of_staff"
 
 
+def test_run_script_routes_bounded_calendar_read_through_typed_interpreter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from keystone_agents.agents.orchestrator import OrchestratorPreflight
+    from keystone_agents.schemas.orchestrator import OrchestratorResult
+
+    script = _load_run_chief_of_staff_script()
+    request = (
+        "CoS, list all events tomorrow from every Google Calendar I can read, "
+        "including selected shared calendars."
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        primary_target="tomorrow's events across readable Google Calendars",
+        target_type="business_system_context",
+        provider_system="google_calendar",
+        provider_operations=["read"],
+        provider_read_scope="bounded_collection",
+        provider_result_mode="items",
+        objective=request,
+        task_objective="context_lookup",
+        expected_artifact_type="context_summary",
+    )
+    resolved_calendar_plan = object()
+    captured: dict[str, object] = {}
+
+    class FakeModelConfig:
+        def as_log_dict(self) -> dict[str, str]:
+            return {"provider": "openai", "name": "gpt-5.4-mini"}
+
+    def fake_preflight(*args: object, **_kwargs: object) -> OrchestratorPreflight:
+        return OrchestratorPreflight(
+            request_text=str(args[0]),
+            requested_agent="chief_of_staff",
+            advisory_only=True,
+            selected_agent="chief_of_staff",
+            manual_request_plan=plan,
+            route_result=OrchestratorResult(
+                route="chief_of_staff",
+                target_agent="chief_of_staff",
+                rationale="Use the typed Google Calendar read path.",
+            ),
+        )
+
+    def fake_resolve(
+        request_text: str,
+        fallback: object,
+        **kwargs: object,
+    ) -> SimpleNamespace:
+        captured["resolve_request"] = request_text
+        captured["fallback"] = fallback
+        captured["resolve_kwargs"] = kwargs
+        return SimpleNamespace(
+            plan=resolved_calendar_plan,
+            openai_requests=1,
+            warnings=(),
+        )
+
+    def fake_run_interpreted(**kwargs: object) -> int:
+        captured["interpreted_kwargs"] = kwargs
+        return 0
+
+    monkeypatch.delenv(MANUAL_REQUEST_PLAN_ENV, raising=False)
+    monkeypatch.delenv(ORCHESTRATOR_PREFLIGHT_ENV, raising=False)
+    monkeypatch.setattr(script, "load_settings", lambda **_: None)
+    monkeypatch.setattr(
+        script,
+        "get_runtime_agent_model_config",
+        lambda *_args, **_kwargs: FakeModelConfig(),
+    )
+    monkeypatch.setattr(script, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(script, "infer_calendar_action_plan", lambda _text: None)
+    monkeypatch.setattr(script, "resolve_calendar_action_plan", fake_resolve)
+    monkeypatch.setattr(script, "_run_interpreted_calendar_action", fake_run_interpreted)
+    monkeypatch.setattr(
+        script,
+        "run_chief_of_staff_sdk",
+        lambda *_args, **_kwargs: pytest.fail(
+            "A bounded Calendar read must not fall through to generic Chief execution."
+        ),
+    )
+
+    assert script.main(["--live-sdk", "--json", "--input", request]) == 0
+
+    assert captured["resolve_request"] == request
+    assert captured["resolve_kwargs"]["manual_plan"] is plan
+    assert captured["resolve_kwargs"]["semantic_candidate"] is True
+    assert captured["resolve_kwargs"]["live"] is True
+    assert captured["interpreted_kwargs"] == {
+        "input_text": request,
+        "plan": resolved_calendar_plan,
+        "json_output": True,
+        "openai_requests": 2,
+        "model_override": None,
+        "manual_plan": plan,
+    }
+
+
 def test_run_script_live_contact_lookup_uses_shared_gmail_workflow_once(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

@@ -13,6 +13,22 @@ from json import JSONDecodeError, dumps, loads
 from typing import Any, TypeVar
 from zoneinfo import ZoneInfo
 
+from keystone_agents.agent_tool_policy import (
+    ToolTier,
+    tool_name_for_policy,
+    tool_tier_for_name,
+)
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
+from keystone_agents.capabilities.admission import (
+    CapabilityAdmissionReceipt,
+    CapabilityEnforcementMode,
+    compile_capability_admission,
+    verify_expected_capability_profile,
+)
+from keystone_agents.capabilities.profile import (
+    RequestCapabilityProfile,
+    compile_request_capability_profile,
+)
 from keystone_agents.costing import (
     AgentRunBudgetExceededError,
     enforce_agent_run_budget,
@@ -38,6 +54,7 @@ from keystone_agents.provider_recovery import (
     ProviderRecoveryStore,
     failure_stage_from_exception,
 )
+from keystone_agents.schemas.execution_request import ExecutionEntrypoint
 from keystone_agents.sdk import AgentLike, repo_instruction_profile_id, run_typed_sdk_sync
 from keystone_agents.sdk_sessions import build_sdk_session_from_env, session_audit_metadata
 from keystone_agents.tool_receipt_journal import (
@@ -182,16 +199,31 @@ def run_typed_sdk_agent(
     trace_config: TraceConfig | None = None,
     max_turns: int | None = None,
     recovery_store: ProviderRecoveryStore | None = None,
+    capability_profile: RequestCapabilityProfile | None = None,
+    capability_authority: Any | None = None,
+    entrypoint: ExecutionEntrypoint = "direct_sdk",
+    execution_shape: str = "typed_sdk_run",
+    prompt_profile: str = "repo_runtime",
+    provider_operations: Sequence[str] | None = None,
+    provider_system: str = "",
+    capability_enforcement: CapabilityEnforcementMode | None = None,
+    send_enabled: bool = False,
 ) -> TypedAgentRunResult[TOutput]:
     """Run an SDK agent through a typed, credential-safe execution path."""
 
     if run_config is not None:
+        execution_model_provider = _run_config_provider_label(run_config)
+        execution_model_name = str(
+            getattr(run_config, "model", "")
+            or getattr(agent, "model", "")
+            or "sdk-local"
+        )
         if config is not None:
             model_provider = config.provider
             model_name = config.model
         else:
-            model_provider = "local"
-            model_name = str(getattr(run_config, "model", "") or "sdk-local")
+            model_provider = execution_model_provider
+            model_name = execution_model_name
     else:
         model_config = config or get_runtime_agent_model_config(
             getattr(agent, "name", None),
@@ -199,6 +231,8 @@ def run_typed_sdk_agent(
         )
         model_provider = model_config.provider
         model_name = model_config.model
+        execution_model_provider = model_provider
+        execution_model_name = model_name
     resolved_session = session or build_sdk_session_from_env()
     prompt = sdk_input_from_typed_input(typed_input, live=live, provider=model_provider)
     base_prompt = prompt
@@ -209,6 +243,52 @@ def run_typed_sdk_agent(
         session=resolved_session,
         max_turns=max_turns,
     )
+    resolved_capability_profile, capability_admission = _sdk_capability_profile(
+        agent=agent,
+        supplied_profile=capability_profile,
+        capability_authority=capability_authority,
+        entrypoint=entrypoint,
+        execution_shape=execution_shape,
+        prompt_profile=prompt_profile,
+        max_turns=max_turns,
+        model_provider=execution_model_provider,
+        model_name=execution_model_name,
+        provider_operations=provider_operations,
+        provider_system=provider_system,
+        capability_enforcement=capability_enforcement,
+        send_enabled=send_enabled,
+    )
+    capability_receipt = resolved_capability_profile.receipt()
+    request_cache["capability_profile"] = capability_receipt
+    request_cache["capability_admission"] = capability_admission.receipt()
+    nested_capability_profiles = [
+        dict(profile)
+        for tool in list(getattr(agent, "tools", []) or [])
+        if isinstance(
+            (profile := getattr(tool, "nested_capability_profile", None)),
+            Mapping,
+        )
+    ]
+    if nested_capability_profiles:
+        request_cache["nested_capability_profiles"] = nested_capability_profiles
+    safe_trace_metadata = (
+        dict(trace_metadata) if isinstance(trace_metadata, Mapping) else {}
+    )
+    safe_trace_metadata.pop("capability_profile", None)
+    trace_metadata = {
+        **safe_trace_metadata,
+        "capability_profile_fingerprint": (
+            resolved_capability_profile.profile_fingerprint
+        ),
+        "capability_tool_count": resolved_capability_profile.tool_count,
+        "capability_write_enabled": resolved_capability_profile.write_enabled,
+        "capability_send_enabled": resolved_capability_profile.send_enabled,
+        "capability_enforcement": capability_admission.enforcement_mode,
+        "capability_provider_system": capability_admission.provider_system,
+        "capability_admitted": capability_admission.admitted,
+        "capability_violation_count": len(capability_admission.violations),
+        "nested_capability_profile_count": len(nested_capability_profiles),
+    }
     rate_limit_retry_count = 0
     structured_output_retry_count = 0
     max_rate_limit_retries = _sdk_rate_limit_max_retries(live=live, run_config=run_config)
@@ -222,7 +302,7 @@ def run_typed_sdk_agent(
         prior_receipts,
         receipt_sink=recovery_store.record_receipt if recovery_store is not None else None,
     )
-    instrument_agent_tools(agent)
+    instrument_agent_tools(agent, capability_admission=capability_admission)
     temporarily_disabled_tools: dict[int, tuple[Any, Any]] = {}
     if prior_receipts:
         prompt = _sdk_prompt_with_recovery_context(
@@ -408,6 +488,130 @@ def run_typed_sdk_agent(
     )
 
 
+def _sdk_capability_profile(
+    *,
+    agent: AgentLike,
+    supplied_profile: RequestCapabilityProfile | None,
+    capability_authority: Any | None,
+    entrypoint: ExecutionEntrypoint,
+    execution_shape: str,
+    prompt_profile: str,
+    max_turns: int | None,
+    model_provider: str,
+    model_name: str,
+    provider_operations: Sequence[str] | None,
+    provider_system: str,
+    capability_enforcement: CapabilityEnforcementMode | None,
+    send_enabled: bool,
+) -> tuple[RequestCapabilityProfile, CapabilityAdmissionReceipt]:
+    """Compile runtime truth and the capability ceiling before any model call."""
+
+    tool_names = tuple(
+        dict.fromkeys(_ordered_tool_names(getattr(agent, "tools", []) or []))
+    )
+    effective_max_turns = max(1, int(max_turns or 10))
+    tiers = tuple(
+        tier
+        for tier in (tool_tier_for_name(name) for name in tool_names)
+        if tier is not None
+    )
+    resolved_provider = str(provider_system or "").strip()
+    authority_source = ""
+    authority_bound = provider_operations is not None
+    normalized_operations = tuple(
+        dict.fromkeys(
+            str(operation or "").strip().lower()
+            for operation in (provider_operations or ())
+            if str(operation or "").strip()
+        )
+    )
+    if capability_authority is not None:
+        authority = (
+            capability_authority
+            if isinstance(capability_authority, ExecutionIntentAuthority)
+            else ExecutionIntentAuthority.from_value(capability_authority)
+        )
+        if authority.invalid:
+            raise RuntimeError("Invalid capability authority cannot admit an SDK run.")
+        if not authority.canonical or authority.plan is None:
+            raise RuntimeError(
+                "Capability authority must contain one canonical semantic plan."
+            )
+        authority_provider = authority.plan.provider_system
+        authority_operations = authority.effective_provider_operations(
+            authority_provider
+        )
+        if resolved_provider and resolved_provider != authority_provider:
+            raise RuntimeError(
+                "Explicit provider system conflicts with canonical capability authority."
+            )
+        if (
+            provider_operations is not None
+            and normalized_operations != authority_operations
+        ):
+            raise RuntimeError(
+                "Explicit provider operations conflict with canonical capability authority."
+            )
+        resolved_provider = authority_provider
+        normalized_operations = authority_operations
+        authority_source = str(authority.plan.source or "canonical")
+        authority_bound = True
+    elif authority_bound:
+        authority_source = "provider_operations_compatibility_adapter"
+
+    enforcement_mode: CapabilityEnforcementMode = (
+        capability_enforcement
+        if capability_enforcement is not None
+        else ("authority_bound" if authority_bound else "compatibility")
+    )
+    if enforcement_mode == "authority_bound" and not authority_bound:
+        raise RuntimeError(
+            "Authority-bound capability enforcement requires canonical authority "
+            "or explicit provider operations."
+        )
+    write_authorized = bool(
+        {"create", "update", "delete", "attach"}.intersection(normalized_operations)
+    )
+    actual_profile = compile_request_capability_profile(
+        entrypoint=entrypoint,
+        agent=agent,
+        execution_shape=execution_shape,
+        prompt_profile=prompt_profile,
+        max_turns=effective_max_turns,
+        retrieval_enabled=any(
+            ToolTier.WEB_SEARCH <= tier <= ToolTier.DIAGNOSTIC for tier in tiers
+        ),
+        provider_operations=normalized_operations,
+        write_enabled=write_authorized,
+        send_enabled=send_enabled,
+        model_provider=model_provider,
+        model_name=model_name,
+    )
+    if actual_profile.tool_names != tool_names:
+        raise RuntimeError(
+            "Capability profile tool normalization does not match runtime inventory."
+        )
+    if supplied_profile is not None:
+        verify_expected_capability_profile(supplied_profile, actual_profile)
+
+    admission = compile_capability_admission(
+        agent=agent,
+        entrypoint=entrypoint,
+        enforcement_mode=enforcement_mode,
+        authorized_provider_operations=normalized_operations,
+        provider_system=resolved_provider,
+        authority_source=authority_source,
+        send_enabled=send_enabled,
+        effective_profile_fingerprint=actual_profile.profile_fingerprint,
+    )
+    if not admission.admitted:
+        raise RuntimeError(
+            "Capability authority does not admit the SDK run: "
+            + "; ".join(admission.violations)
+        )
+    return actual_profile, admission
+
+
 def _disable_completed_mutation_tools(
     agent: AgentLike,
     receipts: list[dict[str, Any]],
@@ -450,6 +654,20 @@ def _sdk_rate_limit_max_retries(*, live: bool, run_config: Any | None) -> int:
         return max(0, min(3, int(raw) if raw else 1))
     except ValueError:
         return 1
+
+
+def _run_config_provider_label(run_config: Any) -> str:
+    """Return an audit-safe identity for the provider the SDK will actually use."""
+
+    provider = getattr(run_config, "model_provider", None)
+    if provider is None:
+        return "local"
+    explicit = str(
+        getattr(provider, "provider_name", "")
+        or getattr(provider, "name", "")
+        or ""
+    ).strip()
+    return explicit or type(provider).__name__
 
 
 def _sdk_structured_output_max_retries(
@@ -825,10 +1043,7 @@ def _session_audit_metadata(session: Any | None) -> dict[str, Any]:
 
 
 def _ordered_tool_names(tools: Sequence[Any]) -> list[str]:
-    return [
-        str(getattr(tool, "name", getattr(tool, "__name__", type(tool).__name__)) or "")
-        for tool in tools
-    ]
+    return [tool_name_for_policy(tool) for tool in tools]
 
 
 def _output_schema_payload(output_type: Any) -> Any:
@@ -998,7 +1213,9 @@ def run_retrieved_sdk_synthesis(
         else:
             resolved_model_provider = "local"
             resolved_model_name = str(
-                getattr(run_config, "model", "") or model_label or "sdk-local"
+                getattr(run_config, "model", "")
+                or model_label
+                or "sdk-local"
             )
         resolved_model_run_mode = "local_sdk"
     else:

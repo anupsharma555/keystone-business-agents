@@ -134,14 +134,14 @@ def retrieve_announcement_feed_history_impl(
     limit: int = DEFAULT_HISTORY_LIMIT,
     database_url: str | None = None,
     live_rss_slack: bool = False,
+    store: SQLiteStore | None = None,
 ) -> dict[str, Any]:
     """Return bounded canonical RSS/preprint history from local application data."""
 
-    resolved_database_url = database_url or database_url_from_env()
     source = _source_filter(kind)
     try:
-        store = SQLiteStore(resolved_database_url)
-        items = store.retrieve_announcement_feed_items(
+        active_store = store or SQLiteStore(database_url or database_url_from_env())
+        items = active_store.retrieve_announcement_feed_items(
             query=query,
             source=source or None,
             selected_only=selected_only,
@@ -518,6 +518,7 @@ def retrieve_rss_announcement_history_impl(
     limit: int = DEFAULT_HISTORY_LIMIT,
     database_url: str | None = None,
     live: bool = False,
+    store: SQLiteStore | None = None,
 ) -> dict[str, Any]:
     """Return historical #announcements/RSS records from local application data."""
 
@@ -528,6 +529,7 @@ def retrieve_rss_announcement_history_impl(
         limit=limit,
         database_url=database_url,
         live_rss_slack=live,
+        store=store,
     )
 
 
@@ -537,6 +539,7 @@ def retrieve_preprint_announcement_history_impl(
     selected_only: bool | None = None,
     limit: int = DEFAULT_HISTORY_LIMIT,
     database_url: str | None = None,
+    store: SQLiteStore | None = None,
 ) -> dict[str, Any]:
     """Return historical preprint/#knowledge-hub records from local application data."""
 
@@ -546,6 +549,7 @@ def retrieve_preprint_announcement_history_impl(
         selected_only=selected_only,
         limit=limit,
         database_url=database_url,
+        store=store,
     )
 
 
