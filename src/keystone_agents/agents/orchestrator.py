@@ -422,6 +422,7 @@ def run_orchestrator_preflight(
         session=session,
         workflow_state=workflow_state,
         cost_callback=record_planner_cost,
+        database_url=database_url,
     )
     route_result = route_request(
         text,
@@ -463,6 +464,9 @@ def _preflight_sdk_usage_event_payload(
         "usage": dict(getattr(sdk_result, "usage", None) or {}),
         "cost": dict(getattr(sdk_result, "cost", None) or {}),
         "request_cache": dict(getattr(sdk_result, "request_cache", None) or {}),
+        "execution_telemetry": dict(
+            getattr(sdk_result, "execution_telemetry", None) or {}
+        ),
     }
 
 

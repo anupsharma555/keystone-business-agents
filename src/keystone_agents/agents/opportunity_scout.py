@@ -57,6 +57,7 @@ from keystone_agents.opportunity_scout.state import (
 from keystone_agents.quality_budget import opportunity_scout_quality_budget
 from keystone_agents.run import run_typed_sdk_agent
 from keystone_agents.schemas.decision_trace import DecisionTrace
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.opportunity import (
     ExistingOpportunityState,
     FilteredOpportunityCandidate,
@@ -7814,6 +7815,7 @@ def run_opportunity_scout_sdk(
     context_flags: Mapping[str, bool] | None = None,
     tool_tier: str | int | None = None,
     max_turns: int | None = None,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
     attach_tools: bool = True,
     compact_instructions: bool = False,
 ) -> TypedAgentRunResult[OpportunityScoutResult]:
@@ -7822,11 +7824,13 @@ def run_opportunity_scout_sdk(
     resolved_tool_tier = tool_tier or _default_opportunity_scout_sdk_tool_tier(
         typed_input,
         live=live,
+        manual_request_plan=manual_request_plan,
     )
     turn_policy = resolve_sdk_turn_policy(
         "opportunity_scout",
         request_text=skill_request_text(typed_input),
         live_search=live,
+        manual_request_plan=manual_request_plan,
         explicit_max_turns=max_turns,
     )
     return run_typed_sdk_agent(
@@ -7851,11 +7855,13 @@ def _default_opportunity_scout_sdk_tool_tier(
     typed_input: OpportunityScoutSDKInput | str,
     *,
     live: bool,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
 ) -> str:
     """Infer a read-only tool tier for default Opportunity Scout SDK runs."""
 
     budget = opportunity_scout_quality_budget(
         request_text=skill_request_text(typed_input),
         live_search=live,
+        manual_request_plan=manual_request_plan,
     )
     return budget.tool_tier or "core_read"

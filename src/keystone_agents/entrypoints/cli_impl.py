@@ -15,7 +15,8 @@ import subprocess
 import sys
 import tempfile
 import traceback
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -76,6 +77,10 @@ from keystone_agents.execution_request import (
     execution_request_planning_text,
     latest_slack_operator_request,
     slack_work_item_control_requested,
+)
+from keystone_agents.execution_telemetry import (
+    ExecutionTelemetryRecorder,
+    compact_execution_telemetry,
 )
 from keystone_agents.file_search import local_file_search_config_summary
 from keystone_agents.finance_expense_receipts import (
@@ -241,6 +246,44 @@ from keystone_agents.workflows import (
     run_keystone_pipeline,
     run_opportunity_to_outreach_loop,
 )
+
+
+class _CLIEntryTelemetryScope:
+    """Request-local CLI timing state with content-free persistence targets."""
+
+    def __init__(self, *, database_url: str | None) -> None:
+        self.recorder = ExecutionTelemetryRecorder()
+        self.database_url = database_url
+        self.store: SQLiteStore | None = None
+        self.agent_run_id: int | None = None
+        self.work_item_id = ""
+
+
+class _ObservedCLIStream:
+    """Delegate output byte-for-byte while observing its first write."""
+
+    def __init__(self, stream: Any, recorder: ExecutionTelemetryRecorder) -> None:
+        self._stream = stream
+        self._recorder = recorder
+
+    def write(self, value: str) -> int:
+        written = self._stream.write(value)
+        if value:
+            self._recorder.mark_first_feedback()
+        return written
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+_ASK_ENTRY_TELEMETRY: ContextVar[_CLIEntryTelemetryScope | None] = ContextVar(
+    "keystone_cli_ask_entry_telemetry",
+    default=None,
+)
+
 
 CONTEXT_AGENT_ROUTES = {
     "airtable_context_agent",
@@ -1074,6 +1117,7 @@ def _persist_direct_calendar_run(
 
 
 def _print_direct_calendar_payload(payload: dict[str, Any], *, json_output: bool) -> int:
+    _register_entry_agent_run(payload.get("agent_run_id"))
     if json_output:
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
@@ -1104,10 +1148,121 @@ def _route_with_manual_plan_advice(route: str, manual_plan: ManualRequestPlan) -
     return resolved
 
 
+def _run_with_entry_telemetry(
+    args: argparse.Namespace,
+    handler: Callable[[], int],
+) -> int:
+    """Measure one CLI entry without changing its stdout or stderr contract."""
+
+    if _ASK_ENTRY_TELEMETRY.get() is not None:
+        return int(handler())
+    scope = _CLIEntryTelemetryScope(
+        database_url=str(getattr(args, "database_url", "") or "") or None,
+    )
+    token = _ASK_ENTRY_TELEMETRY.set(scope)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    observed_stdout = _ObservedCLIStream(original_stdout, scope.recorder)
+    observed_stderr = _ObservedCLIStream(original_stderr, scope.recorder)
+    telemetry_status = "completed"
+    result: int | None = None
+    failure: BaseException | None = None
+    try:
+        sys.stdout = observed_stdout
+        sys.stderr = observed_stderr
+        try:
+            with scope.recorder.span(
+                "entry.dispatch",
+                attributes={"source": "cli"},
+            ):
+                result = int(handler())
+        except BaseException as exc:
+            telemetry_status = "failed"
+            failure = exc
+        observed_stdout.flush()
+        observed_stderr.flush()
+        if failure is None:
+            scope.recorder.mark_final_response()
+        else:
+            failed_snapshot = scope.recorder.snapshot(status="failed")
+            if failed_snapshot.first_feedback_ms is not None:
+                scope.recorder.mark_final_response()
+        telemetry = compact_execution_telemetry(
+            scope.recorder.snapshot(status=telemetry_status)
+        )
+        _persist_entry_execution_telemetry(scope, telemetry)
+        if failure is not None:
+            raise failure
+        return int(result or 0)
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        _ASK_ENTRY_TELEMETRY.reset(token)
+
+
+def _register_entry_agent_run(run_id: object) -> None:
+    scope = _ASK_ENTRY_TELEMETRY.get()
+    if scope is None:
+        return
+    try:
+        scope.agent_run_id = int(run_id)
+    except (TypeError, ValueError):
+        return
+
+
+def _register_entry_work_item(work_item_id: object) -> None:
+    scope = _ASK_ENTRY_TELEMETRY.get()
+    if scope is not None:
+        scope.work_item_id = str(work_item_id or "").strip()
+
+
+def _register_entry_store(store: SQLiteStore) -> None:
+    scope = _ASK_ENTRY_TELEMETRY.get()
+    if scope is not None:
+        scope.store = store
+
+
+def _persist_entry_execution_telemetry(
+    scope: _CLIEntryTelemetryScope,
+    telemetry: dict[str, Any],
+) -> None:
+    """Persist only the compact timing projection, never rendered content."""
+
+    if not telemetry:
+        return
+    try:
+        store = scope.store or SQLiteStore(
+            scope.database_url or database_url_from_env()
+        )
+        if scope.agent_run_id is not None:
+            store.annotate_agent_run_execution_telemetry(
+                scope.agent_run_id,
+                telemetry=telemetry,
+            )
+        if scope.work_item_id:
+            item = store.get_work_item(scope.work_item_id)
+            if item is not None:
+                record_event(
+                    item,
+                    event_type="entrypoint_execution_telemetry",
+                    summary="Recorded content-free CLI entry timing.",
+                    metadata={"execution_telemetry": telemetry},
+                    store=store,
+                )
+    except Exception:
+        # Performance telemetry is advisory and must not change task execution.
+        return
+
+
 def _run_ask(args: argparse.Namespace) -> int:
-    if args.live_sdk is True:
-        return _run_live_ask_with_environment(args)
-    return _run_ask_with_current_environment(args)
+    return _run_with_entry_telemetry(
+        args,
+        lambda: (
+            _run_live_ask_with_environment(args)
+            if args.live_sdk is True
+            else _run_ask_with_current_environment(args)
+        ),
+    )
 
 
 @with_cli_environment(force_dotenv=True)
@@ -11423,6 +11578,7 @@ def _print_ask_clarification(
 
 
 def _print_ask_live_payload(payload: dict[str, object], *, json_output: bool) -> int:
+    _register_entry_agent_run(payload.get("agent_run_id"))
     attach_execution_public_result(payload)
     if json_output:
         print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
@@ -11783,7 +11939,17 @@ def _run_automations_audit(args: argparse.Namespace) -> int:
 
 
 def _run_work_items_advance(args: argparse.Namespace) -> int:
+    return _run_with_entry_telemetry(
+        args,
+        lambda: _run_work_items_advance_with_current_environment(args),
+    )
+
+
+def _run_work_items_advance_with_current_environment(
+    args: argparse.Namespace,
+) -> int:
     store = SQLiteStore(args.database_url or database_url_from_env())
+    _register_entry_store(store)
     input_text = _read_input(args.input)
     work_item_id = _resolve_continue_work_item_id(
         store,
@@ -12142,6 +12308,7 @@ def _print_work_item_result(
 ) -> int:
     result = _shape_work_item_result_for_requested_output(result)
     result, user_facing_result_verified = _ensure_work_item_user_facing_summary(result)
+    _register_entry_work_item(getattr(result.work_item, "id", ""))
     if json_output:
         payload = result.model_dump(mode="json")
         result_status = str(getattr(result.status, "value", result.status))
