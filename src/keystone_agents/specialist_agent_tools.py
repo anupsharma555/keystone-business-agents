@@ -530,6 +530,7 @@ def build_specialist_agent_tools(
             provider_operations=("read", "search", "verify"),
             write_enabled=False,
             send_enabled=False,
+            model_provider="nested_sdk",
         )
         _safe_setattr(
             tools[-1],

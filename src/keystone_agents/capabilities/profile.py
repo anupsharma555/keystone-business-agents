@@ -9,8 +9,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from keystone_agents.contracts.completion import blocking_request_coverage
 from keystone_agents.agent_tool_policy import tool_name_for_policy
+from keystone_agents.contracts.completion import blocking_request_coverage
 from keystone_agents.schemas.execution_request import ExecutionEntrypoint
 from keystone_agents.schemas.request_coverage import RequestCoverage
 
@@ -27,6 +27,7 @@ class RequestCapabilityProfile(BaseModel):
     prompt_profile: str
     prompt_chars: int = Field(ge=0)
     prompt_sha256: str
+    model_provider: str = ""
     model_name: str
     max_turns: int = Field(ge=1)
     tool_names: tuple[str, ...] = ()
@@ -108,6 +109,8 @@ def compile_request_capability_profile(
     provider_operations: Sequence[str] = (),
     write_enabled: bool = False,
     send_enabled: bool = False,
+    model_provider: str = "",
+    model_name: str | None = None,
 ) -> RequestCapabilityProfile:
     """Compile an exact, entrypoint-neutral effective profile from an SDK agent."""
 
@@ -133,7 +136,12 @@ def compile_request_capability_profile(
         "execution_shape": str(execution_shape or "").strip(),
         "prompt_profile": str(prompt_profile or "").strip(),
         "prompt_sha256": _sha256(instructions),
-        "model_name": str(getattr(agent, "model", "") or "").strip(),
+        "model_provider": str(model_provider or "").strip(),
+        "model_name": str(
+            model_name
+            if model_name is not None
+            else getattr(agent, "model", "") or ""
+        ).strip(),
         "max_turns": int(max_turns),
         "tool_names": tool_names,
         "retrieval_enabled": bool(retrieval_enabled),
@@ -148,6 +156,7 @@ def compile_request_capability_profile(
         prompt_profile=fingerprint_payload["prompt_profile"],
         prompt_chars=len(instructions),
         prompt_sha256=fingerprint_payload["prompt_sha256"],
+        model_provider=fingerprint_payload["model_provider"],
         model_name=fingerprint_payload["model_name"],
         max_turns=fingerprint_payload["max_turns"],
         tool_names=tool_names,

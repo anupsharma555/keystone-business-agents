@@ -13,6 +13,10 @@ from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from typing import Any
 
+from keystone_agents.capabilities.admission import (
+    CapabilityAdmissionReceipt,
+    guard_tool_invocation,
+)
 from keystone_agents.receipts.mutations import (
     mutation_tool_names,
     receipt_reports_possible_write,
@@ -27,6 +31,14 @@ _TOOL_RECEIPT_SINK: ContextVar[Callable[[Mapping[str, Any]], Any] | None] = Cont
     "keystone_tool_receipt_sink",
     default=None,
 )
+_TOOL_CAPABILITY_ADMISSION: ContextVar[
+    CapabilityAdmissionReceipt | Mapping[str, Any] | None
+] = ContextVar(
+    "keystone_tool_capability_admission",
+    default=None,
+)
+
+
 def reset_tool_receipt_journal(
     initial_receipts: list[dict[str, Any]] | None = None,
     *,
@@ -59,9 +71,14 @@ def record_tool_output(tool_name: str, output: Any) -> None:
         receipt_sink(receipt)
 
 
-def instrument_agent_tools(agent: Any) -> None:
+def instrument_agent_tools(
+    agent: Any,
+    *,
+    capability_admission: CapabilityAdmissionReceipt | Mapping[str, Any] | None = None,
+) -> None:
     """Wrap SDK function tools so outputs survive final-output validation errors."""
 
+    _TOOL_CAPABILITY_ADMISSION.set(capability_admission)
     for tool in list(getattr(agent, "tools", []) or []):
         original = getattr(tool, "on_invoke_tool", None)
         name = str(getattr(tool, "name", "") or "").strip()
@@ -76,7 +93,13 @@ def instrument_agent_tools(agent: Any) -> None:
             *,
             _original: Any = original,
             _name: str = name,
+            _tool: Any = tool,
         ) -> Any:
+            guard_tool_invocation(
+                _TOOL_CAPABILITY_ADMISSION.get(),
+                tool_name=_name,
+                tool_input=tool_input,
+            )
             result = _original(context, tool_input)
             if inspect.isawaitable(result):
                 result = await result

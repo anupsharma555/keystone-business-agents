@@ -526,8 +526,33 @@ def _canonical_chief_of_staff_tools(
     if provider == "google_workspace":
         workspace_tools = google_workspace_tools()
         include_names = set(GOOGLE_WORKSPACE_READ_TOOLS)
-        if operations.intersection({"create", "update", "delete", "attach"}):
-            include_names.update(GOOGLE_WORKSPACE_WRITE_TOOLS)
+        workspace_write_names = {
+            "create": {
+                "google_doc_write",
+                "google_drive_create_folder",
+                "google_sheet_create",
+                "google_sheet_create_tab",
+                "presentation_extract_slide_copy_local",
+            },
+            "update": {
+                "google_doc_write",
+                "google_drive_rename_folder",
+                "google_sheet_append_rows",
+                "google_sheet_update_row",
+                "google_sheet_update_tab",
+            },
+            "delete": {
+                "google_doc_trash",
+                "google_drive_remove_folder",
+                "google_sheet_delete_rows",
+                "google_sheet_remove_tab",
+                "google_sheet_trash",
+                "presentation_delete_test_artifact_local",
+            },
+            "attach": set(),
+        }
+        for operation in operations:
+            include_names.update(workspace_write_names.get(operation, set()))
         tools.extend(
             tool
             for tool in workspace_tools
@@ -6358,7 +6383,13 @@ def run_chief_of_staff_sdk(
         live=live,
         session=session,
         max_turns=budget.max_turns,
-        provider_operations=provider_operations,
+        provider_operations=(
+            None if execution_authority.canonical else provider_operations
+        ),
+        provider_system="",
+        capability_authority=(
+            execution_authority if execution_authority.canonical else None
+        ),
         trace_metadata={
             "quality_mode": budget.mode.value,
             "quality_max_turns": budget.max_turns,
