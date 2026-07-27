@@ -9483,6 +9483,60 @@ def test_orchestrator_plan_missing_draft_is_limited_not_blocked(tmp_path: Path) 
     }
 
 
+def test_canonical_plan_round_trips_through_real_continue_without_compaction(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="business_research_analyst",
+        target_agent="business_research_analyst",
+        workflow=["business_research_analyst"],
+        intent="company_research",
+        primary_target="NeuroFlow",
+        target_type="company",
+        task_objective="entity_research",
+        expected_artifact_type="research_brief",
+        desired_count=2,
+        desired_count_explicit=True,
+        provider_selection_order="latest",
+        gmail_exclude_threads_with_operator_reply=True,
+        ask_shape=AskShapePolicy(
+            permission_state="read_only",
+            stop_condition="Stop after exactly two verified dimensions.",
+        ),
+    ).model_dump(mode="json")
+    item = WorkItem(
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        status=WorkItemStatus.IN_PROGRESS,
+        title="Research NeuroFlow",
+        request_text="research NeuroFlow",
+        target=WorkItemTarget(
+            name="NeuroFlow",
+            object_type="company",
+            metadata={"manual_request_plan": plan},
+        ),
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+    )
+    store.save_work_item(item)
+
+    advance_work_item(
+        WorkflowRunRequest(
+            request_text="continue",
+            work_item_id=item.id,
+            database_url=database_url,
+            save=True,
+            manual_request_plan=plan,
+        )
+    )
+
+    reloaded = store.get_work_item(item.id)
+    assert reloaded is not None
+    assert reloaded.target.name == "NeuroFlow"
+    assert reloaded.target.metadata["manual_request_plan"] == plan
+
+
 def test_manager_loop_answers_state_followup_without_rerunning(tmp_path: Path) -> None:
     database_url = _database_url(tmp_path)
     prompt = (

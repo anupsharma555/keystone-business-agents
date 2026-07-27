@@ -1232,6 +1232,57 @@ def test_langgraph_reuses_one_request_runtime_across_graph_nodes(
     assert calls == [_database_url(tmp_path)]
 
 
+def test_langgraph_in_memory_store_survives_checkpoint_recording(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stores: list[SQLiteStore] = []
+    original = langgraph_workflow._record_langgraph_checkpoint_event
+
+    def capture_store(**kwargs):
+        stores.append(kwargs["store"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        langgraph_workflow,
+        "_record_langgraph_checkpoint_event",
+        capture_store,
+    )
+
+    outcome = run_work_item_langgraph(
+        WorkflowRunRequest(
+            request_text="research NeuroFlow",
+            database_url="sqlite:///:memory:",
+            save=True,
+        )
+    )
+
+    assert outcome.result.advanced is True
+    events = stores[0].list_work_item_events(outcome.result.work_item.id)
+    assert any(event.event_type == "langgraph_orchestration" for event in events)
+
+
+def test_langgraph_request_runtime_context_resets_after_invoke_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingGraph:
+        def invoke(self, *_args, **_kwargs):
+            raise RuntimeError("graph failed")
+
+    monkeypatch.setattr(langgraph_workflow, "langgraph_available", lambda: True)
+    monkeypatch.setattr(
+        langgraph_workflow,
+        "build_work_item_langgraph",
+        lambda **_kwargs: FailingGraph(),
+    )
+
+    with pytest.raises(RuntimeError, match="graph failed"):
+        run_work_item_langgraph(
+            WorkflowRunRequest(request_text="research NeuroFlow", save=False)
+        )
+
+    assert langgraph_workflow._ACTIVE_REQUEST_RUNTIME.get() is None
+
+
 def test_langgraph_quality_comparison_requires_route_and_safety_fidelity() -> None:
     control = {
         "schema": "keystone.langgraph.quality_markers.v1",

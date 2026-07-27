@@ -27,6 +27,7 @@ from keystone_agents.slack_action_contract import (
     KBA_CREATE_GMAIL_DRAFT,
     KBA_FIND_CONTACT,
     KBA_INTENT_CONTINUE_WORK_ITEM,
+    KBA_INTENT_FIND_CONTACT,
     KBA_INTENT_MORE_RESEARCH,
     KBA_INTENT_OPEN_WORK_ITEM,
     KBA_INTENT_RESEARCH_ALL_CANDIDATES,
@@ -1065,6 +1066,17 @@ def test_kba_revise_draft_modal_submission_records_feedback_and_queues_agent(
     database_url = f"sqlite:///{tmp_path / 'slack-workitem.db'}"
     store = SQLiteStore(database_url)
     item = _save_linked_work_item_approval(store)
+    stale_research_plan = _canonical_research_plan(target="OpenEvidence")
+    item = item.model_copy(
+        update={
+            "target": WorkItemTarget(
+                name="OpenEvidence",
+                object_type="company",
+                metadata={"manual_request_plan": stale_research_plan},
+            )
+        }
+    )
+    store.save_work_item(item)
     calls: list[object] = []
 
     def fake_advance(request, **_kwargs):
@@ -1129,9 +1141,16 @@ def test_kba_revise_draft_modal_submission_records_feedback_and_queues_agent(
     assert request_authority.plan is not None
     assert request.manual_request_plan["intent"] == "outreach_draft"
     assert request.manual_request_plan["target_agent"] == WorkItemRoute.OUTREACH_COMPOSER.value
+    assert request.manual_request_plan["primary_target"] == "OpenEvidence"
+    assert request.manual_request_plan != stale_research_plan
+    assert request.manual_request_plan == request.orchestrator_preflight[
+        "manual_request_plan"
+    ]
     assert "slack_query_prompt" not in request.manual_request_plan
     assert request.slack_query_prompt["kind"] == "continue_or_revise"
-    assert request.orchestrator_preflight["request_text"].startswith("Revise the outreach draft")
+    assert request.orchestrator_preflight["request_text"].startswith(
+        "OpenEvidence outreach draft revision"
+    )
     assert request.orchestrator_preflight["manual_request_plan"]["requested_agent"] == (
         WorkItemRoute.OUTREACH_COMPOSER.value
     )
@@ -1238,6 +1257,11 @@ def test_kba_more_research_records_event_and_duplicate_is_idempotent(
     authority = ExecutionIntentAuthority.from_value(calls[0].manual_request_plan)
     assert authority.canonical is True
     assert calls[0].manual_request_plan == _canonical_research_plan()
+    assert calls[0].manual_request_plan["desired_count_explicit"] is True
+    assert calls[0].manual_request_plan["ask_shape"]["permission_state"] == "read_only"
+    assert calls[0].manual_request_plan["ask_shape"]["stop_condition"].startswith(
+        "Stop after exactly two"
+    )
     assert calls[0].manual_request_plan["intent"] == "company_research"
     assert "slack_query_prompt" not in calls[0].manual_request_plan
     assert duplicate.idempotent is True
@@ -1315,6 +1339,64 @@ def test_kba_run_again_reuses_persisted_canonical_plan(
     persisted = store.get_work_item(item.id)
     assert persisted is not None
     assert persisted.target.metadata["manual_request_plan"] == original_plan
+
+
+def test_kba_find_contact_replaces_stale_research_plan(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'slack-workitem.db'}"
+    store = SQLiteStore(database_url)
+    stale_plan = _canonical_research_plan(target="NeuroFlow")
+    item = _save_linked_work_item_approval(store)
+    item = item.model_copy(
+        update={
+            "target": WorkItemTarget(
+                name="NeuroFlow",
+                object_type="company",
+                metadata={"manual_request_plan": stale_plan},
+            ),
+        }
+    )
+    store.save_work_item(item)
+    captured: list[object] = []
+
+    def fake_advance(request, **_kwargs):
+        captured.append(request)
+        loaded = SQLiteStore(database_url).get_work_item(item.id)
+        assert loaded is not None
+        return WorkflowRunResult(
+            work_item=loaded,
+            route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            status=loaded.status,
+            advanced=False,
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.slack_interactions.advance_work_item_manager_loop_with_optional_langgraph",
+        fake_advance,
+    )
+
+    result = handle_slack_approval_interaction(
+        _kba_payload(
+            action_id=KBA_FIND_CONTACT,
+            intent=KBA_INTENT_FIND_CONTACT,
+            approval_id="approval-workitem",
+            work_item_id=item.id,
+        ),
+        database_url=database_url,
+    )
+
+    assert result.outcome == "contact_search_completed"
+    request = captured[0]
+    assert request.manual_request_plan != stale_plan
+    assert request.manual_request_plan == request.orchestrator_preflight[
+        "manual_request_plan"
+    ]
+    assert request.manual_request_plan["task_objective"] == "contact_discovery"
+    assert request.manual_request_plan["expected_artifact_type"] == "contact_candidates"
+    assert request.manual_request_plan["primary_target"] == "NeuroFlow"
+    assert request.request_text.endswith("for NeuroFlow.")
 
 
 def test_kba_more_research_retry_after_started_event_is_not_deduped(
@@ -1825,6 +1907,73 @@ def test_kba_continue_reuses_canonical_plan_without_planner_call(
     assert "sdk_usage_events" not in request.orchestrator_preflight
     assert request.slack_query_prompt["kind"] == "continue_or_revise"
     assert request.request_text == "continue"
+
+
+@pytest.mark.parametrize(
+    "route",
+    [WorkItemRoute.OUTREACH_COMPOSER, WorkItemRoute.GMAIL_TRIAGE],
+)
+def test_kba_continue_query_prompt_keeps_current_specialist_route(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    route: WorkItemRoute,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / f'{route.value}.db'}"
+    store = SQLiteStore(database_url)
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent=route.value,
+        target_agent=route.value,
+        workflow=[route.value],
+        intent=("outreach_draft" if route == WorkItemRoute.OUTREACH_COMPOSER else "gmail_triage"),
+        primary_target="selected thread",
+    ).model_dump(mode="json")
+    item = WorkItem(
+        kind=(
+            WorkItemKind.OUTREACH
+            if route == WorkItemRoute.OUTREACH_COMPOSER
+            else WorkItemKind.GMAIL_THREAD
+        ),
+        status=WorkItemStatus.IN_PROGRESS,
+        title=f"Continue {route.value}",
+        request_text=f"run {route.value}",
+        target=WorkItemTarget(
+            name="selected thread",
+            object_type="operator_reference",
+            metadata={"manual_request_plan": plan},
+        ),
+        current_route=route,
+    )
+    store.save_work_item(item)
+    captured: list[object] = []
+
+    def fake_advance(request, **_kwargs):
+        captured.append(request)
+        loaded = SQLiteStore(database_url).get_work_item(item.id)
+        assert loaded is not None
+        return WorkflowRunResult(
+            work_item=loaded,
+            route=route,
+            status=loaded.status,
+            advanced=False,
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.slack_interactions.advance_work_item_manager_loop_with_optional_langgraph",
+        fake_advance,
+    )
+
+    handle_slack_approval_interaction(
+        _kba_payload(
+            action_id=KBA_COS_CONTINUE_WORK_ITEM,
+            intent=KBA_INTENT_CONTINUE_WORK_ITEM,
+            approval_id="",
+            work_item_id=item.id,
+        ),
+        database_url=database_url,
+    )
+
+    assert captured[0].slack_query_prompt["target_route"] == route.value
 
 
 def test_kba_overflow_show_sources_and_open_work_item_are_read_only(tmp_path) -> None:
