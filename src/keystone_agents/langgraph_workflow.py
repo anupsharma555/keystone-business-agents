@@ -59,7 +59,7 @@ from keystone_agents.schemas.work_item import (
     WorkItemSourceRef,
     WorkItemStatus,
 )
-from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
+from keystone_agents.storage.sqlite_store import SQLiteStore
 from keystone_agents.tools.announcement_context_tools import (
     retrieve_preprint_announcement_history_impl,
     retrieve_rss_announcement_history_impl,
@@ -1663,11 +1663,7 @@ def _manager_loop_finalize_node(state: WorkItemGraphState) -> WorkItemGraphState
         or "stopped because no next graph edge was available"
     )
     loop_steps = list(state.get("loop_steps") or [])
-    store = (
-        SQLiteStore(original_request.database_url or database_url_from_env())
-        if original_request.save
-        else None
-    )
+    store = _request_store(original_request)
     result = finalize_manager_loop_result(
         result,
         original_request=original_request,
@@ -1678,7 +1674,7 @@ def _manager_loop_finalize_node(state: WorkItemGraphState) -> WorkItemGraphState
     )
     if original_request.save:
         if store is None:
-            store = SQLiteStore(original_request.database_url or database_url_from_env())
+            raise RuntimeError("Saved graph requests require a request-owned store.")
         node_path = [*state.get("node_path", []), "manager_loop_finalize"]
         graph_completion_review = _graph_completion_review(
             original_request=original_request,
@@ -1732,6 +1728,12 @@ def _request_runtime(request: WorkflowRunRequest) -> RequestRuntime:
     if runtime is None:
         return RequestRuntime.from_workflow_request(request)
     return runtime.with_request(request)
+
+
+def _request_store(request: WorkflowRunRequest) -> SQLiteStore | None:
+    """Return the request-owned store without constructing a node-local copy."""
+
+    return _request_runtime(request).store
 
 
 def _normalize_request_node(state: WorkItemGraphState) -> WorkItemGraphState:
@@ -1862,9 +1864,8 @@ def _stage_feed_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
         ),
         artifact,
     )
-    store = None
-    if prepared.request.save:
-        store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+    store = _request_store(prepared.request)
+    if store is not None:
         store.save_work_item(work_item)
     prepared = PreparedWorkItemStep(
         request=prepared.request,
@@ -1875,7 +1876,7 @@ def _stage_feed_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
     )
     if prepared.request.save:
         if store is None:
-            store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+            raise RuntimeError("Saved graph requests require a request-owned store.")
         record_event(
             work_item,
             event_type="context_evidence_staged",
@@ -1968,9 +1969,8 @@ def _stage_zotero_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
         request_text,
         prepared=prepared,
     )
-    store = None
-    if prepared.request.save:
-        store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+    store = _request_store(prepared.request)
+    if store is not None:
         store.save_work_item(work_item)
     prepared = PreparedWorkItemStep(
         request=prepared.request,
@@ -1981,7 +1981,7 @@ def _stage_zotero_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
     )
     if prepared.request.save:
         if store is None:
-            store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+            raise RuntimeError("Saved graph requests require a request-owned store.")
         record_event(
             work_item,
             event_type="context_evidence_staged",
@@ -2076,9 +2076,8 @@ def _stage_airtable_context_node(state: WorkItemGraphState) -> WorkItemGraphStat
             ),
             artifact,
         )
-        store = None
-        if prepared.request.save:
-            store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+        store = _request_store(prepared.request)
+        if store is not None:
             store.save_work_item(work_item)
         prepared = PreparedWorkItemStep(
             request=prepared.request,
@@ -2089,7 +2088,7 @@ def _stage_airtable_context_node(state: WorkItemGraphState) -> WorkItemGraphStat
         )
         if prepared.request.save:
             if store is None:
-                store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+                raise RuntimeError("Saved graph requests require a request-owned store.")
             record_event(
                 work_item,
                 event_type="context_evidence_staged",
@@ -2174,11 +2173,8 @@ def _stage_airtable_context_node(state: WorkItemGraphState) -> WorkItemGraphStat
             ),
             artifact,
         ).touch()
-        store = None
-        if prepared.request.save:
-            store = SQLiteStore(
-                prepared.request.database_url or database_url_from_env()
-            )
+        store = _request_store(prepared.request)
+        if store is not None:
             store.save_work_item(work_item)
             record_event(
                 work_item,
@@ -2255,9 +2251,8 @@ def _stage_airtable_context_node(state: WorkItemGraphState) -> WorkItemGraphStat
         ),
         artifact,
     ).touch()
-    store = None
-    if prepared.request.save:
-        store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+    store = _request_store(prepared.request)
+    if store is not None:
         store.save_work_item(work_item)
         record_event(
             work_item,
@@ -2371,9 +2366,8 @@ def _stage_google_workspace_context_node(state: WorkItemGraphState) -> WorkItemG
             ),
             artifact,
         )
-        store = None
-        if prepared.request.save:
-            store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+        store = _request_store(prepared.request)
+        if store is not None:
             store.save_work_item(work_item)
         prepared = PreparedWorkItemStep(
             request=prepared.request,
@@ -2384,7 +2378,7 @@ def _stage_google_workspace_context_node(state: WorkItemGraphState) -> WorkItemG
         )
         if prepared.request.save:
             if store is None:
-                store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+                raise RuntimeError("Saved graph requests require a request-owned store.")
             record_event(
                 work_item,
                 event_type="context_evidence_staged",
@@ -2470,9 +2464,8 @@ def _stage_google_workspace_context_node(state: WorkItemGraphState) -> WorkItemG
         ),
         artifact,
     ).touch()
-    store = None
-    if prepared.request.save:
-        store = SQLiteStore(prepared.request.database_url or database_url_from_env())
+    store = _request_store(prepared.request)
+    if store is not None:
         store.save_work_item(work_item)
         record_event(
             work_item,
@@ -2590,11 +2583,7 @@ def _finalize_step_node(state: WorkItemGraphState) -> WorkItemGraphState:
         original_request = WorkflowRunRequest.model_validate(
             state.get("original_request") or state.get("request") or {}
         )
-        store = (
-            SQLiteStore(original_request.database_url or database_url_from_env())
-            if original_request.save
-            else None
-        )
+        store = _request_store(original_request)
         step_index = len(loop_steps) + 1
         result = review_and_reconcile_manager_step(
             result,

@@ -1283,6 +1283,21 @@ def test_langgraph_request_runtime_context_resets_after_invoke_error(
     assert langgraph_workflow._ACTIVE_REQUEST_RUNTIME.get() is None
 
 
+def test_langgraph_restores_outer_request_runtime_after_nested_invoke() -> None:
+    outer_request = WorkflowRunRequest(request_text="outer", save=False)
+    outer_runtime = RequestRuntime.from_workflow_request(outer_request)
+    token = langgraph_workflow._ACTIVE_REQUEST_RUNTIME.set(outer_runtime)
+    try:
+        outcome = run_work_item_langgraph(
+            WorkflowRunRequest(request_text="research NeuroFlow", save=False)
+        )
+
+        assert outcome.result.advanced is True
+        assert langgraph_workflow._ACTIVE_REQUEST_RUNTIME.get() is outer_runtime
+    finally:
+        langgraph_workflow._ACTIVE_REQUEST_RUNTIME.reset(token)
+
+
 def test_langgraph_quality_comparison_requires_route_and_safety_fidelity() -> None:
     control = {
         "schema": "keystone.langgraph.quality_markers.v1",
@@ -7616,9 +7631,22 @@ def test_langgraph_stages_preprints_context_before_business_research(
 
 def test_langgraph_stages_feed_and_zotero_context_before_business_research(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database_url = _database_url(tmp_path)
     store = SQLiteStore(database_url)
+    runtime_calls: list[str] = []
+    original_runtime = RequestRuntime.from_workflow_request.__func__
+
+    def tracked_runtime(cls, request):
+        runtime_calls.append(request.database_url or "")
+        return original_runtime(cls, request)
+
+    monkeypatch.setattr(
+        RequestRuntime,
+        "from_workflow_request",
+        classmethod(tracked_runtime),
+    )
     store.save_announcement_feed_item(
         AnnouncementFeedItem(
             title="Preprint on depression evidence workflows",
@@ -7707,6 +7735,7 @@ def test_langgraph_stages_feed_and_zotero_context_before_business_research(
         for artifact in outcome.result.work_item.artifact_refs
         if artifact.source_agent in {"preprints_context_agent", "zotero_context_agent"}
     )
+    assert runtime_calls == [database_url]
 
 
 def test_langgraph_stages_google_workspace_artifact_plan_before_approval_checkpoint(
