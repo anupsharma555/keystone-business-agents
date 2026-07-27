@@ -1727,6 +1727,11 @@ def _request_runtime(request: WorkflowRunRequest) -> RequestRuntime:
     runtime = _ACTIVE_REQUEST_RUNTIME.get()
     if runtime is None:
         return RequestRuntime.from_workflow_request(request)
+    if not runtime.matches_storage_scope(request):
+        raise RuntimeError(
+            "LangGraph request storage scope changed during one invocation; "
+            "resume with the original save and database settings."
+        )
     return runtime.with_request(request)
 
 
@@ -1817,6 +1822,7 @@ def _stage_feed_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
         kind=kind,
         request_text=request_text,
         database_url=prepared.request.database_url,
+        store=_request_store(prepared.request),
     )
     source_refs = _feed_context_source_refs(
         work_item_id=work_item.id,
@@ -3771,6 +3777,7 @@ def _retrieve_feed_context_history(
     kind: Literal["rss", "preprints"],
     request_text: str,
     database_url: str | None,
+    store: SQLiteStore | None,
 ) -> dict[str, Any]:
     query = _compact_context_edge_text(request_text, 240)
     if kind == "preprints":
@@ -3779,12 +3786,14 @@ def _retrieve_feed_context_history(
             selected_only=True,
             limit=5,
             database_url=database_url,
+            store=store,
         )
     return retrieve_rss_announcement_history_impl(
         query=query,
         selected_only=True,
         limit=5,
         database_url=database_url,
+        store=store,
     )
 
 

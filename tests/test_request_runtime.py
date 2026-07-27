@@ -67,6 +67,25 @@ def test_request_runtime_rebuilds_store_when_storage_scope_changes(
     ]
 
 
+def test_request_runtime_reports_storage_scope_compatibility() -> None:
+    request = WorkflowRunRequest(
+        request_text="first",
+        database_url="sqlite:////tmp/kba-runtime-a.sqlite3",
+        save=True,
+    )
+    runtime = RequestRuntime.from_workflow_request(request)
+
+    assert runtime.matches_storage_scope(
+        request.model_copy(update={"request_text": "normalized"})
+    )
+    assert not runtime.matches_storage_scope(
+        request.model_copy(update={"database_url": "sqlite:////tmp/kba-runtime-b.sqlite3"})
+    )
+    assert not runtime.matches_storage_scope(
+        request.model_copy(update={"save": False})
+    )
+
+
 def test_request_runtime_builds_named_service_once() -> None:
     runtime = RequestRuntime.from_workflow_request(
         WorkflowRunRequest(request_text="fixture", save=False)

@@ -1298,6 +1298,25 @@ def test_langgraph_restores_outer_request_runtime_after_nested_invoke() -> None:
         langgraph_workflow._ACTIVE_REQUEST_RUNTIME.reset(token)
 
 
+def test_langgraph_rejects_storage_scope_drift_without_rebinding() -> None:
+    outer_request = WorkflowRunRequest(request_text="outer", save=False)
+    outer_runtime = RequestRuntime.from_workflow_request(outer_request)
+    token = langgraph_workflow._ACTIVE_REQUEST_RUNTIME.set(outer_runtime)
+    try:
+        restored_request = WorkflowRunRequest(
+            request_text="resume",
+            save=True,
+            database_url="sqlite:///:memory:",
+        )
+
+        with pytest.raises(RuntimeError, match="storage scope changed"):
+            langgraph_workflow._request_runtime(restored_request)
+
+        assert langgraph_workflow._ACTIVE_REQUEST_RUNTIME.get() is outer_runtime
+    finally:
+        langgraph_workflow._ACTIVE_REQUEST_RUNTIME.reset(token)
+
+
 def test_langgraph_quality_comparison_requires_route_and_safety_fidelity() -> None:
     control = {
         "schema": "keystone.langgraph.quality_markers.v1",
@@ -7636,16 +7655,30 @@ def test_langgraph_stages_feed_and_zotero_context_before_business_research(
     database_url = _database_url(tmp_path)
     store = SQLiteStore(database_url)
     runtime_calls: list[str] = []
+    store_calls: list[str] = []
     original_runtime = RequestRuntime.from_workflow_request.__func__
+    original_store = SQLiteStore
 
     def tracked_runtime(cls, request):
         runtime_calls.append(request.database_url or "")
         return original_runtime(cls, request)
 
+    def tracked_store(database_url: str):
+        store_calls.append(database_url)
+        return original_store(database_url)
+
     monkeypatch.setattr(
         RequestRuntime,
         "from_workflow_request",
         classmethod(tracked_runtime),
+    )
+    monkeypatch.setattr(
+        "keystone_agents.runtime.request.SQLiteStore",
+        tracked_store,
+    )
+    monkeypatch.setattr(
+        "keystone_agents.tools.announcement_context_tools.SQLiteStore",
+        tracked_store,
     )
     store.save_announcement_feed_item(
         AnnouncementFeedItem(
@@ -7736,6 +7769,7 @@ def test_langgraph_stages_feed_and_zotero_context_before_business_research(
         if artifact.source_agent in {"preprints_context_agent", "zotero_context_agent"}
     )
     assert runtime_calls == [database_url]
+    assert store_calls == [database_url]
 
 
 def test_langgraph_stages_google_workspace_artifact_plan_before_approval_checkpoint(
