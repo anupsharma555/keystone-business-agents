@@ -167,8 +167,10 @@ _COUNT_RE = re.compile(
     r"(?:how\s+)?"
     r"(?:up\s+to\s+)?(?P<count>\d{1,2})\b"
     r"|\b(?P<count2>\d{1,2})\s+"
-    r"(?:[a-z][\w-]*\s+){0,4}"
-    r"(?:opportunities|companies|institutes|researchers|conferences|people|leads|emails|"
+    r"(?:[a-z][\w.-]*\s+){0,6}"
+    r"(?:opportunities|companies|programs|accelerators|incubators|institutes|"
+    r"researchers|conferences|people|leads|emails|"
+    r"messages|threads|conversations|"
     r"roles|jobs|positions|postings|openings|products|targets|vendors|"
     r"preprints|papers|articles|bullets|items|points|talking\s+points|"
     r"recommendations)\b",
@@ -192,8 +194,10 @@ _COUNT_WORD_RE = re.compile(
     r"(?:up\s+to\s+|the\s+)?"
     r"(?P<count_word>one|two|three|four|five|six|seven|eight|nine|ten)\b"
     r"|\b(?P<count_word2>one|two|three|four|five|six|seven|eight|nine|ten)\s+"
-    r"(?:[a-z][\w-]*\s+){0,4}"
-    r"(?:opportunities|companies|institutes|researchers|conferences|people|leads|emails|"
+    r"(?:[a-z][\w.-]*\s+){0,6}"
+    r"(?:opportunities|companies|programs|accelerators|incubators|institutes|"
+    r"researchers|conferences|people|leads|emails|"
+    r"messages|threads|conversations|"
     r"roles|jobs|positions|postings|openings|products|targets|vendors|"
     r"preprints|papers|articles|bullets|items|points|talking\s+points|"
     r"recommendations)\b",
@@ -321,7 +325,8 @@ _NO_EXTERNAL_RESEARCH_RE = re.compile(
     r"|"
     r"\b(?:use|using|based)\s+only(?:\s+on)?\b"
     r"[^.;\n]{0,160}\b"
-    r"(?:context|note|packet|materials?|facts?|(?:selected\s+)?thread|email)\b",
+    r"(?:analysis|brief|context|dossier|note|packet|profile|report|research|"
+    r"materials?|facts?|(?:selected\s+)?thread|email)\b",
     re.I,
 )
 _WORKFLOW_AGENT_MARKER_RE = re.compile(
@@ -350,6 +355,18 @@ _RESEARCH_COMPANY_ACTION_RE = re.compile(
     r"\b(?i:research|profile|analyze|investigate|assess|summarize)\s+"
     r"(?P<name>(?:[A-Z][\w&.-]*|[A-Z]{2,})(?:\s+(?:[A-Z][\w&.-]*|[A-Z]{2,})){0,5})"
     r"\s+(?i:as|for|with|and|before|using|from|about|to|,|\.)\b"
+)
+_RESEARCH_ENTITY_TARGET_RE = re.compile(
+    r"\b(?:(?i:deeply|first|thoroughly)\s+)?"
+    r"(?i:research|profile|analyze|investigate|assess|study|summarize)\s+"
+    r"(?:(?i:the\s+company)\s+)?"
+    r"(?P<name>[A-Z0-9][\w&.-]*(?:\s+[A-Z0-9][\w&.-]*){0,5}?)"
+    r"(?=[?.,;:]|\s+(?i:first|then|before|using|with|for|on|across|by|and)\b|$)",
+)
+_EVALUATED_ENTITY_TARGET_RE = re.compile(
+    r"\b(?i:assess|evaluate|decide|determine)\s+(?i:whether|if)\s+"
+    r"(?P<name>[A-Z0-9][\w&.-]*(?:\s+[A-Z0-9][\w&.-]*){0,5}?)"
+    r"\s+(?i:is|would|has|could|represents|offers)\b",
 )
 _COMPANY_PROFILE_TARGET_PATTERNS = (
     re.compile(
@@ -381,7 +398,24 @@ _COMPANY_COMPARISON_RE = re.compile(
 )
 _COMPANY_LIST_COMPARISON_RE = re.compile(
     r"\bcompare\s+(?P<companies>[^.;:]+?)"
-    r"(?=\s+and\s+(?:explain|summarize|tell|show|identify|describe)\b|[.;:]|$)",
+    r"(?=\s+(?:on|across|by)\s+|"
+    r"\s+and\s+(?:explain|summarize|tell|show|identify|describe)\b|[.;:]|$)",
+    re.I,
+)
+_ANCHORED_RESEARCH_TARGET_RE = re.compile(
+    r"\b(?:(?i:deeply)\s+|(?i:first)\s+)?"
+    r"(?i:research|profile|analyze|investigate|assess)\s+"
+    r"(?P<name>(?:[A-Z][\w&.-]*|[A-Z]{2,})"
+    r"(?:\s+(?:[A-Z][\w&.-]*|[A-Z]{2,})){0,5})"
+    r"\s*,?\s+(?i:then|before)\s+"
+    r"(?i:identify|find|discover|compare|research)\b",
+)
+_OPEN_SET_COMPARISON_ANCHOR_RE = re.compile(
+    r"\b(?:competitors?|alternatives?|peers?|companies\s+similar)\s+"
+    r"(?:to|of|for|with)\s+"
+    r"(?P<name>(?:[A-Z0-9][\w&.-]*)(?:\s+(?:[A-Z0-9][\w&.-]*)){0,5})"
+    r"(?=[?.,;:]|\s+(?:that|which|who|in|using|with|focused|focusing|"
+    r"serving|providing)\b|$)",
     re.I,
 )
 _COMPANY_WORTH_RE = re.compile(
@@ -447,6 +481,12 @@ def infer_manual_request_plan(
     )
     desired_count = _desired_count(text)
     desired_count_explicit = _desired_count_is_domain_limit(text)
+    desired_count_mode = (
+        _desired_count_mode(text) if desired_count_explicit else "unspecified"
+    )
+    desired_count_scope = (
+        _desired_count_scope(text) if desired_count_explicit else "unspecified"
+    )
     target_agent = _semantic_target_agent(request, text, requested_agent=normalized_agent)
     chief_context_workflow, chief_work_items_requested = (
         _chief_multi_source_context_workflow(text)
@@ -487,6 +527,17 @@ def infer_manual_request_plan(
         if workflow
         else _primary_target(text, target_agent=target_agent)
     )
+    research_set = _research_target_set_contract(
+        text,
+        target_agent=target_agent,
+        desired_count=desired_count,
+        desired_count_explicit=desired_count_explicit,
+        desired_count_scope=desired_count_scope,
+    )
+    if research_set["primary_target"]:
+        inferred_primary_target = str(research_set["primary_target"])
+    if research_set["desired_count_scope"]:
+        desired_count_scope = str(research_set["desired_count_scope"])
     workflow_allowed = normalized_agent in {None, "orchestrator"}
     intent = (
         "outreach_draft"
@@ -527,6 +578,8 @@ def infer_manual_request_plan(
         zotero_context=zotero_context,
     )
     ask_shape = _ask_shape_policy(text)
+    if research_set["multi_target"]:
+        ask_shape = ask_shape.model_copy(update={"ask_breadth": "broad"})
     if chief_context_summary:
         source_by_route = {
             "gmail_triage": "gmail",
@@ -571,6 +624,8 @@ def infer_manual_request_plan(
             if chief_context_summary
             else "zotero_article"
             if zotero_selection_rank is not None
+            else str(research_set["target_type"])
+            if research_set["target_type"]
             else "topic"
             if workflow and inferred_target_type == "unknown"
             else inferred_target_type
@@ -597,6 +652,7 @@ def infer_manual_request_plan(
             if internal_contact_lookup
             or gmail_collection_read
             or zotero_selection_rank is not None
+            or research_set["multi_target"]
             else "unspecified"
         ),
         provider_selection_order=zotero_selection_order,
@@ -654,6 +710,14 @@ def infer_manual_request_plan(
             if airtable_record_plan_requested
             else "none"
             if workflow
+            else "research_brief"
+            if (
+                research_set["multi_target"]
+                and (
+                    research_set["anchor_entity"]
+                    or research_set["required_entities"]
+                )
+            )
             else _expected_artifact_type(
                 text,
                 target_agent=target_agent,
@@ -662,10 +726,19 @@ def infer_manual_request_plan(
         ),
         desired_count=desired_count,
         desired_count_explicit=desired_count_explicit,
+        desired_count_mode=desired_count_mode,
+        desired_count_scope=desired_count_scope,
+        requires_target_discovery=bool(research_set["requires_target_discovery"]),
+        anchor_entity=str(research_set["anchor_entity"]),
         constraints=_constraints(text),
         ask_shape=ask_shape,
-        required_entities=_required_entities(text),
-        required_terms=_required_terms(text),
+        required_entities=list(research_set["required_entities"])
+        or _required_entities(text),
+        required_terms=(
+            _comparison_dimensions(text)
+            if research_set["multi_target"]
+            else _required_terms(text)
+        ),
         gmail_query=_gmail_query(text) if intent == "gmail_triage" else "",
         lookback_days=_lookback_days(text) if intent == "gmail_triage" else None,
         draft_policy=(
@@ -1071,8 +1144,8 @@ def _infer_goal_workflow(text: str) -> list[ManualTargetAgent]:
             "gmail_triage",
             re.compile(
                 r"\b(?:review|triage|summari[sz]e|extract|inspect)\b"
-                r"[\s\S]{0,140}\b(?:gmail|email|inbox)\b"
-                r"|\b(?:gmail|email|inbox)\b"
+                r"[\s\S]{0,140}\b(?:gmail|email|inbox|mailbox)\b"
+                r"|\b(?:gmail|email|inbox|mailbox)\b"
                 r"[\s\S]{0,140}\b(?:review|triage|summari[sz]e|extract|inspect)\b",
                 re.I,
             ),
@@ -1172,6 +1245,8 @@ def request_forbids_live_research(text: str) -> bool:
     """Return whether the operator explicitly bounded work away from live research."""
 
     source = _without_reported_quoted_text(text)
+    if _has_supplied_context_boundary(source):
+        return True
     explicit_constraints = _explicit_negative_constraints(source)
     if any(_negative_constraint_forbids_live_search(item) for item in explicit_constraints):
         return True
@@ -1336,7 +1411,7 @@ def _ask_shape_policy(text: str) -> AskShapePolicy:
             else "bullets"
             if re.search(r"\b(?:bullets?|bulleted|talking\s+points?)\b", lower)
             else "plan"
-            if re.search(r"\b(?:plan|next steps)\b", lower)
+            if _explicit_plan_output_request(lower)
             else "draft"
             if draft_requested
             else "brief"
@@ -1373,6 +1448,39 @@ def _ask_shape_policy(text: str) -> AskShapePolicy:
         ),
         stop_condition=stop_condition,
         output_constraints=output_constraints,
+    )
+
+
+def _explicit_plan_output_request(text: str) -> bool:
+    """Recognize a requested planning artifact, not an incidental plan noun."""
+
+    normalized = " ".join(str(text or "").casefold().split())
+    if not normalized:
+        return False
+    if re.search(
+        r"\b(?:plan\s+and\s+(?:execute|run|research|perform|complete)|"
+        r"(?:execute|run|perform|complete)\s+(?:the\s+)?plan)\b",
+        normalized,
+    ):
+        return False
+    if re.search(
+        r"\b(?:pricing|subscription|treatment|business|health|insurance)\s+plan\b",
+        normalized,
+    ):
+        return False
+    if re.search(
+        r"\b(?:plan\s+only|planning\s+only|do\s+not\s+execute|"
+        r"without\s+executing|no\s+execution)\b",
+        normalized,
+    ):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:give|provide|create|write|outline|prepare|show)\b"
+            r"[^.;\n]{0,60}\b(?:research\s+|execution\s+|workflow\s+)?plan\b",
+            normalized,
+        )
+        or re.search(r"\b(?:give|provide|outline)\b[^.;\n]{0,40}\bnext steps\b", normalized)
     )
 
 
@@ -1958,6 +2066,15 @@ def merge_manual_request_plan(
         plan = _repair_structurally_invalid_llm_plan(base, plan)
         plan = _prune_forbidden_llm_capabilities(base, plan)
     candidate_values = plan.model_dump(mode="json")
+    if base.desired_count_explicit:
+        # Exact arithmetic belongs to the deterministic current-turn contract.
+        # A planner may explain the request, but it must not bind a later
+        # per-item source count (for example "at least one official source") to
+        # the earlier domain-result count.
+        candidate_values["desired_count"] = base.desired_count
+        candidate_values["desired_count_explicit"] = True
+        candidate_values["desired_count_mode"] = base.desired_count_mode
+        candidate_values["desired_count_scope"] = base.desired_count_scope
     if base.requested_agent not in {None, ""}:
         # ``requested_agent`` records the human entry surface. The semantic
         # planner may select a better execution owner in ``target_agent``, but
@@ -2051,6 +2168,33 @@ def merge_manual_request_plan(
         merged.requested_agent = base.requested_agent
     if not merged.primary_target:
         merged.primary_target = base.primary_target
+    if not merged.anchor_entity:
+        merged.anchor_entity = base.anchor_entity
+    bounded_research_topology_agreement = bool(
+        llm_interpretation
+        and base.target_agent == merged.target_agent == "business_research_analyst"
+        and base.intent == merged.intent
+        and base.intent in {"company_research", "research_brief"}
+        and base.expected_artifact_type == merged.expected_artifact_type
+        and base.expected_artifact_type in {"research_brief", "source_summary"}
+    )
+    if bounded_research_topology_agreement:
+        base_has_target_topology = bool(
+            base.anchor_entity
+            or base.required_entities
+            or base.requires_target_discovery
+        )
+        if base_has_target_topology:
+            merged.target_type = base.target_type
+            merged.primary_target = base.primary_target
+            merged.requires_target_discovery = base.requires_target_discovery
+            merged.anchor_entity = base.anchor_entity
+            merged.required_entities = list(base.required_entities)
+        elif merged.target_type == "unknown":
+            merged.target_type = base.target_type
+        merged.required_terms = list(
+            dict.fromkeys([*base.required_terms, *merged.required_terms])
+        )
     if not merged.objective:
         merged.objective = base.objective
     if llm_interpretation:
@@ -2268,7 +2412,40 @@ def merge_manual_request_plan(
     if base.desired_count_explicit:
         merged.desired_count = base.desired_count
         merged.desired_count_explicit = True
+        merged.desired_count_mode = base.desired_count_mode
+        merged.desired_count_scope = base.desired_count_scope
     merged.desired_count = max(1, min(10, merged.desired_count or base.desired_count))
+    if (
+        base.ask_shape.output_form == "plan"
+        and _explicit_plan_output_request(base.objective)
+    ):
+        merged.target_agent = (
+            base.target_agent
+            if base.target_agent in {"orchestrator", "chief_of_staff"}
+            else "orchestrator"
+        )
+        merged.intent = "route_request"
+        merged.task_objective = "route_or_continue"
+        merged.expected_artifact_type = "none"
+        merged.workflow = []
+        merged.provider_operations = []
+        merged.provider_action_steps = []
+        merged.requires_target_discovery = False
+        merged.anchor_entity = ""
+        merged.requires_live_search = False
+        merged.requires_approved_context = False
+        merged.requires_durable_state = False
+        merged.planner_warnings = list(
+            dict.fromkeys(
+                [
+                    *merged.planner_warnings,
+                    (
+                        "Preserved the authoritative current turn as a non-executing "
+                        "plan-only request."
+                    ),
+                ]
+            )
+        )
     merged.side_effect_policy = (
         "internal_write_approval_required"
         if merged.intent == "business_system_write"
@@ -2574,6 +2751,58 @@ def _normalize_llm_plan_contract(candidate: ManualRequestPlan) -> ManualRequestP
     }
     updates: dict[str, Any] = {}
     warnings = list(candidate.planner_warnings)
+    if _single_owner_research_contract(candidate):
+        if candidate.anchor_entity and not candidate.requires_target_discovery:
+            updates["requires_target_discovery"] = True
+            warnings.append(
+                "Recovered target discovery from the typed anchor-entity contract "
+                "after the planner left its discovery flag at the default."
+            )
+        unrelated_stages = [
+            route
+            for route in candidate.workflow
+            if route != "business_research_analyst"
+        ]
+        if unrelated_stages:
+            updates["workflow"] = []
+            warnings.append(
+                "Removed downstream stages that did not own the typed research "
+                "deliverable; Business Research remains the single semantic owner."
+            )
+        if candidate.target_agent != "business_research_analyst":
+            updates["target_agent"] = "business_research_analyst"
+            warnings.append(
+                "Normalized the executable research brief to its Business Research owner."
+            )
+    if _planner_only_shape_conflicts_with_execution(candidate):
+        output_constraints = candidate.ask_shape.output_constraints
+        planning_only_styles = {
+            "plan only",
+            "plan-only",
+            "planning only",
+            "planning-only",
+        }
+        cleaned_styles = [
+            style
+            for style in output_constraints.style_requirements
+            if " ".join(str(style or "").casefold().split()) not in planning_only_styles
+        ]
+        cleaned_constraints = output_constraints.model_copy(
+            update={
+                "interpretation": "",
+                "style_requirements": cleaned_styles,
+            }
+        )
+        updates["ask_shape"] = candidate.ask_shape.model_copy(
+            update={
+                "output_form": "unspecified",
+                "output_constraints": cleaned_constraints,
+            }
+        )
+        warnings.append(
+            "Removed an ungrounded plan-only response shape from an executable "
+            "research contract."
+        )
     if internal_gmail_collection_draft:
         updates.update(
             {
@@ -2618,6 +2847,29 @@ def _normalize_llm_plan_contract(candidate: ManualRequestPlan) -> ManualRequestP
         return candidate
     updates["planner_warnings"] = list(dict.fromkeys(warnings))
     return candidate.model_copy(update=updates)
+
+
+def _single_owner_research_contract(candidate: ManualRequestPlan) -> bool:
+    """Keep research-only artifacts with Business Research, not Opportunity Scout."""
+
+    return bool(
+        candidate.intent in {"company_research", "research_brief"}
+        and candidate.task_objective in {"entity_research", "source_research"}
+        and candidate.expected_artifact_type in {"research_brief", "source_summary"}
+    )
+
+
+def _planner_only_shape_conflicts_with_execution(candidate: ManualRequestPlan) -> bool:
+    """Reject plan-only copy when the typed plan authorizes actual execution."""
+
+    if candidate.ask_shape.output_form != "plan":
+        return False
+    return bool(
+        candidate.requires_live_search
+        or candidate.provider_operations
+        or candidate.workflow
+        or candidate.requires_durable_state
+    )
 
 
 def _repair_structurally_invalid_llm_plan(
@@ -2908,6 +3160,13 @@ def _prune_forbidden_llm_capabilities(
                 "task_objective": "route_or_continue",
                 "expected_artifact_type": "none",
                 "requires_approved_context": False,
+                "recipient": "",
+                "outreach_channel": "",
+                "tone": "",
+                "draft_policy": "no_drafts_requested",
+                "ask_shape": candidate.ask_shape.model_copy(
+                    update={"permission_state": "read_only"}
+                ),
                 "side_effect_policy": "draft_or_read_only",
             }
         )
@@ -3073,6 +3332,16 @@ def _semantic_target_agent(
         # generic company/research and side-effect fallbacks inspect its title.
         return "chief_of_staff"
     if _looks_like_research_table_synthesis(route_text):
+        return "business_research_analyst"
+    if (
+        requested_agent == "opportunity_scout"
+        and _looks_like_opportunity_deliverable_request(route_text)
+    ):
+        return "opportunity_scout"
+    if (
+        _ask_shape_policy(route_text).output_form != "plan"
+        and _looks_like_multi_target_source_research_request(route_text)
+    ):
         return "business_research_analyst"
     if _looks_like_unnamed_company_set_discovery(route_text):
         return "opportunity_scout"
@@ -3368,16 +3637,25 @@ def _has_supplied_context_boundary(text: str) -> bool:
             r"(?:this|the|these|those|provided|supplied|operator[- ]supplied)\s+"
             r"(?:(?:approved|provided|supplied|operator[- ]supplied)\s+)?"
             r"(?:(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+)?"
-            r"(?:note|notes|fact|facts|text|material|information|details|context)\b"
+            r"(?:company\s+)?(?:analysis|brief|dossier|note|notes|fact|facts|text|material|"
+            r"information|details|context|packet|profile|report|research)\b"
+            r"|\bbased\s+only\s+on\s+"
+            r"(?:this|the|these|those|provided|supplied|operator[- ]supplied)\s+"
+            r"(?:(?:approved|provided|supplied|operator[- ]supplied)\s+)?"
+            r"(?:(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+)?"
+            r"(?:company\s+)?(?:analysis|brief|dossier|note|notes|fact|facts|text|material|"
+            r"information|details|context|packet|profile|report|research)\b"
             r"|\b(?:using|use|from|within|based on|grounded in)\s+"
             r"(?:this|the|these|those|provided|supplied|operator[- ]supplied)\s+"
             r"(?:(?:approved|provided|supplied|operator[- ]supplied)\s+)?"
             r"(?:(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+)?"
-            r"(?:note|notes|fact|facts|text|material|information|details|context)"
+            r"(?:analysis|brief|dossier|note|notes|fact|facts|text|material|"
+            r"information|details|context|packet|profile|report|research)"
             r"\s+only\b"
             r"|\bstay within (?:the )?(?:supplied|provided|following) text\b"
             r"|\bturn (?:the )?following (?:supplied |provided )?"
-            r"(?:note|notes|fact|facts|text|material|information|details|context)\b",
+            r"(?:analysis|brief|dossier|note|notes|fact|facts|text|material|"
+            r"information|details|context|packet|profile|report|research)\b",
             lower,
         )
     )
@@ -3574,6 +3852,13 @@ def _has_clear_task_ownership(
             _company_profile_target(route_text)
             or _company_comparison_target(route_text)
             or _workflow_company_target(route_text)
+            or (
+                _ask_shape_policy(route_text).output_form != "plan"
+                and (
+                    _open_set_research_anchor(route_text)
+                    or _looks_like_multi_target_source_research_request(route_text)
+                )
+            )
             or _looks_like_research_table_synthesis(route_text)
             or _looks_like_explicit_business_research_instruction(route_text)
         )
@@ -3799,7 +4084,12 @@ def _intent_for_target(
     ):
         return "company_research"
     if _looks_like_supplied_context_synthesis_request(text):
-        return "route_request"
+        return (
+            "opportunity_search"
+            if target_agent == "opportunity_scout"
+            and _looks_like_opportunity_deliverable_request(text)
+            else "route_request"
+        )
     if _looks_like_browser_diagnostics_only_request(text):
         return "browser_diagnostics"
     if target_agent == "chief_of_staff" and is_calendar_action_candidate(text):
@@ -4439,6 +4729,71 @@ def _desired_count_is_domain_limit(text: str) -> bool:
     return True
 
 
+def _desired_count_mode(text: str) -> str:
+    """Classify only the arithmetic meaning of an explicit domain-result count."""
+
+    match = _COUNT_RE.search(text)
+    count_group = ""
+    if match is not None:
+        count_group = "count" if match.group("count") else "count2"
+    else:
+        match = _COUNT_WORD_RE.search(text)
+        if match is not None:
+            count_group = "count_word" if match.group("count_word") else "count_word2"
+    if match is None or not count_group:
+        return "unspecified"
+
+    if re.search(
+        r"\b(?:return|provide|list|show|include)\s+(?:only\s+)?fewer"
+        r"(?:\s+than\s+(?:\d{1,2}|one|two|three|four|five|six|seven|"
+        r"eight|nine|ten))?\s+(?:if|when|rather\s+than)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return "maximum"
+
+    count_start = match.start(count_group)
+    prefix = text[max(0, count_start - 48) : count_start]
+    if re.search(
+        r"(?:up\s+to|at\s+most|no\s+more\s+than|maximum(?:\s+of)?|"
+        r"max(?:\s+of)?)\s*$",
+        prefix,
+        re.IGNORECASE,
+    ):
+        return "maximum"
+    if re.search(
+        r"(?:at\s+least|no\s+fewer\s+than|minimum(?:\s+of)?|"
+        r"min(?:\s+of)?)\s*$",
+        prefix,
+        re.IGNORECASE,
+    ):
+        return "minimum"
+    if re.search(r"(?:exactly|precisely)\s*$", prefix, re.IGNORECASE):
+        return "exact"
+    return "target"
+
+
+def _desired_count_scope(text: str) -> str:
+    """Infer anchor-relative count scope only for the compatibility planner."""
+
+    count_token = r"(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)"
+    if re.search(
+        rf"(?:\b(?:additional|other|more)\b.{{0,24}}\b{count_token}\b|"
+        rf"\b{count_token}\s+(?:additional|other|more)\b)",
+        text,
+        re.IGNORECASE,
+    ):
+        return "additional"
+    if re.search(
+        rf"(?:\b{count_token}\b.{{0,32}}\b(?:including|inclusive\s+of)\b|"
+        rf"\b(?:total|in\s+total)\b.{{0,24}}\b{count_token}\b)",
+        text,
+        re.IGNORECASE,
+    ):
+        return "total"
+    return "unspecified"
+
+
 def _primary_target(text: str, *, target_agent: ManualTargetAgent) -> str:
     cleaned = _strip_direct_agent_prefix(text).strip()
     if _looks_like_browser_diagnostics_request(cleaned):
@@ -4587,7 +4942,11 @@ def _target_type(text: str, *, target_agent: ManualTargetAgent) -> ManualTargetT
     if target_agent == "chief_of_staff" and looks_like_local_kni_evidence_lookup(text):
         return "local_document_collection"
     if _looks_like_supplied_context_synthesis_request(text) and not (
-        target_agent == "business_research_analyst" and looks_like_company(text)
+        (target_agent == "business_research_analyst" and looks_like_company(text))
+        or (
+            target_agent == "opportunity_scout"
+            and _looks_like_opportunity_deliverable_request(text)
+        )
     ):
         return "unknown"
     if _looks_like_browser_diagnostics_request(text):
@@ -4622,6 +4981,8 @@ def _target_type(text: str, *, target_agent: ManualTargetAgent) -> ManualTargetT
     if target_agent == "opportunity_scout":
         if looks_like_opportunity_to_outreach_loop(text):
             return "opportunity"
+        if _EVALUATED_ENTITY_TARGET_RE.search(text):
+            return "company"
         if _looks_like_unnamed_company_set_discovery(text):
             return "topic"
         if _ROLE_DISCOVERY_RE.search(text):
@@ -4947,6 +5308,8 @@ def _workflow_company_target(text: str) -> str:
         _COMPANY_NAME_RE,
         _COMPANY_LABEL_RE,
         _RESEARCH_ON_COMPANY_RE,
+        _RESEARCH_ENTITY_TARGET_RE,
+        _EVALUATED_ENTITY_TARGET_RE,
         _RESEARCH_COMPANY_ACTION_RE,
         _COMPANY_WORTH_RE,
         _COMPANY_LOOK_RE,
@@ -5003,24 +5366,408 @@ def _plausible_company_profile_target(candidate: str) -> bool:
 
 
 def _company_comparison_target(text: str) -> str:
+    companies = _company_comparison_entities(text)
+    return " vs ".join(companies) if len(companies) >= 2 else ""
+
+
+def _company_comparison_entities(text: str) -> list[str]:
+    """Extract a bounded fixed comparison set, excluding dimension prose."""
+
     match = _COMPANY_COMPARISON_RE.search(str(text or ""))
     if match:
         company_a = _clean_company_candidate(match.group("company_a"))
         company_b = _clean_company_candidate(match.group("company_b"))
-        if company_a and company_b:
-            return f"{company_a} vs {company_b}"
+        if (
+            company_a
+            and company_b
+            and _plausible_fixed_comparison_entity(
+                match.group("company_a"), company_a
+            )
+            and _plausible_fixed_comparison_entity(
+                match.group("company_b"), company_b
+            )
+        ):
+            return [company_a, company_b]
     list_match = _COMPANY_LIST_COMPARISON_RE.search(str(text or ""))
     if not list_match:
-        return ""
-    companies = [
-        _clean_company_candidate(item)
-        for item in re.split(
-            r"\s*,\s*and\s+|\s*,\s*|\s+and\s+",
-            list_match.group("companies"),
+        return []
+    remainder = str(text or "")[list_match.end() :]
+    if re.match(
+        r"\s+for\s+(?:the\s+)?(?:selected|same|this|that)\s+"
+        r"(?:company|companies|vendor|vendors|platform|platforms|product|products)\b",
+        remainder,
+        re.I,
+    ):
+        return []
+    structural_entity_list = bool(
+        re.match(r"\s+(?:on|across|by)\b", remainder, re.I)
+        or re.match(
+            r"\s+and\s+(?:explain|summarize|tell|show|identify|describe)\b",
+            remainder,
+            re.I,
         )
+        or re.search(
+            r"\bcompare\s+(?:the\s+)?(?:companies|vendors|platforms|products)\s+",
+            str(text or ""),
+            re.I,
+        )
+    )
+    if not structural_entity_list:
+        return []
+    raw_companies = re.split(
+        r"\s*,\s*and\s+|\s*,\s*|\s+and\s+",
+        list_match.group("companies"),
+    )
+    companies = [_clean_company_candidate(item) for item in raw_companies]
+    cleaned = [
+        company
+        for raw, company in zip(raw_companies, companies, strict=True)
+        if company
+        and _plausible_fixed_comparison_entity(raw, company)
     ]
-    cleaned = [company for company in companies if company]
-    return " vs ".join(cleaned) if len(cleaned) >= 2 else ""
+    return list(dict.fromkeys(cleaned)) if len(cleaned) >= 2 else []
+
+
+def _plausible_fixed_comparison_entity(raw: str, cleaned: str) -> bool:
+    """Require entity-shaped evidence before treating a comparison list as targets."""
+
+    dimension_terms = {
+        "adoption",
+        "buyer",
+        "buyers",
+        "clinical use",
+        "evidence",
+        "evidence strength",
+        "integrations",
+        "modalities",
+        "privacy",
+        "product",
+        "risk",
+        "safety",
+        "source quality",
+        "target customer",
+        "target customers",
+        "target user",
+        "target users",
+        "validation",
+    }
+    dimension_tokens = {
+        "adoption",
+        "buyer",
+        "buyers",
+        "clinical",
+        "compliance",
+        "cost",
+        "customer",
+        "customers",
+        "data",
+        "evidence",
+        "experience",
+        "features",
+        "functionality",
+        "integration",
+        "integrations",
+        "modalities",
+        "modality",
+        "performance",
+        "price",
+        "pricing",
+        "privacy",
+        "product",
+        "quality",
+        "risk",
+        "safety",
+        "scalability",
+        "security",
+        "source",
+        "speed",
+        "strength",
+        "support",
+        "target",
+        "use",
+        "user",
+        "users",
+        "validation",
+    }
+    normalized = " ".join(cleaned.lower().split())
+    if normalized in dimension_terms:
+        return False
+    tokens = [
+        token.strip("()[]{}.,:;")
+        for token in str(raw or "").split()
+        if token.strip("()[]{}.,:;")
+    ]
+    if not 1 <= len(tokens) <= 6:
+        return False
+    if any(
+        token[:1].isupper()
+        or (len(token) > 1 and token.isupper())
+        or token.lower().endswith((".ai", ".health"))
+        for token in tokens
+    ):
+        return True
+    semantic_tokens = {
+        token.casefold()
+        for token in tokens
+        if token.casefold() not in {"and", "or", "the", "of"}
+    }
+    return bool(semantic_tokens - dimension_tokens)
+
+
+def _open_set_research_anchor(text: str) -> str:
+    """Return the named reference entity for a structurally open comparison set."""
+
+    source = _strip_direct_agent_prefix(str(text or ""))
+    sequence_discovery = bool(
+        re.search(
+            r"\b(?:then|before)\b[\s\S]{0,160}"
+            r"\b(?:compare|discover|find|identify|research|search)\b[\s\S]{0,100}"
+            r"\b(?:additional|alternatives?|competitors?|more|other|peers?)\b",
+            source,
+            re.I,
+        )
+    )
+    patterns = [
+        _ANCHORED_RESEARCH_TARGET_RE,
+        _OPEN_SET_COMPARISON_ANCHOR_RE,
+    ]
+    if sequence_discovery:
+        patterns.insert(0, _RESEARCH_ENTITY_TARGET_RE)
+    for pattern in patterns:
+        match = pattern.search(source)
+        if match is None:
+            continue
+        candidate = _clean_company_candidate(match.group("name"))
+        normalized = " ".join(candidate.casefold().split())
+        if (
+            candidate
+            and normalized
+            not in {
+                "company",
+                "the company",
+                "this company",
+                "other companies",
+                "competitor",
+                "competitors",
+                "alternative",
+                "alternatives",
+            }
+            and 1 <= len(candidate.split()) <= 6
+        ):
+            return candidate
+    return ""
+
+
+def _looks_like_multi_target_source_research_request(text: str) -> bool:
+    """Distinguish evidence comparison from lead or opportunity discovery."""
+
+    lower = " ".join(_strip_direct_agent_prefix(str(text or "")).casefold().split())
+    if not re.search(
+        r"\b(?:compare|discover|find|identify|research|source)\b", lower
+    ):
+        return False
+    open_set = bool(
+        _open_set_research_anchor(text)
+        or (
+            re.search(r"\b(?:companies|vendors|platforms|products|tools)\b", lower)
+            and re.search(
+                r"\b(?:evidence|independent|official|primary|research|"
+                r"source-backed|validation)\b",
+                lower,
+            )
+        )
+    )
+    opportunity_output = bool(
+        re.search(
+            r"\b(?:contact|funding|grant|lead|opportunit(?:y|ies)|outreach|"
+            r"partner|partnership|prospect)\b",
+            lower,
+        )
+    )
+    return open_set and not opportunity_output
+
+
+def _looks_like_opportunity_deliverable_request(text: str) -> bool:
+    """Recognize an evaluation/ranking deliverable owned by Opportunity Scout."""
+
+    lower = " ".join(_strip_direct_agent_prefix(str(text or "")).casefold().split())
+    evaluation = bool(
+        re.search(
+            r"\b(?:assess|evaluate|rank|score|prioritize|determine|decide|"
+            r"recommend|identify)\b",
+            lower,
+        )
+    )
+    fit_or_opportunity = bool(
+        re.search(
+            r"\b(?:advisory|commercial|consulting|customer|funding|grant|"
+            r"kni|keystone|opportunit(?:y|ies)|partner(?:ship)?|prospect|"
+            r"strategic)\b[\w\s-]{0,40}\b(?:fit|potential|priority|relevance|"
+            r"opportunit(?:y|ies)|candidate|value)\b",
+            lower,
+        )
+        or re.search(
+            r"\b(?:credible|concrete|actionable|qualified)\s+"
+            r"(?:kni\s+|keystone\s+)?(?:opportunity|partner|prospect)\b",
+            lower,
+        )
+    )
+    return evaluation and fit_or_opportunity
+
+
+def _research_target_set_contract(
+    text: str,
+    *,
+    target_agent: ManualTargetAgent,
+    desired_count: int,
+    desired_count_explicit: bool,
+    desired_count_scope: str,
+) -> dict[str, object]:
+    """Infer only the set topology for a bounded Business Research request."""
+
+    empty: dict[str, object] = {
+        "multi_target": False,
+        "requires_target_discovery": False,
+        "anchor_entity": "",
+        "required_entities": [],
+        "primary_target": "",
+        "target_type": "",
+        "desired_count_scope": "",
+    }
+    if target_agent != "business_research_analyst":
+        return empty
+    fixed_entities = _company_comparison_entities(text)
+    if len(fixed_entities) >= 2:
+        return {
+            **empty,
+            "multi_target": True,
+            "required_entities": fixed_entities,
+            "primary_target": " vs ".join(fixed_entities),
+            "target_type": "company",
+        }
+    open_set_anchor = _open_set_research_anchor(text)
+    if open_set_anchor and _looks_like_multi_target_source_research_request(text):
+        return {
+            **empty,
+            "multi_target": True,
+            "requires_target_discovery": True,
+            "anchor_entity": open_set_anchor,
+            "required_entities": [open_set_anchor],
+            "primary_target": open_set_anchor,
+            "target_type": "company",
+            "desired_count_scope": (
+                "additional" if desired_count_explicit else "unspecified"
+            ),
+        }
+    category_source_research = _looks_like_multi_target_source_research_request(text)
+    if not (
+        (
+            desired_count_explicit
+            and desired_count > 1
+            and _looks_like_unnamed_company_set_discovery(text)
+        )
+        or category_source_research
+    ):
+        return empty
+    anchor = ""
+    if desired_count_scope == "additional":
+        anchor_match = _ANCHORED_RESEARCH_TARGET_RE.search(str(text or ""))
+        anchor = (
+            _clean_company_candidate(anchor_match.group("name"))
+            if anchor_match
+            else _workflow_company_target(text)
+        )
+    if anchor:
+        return {
+            **empty,
+            "multi_target": True,
+            "requires_target_discovery": True,
+            "anchor_entity": anchor,
+            "required_entities": [anchor],
+            "primary_target": anchor,
+            "target_type": "company",
+            "desired_count_scope": "additional",
+        }
+    return {
+        **empty,
+        "multi_target": True,
+        "requires_target_discovery": True,
+        "primary_target": _unnamed_company_set_topic(text),
+        "target_type": "topic",
+        "desired_count_scope": (
+            desired_count_scope
+            if desired_count_scope in {"total", "additional"}
+            else "total"
+        ),
+    }
+
+
+def _unnamed_company_set_topic(text: str) -> str:
+    """Return the category noun phrase without output/evidence instructions."""
+
+    cleaned = _strip_direct_agent_prefix(str(text or "")).strip()
+    cleaned = re.sub(
+        r"^\s*(?:please\s+)?(?:find|identify|discover|list|source|compare)\s+",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = re.sub(
+        r"^\s*(?:up\s+to|at\s+most|exactly|about|around)?\s*"
+        r"(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)\s+",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = re.split(
+        r"\s+(?:with|using)\s+(?:official|primary|independent|source-backed)\b"
+        r"|\.\s*(?:strict|compare|return|include|read-only)\b",
+        cleaned,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    return " ".join(cleaned.split()).strip(" .,:;-")[:180]
+
+
+def _comparison_dimensions(text: str) -> list[str]:
+    """Extract the operator's comparison rubric without inferring companies."""
+
+    cleaned = _strip_direct_agent_prefix(str(text or ""))
+    match = re.search(
+        r"\bcompare\s+.+?\s+(?:on|across|by)\s+(?P<dimensions>[^.;]+)",
+        cleaned,
+        flags=re.I,
+    )
+    if match is None:
+        match = re.search(
+            r"\bcompare\s+(?P<dimensions>[^.;]+)",
+            cleaned,
+            flags=re.I,
+        )
+    if match is None:
+        return _required_terms(text)
+    dimension_text = re.split(
+        r"\s+(?:using|with)\s+(?:official|primary|independent|source-backed)\b"
+        r"|\s+and\s+include\s+visible\s+urls?\b",
+        match.group("dimensions"),
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    dimensions = [
+        re.sub(
+            r"^(?:and|or)\s+",
+            "",
+            " ".join(item.split()).strip(" .,:;-"),
+            flags=re.I,
+        )
+        for item in re.split(r"\s*,\s*|\s+and\s+", dimension_text)
+    ]
+    bounded = [
+        item
+        for item in dimensions
+        if item and len(item.split()) <= 8
+    ]
+    return list(dict.fromkeys(bounded)) or _required_terms(text)
 
 
 def _looks_like_unnamed_company_set_discovery(text: str) -> bool:
@@ -5300,6 +6047,13 @@ def _negative_constraint_forbids_composition(constraint: str) -> bool:
         if re.match(
             r"^(?:to|in|into|on)\s+(?:gmail|a\s+provider|the\s+provider|"
             r"airtable|google\s+(?:docs?|drive|workspace)|slack)\b",
+            scope,
+        ):
+            return False
+        if re.match(
+            r"^(?:an?\s+|the\s+)?(?:gmail|provider|airtable|slack|google\s+"
+            r"(?:docs?|drive|workspace))\s+"
+            r"(?:draft|reply|message|email|note|record|artifact)\b",
             scope,
         ):
             return False

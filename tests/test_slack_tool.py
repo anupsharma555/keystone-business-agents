@@ -4,7 +4,9 @@ import json
 
 import pytest
 
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.schemas.approval import ApprovalQueueItem, ApprovalQueueStatus, ApprovalState
+from keystone_agents.schemas.manual_request_plan import AskShapePolicy, ManualRequestPlan
 from keystone_agents.schemas.review_card import ReviewCard, ReviewEvidenceItem, ReviewSourceItem
 from keystone_agents.schemas.work_item import (
     WorkflowRunResult,
@@ -28,6 +30,7 @@ from keystone_agents.slack_action_contract import (
     KBA_INTENT_MORE_RESEARCH,
     KBA_INTENT_OPEN_WORK_ITEM,
     KBA_INTENT_RESEARCH_ALL_CANDIDATES,
+    KBA_INTENT_RUN_AGAIN,
     KBA_INTENT_SHOW_SOURCES,
     KBA_INTENT_SKIP_COMPANY,
     KBA_MORE_RESEARCH,
@@ -874,6 +877,33 @@ def _kba_payload(
     }
 
 
+def _canonical_research_plan(*, target: str = "OpenEvidence") -> dict[str, object]:
+    return ManualRequestPlan(
+        source="llm",
+        requested_agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        target_agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        workflow=[WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value],
+        intent="company_research",
+        objective=f"Compare exactly two evidence dimensions for {target}.",
+        task_objective="entity_research",
+        primary_target=target,
+        target_type="company",
+        requires_live_search=True,
+        desired_count=2,
+        desired_count_explicit=True,
+        desired_count_mode="exact",
+        desired_count_scope="total",
+        expected_artifact_type="research_brief",
+        provider_system="unspecified",
+        side_effect_policy="read_only_no_send_no_publish",
+        ask_shape=AskShapePolicy(
+            evidence_depth="deep",
+            permission_state="read_only",
+            stop_condition="Stop after exactly two verified dimensions.",
+        ),
+    ).model_dump(mode="json")
+
+
 def test_business_agent_card_buttons_use_first_class_payload_schema() -> None:
     message = slack_review_message_from_approval_item(
         ApprovalQueueItem(
@@ -1095,8 +1125,12 @@ def test_kba_revise_draft_modal_submission_records_feedback_and_queues_agent(
     assert submitted.slack_view_response_payload is not None
     assert len(calls) == 1
     request = calls[0]
-    assert request.manual_request_plan["source"] == "slack_business_agent_action"
-    assert request.manual_request_plan["intent"] == "revise_draft"
+    request_authority = ExecutionIntentAuthority.from_value(request.manual_request_plan)
+    assert request_authority.plan is not None
+    assert request.manual_request_plan["intent"] == "outreach_draft"
+    assert request.manual_request_plan["target_agent"] == WorkItemRoute.OUTREACH_COMPOSER.value
+    assert "slack_query_prompt" not in request.manual_request_plan
+    assert request.slack_query_prompt["kind"] == "continue_or_revise"
     assert request.orchestrator_preflight["request_text"].startswith("Revise the outreach draft")
     assert request.orchestrator_preflight["manual_request_plan"]["requested_agent"] == (
         WorkItemRoute.OUTREACH_COMPOSER.value
@@ -1153,7 +1187,13 @@ def test_kba_more_research_records_event_and_duplicate_is_idempotent(
     store = SQLiteStore(database_url)
     item = _save_linked_work_item_approval(store)
     item = item.model_copy(
-        update={"target": WorkItemTarget(name="OpenEvidence", object_type="company")}
+        update={
+            "target": WorkItemTarget(
+                name="OpenEvidence",
+                object_type="company",
+                metadata={"manual_request_plan": _canonical_research_plan()},
+            )
+        }
     )
     store.save_work_item(item)
     calls: list[object] = []
@@ -1195,6 +1235,11 @@ def test_kba_more_research_records_event_and_duplicate_is_idempotent(
     assert calls[0].hosted_web_search_max_calls == 2
     assert calls[0].slack_query_prompt["kind"] == "deeper_research"
     assert calls[0].external_context["slack_query_prompt"]["task_brief"]
+    authority = ExecutionIntentAuthority.from_value(calls[0].manual_request_plan)
+    assert authority.canonical is True
+    assert calls[0].manual_request_plan == _canonical_research_plan()
+    assert calls[0].manual_request_plan["intent"] == "company_research"
+    assert "slack_query_prompt" not in calls[0].manual_request_plan
     assert duplicate.idempotent is True
     assert len(calls) == 1
     events = store.list_work_item_events(item.id)
@@ -1206,6 +1251,70 @@ def test_kba_more_research_records_event_and_duplicate_is_idempotent(
         "started",
         "completed",
     ]
+
+
+def test_kba_run_again_reuses_persisted_canonical_plan(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'slack-workitem.db'}"
+    store = SQLiteStore(database_url)
+    original_plan = _canonical_research_plan(target="NeuroFlow")
+    item = _save_linked_work_item_approval(store)
+    item = item.model_copy(
+        update={
+            "current_route": WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            "target": WorkItemTarget(
+                name="NeuroFlow",
+                object_type="company",
+                metadata={"manual_request_plan": original_plan},
+            ),
+        }
+    )
+    store.save_work_item(item)
+    captured: list[object] = []
+
+    def fake_advance(request, **_kwargs):
+        captured.append(request)
+        loaded = SQLiteStore(database_url).get_work_item(item.id)
+        assert loaded is not None
+        return WorkflowRunResult(
+            work_item=loaded,
+            route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            status=loaded.status,
+            advanced=False,
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.slack_interactions.advance_work_item_manager_loop_with_optional_langgraph",
+        fake_advance,
+    )
+
+    result = handle_slack_approval_interaction(
+        _kba_payload(
+            action_id=KBA_OVERFLOW,
+            intent=KBA_INTENT_RUN_AGAIN,
+            work_item_id=item.id,
+        ),
+        database_url=database_url,
+    )
+
+    assert result.outcome == "run_again_completed"
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.manual_request_plan == original_plan
+    assert request.manual_request_plan["desired_count"] == 2
+    assert request.manual_request_plan["desired_count_mode"] == "exact"
+    assert request.manual_request_plan["expected_artifact_type"] == "research_brief"
+    assert request.manual_request_plan["ask_shape"]["permission_state"] == "read_only"
+    assert request.manual_request_plan["ask_shape"]["stop_condition"].startswith(
+        "Stop after exactly two"
+    )
+    assert request.slack_query_prompt["kind"] == "continue_or_revise"
+    assert ExecutionIntentAuthority.from_value(request.manual_request_plan).canonical is True
+    persisted = store.get_work_item(item.id)
+    assert persisted is not None
+    assert persisted.target.metadata["manual_request_plan"] == original_plan
 
 
 def test_kba_more_research_retry_after_started_event_is_not_deduped(
@@ -1651,6 +1760,71 @@ def test_kba_continue_work_item_preserves_live_execution_flags(
     request = captured[0]
     assert request.live_search is True
     assert request.live_sdk is True
+
+
+def test_kba_continue_reuses_canonical_plan_without_planner_call(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'slack-workitem.db'}"
+    store = SQLiteStore(database_url)
+    original_plan = _canonical_research_plan(target="NeuroFlow")
+    item = WorkItem(
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        status=WorkItemStatus.IN_PROGRESS,
+        title="Research NeuroFlow",
+        request_text="research NeuroFlow",
+        target=WorkItemTarget(
+            name="NeuroFlow",
+            object_type="company",
+            metadata={"manual_request_plan": original_plan},
+        ),
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+    )
+    store.save_work_item(item)
+    captured: list[object] = []
+
+    def fail_if_planner_called(*_args, **_kwargs):
+        raise AssertionError("Literal continuation must reuse the persisted canonical plan.")
+
+    def fake_advance(request, **_kwargs):
+        captured.append(request)
+        loaded = SQLiteStore(database_url).get_work_item(item.id)
+        assert loaded is not None
+        return WorkflowRunResult(
+            work_item=loaded,
+            route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            status=loaded.status,
+            advanced=False,
+        )
+
+    monkeypatch.setattr(
+        "keystone_agents.slack_interactions.run_orchestrator_preflight",
+        fail_if_planner_called,
+    )
+    monkeypatch.setattr(
+        "keystone_agents.slack_interactions.advance_work_item_manager_loop_with_optional_langgraph",
+        fake_advance,
+    )
+
+    result = handle_slack_approval_interaction(
+        _kba_payload(
+            action_id=KBA_COS_CONTINUE_WORK_ITEM,
+            intent=KBA_INTENT_CONTINUE_WORK_ITEM,
+            approval_id="",
+            work_item_id=item.id,
+        ),
+        database_url=database_url,
+    )
+
+    assert result.outcome == "continued"
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.manual_request_plan == original_plan
+    assert request.orchestrator_preflight["manual_request_plan"] == original_plan
+    assert "sdk_usage_events" not in request.orchestrator_preflight
+    assert request.slack_query_prompt["kind"] == "continue_or_revise"
+    assert request.request_text == "continue"
 
 
 def test_kba_overflow_show_sources_and_open_work_item_are_read_only(tmp_path) -> None:

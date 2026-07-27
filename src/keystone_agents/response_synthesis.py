@@ -61,7 +61,7 @@ class UserFacingResponseSynthesisInput(BaseModel):
                 "Synthesize a clear user-facing response from this bounded WorkItem state.",
                 "",
                 "Rules:",
-                "- Use only the facts in the payload.",
+                "- Use only the facts in the bounded evidence below.",
                 "- Do not invent sources, counts, amounts, deadlines, or conclusions.",
                 "- Treat latest_user_request as the primary objective when present.",
                 "- Treat prior thread, WorkItem, artifact, and profile context as background evidence.",
@@ -71,6 +71,11 @@ class UserFacingResponseSynthesisInput(BaseModel):
                 "- Lead with the substantive answer, not run status or evaluator framing.",
                 "- Answer in KNI's operator voice; do not write as an unnamed evaluator.",
                 "- Avoid phrases like 'the evidence does answer the core request' or 'the review flagged'.",
+                "- Never refer to the payload, an extracted source, attached source refs, a source packet, the source set, an artifact, a WorkItem, or what 'this run surfaced' in reader-facing fields.",
+                "- Translate internal evidence state into direct prose: name the source or company, state what it supports, and say plainly what evidence is still missing.",
+                "- Do not write phrases such as 'the other extracted source is', 'the payload does not provide', 'the attached source refs point to', or 'the source-backed match surfaced in this run'.",
+                "- Do not quote or paraphrase webpage navigation, press-archive date chains, challenge/error pages, support boilerplate, or extraction artifacts. Keep only target-specific claims that help answer the user's question.",
+                "- Preserve the user's technical meaning. For AI/data research, 'multimodal' requires evidence of multiple input or data modalities such as voice, video, text, sensors, or physiology; do not redefine it as multiple workflow features such as scheduling, billing, notes, or telehealth.",
                 "- State what the current sources support and what remains unknown.",
                 "- Treat payload sources and provider_results as the bounded retrieved context for Answer and the Detailed Summary; do not synthesize from route metadata alone.",
                 "- Treat source_data_summaries as the primary factual substrate for the Detailed Summary; summarize what those source summaries say before explaining Keystone/operator relevance.",
@@ -85,6 +90,9 @@ class UserFacingResponseSynthesisInput(BaseModel):
                 "- Treat manual_plan.ask_shape.output_constraints as the canonical current-turn completion contract after planner reconciliation. Reason from it together with the raw request and satisfy its response scope, counts, sections, source visibility, forbidden content, and style requirements.",
                 "- When output_constraints requests a narrow answer-only response, put the compliant response in answer and leave synthesis and optional sections empty unless the request explicitly requires them. Shared Detailed Summary defaults must not override a narrower operator ask.",
                 "- If source_triage_notes says broaden/deepen is recommended, state what is missing or thin before making strong conclusions; use retained sources first and avoid padding with weak adjacent sources.",
+                "- A partial or blocked research result must still answer with the strongest defensible candidates or findings available, clearly labeling them as direct, adjacent, provisional, or unverified as appropriate.",
+                "- Do not substitute an evidence disclaimer for the answer. Put missing official sources, uncertain product scope, thin corroboration, and other evidence gaps in caveats so they render under Limitations.",
+                "- Only say that no candidate can be named when none has usable supporting evidence; otherwise provide the best bounded answer first.",
                 "- If source_context_notes says extracted page evidence is missing, do not write a detailed factual synthesis from provider snippets alone; state the limitation and recommend reading/extracting the relevant URLs.",
                 "- If source_context_notes says selected sources do not match the request focus, do not treat broad or adjacent sources as answering the focused ask; state the mismatch and use focused provider candidates only as follow-up targets unless they were extracted.",
                 "- If the latest request asks to summarize link N, source N, or a source from the prior Slack thread, resolve N from ordered_sources and focus on that prior source first. Do not broaden into a new topic brief or provider comparison unless the linked source is missing.",
@@ -429,8 +437,8 @@ def _source_data_summary(source: dict[str, Any]) -> str:
 def _source_data_facts(source: dict[str, Any]) -> list[str]:
     facts: list[str] = []
     excerpt = str(source.get("evidence_excerpt") or "").strip()
-    if excerpt:
-        facts.extend(_source_excerpt_sentences(excerpt))
+    excerpt_facts = _source_excerpt_sentences(excerpt) if excerpt else []
+    facts.extend(excerpt_facts)
     claim = str(source.get("supported_claim") or "").strip()
     if claim:
         facts.append(_first_sentence(claim, max_chars=240))
@@ -459,7 +467,8 @@ def _source_excerpt_sentences(
     max_sentences: int = 3,
     max_chars: int = 700,
 ) -> list[str]:
-    cleaned = " ".join(str(excerpt or "").split()).strip()
+    cleaned = re.sub(r"(?m)^\s*#{1,6}\s*", "", str(excerpt or ""))
+    cleaned = " ".join(cleaned.split()).strip()
     if not cleaned:
         return []
     parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", cleaned) if part.strip()]
@@ -468,6 +477,13 @@ def _source_excerpt_sentences(
     selected: list[str] = []
     used_chars = 0
     for part in parts:
+        if re.search(
+            r"^(?:faqs?\b|page unavailable\b|please be advised\b|"
+            r"sign in\b|open a support ticket\b|cookie preferences?\b)",
+            part,
+            flags=re.I,
+        ):
+            continue
         remaining = max_chars - used_chars
         if remaining <= 0 or len(selected) >= max_sentences:
             break
@@ -753,9 +769,18 @@ def _nested_values_for_key(
 def _request_coverage_required(manual_plan: dict[str, Any] | None) -> bool:
     if not isinstance(manual_plan, dict):
         return False
+    semantic_completion_contract = bool(
+        manual_plan.get("desired_count_explicit") is True
+        or manual_plan.get("requires_target_discovery") is True
+        or manual_plan.get("required_entities")
+        or manual_plan.get("required_terms")
+        or manual_plan.get("workflow")
+        or str(manual_plan.get("expected_artifact_type") or "")
+        not in {"", "none", "unspecified"}
+    )
     ask_shape = manual_plan.get("ask_shape")
     if not isinstance(ask_shape, dict):
-        return False
+        return semantic_completion_contract
     output_constraints = ask_shape.get("output_constraints")
     output_constraints_explicit = bool(
         isinstance(output_constraints, dict)
@@ -781,7 +806,8 @@ def _request_coverage_required(manual_plan: dict[str, Any] | None) -> bool:
         )
     )
     return bool(
-        str(ask_shape.get("stop_condition") or "").strip()
+        semantic_completion_contract
+        or str(ask_shape.get("stop_condition") or "").strip()
         or output_constraints_explicit
         or str(ask_shape.get("strict_filter_mode") or "")
         not in {"", "unspecified"}
@@ -1181,6 +1207,7 @@ def format_user_response_synthesis(
     sources: Any | None = None,
     metadata_lines: list[str] | None = None,
     low_metadata: bool = False,
+    show_metadata: bool = True,
 ) -> str:
     """Render synthesized response fields into compact Slack-readable text."""
 
@@ -1262,7 +1289,8 @@ def format_user_response_synthesis(
         lines.extend(["", "Recommended actions"])
         lines.extend(f"* {item}" for item in recommended_actions)
     if caveats and not low_metadata:
-        lines.extend(["", "Run notes"])
+        caveat_heading = "Limitations" if sources else "Run notes"
+        lines.extend(["", caveat_heading])
         lines.extend(f"* {item}" for item in caveats)
     metadata = (
         []
@@ -1271,7 +1299,7 @@ def format_user_response_synthesis(
     )
     body_text = "\n".join(line for line in lines if line is not None).strip()
     body_text = append_visible_source_urls_to_text(body_text, sources)
-    if metadata and not _has_section_heading(body_text, "metadata"):
+    if show_metadata and metadata and not _has_section_heading(body_text, "metadata"):
         metadata_text = "\n".join(["Metadata", *(f"* {item}" for item in metadata[:7])])
         text = f"{body_text}\n\n{metadata_text}" if body_text else metadata_text
     else:
@@ -1500,8 +1528,10 @@ def _metadata_lines_indicate_source_focus_mismatch(lines: list[str] | None) -> b
 
 def _source_evidence_note(source: dict[str, Any]) -> str:
     excerpt = str(source.get("evidence_excerpt") or "").strip()
-    if excerpt and _source_is_extracted(source):
-        return _first_sentence(excerpt)
+    if excerpt:
+        sentences = _source_excerpt_sentences(excerpt, max_sentences=1, max_chars=400)
+        if sentences:
+            return sentences[0]
     for key in ("supported_claim",):
         value = str(source.get(key) or "").strip()
         if value:
@@ -1510,8 +1540,6 @@ def _source_evidence_note(source: dict[str, Any]) -> str:
         value = str(item or "").strip()
         if value:
             return _first_sentence(value)
-    if excerpt:
-        return _first_sentence(excerpt)
     return ""
 
 

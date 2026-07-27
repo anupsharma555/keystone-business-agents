@@ -12,6 +12,10 @@ from keystone_agents.authority.semantic import (
     StageOutputContract,
     reconcile_stage_output,
 )
+from keystone_agents.contracts.completion import (
+    deterministic_request_coverage,
+    evaluate_deterministic_completion,
+)
 from keystone_agents.presentation.consistency import reconcile_failed_review
 from keystone_agents.receipts.mutations import receipt_reports_possible_write
 from keystone_agents.schemas.execution_request import (
@@ -28,7 +32,20 @@ def attach_execution_public_result(
     existing = payload.get("public_result")
     if isinstance(existing, Mapping):
         result = ExecutionPublicResult.model_validate(existing)
+        original_status = result.status
+        result = _reconcile_declared_terminal_status(payload, result)
+        result = _reconcile_host_completion_coverage(payload, result)
         result = reconcile_failed_review(payload, result)
+        if result.status != original_status:
+            result = result.model_copy(
+                update={
+                    "title": _default_public_result_title(result.status),
+                    "omit_title": _completed_result_requires_title_omission(
+                        payload,
+                        status=result.status,
+                    ),
+                }
+            )
         payload["public_result"] = result.model_dump(mode="json")
         _mirror_public_result(payload, result)
         return result
@@ -44,7 +61,8 @@ def attach_execution_public_result(
             "output.summary",
         ),
     )
-    raw_status = str(payload.get("status") or payload.get("mode") or "").strip().lower()
+    raw_status = str(payload.get("status") or "").strip().lower()
+    declared_status = _declared_terminal_status(payload)
     output = payload.get("output")
     output_mapping = output if isinstance(output, Mapping) else {}
     script_payload = payload.get("script_payload")
@@ -55,10 +73,13 @@ def attach_execution_public_result(
         *(_string_list(output_mapping.get("audit_notes"))),
         *(_string_list(script_output_mapping.get("audit_notes"))),
     ]
-    recovery_used = any(
-        "deterministic chief of staff fallback was rendered instead" in note.lower()
-        or "live sdk output failed validation" in note.lower()
-        for note in audit_notes
+    recovery_used = bool(
+        declared_status == "recovered"
+        or any(
+            "deterministic chief of staff fallback was rendered instead" in note.lower()
+            or "live sdk output failed validation" in note.lower()
+            for note in audit_notes
+        )
     )
     missing_information = [
         *_string_list(payload.get("missing_information")),
@@ -100,14 +121,18 @@ def attach_execution_public_result(
             )
         )
     )
-    failed = raw_status in {"failed", "timeout", "error"}
-    blocked = raw_status in {"blocked", "needs_context", "needs_approval"}
+    failed = declared_status == "failed"
+    blocked = declared_status == "blocked"
+    partial = declared_status == "partial"
+    canceled = declared_status == "canceled"
     completion_confirmed = bool(
         payload.get("completion_confirmed")
         if "completion_confirmed" in payload
-        else text and not failed and not blocked and not clarification
+        else text
+        and declared_status in {None, "verified", "completed", "recovered"}
+        and not clarification
     )
-    if failed or blocked or clarification:
+    if failed or blocked or partial or canceled or clarification:
         completion_confirmed = False
 
     receipts = _payload_receipts(payload)
@@ -149,11 +174,13 @@ def attach_execution_public_result(
         completion_confirmed = False
 
     status: ExecutionResultStatus
-    if failed:
-        status = "failed"
-    elif clarification:
+    if clarification:
         status = "needs_input"
-    elif blocked:
+    elif declared_status in {"partial", "needs_input", "blocked", "failed", "canceled"}:
+        status = declared_status
+    elif declared_status is not None and completion_confirmed:
+        status = declared_status
+    elif declared_status is not None:
         status = "blocked"
     elif recovery_used and completion_confirmed:
         status = "recovered"
@@ -178,16 +205,32 @@ def attach_execution_public_result(
         or output_failure_mapping.get("code")
         or ""
     ).strip()
-    failure_summary = (
-        text if status in {"failed", "blocked", "needs_input"} else ""
+    provisional = ExecutionPublicResult(
+        status=status,
+        title="",
+        text=text,
+        completion_confirmed=completion_confirmed,
+        provider_write_attempted=provider_write_attempted,
+        provider_receipt_verified=provider_receipt_verified,
+        recovery_used=recovery_used,
+        recovery_notice=recovery_notice,
+        failure_code=failure_code,
+        failure_summary=(
+            text
+            if status in {"failed", "blocked", "needs_input", "partial", "canceled"}
+            else ""
+        ),
+        run_id=str(payload.get("agent_run_id") or payload.get("run_id") or ""),
     )
-    title = str(payload.get("slack_display_title") or "").strip() or {
-        "completed": "Business Agents Result Ready",
-        "recovered": "Business Agents Result Recovered",
-        "needs_input": "Business Agents Need Input",
-        "blocked": "Business Agents Blocked",
-        "failed": "Business Agents Run Failed",
-    }[status]
+    provisional = _reconcile_host_completion_coverage(payload, provisional)
+    status = provisional.status
+    completion_confirmed = provisional.completion_confirmed
+    failure_code = provisional.failure_code
+    failure_summary = provisional.failure_summary
+    title = (
+        str(payload.get("slack_display_title") or "").strip()
+        or _default_public_result_title(status)
+    )
     result = ExecutionPublicResult(
         status=status,
         title=title,
@@ -206,6 +249,124 @@ def attach_execution_public_result(
     payload["public_result"] = result.model_dump(mode="json")
     _mirror_public_result(payload, result)
     return result
+
+
+def _default_public_result_title(status: ExecutionResultStatus) -> str:
+    return {
+        "verified": "Business Agents Result Verified",
+        "completed": "Business Agents Result Ready",
+        "recovered": "Business Agents Result Recovered",
+        "partial": "Business Agents Partially Completed",
+        "needs_input": "Business Agents Need Input",
+        "blocked": "Business Agents Blocked",
+        "failed": "Business Agents Run Failed",
+        "canceled": "Business Agents Run Canceled",
+    }[status]
+
+
+def _declared_terminal_status(
+    payload: Mapping[str, Any],
+) -> ExecutionResultStatus | None:
+    """Normalize an explicit terminal state without treating execution mode as one."""
+
+    aliases: dict[str, ExecutionResultStatus] = {
+        "verified": "verified",
+        "completed": "completed",
+        "complete": "completed",
+        "done": "completed",
+        "success": "completed",
+        "succeeded": "completed",
+        "recovered": "recovered",
+        "partial": "partial",
+        "needs_input": "needs_input",
+        "clarification_required": "needs_input",
+        "blocked": "blocked",
+        "needs_context": "blocked",
+        "needs_approval": "blocked",
+        "pending_approval": "blocked",
+        "awaiting_approval": "blocked",
+        "failed": "failed",
+        "error": "failed",
+        "timeout": "failed",
+        "rejected": "failed",
+        "canceled": "canceled",
+        "cancelled": "canceled",
+    }
+    if "status" in payload:
+        raw = str(payload.get("status") or "").strip().lower()
+        if not raw:
+            return None
+        return aliases.get(raw, "blocked")
+    mode = str(payload.get("mode") or "").strip().lower()
+    return aliases.get(mode)
+
+
+def _reconcile_declared_terminal_status(
+    payload: Mapping[str, Any],
+    result: ExecutionPublicResult,
+) -> ExecutionPublicResult:
+    """Prevent outer or existing non-success state from being promoted."""
+
+    declared = _declared_terminal_status(payload)
+    non_success_priority: dict[ExecutionResultStatus, int] = {
+        "partial": 1,
+        "needs_input": 2,
+        "blocked": 2,
+        "canceled": 3,
+        "failed": 4,
+    }
+    existing_non_success = result.status in non_success_priority
+    declared_non_success = declared in non_success_priority
+    if existing_non_success and not declared_non_success:
+        return result.model_copy(update={"completion_confirmed": False})
+    if not declared_non_success:
+        return result
+    status = declared
+    if existing_non_success and (
+        non_success_priority[result.status] >= non_success_priority[declared]
+    ):
+        status = result.status
+    return result.model_copy(
+        update={
+            "status": status,
+            "completion_confirmed": False,
+            "failure_summary": result.failure_summary or result.text,
+        }
+    )
+
+
+def _reconcile_host_completion_coverage(
+    payload: Mapping[str, Any],
+    result: ExecutionPublicResult,
+) -> ExecutionPublicResult:
+    """Downgrade only a success-family result when host coverage is incomplete."""
+
+    if result.status in {
+        "partial",
+        "needs_input",
+        "blocked",
+        "failed",
+        "canceled",
+    }:
+        return result.model_copy(update={"completion_confirmed": False})
+
+    coverage = deterministic_request_coverage(payload)
+    if coverage is None:
+        return result
+    decision = evaluate_deterministic_completion([coverage])
+    if decision.completion_allowed:
+        return result
+    status: ExecutionResultStatus = (
+        "partial" if coverage.status == "partial" and bool(result.text) else "blocked"
+    )
+    return result.model_copy(
+        update={
+            "status": status,
+            "completion_confirmed": False,
+            "failure_code": result.failure_code or decision.reason_code,
+            "failure_summary": result.failure_summary or result.text,
+        }
+    )
 
 
 def _public_result_operation_boundary(

@@ -34,7 +34,7 @@
   },
   "expected": {
     "route": "outreach_composer",
-    "status": "needs_approval",
+    "status": "blocked",
     "artifact_types": [
       "opportunity",
       "company_profile",

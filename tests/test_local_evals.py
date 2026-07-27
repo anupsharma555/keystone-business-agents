@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
+from keystone_agents.multi_target_research import should_run_multi_target_research
 from scripts.run_local_evals import (
     DEFAULT_EVAL_DIR,
     LocalEvalCase,
@@ -55,6 +57,26 @@ def test_seed_eval_datasets_exist_and_cover_required_tasks() -> None:
     assert all(isinstance(row.get("validates_prompts"), list) for row in rows)
     assert all(row["validates_prompts"] for row in rows)
     assert "skill_task_matrix.jsonl" in dataset_names
+
+
+def test_slack_multi_target_eval_uses_canonical_executable_plan() -> None:
+    rows = _jsonl_rows(DEFAULT_EVAL_DIR / "slack_research_workflow.jsonl")
+    row = next(
+        item
+        for item in rows
+        if item["id"] == "slack_reusable_prompt_multi_target_source_read"
+    )
+    input_payload = row["input"]
+    assert isinstance(input_payload, dict)
+    manual_plan = input_payload["manual_plan"]
+    authority = ExecutionIntentAuthority.from_value(manual_plan)
+
+    assert authority.canonical
+    assert should_run_multi_target_research(
+        request_text=str(input_payload["request"]),
+        manual_plan=manual_plan,
+        target=str(input_payload["topic"]),
+    )
 
 
 def test_local_evals_pass_offline(monkeypatch) -> None:

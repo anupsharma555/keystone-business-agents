@@ -14,6 +14,7 @@ from keystone_agents.capability_profile import (
     compile_child_result_promotion_receipt,
     compile_request_capability_profile,
 )
+from keystone_agents.contracts.completion import build_count_request_coverage
 from keystone_agents.models import OutreachComposerSDKInput, TypedAgentRunResult
 from keystone_agents.schemas.execution_request import ExecutionEntrypoint
 
@@ -221,3 +222,42 @@ def test_unverified_legacy_summary_cannot_compile_reader_promotion() -> None:
     assert receipt.instruction_repair_verified is False
     assert receipt.typed_display_verified is False
     assert receipt.rendered_display_verified is False
+
+
+@pytest.mark.parametrize("status", ["partial", "canceled", "in_progress", "unknown"])
+def test_non_success_child_status_cannot_compile_reader_promotion(status: str) -> None:
+    receipt = compile_child_result_promotion_receipt(
+        {
+            "status": status,
+            "output_type": "OpportunityScoutResult",
+            "send_enabled": False,
+        },
+        summary="A readable but incomplete result.",
+        typed_display_verified=True,
+    )
+
+    assert receipt.reader_ready is False
+
+
+def test_host_underfill_blocks_child_reader_promotion() -> None:
+    coverage = build_count_request_coverage(
+        interpreted_request="Return exactly three opportunities.",
+        expected_count=3,
+        observed_count=1,
+        item_label="opportunities",
+        next_safe_action="Continue bounded research.",
+        count_mode="exact",
+    )
+
+    receipt = compile_child_result_promotion_receipt(
+        {
+            "status": "completed",
+            "output_type": "OpportunityScoutResult",
+            "send_enabled": False,
+        },
+        summary="One source-backed opportunity is ready.",
+        typed_display_verified=True,
+        host_request_coverage=coverage,
+    )
+
+    assert receipt.reader_ready is False

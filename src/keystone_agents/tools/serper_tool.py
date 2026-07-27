@@ -68,7 +68,10 @@ def reset_sdk_search_telemetry() -> None:
 
     _SDK_SEARCH_TELEMETRY.set([])
     _SDK_SEARCH_REQUEST_CONTEXT.set("")
-    _SDK_SEARCH_REQUEST_BUDGET.set(None)
+    # Seed the mutable budget in the parent run context. Agents SDK tool calls
+    # execute in copied contexts, so setting a new ContextVar value inside one
+    # tool call is not visible to later calls. The shared object reference is.
+    _SDK_SEARCH_REQUEST_BUDGET.set(ProviderRequestBudget({}))
 
 
 def set_sdk_search_request_context(request_text: str) -> None:

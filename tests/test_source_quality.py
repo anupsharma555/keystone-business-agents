@@ -11,12 +11,21 @@ from keystone_agents.source_enrichment import dedupe_and_rank_source_records
 from keystone_agents.source_quality import (
     assess_research_completeness,
     combined_source_confidence,
+    has_unusable_page_content,
     score_source_quality,
     summarize_source_quality,
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 AS_OF_DATE = date(2026, 4, 21)
+
+
+def test_unusable_page_content_requires_error_context_for_status_numbers() -> None:
+    assert has_unusable_page_content(["HTTP 500 error"])
+    assert has_unusable_page_content(["404 Not Found"])
+    assert not has_unusable_page_content(
+        ["A Fortune 500 company served 500 patients during the pilot."]
+    )
 
 
 def test_company_site_source_scores_high_for_company_facts() -> None:

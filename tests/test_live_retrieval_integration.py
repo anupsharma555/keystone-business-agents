@@ -3,14 +3,193 @@ from __future__ import annotations
 import json
 import sys
 from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Lock
+from time import perf_counter, sleep
 from types import SimpleNamespace
 
 import pytest
 
 from keystone_agents.schemas.company_profile import CompanyProfile
-from keystone_agents.schemas.opportunity import OpportunityScoutResult
+from keystone_agents.schemas.opportunity import (
+    FilteredOpportunityCandidate,
+    OpportunityScoutResult,
+)
 from keystone_agents.tools.search_provider import SearchResult
+from keystone_agents.tools.website_extraction_tool import WebsiteExtractionResult
+
+
+def test_shared_retrieval_context_enforces_aggregate_budget_and_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    calls = 0
+    active = 0
+    peak = 0
+    lock = Lock()
+
+    class FakeProvider:
+        provider_name = "agents-web-search"
+
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            nonlocal calls, active, peak
+            with lock:
+                calls += 1
+                active += 1
+                peak = max(peak, active)
+            sleep(0.01)
+            with lock:
+                active -= 1
+            return [
+                SearchResult(
+                    title=f"{query} result",
+                    link=f"https://example.com/{calls}",
+                    snippet="Source-backed company evidence.",
+                    source="agents-web-search",
+                )
+            ]
+
+    settings = SimpleNamespace(
+        search_provider="agents-web-search",
+        website_extractor="trafilatura",
+        serper_enabled=False,
+        searxng_base_url="",
+    )
+    monkeypatch.setenv("KEYSTONE_ENABLE_WEBSITE_EXTRACTION", "false")
+    with live_retrieval.live_retrieval_request_context(
+        requested_provider="agents-web-search",
+        agents_web_search_max_calls=3,
+        settings_loader=lambda: settings,
+        manage_searxng_runtime=False,
+        network_concurrency=2,
+    ) as execution_context:
+
+        def retrieve(company: str) -> tuple[CompanyProfile, dict[str, object]]:
+            return live_retrieval.retrieve_company_profile_live(
+                company=company,
+                max_results=2,
+                max_queries=3,
+                extract_selected_pages=False,
+                query_builder=lambda name, _url: [
+                    f"{name} query 1",
+                    f"{name} query 2",
+                    f"{name} query 3",
+                ],
+                search_provider_builder=lambda **_kwargs: FakeProvider(),
+                profile_builder=lambda **kwargs: CompanyProfile(
+                    name=str(kwargs["company_name"])
+                ),
+                execution_context=execution_context,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            list(executor.map(retrieve, ["Alpha Health", "Beta Care"]))
+
+    assert calls == 3
+    assert peak <= 2
+
+
+def test_shared_retrieval_context_owns_one_transient_runtime_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    lifecycle: list[str] = []
+    settings = SimpleNamespace(
+        search_provider="searxng",
+        website_extractor="trafilatura",
+        serper_enabled=False,
+        searxng_base_url="http://127.0.0.1:18080",
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "_searxng_endpoint_reachable",
+        lambda _base_url: False,
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "_run_searxng_lifecycle_command",
+        lambda action, **_kwargs: lifecycle.append(action),
+    )
+
+    with live_retrieval.live_retrieval_request_context(
+        settings_loader=lambda: settings,
+        manage_searxng_runtime=True,
+    ) as execution_context:
+        assert execution_context.runtime_metadata["started"] is True
+        assert lifecycle == ["start"]
+
+    assert lifecycle == ["start", "stop"]
+
+
+def test_shared_retrieval_deadline_blocks_new_provider_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    calls = 0
+
+    class FakeProvider:
+        provider_name = "agents-web-search"
+
+        def search_web(self, _query: str, num_results: int = 5) -> list[SearchResult]:
+            nonlocal calls
+            calls += 1
+            return []
+
+    settings = SimpleNamespace(
+        search_provider="agents-web-search",
+        website_extractor="trafilatura",
+        serper_enabled=False,
+        searxng_base_url="",
+    )
+    monkeypatch.setenv("KEYSTONE_ENABLE_WEBSITE_EXTRACTION", "false")
+    with live_retrieval.live_retrieval_request_context(
+        requested_provider="agents-web-search",
+        settings_loader=lambda: settings,
+        manage_searxng_runtime=False,
+        deadline_seconds=0.001,
+    ) as execution_context:
+        sleep(0.005)
+        _profile, metadata = live_retrieval.retrieve_company_profile_live(
+            company="Alpha Health",
+            max_queries=1,
+            extract_selected_pages=False,
+            query_builder=lambda _name, _url: ["Alpha Health evidence"],
+            search_provider_builder=lambda **_kwargs: FakeProvider(),
+            profile_builder=lambda **kwargs: CompanyProfile(
+                name=str(kwargs["company_name"])
+            ),
+            execution_context=execution_context,
+        )
+
+    assert calls == 0
+    errors = metadata["search_provider_errors"]
+    assert errors[0]["error_type"] == "TimeoutError"
+
+
+def test_shared_retrieval_deadline_returns_without_waiting_for_slow_provider() -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    settings = SimpleNamespace(
+        search_provider="agents-web-search",
+        website_extractor="trafilatura",
+        serper_enabled=False,
+        searxng_base_url="",
+    )
+    started_at = perf_counter()
+    with live_retrieval.live_retrieval_request_context(
+        requested_provider="agents-web-search",
+        settings_loader=lambda: settings,
+        manage_searxng_runtime=False,
+        deadline_seconds=0.05,
+    ) as execution_context:
+        with pytest.raises(TimeoutError, match="exceeded the request deadline"):
+            execution_context.run_provider_call(lambda: sleep(0.3))
+
+    assert perf_counter() - started_at < 0.2
 
 
 def test_company_website_extraction_prioritizes_query_focused_company_pages() -> None:
@@ -56,6 +235,58 @@ def test_company_website_extraction_prioritizes_query_focused_company_pages() ->
         "https://openai.com/index/introducing-trusted-contact-in-chatgpt/",
     ]
     assert "https://openai.com/" in urls
+
+
+def test_company_website_extraction_suppresses_host_after_terminal_error_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    calls: list[str] = []
+    monkeypatch.setattr(live_retrieval, "website_extraction_enabled", lambda: True)
+    monkeypatch.setattr(live_retrieval, "agent_html_review_enabled", lambda: False)
+    monkeypatch.setattr(
+        live_retrieval,
+        "_company_website_extraction_urls",
+        lambda **_kwargs: [
+            "https://www.businesswire.com/news/first",
+            "https://www.businesswire.com/news/second",
+        ],
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "website_extraction_budget",
+        lambda: SimpleNamespace(firecrawl_max_calls=0, firecrawl_calls_attempted=0),
+    )
+
+    def fake_extract(url: str, **_kwargs: object) -> WebsiteExtractionResult:
+        calls.append(url)
+        return WebsiteExtractionResult(
+            url=url,
+            title="Page Unavailable",
+            provider="trafilatura",
+            status="insufficient_content",
+            text_or_markdown="Please be advised that this page is unavailable.",
+            claims=[],
+        )
+
+    monkeypatch.setattr(
+        live_retrieval,
+        "extract_website_content_with_fallbacks",
+        fake_extract,
+    )
+
+    inputs, errors, stats = live_retrieval._extract_company_website_inputs(
+        company="Example",
+        company_url=None,
+        search_results=[],
+        provider="trafilatura",
+    )
+
+    assert inputs == []
+    assert calls == ["https://www.businesswire.com/news/first"]
+    assert any("skipped after a confirmed error" in item for item in errors)
+    assert stats["terminal_error_hosts"] == ["businesswire.com"]
 
 
 def test_company_live_retrieval_prioritizes_request_focused_sources(
@@ -1486,6 +1717,181 @@ def test_opportunity_scout_live_retrieval_stages_sandbox_packet_when_review_is_r
     assert packet["topic"] == "thin collaboration packet"
     assert packet["retrieved_results"][0]["url"] == "https://example.test/collaboration"
     assert any("staged" in note.lower() for note in result.audit_notes)
+
+
+def test_opportunity_provider_failures_do_not_claim_bounded_search_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    class FailedProvider:
+        def telemetry(self) -> dict[str, object]:
+            return {
+                "search_provider": "searxng",
+                "provider_usage": {
+                    "searxng": {
+                        "requests_attempted": 4,
+                        "requests_succeeded": 0,
+                    }
+                },
+                "search_provider_errors": [
+                    {
+                        "provider": "searxng",
+                        "error_type": "SearxngSearchError",
+                        "message": "fixture failure",
+                    }
+                ],
+            }
+
+        def collected_results(self) -> list[SearchResult]:
+            return []
+
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_opportunity_search_provider",
+        lambda **_kwargs: FailedProvider(),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "scout_opportunities_live_search",
+        lambda **_kwargs: OpportunityScoutResult(
+            topic="bounded failure",
+            dry_run=False,
+            search_provider="searxng",
+            search_queries=["q1", "q2", "q3", "q4"],
+            records=[],
+            audit_notes=[],
+            retrieval_diagnostics={
+                "status": "complete",
+                "query_count": 4,
+                "stopped_before_stage": None,
+            },
+        ),
+    )
+
+    result, metadata = live_retrieval.run_opportunity_scout_live(
+        topic="bounded failure",
+        max_results=3,
+    )
+
+    receipt = result.retrieval_diagnostics["bounded_search_receipt"]
+    assert receipt["provider_attempt_count"] == 4
+    assert receipt["provider_completed"] is False
+    assert receipt["budget_or_deadline_stopped"] is True
+    assert receipt["exhausted"] is False
+    assert metadata["bounded_search_receipt"] == receipt
+
+
+def test_opportunity_live_metadata_preserves_bounded_admission_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    class FakeProvider:
+        def telemetry(self) -> dict[str, object]:
+            return {
+                "search_provider": "searxng+exa",
+                "provider_usage": {
+                    "searxng": {
+                        "requests_attempted": 2,
+                        "requests_succeeded": 2,
+                        "raw_result_count": 3,
+                    }
+                },
+            }
+
+        def collected_results(self) -> list[SearchResult]:
+            return [
+                SearchResult(
+                    title="Official accelerator",
+                    link="https://program.example.org/apply",
+                    snippet="Now accepting applications.",
+                    source="searxng",
+                )
+            ]
+
+    candidate_admission = {
+        "filtered_count": 1,
+        "review_count": 0,
+        "reason_counts": {"applicant eligibility was not verified": 1},
+        "samples": [
+            {
+                "disposition": "filtered",
+                "company_name": "Example Accelerator",
+                "entity_kind": "grant_program",
+                "source_category": "grant",
+                "source_url": "https://program.example.org/apply",
+                "reasons": ["applicant eligibility was not verified"],
+            }
+        ],
+    }
+    verification = {
+        "attempt_count": 1,
+        "status_counts": {"verified": 1},
+        "attempts": [
+            {
+                "url": "https://program.example.org/apply",
+                "status": "verified",
+                "provider": "trafilatura",
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_opportunity_search_provider",
+        lambda **_kwargs: FakeProvider(),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "scout_opportunities_live_search",
+        lambda **_kwargs: OpportunityScoutResult(
+            topic="accelerator programs",
+            dry_run=False,
+            search_provider="searxng+exa",
+            search_queries=["query one", "query two"],
+            raw_search_result_count=3,
+            deduped_candidate_count=0,
+            filtered_candidates=[
+                FilteredOpportunityCandidate(
+                    company_name="Example Accelerator",
+                    source_url="https://program.example.org/apply",
+                    reasons=["applicant eligibility was not verified"],
+                )
+            ],
+            retrieval_diagnostics={
+                "status": "complete",
+                "query_count": 2,
+                "raw_search_result_count": 3,
+                "candidate_admission": candidate_admission,
+                "verification": verification,
+                "resolved_search_plan": {
+                    "target_entity_types": ["grant_program"],
+                    "objectives": ["funding"],
+                    "strict_targeting": True,
+                    "lane_types": ["grant_funding"],
+                },
+            },
+        ),
+    )
+
+    result, metadata = live_retrieval.run_opportunity_scout_live(
+        topic="accelerator programs",
+        max_results=3,
+    )
+
+    assert metadata["search_queries"] == ["query one", "query two"]
+    assert metadata["raw_search_result_count"] == 3
+    diagnostics = metadata["retrieval_diagnostics"]
+    assert diagnostics["query_count"] == 2
+    assert diagnostics["raw_search_result_count"] == 3
+    assert diagnostics["candidate_admission"]["reason_counts"] == {
+        "applicant eligibility was not verified": 1
+    }
+    assert diagnostics["opportunity_verification"]["attempts"][0]["status"] == "verified"
+    assert diagnostics["opportunity_search_plan"]["target_entity_types"] == [
+        "grant_program"
+    ]
+    assert result.retrieval_diagnostics["candidate_admission"] == candidate_admission
 
 
 def test_opportunity_scout_live_retrieval_records_sandbox_hosted_web_search_config(

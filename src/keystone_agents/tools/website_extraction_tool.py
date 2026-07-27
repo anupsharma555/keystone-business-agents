@@ -20,6 +20,7 @@ from keystone_agents.guardrails import (
     enforce_tool_output_guardrails,
 )
 from keystone_agents.source_enrichment import extract_claim_candidates, extract_clean_text
+from keystone_agents.source_quality import has_unusable_page_content
 
 WebsiteExtractorProvider = Literal["trafilatura", "crawl4ai", "firecrawl"]
 WebsiteExtractionGuardrailContext = Literal[
@@ -198,6 +199,8 @@ def extract_website_content_with_fallbacks(
             }
         )
         candidates.append(result)
+        if _website_extraction_has_error_content(result):
+            break
         if _website_extraction_is_useful(result, minimum_useful_chars=minimum_useful_chars):
             return result.model_copy(
                 update={
@@ -212,13 +215,20 @@ def extract_website_content_with_fallbacks(
 
     if candidates:
         best = max(candidates, key=_website_extraction_candidate_score)
+        unusable_content = _website_extraction_has_error_content(best)
         return best.model_copy(
             update={
+                "status": "insufficient_content" if unusable_content else best.status,
+                "claims": [] if unusable_content else best.claims,
                 "metadata": {
                     **best.metadata,
                     "extraction_attempts": attempts,
                     "fallback_used": len(attempts) > 1,
-                    "quality_gate": "no provider met the useful-content threshold",
+                    "quality_gate": (
+                        "extracted page was an error, access, or challenge response"
+                        if unusable_content
+                        else "no provider met the useful-content threshold"
+                    ),
                     "extraction_strategy": page_profile,
                 }
             }
@@ -309,14 +319,25 @@ def _website_extraction_is_useful(
         result.status == "success"
         and bool(result.claims)
         and len(text) >= max(200, int(minimum_useful_chars))
+        and not _website_extraction_has_error_content(result)
     )
 
 
 def _website_extraction_candidate_score(result: WebsiteExtractionResult) -> tuple[int, int, int]:
     return (
-        int(result.status == "success"),
+        int(result.status == "success" and not _website_extraction_has_error_content(result)),
         len(result.claims),
         len(result.text_or_markdown.strip()),
+    )
+
+
+def _website_extraction_has_error_content(result: WebsiteExtractionResult) -> bool:
+    return has_unusable_page_content(
+        [
+            str(result.title or ""),
+            str(result.text_or_markdown or "")[:1200],
+            *[str(claim or "") for claim in result.claims[:3]],
+        ]
     )
 
 

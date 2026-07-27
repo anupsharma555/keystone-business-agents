@@ -138,9 +138,10 @@ Provider selection stays in Python policy rather than prompt-specific branches.
 The current ladder is:
 
 - Always/default live discovery: SearXNG.
-  The repo container mounts `infra/searxng/core-config/settings.yml` as a
-  read-only file so JSON API output remains enabled. Restart the dedicated
-  `kba-searxng` profile after changing this mount contract.
+  The repo container mounts `infra/searxng/core-config/` read-only at
+  `/etc/searxng` so image-declared config volumes cannot hide `settings.yml`
+  and JSON API output remains enabled. Restart the dedicated `kba-searxng`
+  profile after changing this mount contract.
 - Default capped corroboration: `agents-web-search`, bounded by hosted-search
   caps and not expanded by default.
 - Conditional semantic deepening: Exa when broad recall misses lanes or the ask

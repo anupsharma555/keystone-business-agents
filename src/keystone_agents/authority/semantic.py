@@ -8,6 +8,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from keystone_agents.contracts.request import (
+    RequestExecutionContract,
+    _compile_request_execution_contract,
+)
 from keystone_agents.schemas.manual_request_plan import (
     ManualProviderActionStep,
     ManualRequestPlan,
@@ -277,6 +281,37 @@ class ExecutionIntentAuthority:
         """Return whether the producer explicitly supplied one plan field."""
 
         return str(field_name or "").strip() in self.supplied_fields
+
+    @property
+    def request_contract(self) -> RequestExecutionContract | None:
+        """Return the derived execution contract for one validated plan."""
+
+        return self.compile_request_contract()
+
+    def compile_request_contract(
+        self,
+        *,
+        raw_request: str = "",
+    ) -> RequestExecutionContract | None:
+        """Compile the only typed execution projection of the semantic plan."""
+
+        if self.plan is None:
+            return None
+        return _compile_request_execution_contract(
+            self.plan,
+            raw_request=raw_request,
+        )
+
+    def effective_result_count(self) -> int:
+        """Return only a count that is authoritative for this plan source."""
+
+        if self.plan is None:
+            return 0
+        if self.canonical:
+            return self.plan.desired_count if self.plan.desired_count_explicit else 0
+        if self.compatibility and self.field_supplied("desired_count"):
+            return self.plan.desired_count
+        return 0
 
     def requests_route(self, route: str) -> bool:
         plan = self.plan

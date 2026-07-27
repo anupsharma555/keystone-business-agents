@@ -37,10 +37,12 @@ from keystone_agents.agents.outreach_composer import (
 )
 from keystone_agents.agents.web_query_planner import resolve_web_query_plan
 from keystone_agents.authority.semantic import ExecutionIntentAuthority
+from keystone_agents.authority.target_scope import TargetScopeResolution, resolve_target_scope
 from keystone_agents.cli_sdk import jsonable
 from keystone_agents.company_research import research_company_fixture
 from keystone_agents.config import cli_default_live_gmail, load_settings
 from keystone_agents.contact_enrichment import build_contact_enrichment_artifact
+from keystone_agents.contracts.completion import BoundedSearchReceipt
 from keystone_agents.cost_tracking import parse_cost_tracking_directive
 from keystone_agents.finance_expense_receipts import (
     extract_finance_receipt_evidence,
@@ -79,11 +81,20 @@ from keystone_agents.models import OutreachComposerSDKInput, ResearchSDKInput
 from keystone_agents.multi_target_research import (
     MultiTargetResearchResult,
     build_multi_target_research_plan,
+    multi_target_whole_request_ready,
     render_multi_target_research_summary,
     run_multi_target_research,
     should_run_multi_target_research,
 )
 from keystone_agents.operator_failures import redact_operator_text
+from keystone_agents.opportunity_scout.admission import (
+    official_program_source_required,
+    requested_formal_opportunity_kinds,
+)
+from keystone_agents.orchestration.completion import (
+    build_count_request_coverage,
+    reconcile_terminal_request_completion,
+)
 from keystone_agents.orchestrator.routing import (
     looks_like_send_side_effect,
     looks_like_thread_local_draft_request,
@@ -954,19 +965,29 @@ def _advance_work_item_one_step(
     )
 
 
-def normalize_workflow_request_for_graph(request: WorkflowRunRequest) -> WorkflowRunRequest:
+def normalize_workflow_request_for_graph(
+    request: WorkflowRunRequest,
+    *,
+    runtime: RequestRuntime | None = None,
+) -> WorkflowRunRequest:
     """Return the normalized request shape used before graph-native execution."""
 
-    store = SQLiteStore(request.database_url or database_url_from_env()) if request.save else None
-    return _normalize_workflow_request_for_context(request, store=store)
+    runtime = runtime or RequestRuntime.from_workflow_request(request)
+    runtime = runtime.with_request(request)
+    return _normalize_workflow_request_for_context(request, store=runtime.store)
 
 
-def answer_work_item_state_followup(request: WorkflowRunRequest) -> WorkflowRunResult | None:
+def answer_work_item_state_followup(
+    request: WorkflowRunRequest,
+    *,
+    runtime: RequestRuntime | None = None,
+) -> WorkflowRunResult | None:
     """Answer same-thread WorkItem state questions before specialist graph execution."""
 
-    request = normalize_workflow_request_for_graph(request)
-    store = SQLiteStore(request.database_url or database_url_from_env()) if request.save else None
-    return _maybe_answer_manager_loop_state_followup(request, store=store)
+    runtime = runtime or RequestRuntime.from_workflow_request(request)
+    request = normalize_workflow_request_for_graph(request, runtime=runtime)
+    runtime = runtime.with_request(request)
+    return _maybe_answer_manager_loop_state_followup(request, store=runtime.store)
 
 
 def prepare_work_item_step(
@@ -1227,6 +1248,7 @@ def finalize_prepared_work_item_step(
             ),
         }
     )
+    result = reconcile_terminal_request_completion(result)
     if synthesize_user_response:
         result = _maybe_synthesize_user_facing_response(
             result,
@@ -1592,7 +1614,7 @@ def advance_work_item_manager_loop(
             synthesize_user_response=False,
             runtime=runtime,
         )
-        result = _review_manager_loop_step(
+        result = review_and_reconcile_manager_step(
             result,
             original_request=request,
             step_index=step_index,
@@ -2529,7 +2551,7 @@ def _manager_loop_efficiency_signal(metrics: dict[str, Any]) -> str:
     return "completed_high_latency"
 
 
-def _review_manager_loop_step(
+def review_and_reconcile_manager_step(
     result: WorkflowRunResult,
     *,
     original_request: WorkflowRunRequest,
@@ -2753,6 +2775,27 @@ def _review_manager_loop_step(
             "blockers": blockers,
             "next_action": next_action,
         }
+    )
+
+
+def _review_manager_loop_step(
+    result: WorkflowRunResult,
+    *,
+    original_request: WorkflowRunRequest,
+    step_index: int,
+    store: SQLiteStore | None,
+    feedback_callback: Callable[[str, dict[str, Any]], None] | None,
+    defer_block_for_repair: bool = False,
+) -> WorkflowRunResult:
+    """Compatibility wrapper for the canonical manager-step review boundary."""
+
+    return review_and_reconcile_manager_step(
+        result,
+        original_request=original_request,
+        step_index=step_index,
+        store=store,
+        feedback_callback=feedback_callback,
+        defer_block_for_repair=defer_block_for_repair,
     )
 
 
@@ -3282,7 +3325,7 @@ def _attempt_manager_loop_repair(
         synthesize_user_response=False,
         runtime=runtime,
     )
-    repaired = _review_manager_loop_step(
+    repaired = review_and_reconcile_manager_step(
         repaired,
         original_request=original_request,
         step_index=step_index,
@@ -4676,7 +4719,9 @@ def _manager_loop_business_research_depth_gap(
     if authority.canonical and authority.plan is not None:
         current_evidence_requested = authority.plan.requires_live_search
     else:
-        request_text = latest_user_request(original_request.request_text).lower()
+        request_text = positive_capability_text(
+            latest_user_request(original_request.request_text)
+        ).lower()
         current_evidence_requested = bool(
             re.search(
                 r"\b(?:2026|current|recent|latest|doing|activity|update|roadmap)\b",
@@ -5595,7 +5640,12 @@ def _sdk_session_spec_for_work_item(request: WorkflowRunRequest, work_item: Work
 def _apply_manual_request_plan(work_item: WorkItem, plan: dict | None) -> WorkItem:
     if not isinstance(plan, dict) or not plan:
         return work_item
-    plan_payload = _manual_plan_event_payload(plan)
+    authority = ExecutionIntentAuthority.from_value(plan)
+    plan_payload = (
+        authority.plan.model_dump(mode="json")
+        if authority.canonical and authority.plan is not None
+        else _manual_plan_event_payload(plan)
+    )
     stored_plan = work_item.target.metadata.get("manual_request_plan")
     target_identity_keys = (
         "primary_target",
@@ -6043,6 +6093,7 @@ def _maybe_synthesize_user_facing_response(
         synthesis,
         sources=response_synthesis_sources(result),
         metadata_lines=response_synthesis_metadata_lines(result),
+        show_metadata=False,
         low_metadata=(
             low_metadata_requested(request.request_text or result.work_item.request_text)
             or any(
@@ -6367,6 +6418,13 @@ def _source_backed_section_is_metadata_like(
         "not using generic source-backed artifacts as filler",
         "keeps the slack answer focused",
         "source-backed shortlist from the current read-only run",
+        "the other extracted source",
+        "the payload does not",
+        "the payload contains",
+        "attached source refs",
+        "source packet",
+        "the source set",
+        "surfaced in this run",
     )
     if any(marker in compact for marker in metadata_markers):
         return True
@@ -7718,10 +7776,17 @@ def _source_provided_opportunity_user_facing_summary(
     *,
     request_text: str = "",
 ) -> str:
-    max_rows = _source_provided_opportunity_requested_count(
-        request_text,
-        fallback=_manual_plan_desired_count(result.manual_request_plan) or 3,
-    )
+    authority = ExecutionIntentAuthority.from_value(result.manual_request_plan)
+    authoritative_count = _execution_plan_desired_count(result.manual_request_plan)
+    if authority.canonical or authority.invalid:
+        max_rows = max(1, min(10, authoritative_count or 3))
+    else:
+        max_rows = _source_provided_opportunity_requested_count(
+            request_text,
+            fallback=authoritative_count
+            or _manual_plan_desired_count(result.manual_request_plan)
+            or 3,
+        )
     artifacts = [
         artifact
         for artifact in result.artifact_refs
@@ -8101,6 +8166,139 @@ def _manual_plan_desired_count(plan: dict[str, Any] | None) -> int:
         return max(1, min(10, int(plan.get("desired_count") or 0)))
     except (TypeError, ValueError):
         return 0
+
+
+def _execution_plan_desired_count(value: Any) -> int:
+    """Return the count allowed to shape execution or public completion.
+
+    Canonical planning may widen work only when the operator's count was
+    explicit. Valid compatibility plans retain their legacy count hint when
+    the field was actually supplied. Invalid canonical state fails closed.
+    """
+
+    return ExecutionIntentAuthority.from_value(value).effective_result_count()
+
+
+def _explicit_opportunity_count_contract(
+    request: WorkflowRunRequest,
+) -> tuple[int, str]:
+    """Return a valid typed Opportunity count contract or fail closed."""
+
+    plan = _manual_request_plan_model(request.manual_request_plan)
+    if (
+        plan is None
+        or (
+            plan.target_agent != WorkItemRoute.OPPORTUNITY_SCOUT.value
+            and WorkItemRoute.OPPORTUNITY_SCOUT.value not in plan.workflow
+        )
+        or plan.expected_artifact_type != "opportunity_record"
+        or not plan.desired_count_explicit
+    ):
+        return 0, "unspecified"
+    return min(plan.desired_count, 10), (
+        plan.desired_count_mode
+        if plan.desired_count_mode != "unspecified"
+        else "target"
+    )
+
+
+def _manual_plan_count_mode(plan: dict[str, Any] | None) -> str:
+    if not isinstance(plan, dict) or plan.get("desired_count_explicit") is not True:
+        return "unspecified"
+    value = str(plan.get("desired_count_mode") or "").strip().lower()
+    if value in {"target", "maximum", "minimum", "exact"}:
+        return value
+    return "target"
+
+
+def _explicit_gmail_collection_count(request: WorkflowRunRequest) -> int:
+    """Return a typed plural Gmail contract, without reparsing request phrases."""
+
+    collection_requested, explicit_count = _gmail_collection_contract(request)
+    if not collection_requested:
+        return 0
+    return explicit_count
+
+
+def _gmail_collection_contract(
+    request: WorkflowRunRequest,
+) -> tuple[bool, int]:
+    """Return typed collection scope plus its optional explicit bound."""
+
+    authority = ExecutionIntentAuthority.from_value(request.manual_request_plan)
+    plan = authority.plan
+    if (
+        plan is None
+        or authority.invalid
+        or plan.target_type != "gmail_message_collection"
+        or plan.provider_system != "gmail"
+        or (
+            plan.target_agent != WorkItemRoute.GMAIL_TRIAGE.value
+            and WorkItemRoute.GMAIL_TRIAGE.value not in plan.workflow
+        )
+    ):
+        return False, 0
+    if (
+        plan.task_objective == "outreach_draft"
+        and plan.expected_artifact_type == "outreach_draft"
+        and plan.desired_count == 1
+    ):
+        return False, 0
+    explicit_count = (
+        min(plan.desired_count, 10)
+        if plan.desired_count_explicit
+        else 0
+    )
+    return True, explicit_count
+
+
+def _explicit_outreach_draft_count(request: WorkflowRunRequest) -> int:
+    """Return a typed plural outreach contract, without reparsing request phrases."""
+
+    plan = _manual_request_plan_model(request.manual_request_plan)
+    if (
+        plan is None
+        or plan.target_agent != WorkItemRoute.OUTREACH_COMPOSER.value
+        or plan.expected_artifact_type != "outreach_draft"
+        or not plan.desired_count_explicit
+        or plan.desired_count <= 1
+    ):
+        return 0
+    return min(plan.desired_count, 10)
+
+
+def _resolve_outreach_target_scope(
+    request: WorkflowRunRequest,
+    *,
+    work_item: WorkItem,
+    store: SQLiteStore,
+) -> TargetScopeResolution[WorkItemArtifactRef]:
+    """Match typed outreach targets to selected profiles without positional fallback."""
+
+    authority = ExecutionIntentAuthority.from_value(request.manual_request_plan)
+    plan = authority.plan
+    contract = authority.request_contract
+    plan_targets: list[str] = []
+    if (
+        plan is not None
+        and contract is not None
+        and plan.target_agent == WorkItemRoute.OUTREACH_COMPOSER.value
+        and plan.expected_artifact_type == "outreach_draft"
+    ):
+        plan_targets = list(contract.target.required_entities)
+    available_profiles: list[tuple[str, WorkItemArtifactRef]] = []
+    for artifact in selected_artifacts(work_item, "company_profile"):
+        profile = _resolve_company_profile_artifact(artifact, store=store)
+        target_name = (
+            profile.name if profile is not None and profile.name.strip() else artifact.title
+        ).strip()
+        if target_name:
+            available_profiles.append((target_name, artifact))
+    return resolve_target_scope(
+        requested_targets=plan_targets,
+        available_targets=available_profiles,
+        explicit_count=_explicit_outreach_draft_count(request),
+    )
 
 
 def _opportunity_artifact_comparison_table(
@@ -8613,6 +8811,9 @@ def _manual_plan_event_payload(plan: Any) -> dict:
         "task_objective",
         "expected_artifact_type",
         "desired_count",
+        "desired_count_explicit",
+        "desired_count_mode",
+        "requires_target_discovery",
         "constraints",
         "ask_shape",
         "required_entities",
@@ -10141,9 +10342,8 @@ def _compact_context_text(value: Any, *, max_chars: int) -> str:
 
 def _effective_max_results(request: WorkflowRunRequest) -> int:
     count = request.max_results
-    plan = request.manual_request_plan if isinstance(request.manual_request_plan, dict) else {}
-    desired = plan.get("desired_count")
-    if isinstance(desired, int):
+    desired = _execution_plan_desired_count(request.manual_request_plan)
+    if desired:
         count = max(count, desired)
     return max(1, min(20, count))
 
@@ -10156,9 +10356,8 @@ def _quality_budgeted_max_results(
 ) -> int:
     count = _effective_max_results(request)
     if preserve_requested_count:
-        plan = request.manual_request_plan if isinstance(request.manual_request_plan, dict) else {}
-        desired_count = plan.get("desired_count")
-        if isinstance(desired_count, int) or request.max_results < 3:
+        desired_count = _execution_plan_desired_count(request.manual_request_plan)
+        if desired_count or request.max_results < 3:
             return count
     if budget.retrieval_max_results is not None:
         count = max(count, budget.retrieval_max_results)
@@ -10210,6 +10409,7 @@ def _comparison_company_names(
             plan.target_agent == "business_research_analyst"
             and plan.intent in {"company_research", "research_brief"}
             and plan.target_type == "company"
+            and not plan.requires_target_discovery
         ):
             return None
         entities = list(
@@ -10414,6 +10614,7 @@ def _advance_gmail_triage(
                 "thread_id": triage.thread_id,
                 "risk_flags": list(triage.risk_flags),
                 "triage_limitations": list(triage.triage_limitations),
+                "request_coverage": triage.request_coverage.model_dump(mode="json"),
             },
         )
         updated = attach_artifact(
@@ -10564,15 +10765,44 @@ def _try_live_gmail_thread_retrieval(
         request.request_text,
         manual_request_plan=request.manual_request_plan,
     )
+    research_requested = _manager_loop_requests_research(
+        request.request_text,
+        manual_request_plan=request.manual_request_plan,
+    )
+    typed_gmail_collection, explicit_gmail_collection_count = (
+        _gmail_collection_contract(request)
+    )
     open_ended_outreach_selection = bool(
         draft_requested and _open_ended_gmail_outreach_selection(request)
     )
+    gmail_collection_requested = bool(
+        typed_gmail_collection and not open_ended_outreach_selection
+    )
+    plural_downstream_requested = bool(
+        gmail_collection_requested and (draft_requested or research_requested)
+    )
+    if gmail_collection_requested and explicit_gmail_collection_count > 8:
+        return _blocked_live_gmail_result(
+            work_item,
+            query=query,
+            code="gmail_collection_count_exceeds_supported_bound",
+            message=(
+                "The bounded Gmail collection path currently supports at most 8 "
+                f"thread summaries per request; {explicit_gmail_collection_count} "
+                "were requested. No Gmail provider read was attempted."
+            ),
+            store=store,
+        )
     exclude_operator_replied = bool(
         open_ended_outreach_selection
         and _gmail_outreach_excludes_operator_replied_threads(request)
     )
     candidate_read_limit = min(
-        max(5 if open_ended_outreach_selection else 3, request.max_results),
+        max(
+            5 if open_ended_outreach_selection else 3,
+            request.max_results,
+            explicit_gmail_collection_count,
+        ),
         8,
     )
     try:
@@ -10630,6 +10860,23 @@ def _try_live_gmail_thread_retrieval(
         _gmail_thread_summary_result_from_payload(thread=thread, query=query)
         for thread in thread_payloads
     ]
+    if gmail_collection_requested:
+        summaries = [
+            summary
+            for summary in summaries
+            if _gmail_collection_summary_is_usable(summary)
+        ]
+        if not summaries:
+            return _blocked_live_gmail_result(
+                work_item,
+                query=query,
+                code="gmail_collection_has_no_usable_summaries",
+                message=(
+                    "Gmail returned bounded candidates, but none had both a stable "
+                    "thread identity and sanitized message evidence."
+                ),
+                store=store,
+            )
     summaries = sorted(
         summaries,
         key=lambda summary: (
@@ -10741,12 +10988,29 @@ def _try_live_gmail_thread_retrieval(
                     store=store,
                     exact_candidate_unsuitable=True,
                 )
-    research_requested = _manager_loop_requests_research(
-        request.request_text,
-        manual_request_plan=request.manual_request_plan,
+    gmail_collection_coverage = build_count_request_coverage(
+        interpreted_request=request.request_text,
+        expected_count=(
+            explicit_gmail_collection_count if gmail_collection_requested else 0
+        ),
+        observed_count=len(summaries),
+        item_label="Gmail thread summaries",
+        next_safe_action=(
+            "Broaden the bounded Gmail query or explicitly accept the smaller result set."
+        ),
+        count_mode=_manual_plan_count_mode(
+            _manual_request_plan_dict(request.manual_request_plan)
+        ),
+        bounded_search_exhausted=bool(
+            gmail_collection_requested
+            and len(thread_payloads) < explicit_gmail_collection_count
+            and len(summaries) == len(thread_payloads)
+        ),
     )
     gmail_research_target = (
-        _gmail_thread_research_target(selected) if research_requested else ""
+        _gmail_thread_research_target(selected)
+        if research_requested and not plural_downstream_requested
+        else ""
     )
     gmail_research_focus_terms = (
         _gmail_thread_research_focus_terms(
@@ -10791,6 +11055,7 @@ def _try_live_gmail_thread_retrieval(
         "send_enabled": False,
         "draft_created": False,
         "labels_modified": False,
+        "request_coverage": gmail_collection_coverage.model_dump(mode="json"),
     }
     artifact_id = str(
         store.save_agent_run(
@@ -10846,9 +11111,44 @@ def _try_live_gmail_thread_retrieval(
             "draft_created": False,
             "labels_modified": False,
             "gmail_live_read_only": True,
+            "collection_result": gmail_collection_requested,
+            "covered_thread_count": len(summaries),
+            "request_coverage": gmail_collection_coverage.model_dump(mode="json"),
+            **(
+                {"request_coverage_enforcement": "deterministic"}
+                if gmail_collection_requested
+                else {}
+            ),
         },
     )
+    downstream_blocker = (
+        WorkItemBlocker(
+            code="gmail_collection_downstream_batch_required",
+            message=(
+                "Gmail Triage retained every bounded thread summary, but downstream "
+                "research or drafting requires one explicit target per thread. No first-thread "
+                "fallback was executed."
+            ),
+        )
+        if plural_downstream_requested
+        else None
+    )
     next_action = (
+        WorkItemNextAction(
+            action="prepare_bounded_gmail_downstream_batch",
+            agent=(
+                WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+                if research_requested
+                else WorkItemRoute.OUTREACH_COMPOSER
+            ),
+            description=(
+                "Resolve and preserve one sender/thread identity per retained Gmail summary, "
+                "then run the bounded downstream batch."
+            ),
+            requires_approval=False,
+        )
+        if plural_downstream_requested
+        else
         WorkItemNextAction(
             action="research_company_from_gmail_context",
             agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
@@ -10881,9 +11181,16 @@ def _try_live_gmail_thread_retrieval(
         work_item.model_copy(
             update={
                 "last_agent": WorkItemRoute.GMAIL_TRIAGE.value,
-                "status": WorkItemStatus.IN_PROGRESS
+                "status": WorkItemStatus.BLOCKED
+                if downstream_blocker is not None
+                else WorkItemStatus.IN_PROGRESS
                 if next_action.agent != WorkItemRoute.GMAIL_TRIAGE
                 else WorkItemStatus.DONE,
+                "blockers": (
+                    [*work_item.blockers, downstream_blocker]
+                    if downstream_blocker is not None
+                    else work_item.blockers
+                ),
                 "target": (
                     work_item.target.model_copy(
                         update={
@@ -10905,9 +11212,14 @@ def _try_live_gmail_thread_retrieval(
                 "audit_notes": [
                     *work_item.audit_notes,
                     (
-                        "Gmail Triage performed read-only live Gmail retrieval, selected "
-                        "the most relevant recent matching thread, and performed no Gmail "
-                        "writes."
+                        "Gmail Triage performed read-only live Gmail retrieval, retained "
+                        + (
+                            "the bounded thread collection without choosing a first-thread "
+                            "downstream fallback"
+                            if plural_downstream_requested
+                            else "the most relevant recent matching thread"
+                        )
+                        + ", and performed no Gmail writes."
                     ),
                 ],
                 "next_action": next_action,
@@ -10933,16 +11245,28 @@ def _try_live_gmail_thread_retrieval(
             store=store,
             run_stage="gmail_semantic_candidate_ranking",
         )
-    return WorkflowRunResult(
+    result = WorkflowRunResult(
         work_item=updated,
         route=WorkItemRoute.GMAIL_TRIAGE,
         status=updated.status,
         advanced=True,
         artifact_refs=[artifact],
+        blockers=[downstream_blocker] if downstream_blocker is not None else [],
         next_action=updated.next_action,
-        human_summary=_format_gmail_thread_summary_work_item_summary(selected, query=query),
+        human_summary=(
+            _format_gmail_collection_work_item_summary(
+                summaries,
+                expected_count=explicit_gmail_collection_count,
+                count_mode=_manual_plan_count_mode(
+                    _manual_request_plan_dict(request.manual_request_plan)
+                ),
+            )
+            if gmail_collection_requested
+            else _format_gmail_thread_summary_work_item_summary(selected, query=query)
+        ),
         audit_notes=updated.audit_notes[-1:],
     )
+    return reconcile_terminal_request_completion(result)
 
 
 def _no_suitable_gmail_outreach_candidate_result(
@@ -12180,6 +12504,26 @@ def _gmail_thread_summary_result_from_payload(
     )
 
 
+def _gmail_collection_summary_is_usable(
+    summary: GmailThreadSummaryResult,
+) -> bool:
+    """Require stable identity and sanitized evidence before counting a thread."""
+
+    if not summary.thread_id.strip():
+        return False
+    evidence = [
+        summary.subject,
+        summary.summary,
+        summary.thread_context,
+        *(
+            value
+            for message in summary.messages
+            for value in (message.subject, message.snippet, message.summary)
+        ),
+    ]
+    return bool(summary.messages and any(str(value or "").strip() for value in evidence))
+
+
 def _gmail_single_message_payload(message: dict[str, Any]) -> dict[str, Any]:
     """Adapt one Gmail message to the summary contract without expanding its thread."""
 
@@ -12424,6 +12768,7 @@ def _open_ended_gmail_outreach_selection(request: WorkflowRunRequest) -> bool:
             and plan.provider_result_mode == "items"
             and plan.task_objective == "outreach_draft"
             and plan.expected_artifact_type == "outreach_draft"
+            and plan.desired_count == 1
         )
     if authority.invalid:
         return False
@@ -12549,6 +12894,69 @@ def _format_gmail_thread_summary_work_item_summary(
                 "*Current state:*",
                 "The latest message closes the exchange positively; earlier scheduling "
                 "questions are historical, not current action items.",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "Safety: read-only Gmail retrieval; no labels changed, no Gmail draft created, and no message sent.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _format_gmail_collection_work_item_summary(
+    summaries: Sequence[GmailThreadSummaryResult],
+    *,
+    expected_count: int,
+    count_mode: str,
+) -> str:
+    """Render every bounded Gmail collection item rather than only the first."""
+
+    display_count = expected_count if expected_count > 0 else len(summaries)
+    count_description = (
+        f"within the requested maximum of {expected_count}."
+        if count_mode == "maximum" and expected_count > 0
+        else f"against the requested count of {expected_count}."
+        if expected_count > 0
+        else "as the requested bounded collection."
+    )
+    lines = [
+        "*Answer:*",
+        (
+            f"Reviewed {len(summaries)} recent Gmail thread(s) read-only, "
+            + count_description
+        ),
+        "",
+        "*Messages:*",
+    ]
+    for index, summary in enumerate(summaries[:display_count], start=1):
+        subject = _redact_gmail_identity_from_public_text(
+            summary.subject or "(no subject)"
+        )
+        main_point = _redact_gmail_identity_from_public_text(
+            summary.summary or summary.thread_context or "Needs review."
+        )
+        lines.append(f"{index}. *{subject}* - {main_point}")
+        if summary.action_items:
+            action = _redact_gmail_identity_from_public_text(
+                summary.action_items[0]
+            )
+            if action:
+                lines.append(f"   Action: {action}")
+    if (
+        expected_count > 0
+        and count_mode != "maximum"
+        and len(summaries) < expected_count
+    ):
+        lines.extend(
+            [
+                "",
+                "*Limitations:*",
+                (
+                    f"The bounded query returned {len(summaries)} usable thread(s), "
+                    f"fewer than the requested {expected_count}."
+                ),
             ]
         )
     lines.extend(
@@ -15034,19 +15442,6 @@ def _advance_research(
             store=store,
         )
 
-    comparison_names = _comparison_company_names(
-        request.request_text or work_item.request_text,
-        manual_plan=manual_plan,
-    )
-    if comparison_names is not None:
-        return _advance_company_comparison_research(
-            work_item,
-            request=request,
-            company_a=comparison_names[0],
-            company_b=comparison_names[1],
-            store=store,
-        )
-
     if should_run_multi_target_research(
         request_text=request.request_text or work_item.request_text,
         manual_plan=manual_plan,
@@ -15057,6 +15452,19 @@ def _advance_research(
             request=request,
             target=target,
             manual_plan=manual_plan,
+            store=store,
+        )
+
+    comparison_names = _comparison_company_names(
+        request.request_text or work_item.request_text,
+        manual_plan=manual_plan,
+    )
+    if comparison_names is not None:
+        return _advance_company_comparison_research(
+            work_item,
+            request=request,
+            company_a=comparison_names[0],
+            company_b=comparison_names[1],
             store=store,
         )
 
@@ -15211,6 +15619,7 @@ def _advance_research(
             "source_context_status": _source_context_status(source_refs[:8]),
             "retrieval_diagnostics": metadata.get("retrieval_diagnostics"),
             "operator_approved_thread_local_drafting": selected_context_outreach,
+            "request_coverage": profile.request_coverage.model_dump(mode="json"),
         },
     )
     contact_artifact: WorkItemArtifactRef | None = None
@@ -16202,6 +16611,7 @@ def _advance_multi_target_research(
         retrieval_hint=_retrieval_hint_for_request(request),
         retrieve_profile=retrieve_company_profile_live,
     )
+    whole_request_ready = multi_target_whole_request_ready(result_payload)
     source_refs = _multi_target_work_item_sources(result_payload)
     artifact_id = ""
     if store is not None:
@@ -16212,7 +16622,7 @@ def _advance_multi_target_research(
                 input_summary=f"Multi-target research plan: {plan.topic}",
                 output=result_payload.model_dump(mode="json", by_alias=True),
                 dry_run=not request.live_search,
-                status="success" if result_payload.comparison_ready else "blocked",
+                status="success" if whole_request_ready else "blocked",
             )
         )
     artifact = WorkItemArtifactRef(
@@ -16223,13 +16633,16 @@ def _advance_multi_target_research(
         title=f"Multi-target research: {plan.topic}",
         summary=(
             f"{len(result_payload.packets)}/{plan.desired_count} target packet(s); "
-            + ("comparison ready" if result_payload.comparison_ready else "source gaps remain")
+            + ("whole request ready" if whole_request_ready else "source gaps remain")
         )[:240],
         metadata={
             "schema": "keystone.multi_target_research.artifact.v1",
             "multi_target_research": result_payload.model_dump(mode="json", by_alias=True),
             "pass_types": result_payload.pass_types,
             "comparison_ready": result_payload.comparison_ready,
+            "whole_request_ready": whole_request_ready,
+            "request_coverage": result_payload.request_coverage.model_dump(mode="json"),
+            "request_coverage_enforcement": "deterministic",
             "blockers": result_payload.blockers,
             "diagnostics": result_payload.diagnostics,
         },
@@ -16246,6 +16659,7 @@ def _advance_multi_target_research(
                             "multi_target_research": {
                                 "pass_types": result_payload.pass_types,
                                 "comparison_ready": result_payload.comparison_ready,
+                                "whole_request_ready": whole_request_ready,
                                 "blockers": result_payload.blockers,
                                 "diagnostics": result_payload.diagnostics,
                             },
@@ -16267,14 +16681,27 @@ def _advance_multi_target_research(
                 "next_action": WorkItemNextAction(
                     action=(
                         "review_multi_target_research"
-                        if result_payload.comparison_ready
-                        else "repair_or_deepen_multi_target_research"
+                        if whole_request_ready
+                        else (
+                            "repair_anchor_research"
+                            if result_payload.readiness.anchor_required
+                            and not result_payload.readiness.anchor_ready
+                            else "repair_or_deepen_multi_target_research"
+                        )
                     ),
                     agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
                     description=(
                         "Review the multi-target comparison evidence."
-                        if result_payload.comparison_ready
-                        else "Broaden candidate discovery or deepen per-target source extraction."
+                        if whole_request_ready
+                        else (
+                            "Deepen the named anchor before completing the comparison."
+                            if result_payload.readiness.anchor_required
+                            and not result_payload.readiness.anchor_ready
+                            else (
+                                "Broaden candidate discovery or deepen per-target "
+                                "source extraction."
+                            )
+                        )
                     ),
                     command_hint=f"keystone work-items advance {work_item.id}",
                 ),
@@ -16282,7 +16709,7 @@ def _advance_multi_target_research(
         ).touch(),
         artifact,
     )
-    if not result_payload.comparison_ready:
+    if not whole_request_ready:
         for blocker_text in result_payload.blockers[:5]:
             updated = add_blocker(
                 updated,
@@ -16295,7 +16722,7 @@ def _advance_multi_target_research(
         update={
             "status": (
                 WorkItemStatus.DONE
-                if result_payload.comparison_ready
+                if whole_request_ready
                 else WorkItemStatus.BLOCKED
             )
         }
@@ -16324,7 +16751,11 @@ def _multi_target_work_item_sources(
 ) -> list[WorkItemSourceRef]:
     refs: list[WorkItemSourceRef] = []
     seen_urls: set[str] = set()
-    for packet in result.packets:
+    packets = [
+        *([result.anchor_packet] if result.anchor_packet is not None else []),
+        *result.packets,
+    ]
+    for packet in packets:
         for raw_source in packet.source_refs[:6]:
             if not isinstance(raw_source, dict):
                 continue
@@ -17229,8 +17660,71 @@ def _advance_opportunity(
         request,
         work_item,
     )
+    planned_opportunity_scope = (
+        _resolve_company_profile_handoff_scope(
+            request,
+            work_item=work_item,
+            store=store,
+        )
+        if planned_company_assessment
+        else None
+    )
+    if planned_opportunity_scope is not None and (
+        planned_opportunity_scope.requires_batch
+        or planned_opportunity_scope.ambiguous
+        or planned_opportunity_scope.missing_targets
+        or planned_opportunity_scope.selected_item is None
+    ):
+        if planned_opportunity_scope.missing_targets:
+            detail = (
+                "missing requested target(s): "
+                + ", ".join(planned_opportunity_scope.missing_targets)
+            )
+            if planned_opportunity_scope.extra_targets:
+                detail += (
+                    "; unmatched selected target(s): "
+                    + ", ".join(planned_opportunity_scope.extra_targets)
+                )
+        elif planned_opportunity_scope.requires_batch:
+            detail = "multiple company profiles require separate assessments"
+        elif planned_opportunity_scope.ambiguous:
+            detail = (
+                "multiple selected company profiles are available without one named target"
+            )
+        else:
+            detail = "the selected company profile does not resolve one exact typed target"
+        return _blocked_result(
+            work_item,
+            (
+                WorkItemBlocker(
+                    code="opportunity_batch_requires_bounded_execution",
+                    message=(
+                        "Opportunity Scout did not select the first profile positionally because "
+                        f"{detail}."
+                    ),
+                ),
+            ),
+            WorkItemNextAction(
+                action="prepare_bounded_opportunity_batch",
+                agent=WorkItemRoute.OPPORTUNITY_SCOUT,
+                description=(
+                    "Resolve one source-backed company profile per requested target, then "
+                    "run the bounded opportunity-assessment batch."
+                ),
+            ),
+            store=store,
+            route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        )
     planned_assessment_result = (
-        _planned_company_profile_opportunity_result(work_item, store=store)
+        _planned_company_profile_opportunity_result(
+            work_item,
+            store=store,
+            company_ref=(
+                planned_opportunity_scope.selected_item
+                if planned_opportunity_scope is not None
+                else None
+            ),
+        )
         if planned_company_assessment
         else None
     )
@@ -17479,6 +17973,11 @@ def _advance_opportunity(
             scout_result = filtered_result
             audit_notes.extend(formal_gate_notes)
         if store is not None:
+            gate_retrieval_diagnostics = (
+                scout_result.retrieval_diagnostics
+                if isinstance(scout_result.retrieval_diagnostics, dict)
+                else {}
+            )
             record_event(
                 work_item,
                 event_type="opportunity_candidate_gates_applied",
@@ -17495,11 +17994,138 @@ def _advance_opportunity(
                         "deadline_or_timing_evidence",
                         "source_url",
                         "sponsor",
+                        "official_extracted_source_evidence",
                         "keystone_applicability_evidence",
                     ],
+                    "candidate_admission": gate_retrieval_diagnostics.get(
+                        "candidate_admission",
+                        {},
+                    ),
+                    "verification": gate_retrieval_diagnostics.get(
+                        "verification",
+                        {},
+                    ),
+                    "resolved_search_plan": gate_retrieval_diagnostics.get(
+                        "resolved_search_plan",
+                        {},
+                    ),
                 },
                 store=store,
             )
+
+    explicit_opportunity_count, opportunity_count_mode = (
+        _explicit_opportunity_count_contract(request)
+    )
+    opportunity_retrieval_diagnostics = (
+        scout_result.retrieval_diagnostics
+        if isinstance(scout_result.retrieval_diagnostics, dict)
+        else {}
+    )
+    if store is not None:
+        record_event(
+            work_item,
+            event_type="opportunity_retrieval_completed",
+            actor=WorkItemRoute.OPPORTUNITY_SCOUT.value,
+            summary="Recorded bounded opportunity retrieval and candidate admission evidence.",
+            metadata={
+                "schema": "keystone.opportunity_retrieval_completed.v1",
+                "formal_opportunity_request": formal_opportunity_request,
+                "retained_record_count": len(scout_result.records),
+                "filtered_candidate_count": len(scout_result.filtered_candidates),
+                "review_candidate_count": len(scout_result.review_candidates),
+                "search_query_count": len(scout_result.search_queries),
+                "raw_search_result_count": scout_result.raw_search_result_count,
+                "deduped_candidate_count": scout_result.deduped_candidate_count,
+                "candidate_admission": opportunity_retrieval_diagnostics.get(
+                    "candidate_admission",
+                    {},
+                ),
+                "verification": opportunity_retrieval_diagnostics.get(
+                    "verification",
+                    {},
+                ),
+                "resolved_search_plan": opportunity_retrieval_diagnostics.get(
+                    "resolved_search_plan",
+                    {},
+                ),
+            },
+            store=store,
+        )
+    opportunity_receipt_payload = opportunity_retrieval_diagnostics.get(
+        "bounded_search_receipt"
+    )
+    if isinstance(opportunity_receipt_payload, dict):
+        opportunity_search_receipt = BoundedSearchReceipt(
+            provider_attempt_count=int(
+                opportunity_receipt_payload.get("provider_attempt_count") or 0
+            ),
+            planned_attempt_count=int(
+                opportunity_receipt_payload.get("planned_attempt_count") or 0
+            ),
+            provider_completed=bool(
+                opportunity_receipt_payload.get("provider_completed")
+            ),
+            budget_or_deadline_stopped=bool(
+                opportunity_receipt_payload.get("budget_or_deadline_stopped")
+            ),
+            discovered_candidate_count=int(
+                opportunity_receipt_payload.get("discovered_candidate_count") or 0
+            ),
+            processed_candidate_count=int(
+                opportunity_receipt_payload.get("processed_candidate_count") or 0
+            ),
+            query_attempt_count=(
+                int(opportunity_receipt_payload.get("query_attempt_count") or 0)
+                if "query_attempt_count" in opportunity_receipt_payload
+                else None
+            ),
+            query_completed_count=(
+                int(opportunity_receipt_payload.get("query_completed_count") or 0)
+                if "query_completed_count" in opportunity_receipt_payload
+                else None
+            ),
+            query_uncovered_count=(
+                int(opportunity_receipt_payload.get("query_uncovered_count") or 0)
+                if "query_uncovered_count" in opportunity_receipt_payload
+                else None
+            ),
+            query_ledger_valid=(
+                bool(opportunity_receipt_payload.get("query_ledger_valid"))
+                if "query_ledger_valid" in opportunity_receipt_payload
+                else None
+            ),
+        )
+    else:
+        opportunity_search_receipt = BoundedSearchReceipt(
+            provider_attempt_count=0,
+            planned_attempt_count=len(scout_result.search_queries),
+            provider_completed=False,
+            budget_or_deadline_stopped=True,
+            discovered_candidate_count=scout_result.deduped_candidate_count,
+            processed_candidate_count=(
+                len(scout_result.records)
+                + len(scout_result.filtered_candidates)
+                + len(scout_result.review_candidates)
+            ),
+        )
+    opportunity_coverage = build_count_request_coverage(
+        interpreted_request=combined_request_text,
+        expected_count=explicit_opportunity_count,
+        observed_count=len(scout_result.records),
+        item_label="opportunity records",
+        next_safe_action=(
+            "Deepen or broaden the same opportunity search until the explicit count "
+            "is met, or report the underfill as the final bounded result."
+        ),
+        count_mode=opportunity_count_mode,
+        bounded_search_exhausted=opportunity_search_receipt.exhausted,
+    )
+    opportunity_count_underfilled = bool(
+        opportunity_coverage.stop_condition_status in {"blocked", "violated"}
+    )
+    scout_result = scout_result.model_copy(
+        update={"request_coverage": opportunity_coverage}
+    )
 
     saved_ids: list[str] = []
     if store is not None:
@@ -17533,12 +18159,48 @@ def _advance_opportunity(
                 "source_refs": [ref.model_dump(mode="json") for ref in record_source_refs],
                 "source_context_status": _source_context_status(record_source_refs),
                 "retrieval_diagnostics": metadata.get("retrieval_diagnostics"),
+                "request_coverage": opportunity_coverage.model_dump(mode="json"),
+                "bounded_search_receipt": opportunity_search_receipt.receipt(),
+                **(
+                    {"request_coverage_enforcement": "deterministic"}
+                    if explicit_opportunity_count
+                    else {}
+                ),
             },
         )
         artifacts.append(artifact)
         work_item = attach_artifact(work_item, artifact)
 
     if not artifacts:
+        if opportunity_count_underfilled:
+            blocker = WorkItemBlocker(
+                code="opportunity_count_underfilled",
+                message=opportunity_coverage.unmet_dimensions[0],
+            )
+            return _blocked_result(
+                work_item,
+                (blocker,),
+                WorkItemNextAction(
+                    action="deepen_opportunity_count",
+                    agent=WorkItemRoute.OPPORTUNITY_SCOUT,
+                    description=(
+                        "Deepen or broaden the same opportunity search until the "
+                        "explicit count is met or a truthful bounded-search exhaustion "
+                        "receipt supports a smaller maximum result."
+                    ),
+                    command_hint=f"keystone work-items advance {work_item.id}",
+                ),
+                store=store,
+                route=WorkItemRoute.OPPORTUNITY_SCOUT,
+                audit_notes=[
+                    *audit_notes,
+                    (
+                        "Opportunity result remained incomplete because the explicit "
+                        "cardinality contract returned zero records without bounded-search "
+                        "exhaustion evidence."
+                    ),
+                ],
+            )
         if _is_strict_role_recency_search(topic) or formal_opportunity_request:
             next_action = WorkItemNextAction(
                 action="broaden_opportunity_search",
@@ -17569,6 +18231,18 @@ def _advance_opportunity(
                         "review_candidate_count": len(scout_result.review_candidates),
                         "constraint_relaxation_suggestion": (
                             scout_result.constraint_relaxation_suggestion
+                        ),
+                        "candidate_admission": opportunity_retrieval_diagnostics.get(
+                            "candidate_admission",
+                            {},
+                        ),
+                        "verification": opportunity_retrieval_diagnostics.get(
+                            "verification",
+                            {},
+                        ),
+                        "resolved_search_plan": opportunity_retrieval_diagnostics.get(
+                            "resolved_search_plan",
+                            {},
                         ),
                     },
                     store=store,
@@ -17663,6 +18337,13 @@ def _advance_opportunity(
         if stop_after_opportunity_packet
         else "Review the opportunity records and run company research for any priority target."
     )
+    if opportunity_count_underfilled:
+        next_agent = WorkItemRoute.OPPORTUNITY_SCOUT
+        next_description = (
+            f"Deepen or broaden the opportunity search: "
+            f"{len(artifacts)}/{explicit_opportunity_count} requested records "
+            "currently satisfy the evidence gates."
+        )
     work_item = work_item.model_copy(
         update={
             "confidence": max(record.priority_score for record in scout_result.records) / 100,
@@ -17680,6 +18361,32 @@ def _advance_opportunity(
             ),
         }
     )
+    if opportunity_count_underfilled:
+        work_item = add_blocker(
+            work_item,
+            WorkItemBlocker(
+                code="opportunity_count_underfilled",
+                message=opportunity_coverage.unmet_dimensions[0],
+            ),
+        )
+        work_item = work_item.model_copy(
+            update={
+                "audit_notes": [
+                    *work_item.audit_notes,
+                    (
+                        "Opportunity result remained incomplete because the explicit "
+                        f"cardinality contract was underfilled "
+                        f"({len(artifacts)}/{explicit_opportunity_count})."
+                    ),
+                ],
+                "next_action": WorkItemNextAction(
+                    action="deepen_opportunity_count",
+                    agent=WorkItemRoute.OPPORTUNITY_SCOUT,
+                    description=next_description,
+                    command_hint=f"keystone work-items advance {work_item.id}",
+                ),
+            }
+        )
     work_item = work_item.model_copy(update={"status": derive_case_status(work_item)}).touch()
     for artifact in artifacts:
         _persist_artifact_and_event(
@@ -17694,6 +18401,9 @@ def _advance_opportunity(
         status=work_item.status,
         advanced=True,
         artifact_refs=artifacts,
+        blockers=[
+            blocker for blocker in work_item.blockers if not blocker.resolved
+        ],
         next_action=work_item.next_action,
         human_summary=(
             f"Opportunity Scout attached {len(artifacts)} source-backed opportunity record(s)."
@@ -17764,14 +18474,19 @@ def _apply_formal_opportunity_result_gates(
     *,
     request_text: str,
 ) -> tuple[OpportunityScoutResult, list[str]]:
-    requested_kinds = _requested_formal_opportunity_kinds(request_text)
+    requested_kinds = requested_formal_opportunity_kinds(request_text)
     if not requested_kinds:
         return scout_result, []
+    official_source_required = official_program_source_required(request_text)
 
     retained_records: list[ScoutOpportunityRecord] = []
     gate_filtered: list[FilteredOpportunityCandidate] = []
     for record in scout_result.records:
-        reasons = _formal_opportunity_record_gate_failures(record, requested_kinds)
+        reasons = _formal_opportunity_record_gate_failures(
+            record,
+            requested_kinds,
+            official_source_required=official_source_required,
+        )
         if reasons:
             gate_filtered.append(_filtered_opportunity_candidate_from_record(record, reasons))
         else:
@@ -17827,30 +18542,24 @@ def _apply_formal_opportunity_result_gates(
 
 
 def _requested_formal_opportunity_kinds(request_text: str) -> set[str]:
-    lower = str(request_text or "").lower()
-    kinds: set[str] = set()
-    if re.search(r"\b(?:grants?|nofo|foa|rfa|funding opportunity|award)\b", lower):
-        kinds.add("grant")
-    if re.search(r"\b(?:rfps?|request\s+for\s+proposals?|solicitations?|procurement)\b", lower):
-        kinds.add("rfp")
-    if re.search(r"\b(?:pilot(?:s| programs?)?|demonstrations?|challenge)\b", lower):
-        kinds.add("pilot")
-    if re.search(r"\b(?:call[- ]for[- ]proposals?|calls?\s+for\s+proposals|cfps?)\b", lower):
-        kinds.add("call_for_proposals")
-    if re.search(r"\bcalls?\s+for\s+applications\b", lower):
-        kinds.add("call_for_applications")
-    return kinds
+    """Compatibility facade for the shared formal-opportunity admission helper."""
+
+    return requested_formal_opportunity_kinds(request_text)
 
 
 def _formal_opportunity_record_gate_failures(
     record: ScoutOpportunityRecord,
     requested_kinds: set[str],
+    *,
+    official_source_required: bool = False,
 ) -> list[str]:
     failures: list[str] = []
     if not str(record.company_name or "").strip() or record.company_name == "Unknown company":
         failures.append("missing visible sponsor")
     if not any(str(source.url or "").strip() for source in record.sources):
         failures.append("missing source URL")
+    if official_source_required and not _record_has_official_read_source(record):
+        failures.append("missing official source with extracted page evidence")
     if not _record_has_requested_formal_opportunity_type(record, requested_kinds):
         failures.append("missing requested grant/RFP/pilot/call-for-proposals evidence")
     if not _record_has_formal_opportunity_timing(record):
@@ -17891,10 +18600,33 @@ def _record_has_requested_formal_opportunity_type(
             r"\b(?:call\s+for\s+applications|applications?\s+open)\b",
             evidence_text,
         ),
+        "accelerator": (
+            r"\b(?:accelerator|incubator|cohort|venture program)\b",
+            f"{evidence_text} {opportunity_type} {record.opportunity_kind}",
+        ),
     }
     for kind in requested_kinds:
         pattern, text = checks.get(kind, ("", ""))
         if pattern and re.search(pattern, text, flags=re.I):
+            return True
+    return False
+
+
+def _record_has_official_read_source(record: ScoutOpportunityRecord) -> bool:
+    """Require bounded page evidence from an authoritative program source type."""
+
+    authoritative_types = {
+        "company_site",
+        "conference",
+        "funding_database",
+        "government",
+    }
+    for source in record.sources:
+        if (
+            str(source.url or "").strip()
+            and str(source.evidence_excerpt or "").strip()
+            and str(source.source_type or "") in authoritative_types
+        ):
             return True
     return False
 
@@ -18267,13 +18999,15 @@ def _planned_company_profile_opportunity_result(
     work_item: WorkItem,
     *,
     store: SQLiteStore | None,
+    company_ref: WorkItemArtifactRef | None = None,
 ) -> tuple[OpportunityScoutResult, dict[str, object]] | None:
     """Assess one researched company without widening into generic discovery."""
 
-    company_refs = selected_artifacts(work_item, "company_profile")
-    if not company_refs:
-        return None
-    company_ref = company_refs[0]
+    if company_ref is None:
+        company_refs = selected_artifacts(work_item, "company_profile")
+        if len(company_refs) != 1:
+            return None
+        company_ref = company_refs[0]
     profile = None
     if store is not None:
         try:
@@ -18469,6 +19203,45 @@ def _planned_company_profile_opportunity_result(
             "retrieval_diagnostics": result.retrieval_diagnostics,
             "debug_notes": ["planned company-profile opportunity assessment"],
         },
+    )
+
+
+def _resolve_company_profile_handoff_scope(
+    request: WorkflowRunRequest,
+    *,
+    work_item: WorkItem,
+    store: SQLiteStore | None,
+) -> TargetScopeResolution[WorkItemArtifactRef]:
+    """Resolve a planned profile handoff without choosing artifact position zero."""
+
+    authority = ExecutionIntentAuthority.from_value(request.manual_request_plan)
+    contract = authority.request_contract
+    requested_targets = (
+        list(contract.target.required_entities)
+        if contract is not None
+        else []
+    )
+    explicit_count = (
+        contract.completion.desired_count
+        if contract is not None and contract.completion.desired_count is not None
+        else 0
+    )
+    available: list[tuple[str, WorkItemArtifactRef]] = []
+    for artifact in selected_artifacts(work_item, "company_profile"):
+        profile = (
+            _resolve_company_profile_artifact(artifact, store=store)
+            if store is not None
+            else None
+        )
+        name = (
+            profile.name if profile is not None and profile.name.strip() else artifact.title
+        ).strip()
+        if name:
+            available.append((name, artifact))
+    return resolve_target_scope(
+        requested_targets=requested_targets,
+        available_targets=available,
+        explicit_count=explicit_count,
     )
 
 
@@ -19447,6 +20220,67 @@ def _advance_outreach(
         request=request,
         store=store,
     )
+    outreach_scope = _resolve_outreach_target_scope(
+        request,
+        work_item=work_item,
+        store=store,
+    )
+    if (
+        outreach_scope.requires_batch
+        or outreach_scope.ambiguous
+        or (
+            outreach_scope.requested_targets
+            and outreach_scope.available_targets
+            and outreach_scope.selected_item is None
+        )
+    ):
+        scope_details = []
+        if outreach_scope.missing_targets:
+            scope_details.append(
+                f"missing selected targets: {', '.join(outreach_scope.missing_targets)}"
+            )
+        if outreach_scope.extra_targets:
+            scope_details.append(
+                f"unrequested selected targets: {', '.join(outreach_scope.extra_targets)}"
+            )
+        if outreach_scope.ambiguous:
+            scope_details.append(
+                "multiple selected company profiles are present without one typed target"
+            )
+        if outreach_scope.explicit_count > 1:
+            scope_details.append(
+                f"the typed contract requests {outreach_scope.explicit_count} drafts"
+            )
+        if len(outreach_scope.requested_targets) > 1:
+            scope_details.append(
+                "the typed contract names "
+                f"{len(outreach_scope.requested_targets)} distinct targets"
+            )
+        detail = "; ".join(scope_details) or "the target scope is not singular"
+        blocker = WorkItemBlocker(
+            code="outreach_batch_requires_bounded_execution",
+            message=(
+                "Outreach drafting cannot select the first profile positionally because "
+                f"{detail}. The current WorkItem step composes one target at a time."
+            ),
+        )
+        return _blocked_result(
+            work_item,
+            (blocker,),
+            WorkItemNextAction(
+                action="prepare_bounded_outreach_batch",
+                agent=WorkItemRoute.OUTREACH_COMPOSER,
+                description=(
+                    "Select and approve one source-backed company profile per requested "
+                    "draft, then run the bounded batch drafting path."
+                ),
+            ),
+            store=store,
+            route=WorkItemRoute.OUTREACH_COMPOSER,
+            audit_notes=[
+                "Outreach Composer withheld a one-target fallback for a plural draft contract."
+            ],
+        )
     gmail_thread_context = _latest_gmail_thread_summary_for_outreach(work_item, store=store)
     thread_local_request = _request_allows_thread_local_outreach_draft(
         request,
@@ -19530,7 +20364,9 @@ def _advance_outreach(
             route=WorkItemRoute.OUTREACH_COMPOSER,
         )
 
-    company_ref = selected_artifacts(work_item, "company_profile")[0]
+    company_ref = outreach_scope.selected_item
+    if company_ref is None:
+        company_ref = selected_artifacts(work_item, "company_profile")[0]
     try:
         company_profile = _resolve_company_profile_artifact(company_ref, store=store)
         if company_profile is None:

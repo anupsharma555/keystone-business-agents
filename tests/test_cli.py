@@ -11,6 +11,7 @@ import pytest
 import keystone_agents.cli as cli
 from keystone_agents.calendar_actions import CalendarActionPlan
 from keystone_agents.cli import main
+from keystone_agents.execution_request import attach_execution_public_result
 from keystone_agents.instruction_following import InstructionFollowingRepairOutput
 from keystone_agents.manual_request import (
     infer_manual_request_plan,
@@ -82,6 +83,109 @@ def test_verified_provider_links_excludes_unverified_or_non_https_receipts() -> 
         "https://airtable.com/app1/rec1",
         "https://calendar.test/event",
     ]
+
+
+def test_direct_opportunity_count_coverage_is_host_owned_and_blocks_underfill() -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="opportunity_scout",
+        target_agent="opportunity_scout",
+        intent="opportunity_search",
+        objective="Return exactly three qualified opportunities.",
+        task_objective="opportunity_discovery",
+        expected_artifact_type="opportunity_record",
+        desired_count=3,
+        desired_count_explicit=True,
+        desired_count_mode="exact",
+        target_type="topic",
+    )
+    payload = {
+        "status": "done",
+        "human_summary": "One source-backed opportunity is ready.",
+        "output": {
+            "records": [{"company_name": "Example Health"}],
+            "request_coverage": {
+                "status": "complete",
+                "stop_condition_status": "satisfied",
+            },
+        },
+    }
+
+    coverage = cli._attach_host_direct_opportunity_coverage(
+        payload,
+        route="opportunity_scout",
+        manual_plan=plan,
+        output=payload["output"],
+    )
+    result = attach_execution_public_result(payload)
+
+    assert coverage is not None
+    assert coverage.status == "partial"
+    assert payload["request_coverage_enforcement"] == "deterministic"
+    assert result.status == "partial"
+    assert result.completion_confirmed is False
+
+
+def test_direct_opportunity_maximum_underfill_requires_bounded_search_receipt() -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="opportunity_scout",
+        target_agent="opportunity_scout",
+        intent="opportunity_search",
+        objective="Return up to three qualified opportunities without padding.",
+        task_objective="opportunity_discovery",
+        expected_artifact_type="opportunity_record",
+        desired_count=3,
+        desired_count_explicit=True,
+        desired_count_mode="maximum",
+        target_type="topic",
+    )
+    output = {
+        "records": [{"company_name": "Example Health"}],
+        "search_queries": ["query one", "query two"],
+        "deduped_candidate_count": 1,
+        "filtered_candidates": [],
+        "review_candidates": [],
+        "retrieval_diagnostics": {
+            "status": "complete",
+            "query_count": 2,
+            "stopped_before_stage": None,
+            "bounded_search_receipt": {
+                "provider_attempt_count": 2,
+                "planned_attempt_count": 2,
+                "provider_completed": True,
+                "budget_or_deadline_stopped": False,
+                "discovered_candidate_count": 1,
+                "processed_candidate_count": 1,
+            },
+        },
+    }
+    payload: dict[str, object] = {}
+
+    coverage = cli._attach_host_direct_opportunity_coverage(
+        payload,
+        route="opportunity_scout",
+        manual_plan=plan,
+        output=output,
+    )
+
+    assert coverage is not None
+    assert coverage.status == "complete"
+    assert payload["bounded_search_receipt"]["exhausted"] is True
+
+    output["retrieval_diagnostics"]["status"] = "partial"
+    output["retrieval_diagnostics"]["stopped_before_stage"] = "candidate_verification"
+    output["retrieval_diagnostics"]["bounded_search_receipt"][
+        "budget_or_deadline_stopped"
+    ] = True
+    stopped_coverage = cli._attach_host_direct_opportunity_coverage(
+        {},
+        route="opportunity_scout",
+        manual_plan=plan,
+        output=output,
+    )
+    assert stopped_coverage is not None
+    assert stopped_coverage.status == "partial"
 
 
 def test_calendar_continuation_keeps_latest_human_task_anchor() -> None:
@@ -183,12 +287,20 @@ def test_direct_specialist_routes_share_one_llm_constraint_repair(
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=0,
             stdout=json.dumps(
-                {
-                    "output_type": "TestOutput",
-                    "send_enabled": False,
-                    "human_summary": "This response is much too long for the request.",
-                    "output": {"summary": "Bounded specialist evidence."},
-                }
+                    {
+                        "output_type": "TestOutput",
+                        "send_enabled": False,
+                        "human_summary": "This response is much too long for the request.",
+                        "user_facing_result_verified": True,
+                        "public_result": {
+                            "schema_name": "keystone.execution_public_result.v1",
+                            "status": "completed",
+                            "completion_confirmed": True,
+                            "provider_write_attempted": False,
+                            "text": "This response is much too long for the request.",
+                        },
+                        "output": {"summary": "Bounded specialist evidence."},
+                    }
             ),
             stderr="",
         ),
@@ -219,6 +331,89 @@ def test_direct_specialist_routes_share_one_llm_constraint_repair(
     assert payload["human_summary"] == "Agents follow natural instructions accurately."
     assert payload["instruction_following"]["repair_attempted"] is True
     assert payload["instruction_following"]["repair_succeeded"] is True
+
+
+def test_instruction_repair_does_not_override_failed_semantic_review(
+    monkeypatch,
+    capsys,
+    tmp_path,
+) -> None:
+    class FailedReview:
+        status = "fail"
+        overall_score = 35
+        approval_boundary_ok = True
+        observed_gaps = ["Output did not answer the request."]
+        recommended_next_step = "Repair the substantive answer."
+
+        def model_dump(self, *, mode: str) -> dict[str, object]:
+            assert mode == "json"
+            return {
+                "status": self.status,
+                "overall_score": self.overall_score,
+                "approval_boundary_ok": self.approval_boundary_ok,
+                "observed_gaps": self.observed_gaps,
+                "recommended_next_step": self.recommended_next_step,
+            }
+
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="business_research_analyst",
+        ask_shape=AskShapePolicy(
+            output_constraints=InterpretedOutputConstraints(
+                interpretation="exact five-word answer",
+                scope="answer",
+                word_count_mode="exact",
+                word_count=5,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_isolated_child_process",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "output_type": "TestOutput",
+                    "send_enabled": False,
+                    "human_summary": "This response is much too long for the request.",
+                    "output": {"summary": "Wrong substantive answer."},
+                }
+            ),
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "review_specialist_output",
+        lambda **_kwargs: FailedReview(),
+    )
+    monkeypatch.setattr(
+        "keystone_agents.instruction_following.run_typed_sdk_agent",
+        lambda **_kwargs: SimpleNamespace(
+            output=InstructionFollowingRepairOutput(
+                response_text="Agents follow natural instructions accurately."
+            ),
+            usage={},
+            cost={},
+            request_cache={},
+        ),
+    )
+
+    exit_code = cli._run_ask_script_live(
+        "business_research_analyst",
+        "Answer this in exactly five words.",
+        ["unused-child-command"],
+        json_output=True,
+        manual_plan=plan,
+        database_url=f"sqlite:///{tmp_path / 'failed-review-after-repair.db'}",
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["instruction_following"]["repair_succeeded"] is True
+    assert payload["orchestrator_review"]["status"] == "fail"
+    assert payload["public_result"]["status"] == "failed"
 
 
 def test_direct_specialist_provider_blocker_skips_llm_constraint_repair(
@@ -284,6 +479,84 @@ def test_direct_specialist_provider_blocker_skips_llm_constraint_repair(
     assert payload["block_kind"] == "gmail_target_not_found"
     assert payload["human_summary"] == summary
     assert "instruction_following" not in payload
+
+
+@pytest.mark.parametrize(
+    ("child_status", "public_status", "stored_status"),
+    [
+        ("partial", "partial", "partial"),
+        ("canceled", "canceled", "error"),
+        ("failed", "failed", "error"),
+        ("in_progress", "blocked", "blocked"),
+    ],
+)
+def test_direct_child_terminal_state_controls_public_and_persisted_status(
+    child_status: str,
+    public_status: str,
+    stored_status: str,
+    monkeypatch,
+    capsys,
+    tmp_path,
+) -> None:
+    class PassedReview:
+        status = "pass"
+
+        def model_dump(self, *, mode: str) -> dict[str, object]:
+            assert mode == "json"
+            return {"status": "pass", "overall_score": 100}
+
+    database_url = f"sqlite:///{tmp_path / f'{child_status}.db'}"
+    monkeypatch.setattr(
+        cli,
+        "run_isolated_child_process",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "status": child_status,
+                    "send_enabled": False,
+                    "human_summary": "The child returned a bounded terminal result.",
+                    "output_type": "TestOutput",
+                    "output": {
+                        "summary": "The child returned a bounded terminal result."
+                    },
+                }
+            ),
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(cli, "review_specialist_output", lambda **_kwargs: PassedReview())
+    monkeypatch.setattr(
+        cli,
+        "resolve_instruction_following_response",
+        lambda *_args, **_kwargs: pytest.fail(
+            "non-success child terminal states must not trigger instruction repair"
+        ),
+    )
+
+    cli._run_ask_script_live(
+        "business_research_analyst",
+        "Return a bounded research result.",
+        ["unused-child-command"],
+        json_output=True,
+        manual_plan=ManualRequestPlan(
+            source="llm",
+            target_agent="business_research_analyst",
+            intent="company_research",
+        ),
+        database_url=database_url,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    with SQLiteStore(database_url).managed_connection() as connection:
+        stored = connection.execute(
+            "SELECT status FROM agent_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert payload["status"] == public_status
+    assert payload["public_result"]["status"] == public_status
+    assert payload["public_result"]["completion_confirmed"] is False
+    assert stored is not None
+    assert stored["status"] == stored_status
 
 
 def test_parent_renderer_prefers_verified_child_provider_summary(
@@ -4992,18 +5265,21 @@ def test_cli_ask_agent_override_promotes_child_human_summary(
 
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["human_summary"] == summary
-    assert payload["slack_display_text"] == summary
-    assert payload["display_text"] == summary
-    assert payload["summary"] == summary
+    assert payload["human_summary"].startswith(
+        "Business Agents could not verify a reader-ready result."
+    )
+    assert payload["slack_display_text"] == payload["human_summary"]
+    assert payload["display_text"] == payload["human_summary"]
+    assert payload["summary"] == payload["human_summary"]
     assert payload["script_payload"]["human_summary"] == summary
     assert payload["output_type"] == "CompanyResearchFocusedBrief"
     assert payload["specialist_output_review"]["status"] == "fail"
-    assert "orchestrator_review" not in payload
+    assert payload["orchestrator_review"]["status"] == "fail"
     assert payload["child_result_promotion_receipt"]["reader_ready"] is True
     assert payload["child_result_promotion_receipt"]["verification_basis"] == [
         "mirrored_child_display_contract"
     ]
+    assert payload["public_result"]["status"] == "failed"
 
 
 def test_cli_live_payload_text_mode_prefers_human_summary_over_message(
@@ -5137,6 +5413,63 @@ def test_cli_live_opportunity_scout_no_external_context_uses_direct_inline_synth
     assert command[command.index("--max-openai-requests") + 1] == "1"
 
 
+def test_cli_live_formal_opportunity_request_uses_workitem_admission_gates(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+    database_url = f"sqlite:///{tmp_path / 'formal-opportunity.db'}"
+    request_text = (
+        "Opportunity Scout: identify exactly 3 current U.S. accelerator or grant "
+        "programs relevant to an early-stage behavioral-health AI company. Require "
+        "at least one official program source for each, compare eligibility, timing, "
+        "and strategic fit for Keystone, and do not draft, submit, post, send, or "
+        "write anything."
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="opportunity_scout",
+        target_agent="opportunity_scout",
+        intent="opportunity_search",
+        objective=request_text,
+        task_objective="opportunity_discovery",
+        expected_artifact_type="opportunity_record",
+        desired_count=3,
+        desired_count_explicit=True,
+        desired_count_mode="exact",
+        requires_live_search=True,
+    )
+
+    def fake_run_ask_work_item(input_text: str, **kwargs: object) -> int:
+        captured["input_text"] = input_text
+        captured.update(kwargs)
+        return 0
+
+    def fail_direct_script(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError("formal opportunity ask must not bypass WorkItem gates")
+
+    monkeypatch.setattr(cli, "_run_ask_work_item", fake_run_ask_work_item)
+    monkeypatch.setattr(cli, "_run_ask_script_live", fail_direct_script)
+
+    exit_code = cli._run_ask_opportunity_scout_live(
+        request_text,
+        json_output=True,
+        manual_plan=plan,
+        orchestrator_preflight=None,
+        sdk_session_spec=None,
+        cost_tracking_requested=True,
+        database_url=database_url,
+    )
+
+    assert exit_code == 0
+    assert captured["input_text"] == request_text
+    assert captured["database_url"] == database_url
+    assert captured["live_search"] is True
+    assert captured["live_sdk"] is True
+    assert captured["max_results"] == 3
+    assert captured["cost_tracking_requested"] is True
+
+
 def test_cli_live_business_research_no_external_context_uses_direct_inline_synthesis(
     monkeypatch,
     tmp_path: Path,
@@ -5178,6 +5511,79 @@ def test_cli_live_business_research_no_external_context_uses_direct_inline_synth
     assert "--no-live-search" in command
     assert "--compact-instructions" in command
     assert "--focused-brief" in command
+
+
+def test_cli_live_multi_target_research_uses_shared_work_item_kernel(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from keystone_agents.agents import manual_request_planner
+
+    captured: dict[str, object] = {}
+    request = (
+        "CoS, determine if there are any companies that are competitors to Deliberate "
+        "AI. Do a deep research of the company and then search for competitors focusing "
+        "on multimodal approaches in behavioral health in a similar way."
+    )
+
+    def fake_run_ask_work_item(input_text: str, **kwargs: object) -> int:
+        captured["input_text"] = input_text
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli, "_run_ask_work_item", fake_run_ask_work_item)
+    monkeypatch.setattr(
+        cli,
+        "_run_ask_script_live",
+        lambda *_args, **_kwargs: pytest.fail(
+            "multi-target research must not launch the single-company child script"
+        ),
+    )
+    malformed_candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        workflow=["business_research_analyst", "opportunity_scout"],
+        intent="company_research",
+        primary_target="Deliberate AI",
+        target_type="company",
+        provider_result_mode="items",
+        task_objective="entity_research",
+        expected_artifact_type="research_brief",
+        requires_target_discovery=True,
+        requires_live_search=True,
+        requires_durable_state=True,
+        ask_shape={"ask_breadth": "broad", "evidence_depth": "deep"},
+    )
+    monkeypatch.setattr(
+        manual_request_planner,
+        "run_typed_sdk_agent",
+        lambda **_kwargs: SimpleNamespace(output=malformed_candidate),
+    )
+    plan = manual_request_planner.resolve_manual_request_plan(
+        request,
+        requested_agent="chief_of_staff",
+        live=False,
+        run_config=object(),
+    )
+
+    exit_code = cli._run_ask_company_research_live(
+        request,
+        json_output=True,
+        manual_plan=plan,
+        orchestrator_preflight=None,
+        sdk_session_spec=None,
+        database_url=f"sqlite:///{tmp_path / 'multi-target.db'}",
+    )
+
+    assert exit_code == 0
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.workflow == []
+    assert plan.requires_target_discovery is True
+    assert captured["manual_plan"] is plan
+    assert captured["live_search"] is True
+    assert captured["live_sdk"] is True
+    assert captured["max_results"] == 3
 
 
 def test_company_research_inline_context_is_one_user_provided_source() -> None:
@@ -13395,10 +13801,18 @@ def test_live_gmail_child_promotes_assessment_and_copyable_draft(
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=0,
             stdout=json.dumps(
-                {
-                    "output_type": "EmailTriageResult",
-                    "send_enabled": False,
-                    "output": {
+                    {
+                        "output_type": "EmailTriageResult",
+                        "send_enabled": False,
+                        "user_facing_result_verified": True,
+                        "public_result": {
+                            "schema_name": "keystone.execution_public_result.v1",
+                            "status": "completed",
+                            "completion_confirmed": True,
+                            "provider_write_attempted": False,
+                            "text": f"{assessment}\n\n*Draft response:*\n{draft}",
+                        },
+                        "output": {
                         "summary": "The sender shared a certification application.",
                         "reasoning": assessment,
                         "needs_reply": True,

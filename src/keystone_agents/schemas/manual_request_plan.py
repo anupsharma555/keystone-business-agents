@@ -73,6 +73,20 @@ ManualExpectedArtifactType = Literal[
     "context_summary",
 ]
 
+ManualDesiredCountMode = Literal[
+    "unspecified",
+    "target",
+    "maximum",
+    "minimum",
+    "exact",
+]
+
+ManualDesiredCountScope = Literal[
+    "unspecified",
+    "total",
+    "additional",
+]
+
 ManualTargetType = Literal[
     "company",
     "person",
@@ -357,6 +371,36 @@ class ManualRequestPlan(BaseModel):
             "results; false when desired_count is merely the schema default."
         ),
     )
+    desired_count_mode: ManualDesiredCountMode = Field(
+        default="unspecified",
+        description=(
+            "How an explicit domain-result count constrains completion: target and "
+            "minimum require at least the count, maximum is a capped target that may "
+            "finish below the count only after bounded-search exhaustion, and exact "
+            "requires equality."
+        ),
+    )
+    desired_count_scope: ManualDesiredCountScope = Field(
+        default="unspecified",
+        description=(
+            "Whether an explicit count includes a named anchor in the total or requests "
+            "that many additional targets beyond the anchor."
+        ),
+    )
+    requires_target_discovery: bool = Field(
+        default=False,
+        description=(
+            "True when the requested research must discover related entities or "
+            "category members beyond the named anchor."
+        ),
+    )
+    anchor_entity: str = Field(
+        default="",
+        description=(
+            "Named entity that anchors an open-set research request. Keep empty for "
+            "category-wide discovery without one reference entity."
+        ),
+    )
     constraints: list[str] = Field(default_factory=list)
     ask_shape: AskShapePolicy = Field(default_factory=AskShapePolicy)
     required_entities: list[str] = Field(default_factory=list)
@@ -477,6 +521,7 @@ class ManualRequestPlan(BaseModel):
     @field_validator(
         "source",
         "primary_target",
+        "anchor_entity",
         "objective",
         "gmail_query",
         "draft_policy",

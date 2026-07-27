@@ -423,6 +423,52 @@ def run_orchestrator_preflight(
         workflow_state=workflow_state,
         cost_callback=record_planner_cost,
     )
+    return _build_orchestrator_preflight(
+        text,
+        manual_plan=manual_plan,
+        database_url=database_url,
+        workflow_state=workflow_state,
+        sdk_usage_events=sdk_usage_events,
+    )
+
+
+def run_orchestrator_preflight_from_plan(
+    request_text: str | Mapping[str, Any] | None,
+    *,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any],
+    database_url: str | None = None,
+    workflow_state: Mapping[str, Any] | None = None,
+) -> OrchestratorPreflight:
+    """Build preflight context from validated persisted semantic authority.
+
+    Literal WorkItem continuation must not spend another planner/model request
+    merely to reinterpret ``continue``. Callers use this only after selecting a
+    concrete WorkItem; invalid persisted state is rejected so they can invoke
+    the ordinary planner fallback explicitly.
+    """
+
+    authority = ExecutionIntentAuthority.from_value(manual_request_plan)
+    if not authority.canonical or authority.plan is None:
+        raise ValueError("Persisted WorkItem plan is not canonical.")
+    return _build_orchestrator_preflight(
+        _payload_text(request_text),
+        manual_plan=authority.plan,
+        database_url=database_url,
+        workflow_state=workflow_state,
+        sdk_usage_events=[],
+    )
+
+
+def _build_orchestrator_preflight(
+    text: str,
+    *,
+    manual_plan: ManualRequestPlan,
+    database_url: str | None,
+    workflow_state: Mapping[str, Any] | None,
+    sdk_usage_events: list[dict[str, Any]],
+) -> OrchestratorPreflight:
+    """Assemble one bounded preflight from the selected semantic plan."""
+
     route_result = route_request(
         text,
         manual_plan=manual_plan,

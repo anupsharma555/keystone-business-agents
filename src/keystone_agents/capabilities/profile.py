@@ -9,7 +9,9 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from keystone_agents.contracts.completion import blocking_request_coverage
 from keystone_agents.schemas.execution_request import ExecutionEntrypoint
+from keystone_agents.schemas.request_coverage import RequestCoverage
 
 
 class RequestCapabilityProfile(BaseModel):
@@ -172,6 +174,7 @@ def compile_child_result_promotion_receipt(
     summary: str,
     instruction_repair_verified: bool = False,
     typed_display_verified: bool = False,
+    host_request_coverage: RequestCoverage | None = None,
 ) -> ChildResultPromotionReceipt:
     """Compile bounded evidence for promoting one successful child summary.
 
@@ -222,10 +225,15 @@ def compile_child_result_promotion_receipt(
         basis.append("typed_display_contract")
     if rendered_display_verified:
         basis.append("mirrored_child_display_contract")
+    host_completion_blocked = bool(
+        host_request_coverage is not None
+        and blocking_request_coverage([host_request_coverage])
+    )
     reader_ready = bool(
         clean_summary
         and not send_enabled
-        and status not in {"blocked", "clarification_required", "failed", "needs_input"}
+        and status in {"verified", "completed", "complete", "done", "success", "recovered"}
+        and not host_completion_blocked
         and (not provider_write_attempted or provider_receipt_verified is True)
         and basis
     )

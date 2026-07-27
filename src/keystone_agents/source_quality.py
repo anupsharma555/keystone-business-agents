@@ -2,12 +2,30 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import re
+from collections.abc import Iterable, Sequence
 from datetime import date, datetime
 from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
+
+_UNUSABLE_PAGE_CONTENT_RE = re.compile(
+    r"(?:"
+    r"\bpage\s+(?:is\s+)?unavailable\b|"
+    r"\b(?:access|request)\s+denied\b|"
+    r"\b(?:http(?:\s+(?:status|error))?|status|error)\s*[:#-]?\s*"
+    r"(?:403|404|410|429|500|502|503)\b|"
+    r"\b(?:403|404|410|429|500|502|503)\s+"
+    r"(?:error|forbidden|not\s+found|unavailable)\b|"
+    r"\bpage\s+not\s+found\b|"
+    r"\btemporarily\s+unavailable\b|"
+    r"\bverify\s+(?:that\s+)?you\s+are\s+human\b|"
+    r"\bcaptcha\b|"
+    r"\benable\s+javascript\b[^.]{0,80}\bcontinue\b"
+    r")",
+    flags=re.I,
+)
 
 SourceQualityType = Literal[
     "fixture",
@@ -24,6 +42,13 @@ SourceQualityType = Literal[
     "social",
     "unknown",
 ]
+
+
+def has_unusable_page_content(parts: Iterable[object]) -> bool:
+    """Return whether bounded source text is clearly an error or challenge page."""
+
+    text = " ".join(str(part or "") for part in parts)
+    return bool(_UNUSABLE_PAGE_CONTENT_RE.search(text))
 
 
 class SourceQualityScore(BaseModel):

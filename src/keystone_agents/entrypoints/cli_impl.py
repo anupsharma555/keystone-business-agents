@@ -58,6 +58,11 @@ from keystone_agents.config import (
     load_settings,
     with_cli_environment,
 )
+from keystone_agents.contracts.completion import (
+    DETERMINISTIC_COVERAGE_ENFORCEMENT,
+    BoundedSearchReceipt,
+    build_count_request_coverage,
+)
 from keystone_agents.cost_tracking import parse_cost_tracking_directive
 from keystone_agents.costing import estimate_usage_cost
 from keystone_agents.direct_response import build_direct_supplied_response_agent
@@ -103,10 +108,14 @@ from keystone_agents.instruction_following import (
 from keystone_agents.local_file_inputs import local_file_input_bundle_from_text
 from keystone_agents.model_provider import get_runtime_agent_model_config
 from keystone_agents.models import RunMode
+from keystone_agents.multi_target_research import should_run_multi_target_research
 from keystone_agents.operator_failures import (
     known_exception_to_operator_failure,
     operator_failure_from_mapping,
     redact_operator_text,
+)
+from keystone_agents.opportunity_scout.admission import (
+    requested_formal_opportunity_kinds,
 )
 from keystone_agents.orchestration.stages import (
     advance_work_item_manager_loop,
@@ -170,6 +179,7 @@ from keystone_agents.schemas.operational_context import (
     RssContextResult,
     ZoteroContextResult,
 )
+from keystone_agents.schemas.request_coverage import RequestCoverage
 from keystone_agents.schemas.work_item import (
     WorkflowRunRequest,
     WorkflowRunResult,
@@ -9346,11 +9356,34 @@ def _run_ask_company_research_live(
     cost_tracking_requested: bool = False,
     database_url: str | None = None,
 ) -> int:
-    if not live_search_allowed_for_execution(
+    execution_live_search = live_search_allowed_for_execution(
         True,
         manual_plan=manual_plan,
         request_text=input_text,
+    )
+    if manual_plan is not None and should_run_multi_target_research(
+        request_text=input_text,
+        manual_plan=manual_plan,
+        target=manual_plan.primary_target,
     ):
+        return _run_ask_work_item(
+            input_text,
+            database_url=database_url,
+            live_search=execution_live_search,
+            live_sdk=True,
+            max_results=max(3, min(10, manual_plan.desired_count)),
+            json_output=json_output,
+            max_manager_steps=3,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            context_file_path=context_file_path,
+            sdk_session_enabled=sdk_session_spec.enabled if sdk_session_spec else None,
+            sdk_session_id=sdk_session_spec.session_id if sdk_session_spec else "",
+            sdk_session_db_path=sdk_session_spec.database_path if sdk_session_spec else "",
+            sdk_session_history_limit=sdk_session_spec.history_limit if sdk_session_spec else None,
+            cost_tracking_requested=cost_tracking_requested,
+        )
+    if not execution_live_search:
         profile = _direct_specialist_runtime_profile(
             "business_research_analyst",
             input_text=input_text,
@@ -9589,6 +9622,24 @@ def _run_ask_opportunity_scout_live(
             input_text,
             database_url=database_url,
             live_search=False,
+            live_sdk=True,
+            max_results=max(1, min(10, max_results)),
+            json_output=json_output,
+            max_manager_steps=3,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            context_file_path=context_file_path,
+            sdk_session_enabled=sdk_session_spec.enabled if sdk_session_spec else None,
+            sdk_session_id=sdk_session_spec.session_id if sdk_session_spec else "",
+            sdk_session_db_path=sdk_session_spec.database_path if sdk_session_spec else "",
+            sdk_session_history_limit=sdk_session_spec.history_limit if sdk_session_spec else None,
+            cost_tracking_requested=cost_tracking_requested,
+        )
+    if requested_formal_opportunity_kinds(input_text):
+        return _run_ask_work_item(
+            input_text,
+            database_url=database_url,
+            live_search=True,
             live_sdk=True,
             max_results=max(1, min(10, max_results)),
             json_output=json_output,
@@ -11123,13 +11174,15 @@ def _run_ask_script_live(
         "script_payload": script_payload,
     }
     script_status = str(script_payload.get("status") or "").strip().lower()
+    child_terminal_status = _normalized_child_terminal_status(script_status)
     typed_display = ""
-    if script_status in {"blocked", "clarification_required", "needs_input"}:
-        payload["status"] = "blocked"
+    if child_terminal_status:
+        payload["status"] = child_terminal_status
+    if child_terminal_status in {"blocked", "needs_input"}:
         payload["block_kind"] = str(
             script_payload.get("block_kind") or script_payload.get("reason_code") or "blocked"
         )
-    if script_status in {"blocked", "clarification_required", "needs_input"}:
+    if child_terminal_status:
         # Provider no-match and ambiguity are already safe terminal outcomes.
         # Do not spend a repair-model request trying to force normal answer-shape
         # constraints onto a blocker.
@@ -11183,12 +11236,22 @@ def _run_ask_script_live(
             else False
         ),
         typed_display_verified=bool(
-            script_status not in {"blocked", "clarification_required", "needs_input"}
+            not child_terminal_status
             and typed_display
+        ),
+        host_request_coverage=_attach_host_direct_opportunity_coverage(
+            payload,
+            route=route,
+            manual_plan=manual_plan,
+            output=output,
         ),
     )
     payload["child_result_promotion_receipt"] = promotion_receipt.receipt()
-    if review.status != "fail" or not promotion_receipt.reader_ready:
+    review_may_defer = bool(
+        promotion_receipt.reader_ready
+        and promotion_receipt.child_public_result_verified
+    )
+    if review.status != "fail" or not review_may_defer:
         payload["orchestrator_review"] = review.model_dump(mode="json")
     if human_summary:
         payload["human_summary"] = human_summary
@@ -11218,6 +11281,21 @@ def _run_ask_script_live(
         model_payload = payload.get("model") if isinstance(payload.get("model"), dict) else {}
         if isinstance(model_payload, dict):
             model_name = str(model_payload.get("name") or model_payload.get("model") or "")
+        public_result = (
+            payload.get("public_result")
+            if isinstance(payload.get("public_result"), Mapping)
+            else {}
+        )
+        public_status = str(public_result.get("status") or "").strip().lower()
+        persisted_status = (
+            "success"
+            if public_status in {"verified", "completed", "recovered"}
+            else "partial"
+            if public_status == "partial"
+            else "blocked"
+            if public_status in {"blocked", "needs_input"}
+            else "error"
+        )
         run_id = SQLiteStore(database_url or database_url_from_env()).save_agent_run(
             agent_name=route,
             input_payload={"request_text": input_text, "route": route},
@@ -11225,12 +11303,144 @@ def _run_ask_script_live(
             output=payload,
             model=f"sdk-live:{model_name or route}",
             dry_run=False,
-            status="blocked" if payload.get("status") == "blocked" else "success",
+            status=persisted_status,
         )
         payload["agent_run_id"] = run_id
     except Exception as exc:  # pragma: no cover - diagnostic metadata only
         payload["agent_run_persistence_error"] = f"{type(exc).__name__}: {exc}"
     return _print_ask_live_payload(payload, json_output=json_output)
+
+
+def _attach_host_direct_opportunity_coverage(
+    payload: dict[str, Any],
+    *,
+    route: str,
+    manual_plan: ManualRequestPlan | None,
+    output: object,
+) -> RequestCoverage | None:
+    """Compile count coverage from canonical plan plus typed Opportunity records."""
+
+    authority = ExecutionIntentAuthority.from_value(manual_plan)
+    plan = authority.plan
+    if (
+        not authority.canonical
+        or plan is None
+        or route != "opportunity_scout"
+        or plan.target_agent != "opportunity_scout"
+        or plan.expected_artifact_type != "opportunity_record"
+        or not plan.desired_count_explicit
+        or not isinstance(output, Mapping)
+        or not isinstance(output.get("records"), list)
+    ):
+        return None
+    search_receipt = _opportunity_bounded_search_receipt(output)
+    coverage = build_count_request_coverage(
+        interpreted_request=plan.objective,
+        expected_count=plan.desired_count,
+        observed_count=len(output["records"]),
+        item_label="opportunities",
+        next_safe_action=(
+            "Continue bounded opportunity research before claiming the requested "
+            "count is complete."
+        ),
+        count_mode=(
+            plan.desired_count_mode
+            if plan.desired_count_mode != "unspecified"
+            else "target"
+        ),
+        bounded_search_exhausted=search_receipt.exhausted,
+    )
+    payload["bounded_search_receipt"] = search_receipt.receipt()
+    payload["request_coverage"] = coverage.model_dump(mode="json")
+    payload["request_coverage_enforcement"] = DETERMINISTIC_COVERAGE_ENFORCEMENT
+    return coverage
+
+
+def _normalized_child_terminal_status(script_status: str) -> str:
+    aliases = {
+        "blocked": "blocked",
+        "clarification_required": "needs_input",
+        "needs_input": "needs_input",
+        "partial": "partial",
+        "canceled": "canceled",
+        "cancelled": "canceled",
+        "failed": "failed",
+        "error": "failed",
+        "rejected": "failed",
+        "timeout": "failed",
+        "in_progress": "blocked",
+        "running": "blocked",
+    }
+    return aliases.get(str(script_status or "").strip().lower(), "")
+
+
+def _opportunity_bounded_search_receipt(
+    output: Mapping[str, Any],
+) -> BoundedSearchReceipt:
+    diagnostics = (
+        output.get("retrieval_diagnostics")
+        if isinstance(output.get("retrieval_diagnostics"), Mapping)
+        else {}
+    )
+    receipt_payload = diagnostics.get("bounded_search_receipt")
+    if isinstance(receipt_payload, Mapping):
+        return BoundedSearchReceipt(
+            provider_attempt_count=int(
+                receipt_payload.get("provider_attempt_count") or 0
+            ),
+            planned_attempt_count=int(
+                receipt_payload.get("planned_attempt_count") or 0
+            ),
+            provider_completed=bool(receipt_payload.get("provider_completed")),
+            budget_or_deadline_stopped=bool(
+                receipt_payload.get("budget_or_deadline_stopped")
+            ),
+            discovered_candidate_count=int(
+                receipt_payload.get("discovered_candidate_count") or 0
+            ),
+            processed_candidate_count=int(
+                receipt_payload.get("processed_candidate_count") or 0
+            ),
+            query_attempt_count=(
+                int(receipt_payload.get("query_attempt_count") or 0)
+                if "query_attempt_count" in receipt_payload
+                else None
+            ),
+            query_completed_count=(
+                int(receipt_payload.get("query_completed_count") or 0)
+                if "query_completed_count" in receipt_payload
+                else None
+            ),
+            query_uncovered_count=(
+                int(receipt_payload.get("query_uncovered_count") or 0)
+                if "query_uncovered_count" in receipt_payload
+                else None
+            ),
+            query_ledger_valid=(
+                bool(receipt_payload.get("query_ledger_valid"))
+                if "query_ledger_valid" in receipt_payload
+                else None
+            ),
+        )
+    provider_attempt_count = int(diagnostics.get("query_count") or 0)
+    planned_attempt_count = len(output.get("search_queries") or [])
+    discovered_count = int(output.get("deduped_candidate_count") or 0)
+    processed_count = sum(
+        len(output.get(key) or [])
+        for key in ("records", "filtered_candidates", "review_candidates")
+    )
+    stopped = bool(
+        diagnostics.get("stopped_before_stage")
+        or str(diagnostics.get("status") or "").strip().lower() != "complete"
+    )
+    return BoundedSearchReceipt(
+        provider_attempt_count=provider_attempt_count,
+        planned_attempt_count=planned_attempt_count,
+        provider_completed=False,
+        budget_or_deadline_stopped=stopped,
+        discovered_candidate_count=discovered_count,
+        processed_candidate_count=processed_count,
+    )
 
 
 def _persist_ask_script_failure(
