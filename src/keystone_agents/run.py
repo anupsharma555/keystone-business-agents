@@ -1211,10 +1211,9 @@ def run_retrieved_sdk_synthesis(
             resolved_model_provider = config.provider
             resolved_model_name = config.model
         else:
-            resolved_model_provider = _run_config_provider_label(run_config)
+            resolved_model_provider = "local"
             resolved_model_name = str(
                 getattr(run_config, "model", "")
-                or getattr(agent, "model", "")
                 or model_label
                 or "sdk-local"
             )
