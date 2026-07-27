@@ -168,8 +168,9 @@ class MultiTargetResearchPlan(BaseModel):
     pass_budget: int = Field(default=2, ge=1, le=3)
     cost_profile: str = ""
     request_text: str = ""
+    anchor_target: str = ""
 
-    @field_validator("topic", "cost_profile", "request_text", mode="before")
+    @field_validator("topic", "cost_profile", "request_text", "anchor_target", mode="before")
     @classmethod
     def _clean_scalar(cls, value: Any) -> str:
         return " ".join(str(value or "").split()).strip()
@@ -237,6 +238,7 @@ class MultiTargetResearchResult(BaseModel):
     plan: MultiTargetResearchPlan
     candidate_targets: list[CandidateTarget] = Field(default_factory=list)
     selected_targets: list[str] = Field(default_factory=list)
+    anchor_packet: PerTargetResearchPacket | None = None
     packets: list[PerTargetResearchPacket] = Field(default_factory=list)
     comparison_ready: bool = False
     blockers: list[str] = Field(default_factory=list)
@@ -261,10 +263,7 @@ def should_run_multi_target_research(
             and plan.intent in {"company_research", "research_brief"}
             and (
                 (plan.desired_count_explicit and plan.desired_count > 1)
-                or (
-                    plan.target_type == "company"
-                    and len(set(plan.required_entities)) > 1
-                )
+                or (plan.target_type == "company" and len(set(plan.required_entities)) > 1)
             )
         )
     if authority.invalid:
@@ -283,7 +282,10 @@ def should_run_multi_target_research(
             " ".join(str(item) for item in plan.get("planner_warnings") or []),
         )
     ).lower()
-    if desired_count > 1 and re.search(r"\b(compare|comparison|versus|vs\.?)\b", text):
+    if desired_count > 1 and re.search(
+        r"\b(compare|comparison|versus|vs\.?|competitors?)\b",
+        text,
+    ):
         return True
     if desired_count > 1 and _looks_like_category_target(target):
         return True
@@ -315,6 +317,7 @@ def build_multi_target_research_plan(
         pass_budget=2,
         cost_profile=cost_profile,
         request_text=request_text,
+        anchor_target=_explicit_anchor_target(plan),
     )
 
 
@@ -330,7 +333,20 @@ def run_multi_target_research(
 ) -> MultiTargetResearchResult:
     """Execute multi-target breadth/depth retrieval with bounded parallelism."""
 
-    pass_types = ["candidate_discovery"]
+    pass_types: list[str] = []
+    anchor_packets: list[PerTargetResearchPacket] = []
+    if plan.anchor_target:
+        pass_types.append("anchor_characterization")
+        anchor_packets = _research_selected_targets(
+            plan,
+            [_anchor_candidate(plan)],
+            live_search=live_search,
+            quality_budget=quality_budget,
+            agents_web_search_max_calls=agents_web_search_max_calls,
+            retrieval_hint=retrieval_hint,
+            retrieve_profile=retrieve_profile,
+        )
+    pass_types.append("candidate_discovery")
     discovery, discovery_diagnostics = _discover_candidate_targets_with_diagnostics(
         plan,
         live_search=live_search,
@@ -342,7 +358,8 @@ def run_multi_target_research(
     if discovery_diagnostics.get("candidate_breadth_repair_passes"):
         pass_types.append("candidate_breadth_repair")
     pass_types.append("target_selection")
-    selected = discovery[: max(plan.desired_count, min(len(discovery), plan.desired_count + 2))]
+    competitor_count = plan.desired_count
+    selected = discovery[: max(competitor_count, min(len(discovery), competitor_count + 2))]
     selected, packets = _research_with_single_substitution_round(
         plan,
         selected_candidates=selected,
@@ -353,30 +370,42 @@ def run_multi_target_research(
         retrieve_profile=retrieve_profile,
     )
     pass_types.append("per_target_depth")
-    if len(packets) < plan.desired_count or any(not packet.source_sufficient for packet in packets):
+    if len(packets) < competitor_count or any(not packet.source_sufficient for packet in packets):
         pass_types.append("target_substitution")
+    anchor_packet = anchor_packets[0] if anchor_packets else None
     ready_packets = [packet for packet in packets if packet.source_sufficient]
-    comparison_ready = len(ready_packets) >= plan.desired_count
-    blockers = _multi_target_blockers(plan, discovery, packets)
+    anchor_ready = anchor_packet is None or anchor_packet.source_sufficient
+    comparison_ready = len(ready_packets) >= plan.desired_count and anchor_ready
+    blockers = _multi_target_blockers(
+        plan,
+        discovery,
+        packets,
+        anchor_packet=anchor_packet,
+    )
     if comparison_ready:
         blockers = []
         pass_types.append("final_synthesis")
     return MultiTargetResearchResult(
         plan=plan,
         candidate_targets=discovery,
-        selected_targets=[candidate.name for candidate in selected[: plan.desired_count]],
-        packets=packets[: plan.desired_count],
+        selected_targets=[candidate.name for candidate in selected[:competitor_count]],
+        anchor_packet=anchor_packet,
+        packets=packets[:competitor_count],
         comparison_ready=comparison_ready,
         blockers=blockers,
         diagnostics={
             "candidate_count": len(discovery),
+            "competitor_count_required": competitor_count,
             "packet_count": len(packets),
+            "total_comparison_packet_count": len(packets) + int(anchor_packet is not None),
             "ready_packet_count": len(ready_packets),
             "parallel_target_depth_limit": _target_depth_concurrency(plan),
+            "anchor_target": plan.anchor_target,
+            "anchor_source_sufficient": bool(anchor_packet and anchor_packet.source_sufficient),
             "target_selection": _target_selection_diagnostics(
                 discovery=discovery,
-                selected=selected[: plan.desired_count],
-                packets=packets[: plan.desired_count],
+                selected=selected[:competitor_count],
+                packets=packets[:competitor_count],
             ),
             **discovery_diagnostics,
         },
@@ -424,7 +453,7 @@ def _discover_candidate_targets_with_diagnostics(
             "candidate_count_after_initial": 0,
         }
     queries = _candidate_discovery_queries(plan)
-    max_results = max(4, min(8, getattr(quality_budget, "max_results", 6) or 6))
+    max_results = _retrieval_max_results(quality_budget)
     search_results: list[Any] = []
     result_query_by_url: dict[str, str] = {}
     search_provider_builder = search_provider_builder or build_search_provider
@@ -450,7 +479,7 @@ def _discover_candidate_targets_with_diagnostics(
     ranked = rank_candidate_targets(ledger, plan=plan)
     initial_count = len(ranked)
     repair_passes = 0
-    if initial_count < plan.desired_count and plan.pass_budget > 1:
+    if initial_count < _competitor_count(plan) and plan.pass_budget > 1:
         repair_passes = 1
         repair_queries = _candidate_discovery_repair_queries(plan)
         search_results = _search_candidate_query_batch(
@@ -493,7 +522,7 @@ def candidate_targets_from_search_results(
         for name in names:
             name = _canonical_candidate_name(name, plan=plan)
             key = _candidate_key(name)
-            if not key:
+            if not key or key in _anchor_candidate_keys(plan):
                 continue
             evidence = CandidateEvidence(
                 query=query,
@@ -559,7 +588,12 @@ def rank_candidate_targets(
             )
         )
     return sorted(
-        [candidate for candidate in ranked if candidate.ranking_score > 0],
+        [
+            candidate
+            for candidate in ranked
+            if candidate.ranking_score > 0
+            and candidate.normalized_key not in _anchor_candidate_keys(plan)
+        ],
         key=lambda item: (-item.ranking_score, item.name.lower()),
     )
 
@@ -569,10 +603,17 @@ def render_multi_target_research_summary(result: MultiTargetResearchResult) -> s
 
     title = f"Multi-target research: {result.plan.topic}"
     if result.comparison_ready:
-        answer = (
-            f"The run found source-backed packets for {len(result.packets)} "
-            "separate targets and can support the requested comparison."
-        )
+        if result.anchor_packet is not None:
+            answer = (
+                f"The run characterized {result.anchor_packet.target_name} and found "
+                f"source-backed packets for {len(result.packets)} competitor(s), so it "
+                "can support the requested comparison."
+            )
+        else:
+            answer = (
+                f"The run found source-backed packets for {len(result.packets)} "
+                "separate targets and can support the requested comparison."
+            )
     else:
         answer = "The run did not yet have enough per-target source evidence for the comparison."
     detailed_summary = _multi_target_detailed_summary(result)
@@ -586,14 +627,19 @@ def render_multi_target_research_summary(result: MultiTargetResearchResult) -> s
         detailed_summary,
         "",
         "Source-backed comparison table",
-        "| Target | Evidence status | Source URLs | Gaps |",
-        "|---|---|---|---|",
+        "| Role | Target | Evidence status | Source URLs | Gaps |",
+        "|---|---|---|---|---|",
     ]
-    for packet in result.packets:
+    for packet in _comparison_packets(result):
         urls = ", ".join(_packet_source_urls(packet)[:3]) or "none"
         gaps = "; ".join(packet.gaps[:3]) or "none"
         status = "sufficient" if packet.source_sufficient else packet.extraction_status
-        lines.append(f"| {packet.target_name} | {status} | {urls} | {gaps} |")
+        role = (
+            "anchor"
+            if _plan_anchor_key(result.plan) == _candidate_key(packet.target_name)
+            else "competitor"
+        )
+        lines.append(f"| {role} | {packet.target_name} | {status} | {urls} | {gaps} |")
     if result.blockers:
         lines.extend(["", "Blockers", *[f"* {blocker}" for blocker in result.blockers[:5]]])
     lines.extend(
@@ -616,7 +662,14 @@ def render_multi_target_research_summary(result: MultiTargetResearchResult) -> s
             (
                 "* Multi-target sufficiency: "
                 f"{result.diagnostics.get('ready_packet_count', 0)}/"
-                f"{result.plan.desired_count} target packet(s) sufficient"
+                f"{result.plan.desired_count} competitor packet(s) sufficient"
+                + (
+                    "; anchor packet sufficient"
+                    if result.anchor_packet is not None and result.anchor_packet.source_sufficient
+                    else (
+                        "; anchor packet insufficient" if result.anchor_packet is not None else ""
+                    )
+                )
             ),
         ]
     )
@@ -624,9 +677,10 @@ def render_multi_target_research_summary(result: MultiTargetResearchResult) -> s
 
 
 def _multi_target_detailed_summary(result: MultiTargetResearchResult) -> str:
-    ready_packets = [packet for packet in result.packets if packet.source_sufficient]
-    weak_packets = [packet for packet in result.packets if not packet.source_sufficient]
-    if not result.packets:
+    comparison_packets = _comparison_packets(result)
+    ready_packets = [packet for packet in comparison_packets if packet.source_sufficient]
+    weak_packets = [packet for packet in comparison_packets if not packet.source_sufficient]
+    if not comparison_packets:
         return (
             "The branch could not build per-target evidence packets. It needs named "
             "candidate targets plus public product, help, policy, or safety pages before "
@@ -653,10 +707,7 @@ def _multi_target_detailed_summary(result: MultiTargetResearchResult) -> str:
             "target-specific evidence, but at least one selected target is missing a "
             "product-specific source or requested feature evidence."
         )
-    source_strengths = [
-        _packet_source_strength_sentence(packet)
-        for packet in result.packets[: result.plan.desired_count]
-    ]
+    source_strengths = [_packet_source_strength_sentence(packet) for packet in comparison_packets]
     source_strength_text = " ".join(item for item in source_strengths if item)
     if source_strength_text:
         summary = f"{summary} {source_strength_text}"
@@ -741,7 +792,7 @@ def _research_with_single_substitution_round(
     selected: list[CandidateTarget] = []
     packets: list[PerTargetResearchPacket] = []
     candidate_iter = iter(selected_candidates)
-    while len(selected) < plan.desired_count:
+    while len(selected) < _competitor_count(plan):
         try:
             selected.append(next(candidate_iter))
         except StopIteration:
@@ -793,7 +844,7 @@ def _research_selected_targets(
     if not candidates:
         return []
     retrieve_profile = retrieve_profile or _default_retrieve_profile
-    max_results = max(4, min(8, getattr(quality_budget, "max_results", 6) or 6))
+    max_results = _retrieval_max_results(quality_budget)
 
     def run_one(candidate: CandidateTarget) -> PerTargetResearchPacket:
         if not live_search:
@@ -822,8 +873,7 @@ def _research_selected_targets(
     ordered: list[PerTargetResearchPacket | None] = [None] * len(candidates)
     with ThreadPoolExecutor(max_workers=_target_depth_concurrency(plan)) as executor:
         futures = {
-            executor.submit(run_one, candidate): index
-            for index, candidate in enumerate(candidates)
+            executor.submit(run_one, candidate): index for index, candidate in enumerate(candidates)
         }
         for future in as_completed(futures):
             index = futures[future]
@@ -873,8 +923,7 @@ def _packet_from_profile(
     extracted_count = sum(
         1
         for source in source_refs
-        if str(source.get("evidence_excerpt") or "").strip()
-        or source.get("supported_claims")
+        if str(source.get("evidence_excerpt") or "").strip() or source.get("supported_claims")
     )
     if extracted_count == 0:
         gaps.append("snippet-only or unextracted source packet")
@@ -906,8 +955,7 @@ def _prioritized_packet_source_refs(
         official = _looks_like_official_target_url(url, candidate.normalized_key)
         dimension = _source_matches_requested_dimensions(source, plan)
         extracted = bool(
-            str(source.get("evidence_excerpt") or "").strip()
-            or source.get("supported_claims")
+            str(source.get("evidence_excerpt") or "").strip() or source.get("supported_claims")
         )
         if official and dimension:
             bucket = 0
@@ -965,7 +1013,7 @@ def _candidate_discovery_quality(results: Sequence[Any], plan: MultiTargetResear
 
     candidates = candidate_targets_from_search_results(results, plan=plan)
     reasons = []
-    needs_precision = len(candidates) < plan.desired_count
+    needs_precision = len(candidates) < _competitor_count(plan)
     if needs_precision:
         reasons.append("too few candidate targets discovered")
     return RetrievalQualityAssessment(
@@ -990,14 +1038,25 @@ def _candidate_discovery_quality(results: Sequence[Any], plan: MultiTargetResear
 def _candidate_discovery_queries(plan: MultiTargetResearchPlan) -> list[str]:
     dims = " ".join(plan.requested_dimensions[:4])
     topic = plan.topic
-    queries = [
-        f"{topic} named products official safety policy pages {dims}",
-        f"{topic} official products {dims} current public source",
-        f"{topic} product safety pages teen users trusted contact escalation",
-        f"{topic} comparison {dims} 2026",
-        f"{topic} teen safety escalation trusted contact product pages",
-        f"{topic} public safety policy help center teen users",
-    ]
+    queries: list[str] = []
+    if plan.anchor_target:
+        queries.extend(
+            [
+                f"{plan.anchor_target} competitors alternatives {dims} official sources",
+                f"companies and products similar to {plan.anchor_target} {dims}",
+                f"{plan.anchor_target} market competitors comparison {dims}",
+            ]
+        )
+    queries.extend(
+        [
+            f"{topic} named products official safety policy pages {dims}",
+            f"{topic} official products {dims} current public source",
+            f"{topic} product safety pages teen users trusted contact escalation",
+            f"{topic} comparison {dims} 2026",
+            f"{topic} teen safety escalation trusted contact product pages",
+            f"{topic} public safety policy help center teen users",
+        ]
+    )
     if _topic_is_ai_companion_or_chatbot(plan):
         queries.extend(
             [
@@ -1011,12 +1070,22 @@ def _candidate_discovery_queries(plan: MultiTargetResearchPlan) -> list[str]:
 def _candidate_discovery_repair_queries(plan: MultiTargetResearchPlan) -> list[str]:
     dims = " ".join(plan.requested_dimensions[:4])
     topic = plan.topic
-    queries = [
-        f"{topic} official safety pages product help policy {dims}",
-        f"{topic} official product safety center named products {dims}",
-        f"{topic} named products public help center safety policy",
-        f"{topic} current product pages teen users safety controls",
-    ]
+    queries: list[str] = []
+    if plan.anchor_target:
+        queries.extend(
+            [
+                f"{plan.anchor_target} alternative vendors official product pages {dims}",
+                f"{plan.anchor_target} direct competitors official sites {dims}",
+            ]
+        )
+    queries.extend(
+        [
+            f"{topic} official safety pages product help policy {dims}",
+            f"{topic} official product safety center named products {dims}",
+            f"{topic} named products public help center safety policy",
+            f"{topic} current product pages teen users safety controls",
+        ]
+    )
     if _topic_is_ai_companion_or_chatbot(plan):
         queries.append(
             "AI chatbot companion products official teen safety policy pages "
@@ -1174,8 +1243,7 @@ def _candidate_matches_ai_companion_topic(candidate: CandidateTarget) -> bool:
     if candidate.normalized_key in _AI_COMPANION_PRODUCT_KEYS:
         return True
     haystack = " ".join(
-        f"{candidate.name} {item.title} {item.snippet} {item.url}"
-        for item in candidate.evidence
+        f"{candidate.name} {item.title} {item.snippet} {item.url}" for item in candidate.evidence
     ).lower()
     return any(marker in haystack for marker in _AI_COMPANION_TOPIC_MARKERS)
 
@@ -1184,11 +1252,15 @@ def _multi_target_blockers(
     plan: MultiTargetResearchPlan,
     candidates: list[CandidateTarget],
     packets: list[PerTargetResearchPacket],
+    *,
+    anchor_packet: PerTargetResearchPacket | None = None,
 ) -> list[str]:
     blockers: list[str] = []
-    if len(candidates) < plan.desired_count:
+    competitor_count = _competitor_count(plan)
+    if len(candidates) < competitor_count:
+        candidate_label = "competitor candidate" if plan.anchor_target else "candidate target"
         blockers.append(
-            f"breadth gap: found {len(candidates)} candidate target(s), need {plan.desired_count}"
+            f"breadth gap: found {len(candidates)} {candidate_label}(s), need {competitor_count}"
         )
     ready = [packet for packet in packets if packet.source_sufficient]
     if len(ready) < plan.desired_count:
@@ -1197,6 +1269,11 @@ def _multi_target_blockers(
             f"{len(ready)}/{plan.desired_count} target packet(s) "
             "have sufficient source evidence"
         )
+    if anchor_packet is not None and not anchor_packet.source_sufficient:
+        blockers.append(
+            "anchor depth gap: the named comparison anchor does not have sufficient source evidence"
+        )
+        blockers.append(f"{anchor_packet.target_name}: " + "; ".join(anchor_packet.gaps[:3]))
     for packet in packets:
         if not packet.source_sufficient:
             blockers.append(f"{packet.target_name}: " + "; ".join(packet.gaps[:3]))
@@ -1255,6 +1332,15 @@ def _packet_source_urls(packet: PerTargetResearchPacket) -> list[str]:
             if str(item.get("url") or "").strip()
         )
     )
+
+
+def _comparison_packets(
+    result: MultiTargetResearchResult,
+) -> list[PerTargetResearchPacket]:
+    return [
+        *([result.anchor_packet] if result.anchor_packet is not None else []),
+        *result.packets,
+    ]
 
 
 def _result_mapping(result: Any) -> dict[str, str]:
@@ -1338,6 +1424,66 @@ def _looks_like_category_target(value: str) -> bool:
             text,
         )
     )
+
+
+def _explicit_anchor_target(plan: dict[str, Any]) -> str:
+    """Return a planner-declared company anchor without parsing request prose."""
+
+    explicit = " ".join(str(plan.get("anchor_target") or "").split()).strip()
+    if explicit:
+        return explicit
+    if str(plan.get("target_type") or "").strip().lower() != "company":
+        return ""
+    primary_target = " ".join(str(plan.get("primary_target") or "").split()).strip()
+    if not primary_target or _looks_like_category_target(primary_target):
+        return ""
+    required_entities = [
+        " ".join(str(item or "").split()).strip()
+        for item in plan.get("required_entities") or []
+        if str(item or "").strip()
+    ]
+    if not required_entities:
+        return primary_target
+    if len(required_entities) == 1:
+        required_target = required_entities[0]
+        if _candidate_key(primary_target) == _candidate_key(required_target):
+            return primary_target
+        return required_target
+    return ""
+
+
+def _anchor_candidate(plan: MultiTargetResearchPlan) -> CandidateTarget:
+    return CandidateTarget(
+        name=plan.anchor_target,
+        normalized_key=_candidate_key(plan.anchor_target),
+    )
+
+
+def _anchor_candidate_keys(plan: MultiTargetResearchPlan) -> set[str]:
+    if not plan.anchor_target:
+        return set()
+    canonical_name = _canonical_candidate_name(plan.anchor_target, plan=plan)
+    return {
+        key
+        for key in {
+            _candidate_key(plan.anchor_target),
+            _candidate_key(canonical_name),
+        }
+        if key
+    }
+
+
+def _plan_anchor_key(plan: MultiTargetResearchPlan) -> str:
+    return _candidate_key(plan.anchor_target)
+
+
+def _competitor_count(plan: MultiTargetResearchPlan) -> int:
+    return plan.desired_count
+
+
+def _retrieval_max_results(quality_budget: AgentQualityBudget | None) -> int:
+    configured = quality_budget.retrieval_max_results if quality_budget is not None else None
+    return max(1, min(8, configured or 6))
 
 
 def _topic_is_ai_companion_or_chatbot(plan: MultiTargetResearchPlan) -> bool:
