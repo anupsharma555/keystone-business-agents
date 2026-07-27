@@ -5,11 +5,12 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, replace
-from datetime import date, timedelta
-from typing import Any
+from datetime import date, datetime, timedelta
+from typing import Any, Literal
 
 from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.calendar_actions import (
+    MONTHS,
     CalendarActionPlan,
     calendar_interpretation_context,
     calendar_lookup_date,
@@ -23,6 +24,8 @@ from keystone_agents.run import run_typed_sdk_agent
 from keystone_agents.schemas.calendar_action import (
     CalendarActionInterpretation,
     CalendarActionInterpretationInput,
+    CalendarLookupSynthesis,
+    CalendarLookupSynthesisInput,
 )
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.sdk import Agent, build_model_settings, build_sdk_agent, compose_instructions
@@ -40,6 +43,32 @@ class CalendarActionResolution:
 
     plan: CalendarActionPlan | None
     interpreter_used: bool = False
+    openai_requests: int = 0
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CalendarLookupSynthesisResolution:
+    """Validated semantic selection over provider-verified Calendar events."""
+
+    synthesis: CalendarLookupSynthesis | None
+    openai_requests: int = 0
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CalendarLookupAnswerResolution:
+    """Reader-ready answer over a bounded Calendar provider receipt."""
+
+    text: str
+    response_scope: Literal[
+        "focused",
+        "full_window",
+        "full_window_with_focus",
+    ]
+    status: Literal["matched", "ambiguous", "no_match", "fallback"]
+    selected_event_indexes: tuple[int, ...] = ()
+    related_event_groups: tuple[tuple[int, ...], ...] = ()
     openai_requests: int = 0
     warnings: tuple[str, ...] = ()
 
@@ -66,6 +95,151 @@ def build_calendar_action_interpreter_agent(model: str | None = None) -> Agent:
             "Interpret one Calendar action before deterministic write validation."
         ),
         enforce_tool_policy=False,
+    )
+
+
+def build_calendar_lookup_synthesizer_agent(model: str | None = None) -> Agent:
+    """Build a tool-less selector over bounded Calendar event metadata."""
+
+    return build_sdk_agent(
+        name="calendar_lookup_synthesizer",
+        instructions=compose_instructions(
+            "keystone_profile.md",
+            "safety_policy.md",
+            "calendar_lookup_synthesizer.md",
+        ),
+        output_type=CalendarLookupSynthesis,
+        tools=[],
+        model=model,
+        model_settings=build_model_settings(
+            reasoning_effort="none",
+            verbosity="low",
+            max_tokens=500,
+        ),
+        handoff_description=(
+            "Select the provider-verified Calendar event that answers one read-only lookup."
+        ),
+        enforce_tool_policy=False,
+    )
+
+
+def resolve_calendar_lookup_synthesis(
+    request_text: str,
+    events: list[dict[str, object]],
+    *,
+    lookup_target: str = "",
+    response_scope: str = "focused",
+    live: bool = False,
+    run_config: Any | None = None,
+    model: str | None = None,
+) -> CalendarLookupSynthesisResolution:
+    """Select relevant events without granting tools or expanding provider scope."""
+
+    bounded_events = [
+        {
+            "index": index,
+            "title": " ".join(str(event.get("title") or "").split())[:240],
+            "start_date": str(
+                event.get("display_start_date") or event.get("start_date") or ""
+            )[:10],
+            "start_time": str(
+                event.get("display_start_time") or event.get("start_time") or ""
+            )[:5],
+            "end_date": str(
+                event.get("display_end_date") or event.get("end_date") or ""
+            )[:10],
+            "end_time": str(
+                event.get("display_end_time") or event.get("end_time") or ""
+            )[:5],
+            "all_day": bool(event.get("all_day")),
+            "display_timezone": " ".join(
+                str(event.get("display_timezone") or "").split()
+            )[:100],
+            "location": " ".join(str(event.get("location") or "").split())[:500],
+            "source_calendar_name": " ".join(
+                str(event.get("source_calendar_name") or "").split()
+            )[:240],
+        }
+        for index, event in enumerate(events[:100])
+    ]
+    if not bounded_events or (not live and run_config is None):
+        return CalendarLookupSynthesisResolution(synthesis=None)
+    try:
+        result = run_typed_sdk_agent(
+            agent=build_calendar_lookup_synthesizer_agent(model=model),
+            typed_input=CalendarLookupSynthesisInput(
+                request_text=request_text,
+                lookup_target=lookup_target,
+                response_scope=response_scope,
+                events=bounded_events,
+            ),
+            output_type=CalendarLookupSynthesis,
+            run_config=run_config,
+            live=live,
+            workflow_name="Keystone Calendar lookup synthesis",
+            tracing_disabled=True,
+            max_turns=1,
+        )
+    except Exception as exc:
+        warning_detail = " ".join(str(exc).split())[:240]
+        return CalendarLookupSynthesisResolution(
+            synthesis=None,
+            openai_requests=1 if type(exc).__name__ == "ModelBehaviorError" else 0,
+            warnings=(
+                f"Calendar lookup synthesis unavailable: {type(exc).__name__}"
+                + (f": {warning_detail}" if warning_detail else ""),
+            ),
+        )
+    synthesis = result.output
+    valid_indexes = [
+        index
+        for index in synthesis.selected_event_indexes
+        if 0 <= index < len(bounded_events)
+    ]
+    if valid_indexes != synthesis.selected_event_indexes:
+        return CalendarLookupSynthesisResolution(
+            synthesis=None,
+            openai_requests=1,
+            warnings=("Calendar lookup synthesis selected an invalid event index.",),
+        )
+    if synthesis.status == "matched" and not valid_indexes:
+        return CalendarLookupSynthesisResolution(
+            synthesis=None,
+            openai_requests=1,
+            warnings=("Calendar lookup synthesis returned a match without an event.",),
+        )
+    selected_index_set = set(valid_indexes)
+    related_event_groups: list[list[int]] = []
+    grouped_indexes: set[int] = set()
+    group_warnings: list[str] = []
+    for group in synthesis.related_event_groups:
+        if (
+            len(group) < 2
+            or any(index not in selected_index_set for index in group)
+            or grouped_indexes.intersection(group)
+        ):
+            group_warnings.append(
+                "Calendar lookup synthesis returned an invalid related-event group; "
+                "the event selection was retained without that relationship."
+            )
+            continue
+        related_event_groups.append(group)
+        grouped_indexes.update(group)
+    if synthesis.status == "no_match" and valid_indexes:
+        synthesis = synthesis.model_copy(
+            update={
+                "selected_event_indexes": [],
+                "related_event_groups": [],
+            }
+        )
+    elif related_event_groups != synthesis.related_event_groups:
+        synthesis = synthesis.model_copy(
+            update={"related_event_groups": related_event_groups}
+        )
+    return CalendarLookupSynthesisResolution(
+        synthesis=synthesis,
+        openai_requests=1,
+        warnings=tuple(group_warnings),
     )
 
 
@@ -125,6 +299,13 @@ def resolve_calendar_action_plan(
             fallback,
             allowed_operations=allowed_operations,
         )
+        canonical_read_plan = canonical_calendar_read_plan(
+            request_text,
+            manual_plan=authority.plan,
+            today=today,
+        )
+        if canonical_read_plan is not None:
+            return CalendarActionResolution(plan=canonical_read_plan)
 
     requires_interpretation = bool(
         allowed_operations
@@ -257,6 +438,142 @@ def resolve_calendar_action_plan(
     )
 
 
+def canonical_calendar_read_plan(
+    request_text: str,
+    *,
+    manual_plan: ManualRequestPlan | dict[str, object] | None,
+    today: date | None = None,
+) -> CalendarActionPlan | None:
+    """Reuse a complete canonical read plan without a second model interpretation."""
+
+    authority = ExecutionIntentAuthority.from_value(manual_plan)
+    if not authority.canonical or authority.plan is None:
+        return None
+    plan = authority.plan
+    if not (
+        authority.authorizes_provider(
+            "google_calendar",
+            allowed_agents={"chief_of_staff"},
+            allowed_intents={"context_lookup"},
+        )
+        and set(authority.effective_provider_operations("google_calendar")) == {"read"}
+        and plan.provider_read_scope == "bounded_collection"
+        and plan.provider_result_mode == "items"
+        and plan.ask_shape.permission_state == "read_only"
+    ):
+        return None
+
+    directive = calendar_interpretation_context(request_text).directive_text
+    window = _canonical_calendar_window(directive, today=today)
+    if window is None:
+        return None
+    date_scope, start_date = window
+    lookup_target = calendar_lookup_target_from_plan(plan)
+    query = _canonical_calendar_query(lookup_target)
+    explicit_scope = _explicit_calendar_scope(directive)
+    calendar_scope = explicit_scope
+    if explicit_scope == "configured" and not re.search(
+        r"\b(?:primary|configured|default)\s+(?:google\s+)?calendar\b",
+        _normalize_source_text(directive),
+    ):
+        calendar_scope = "all_readable"
+    return CalendarActionPlan(
+        operation="read",
+        read_scope="filtered_window" if query else "time_window",
+        read_selection="all",
+        date_scope=date_scope,
+        query=query,
+        start_date=start_date,
+        calendar_id=(
+            os.getenv(GOOGLE_CALENDAR_ID_ENV, DEFAULT_CALENDAR_ID).strip()
+            or DEFAULT_CALENDAR_ID
+        ),
+        calendar_scope=calendar_scope,
+        timezone=(
+            os.getenv(
+                GOOGLE_CALENDAR_TIMEZONE_ENV,
+                DEFAULT_CALENDAR_TIMEZONE,
+            ).strip()
+            or DEFAULT_CALENDAR_TIMEZONE
+        ),
+        all_day=False,
+        complete=True,
+    )
+
+
+def _canonical_calendar_window(
+    directive: str,
+    *,
+    today: date | None,
+) -> tuple[str, str] | None:
+    """Resolve one explicit day window without inferring an unstated date."""
+
+    normalized = _normalize_source_text(directive)
+    relative_scopes = {
+        scope
+        for scope, pattern in (
+            ("today", r"\btoday\b"),
+            ("tomorrow", r"\btomorrow\b"),
+        )
+        if re.search(pattern, normalized)
+    }
+    if len(relative_scopes) > 1:
+        return None
+    reference = today or current_calendar_date()
+    if relative_scopes == {"today"}:
+        return "today", reference.isoformat()
+    if relative_scopes == {"tomorrow"}:
+        return "tomorrow", (reference + timedelta(days=1)).isoformat()
+    explicit_date = calendar_lookup_date(directive, today=reference)
+    return ("specific_date", explicit_date) if explicit_date else None
+
+
+def _canonical_calendar_query(lookup_target: str) -> str:
+    """Remove only generic Calendar/window words from a planner-owned target."""
+
+    clean = _clean_source_value(lookup_target)
+    if not clean:
+        return ""
+    clean = re.sub(r"\b20\d{2}-\d{2}-\d{2}\b", " ", clean)
+    clean = re.sub(r"\b\d{1,2}/\d{1,2}/20\d{2}\b", " ", clean)
+    month_names = "|".join(MONTHS)
+    clean = re.sub(
+        rf"\b(?:{month_names})\s+\d{{1,2}}(?:st|nd|rd|th)?"
+        rf"(?:,?\s+20\d{{2}})?\b",
+        " ",
+        clean,
+        flags=re.I,
+    )
+    generic = {
+        "a",
+        "all",
+        "an",
+        "any",
+        "calendar",
+        "calendars",
+        "earliest",
+        "event",
+        "events",
+        "first",
+        "for",
+        "from",
+        "google",
+        "in",
+        "last",
+        "latest",
+        "my",
+        "next",
+        "on",
+        "our",
+        "the",
+        "today",
+        "tomorrow",
+    }
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9'_-]*", clean)
+    query = " ".join(token for token in tokens if token.lower() not in generic)
+    return query if _calendar_query_is_discriminating(query) else ""
+
+
 def calendar_lookup_target_from_plan(
     manual_plan: ManualRequestPlan | dict[str, object] | None,
 ) -> str:
@@ -281,6 +598,291 @@ def calendar_lookup_target_from_plan(
         if clean and _normalize_source_text(clean) not in generic_targets:
             return clean
     return ""
+
+
+def calendar_lookup_response_scope(
+    manual_plan: ManualRequestPlan | dict[str, object] | None,
+    plan: CalendarActionPlan,
+) -> Literal["focused", "full_window", "full_window_with_focus"]:
+    """Map the canonical ask shape to one stable Calendar response scope."""
+
+    validated_plan: ManualRequestPlan | None
+    if isinstance(manual_plan, dict):
+        try:
+            validated_plan = ManualRequestPlan.model_validate(manual_plan)
+        except ValueError:
+            validated_plan = None
+    else:
+        validated_plan = manual_plan
+    ask_shape = getattr(validated_plan, "ask_shape", None)
+    ask_breadth = str(getattr(ask_shape, "ask_breadth", "") or "")
+    has_lookup_target = bool(calendar_lookup_target_from_plan(validated_plan))
+    has_calendar_filter = bool(
+        str(getattr(plan, "query", "") or "").strip()
+        or str(getattr(plan, "read_scope", "") or "") == "filtered_window"
+    )
+    if ask_breadth == "narrow":
+        return "focused"
+    if ask_breadth in {"bounded", "broad"}:
+        return "full_window_with_focus" if has_calendar_filter else "full_window"
+    return "focused" if (has_lookup_target or has_calendar_filter) else "full_window"
+
+
+def resolve_calendar_lookup_answer(
+    request_text: str,
+    events: list[dict[str, object]],
+    *,
+    lookup_target: str,
+    response_scope: Literal[
+        "focused",
+        "full_window",
+        "full_window_with_focus",
+    ],
+    fallback: str,
+    live: bool,
+    model: str | None = None,
+) -> CalendarLookupAnswerResolution:
+    """Select relevant events and render only provider-verified Calendar facts."""
+
+    if not events or response_scope == "full_window":
+        return CalendarLookupAnswerResolution(
+            text=fallback or "Google Calendar read completed.",
+            response_scope=response_scope,
+            status="fallback",
+        )
+    resolution = resolve_calendar_lookup_synthesis(
+        request_text,
+        events,
+        lookup_target=lookup_target,
+        response_scope=response_scope,
+        live=live,
+        model=model,
+    )
+    synthesis = resolution.synthesis
+    if synthesis is None:
+        text = (
+            fallback
+            if response_scope == "full_window_with_focus"
+            else "I found Calendar events in the requested window, but I could not "
+            "confidently identify one matching event."
+        )
+        return CalendarLookupAnswerResolution(
+            text=text,
+            response_scope=response_scope,
+            status="fallback",
+            openai_requests=resolution.openai_requests,
+            warnings=resolution.warnings,
+        )
+
+    selected_pairs = [
+        (index, events[index])
+        for index in synthesis.selected_event_indexes
+        if 0 <= index < len(events)
+    ]
+    selected_indexes = tuple(index for index, _event in selected_pairs)
+    selected = [event for _index, event in selected_pairs]
+    related_event_groups = tuple(
+        tuple(group) for group in synthesis.related_event_groups
+    )
+    if synthesis.status == "matched" and len(selected) == 1:
+        detail = _calendar_event_answer_detail(selected[0])
+        location = " ".join(str(selected[0].get("location") or "").split())
+        location_text = (
+            f" Location: {location}."
+            if location
+            else " No location is listed in the Calendar event."
+        )
+        focused = f"I found one matching event: {detail}.{location_text}"
+        if response_scope == "full_window_with_focus" and fallback:
+            focused = f"{focused}\n\n{fallback}"
+        return CalendarLookupAnswerResolution(
+            text=focused,
+            response_scope=response_scope,
+            status="matched",
+            selected_event_indexes=selected_indexes,
+            related_event_groups=related_event_groups,
+            openai_requests=resolution.openai_requests,
+            warnings=resolution.warnings,
+        )
+    if related_event_groups:
+        grouped_indexes = set(related_event_groups[0])
+        grouped_events = [
+            events[index]
+            for index in related_event_groups[0]
+            if 0 <= index < len(events)
+        ]
+        lines = [
+            (
+                "I found one likely event represented by "
+                f"{len(grouped_events)} Calendar entries:"
+            )
+        ]
+        lines.extend(
+            f"- {_calendar_event_answer_detail(event)}. "
+            f"{_calendar_event_location_detail(event)}"
+            for event in grouped_events
+        )
+        conflict_note = _calendar_related_event_conflict_note(grouped_events)
+        if conflict_note:
+            lines.append(conflict_note)
+        remaining_events = [
+            event
+            for index, event in selected_pairs
+            if index not in grouped_indexes
+        ]
+        if remaining_events:
+            lines.append("Other matching Calendar entries:")
+            lines.extend(
+                f"- {_calendar_event_answer_detail(event)}. "
+                f"{_calendar_event_location_detail(event)}"
+                for event in remaining_events
+            )
+        if response_scope == "full_window_with_focus" and fallback:
+            lines.extend(["", fallback])
+        return CalendarLookupAnswerResolution(
+            text="\n".join(lines),
+            response_scope=response_scope,
+            status=synthesis.status,
+            selected_event_indexes=selected_indexes,
+            related_event_groups=related_event_groups,
+            openai_requests=resolution.openai_requests,
+            warnings=resolution.warnings,
+        )
+    if synthesis.status in {"matched", "ambiguous"} and selected:
+        lines = [
+            (
+                "I found multiple possible matches:"
+                if synthesis.status == "ambiguous"
+                else f"I found {len(selected)} matching events:"
+            )
+        ]
+        lines.extend(
+            f"- {_calendar_event_answer_detail(event)}. "
+            f"{_calendar_event_location_detail(event)}"
+            for event in selected
+        )
+        if synthesis.status == "ambiguous":
+            lines.append("The Calendar details do not identify one best match.")
+        if response_scope == "full_window_with_focus" and fallback:
+            lines.extend(["", fallback])
+        return CalendarLookupAnswerResolution(
+            text="\n".join(lines),
+            response_scope=response_scope,
+            status=synthesis.status,
+            selected_event_indexes=selected_indexes,
+            related_event_groups=related_event_groups,
+            openai_requests=resolution.openai_requests,
+            warnings=resolution.warnings,
+        )
+
+    no_match_text = "I could not identify a matching Calendar event."
+    if response_scope == "full_window_with_focus" and fallback:
+        no_match_text = f"{no_match_text}\n\n{fallback}"
+    return CalendarLookupAnswerResolution(
+        text=no_match_text,
+        response_scope=response_scope,
+        status="no_match",
+        openai_requests=resolution.openai_requests,
+        warnings=resolution.warnings,
+    )
+
+
+def _calendar_event_answer_detail(event: dict[str, object]) -> str:
+    """Render one selected event without provider IDs or workflow metadata."""
+
+    title = " ".join(str(event.get("title") or "Untitled event").split())
+    source_calendar = " ".join(
+        str(event.get("source_calendar_name") or "").split()
+    )
+    source_suffix = (
+        f" on the {source_calendar} calendar"
+        if (
+            source_calendar
+            and "@" not in source_calendar
+            and not event.get("source_calendar_primary")
+        )
+        else ""
+    )
+    date_text = str(
+        event.get("display_start_date") or event.get("start_date") or ""
+    ).strip()
+    date_suffix = f" on {date_text}" if date_text else ""
+    start_time = str(
+        event.get("display_start_time") or event.get("start_time") or ""
+    ).strip()
+    end_time = str(
+        event.get("display_end_time") or event.get("end_time") or ""
+    ).strip()
+    display_timezone = " ".join(
+        str(event.get("display_timezone") or "").split()
+    )
+    time_suffix = ""
+    if start_time:
+        try:
+            start_display = datetime.strptime(start_time[:5], "%H:%M").strftime(
+                "%-I:%M %p"
+            )
+        except ValueError:
+            start_display = start_time
+        if end_time:
+            try:
+                end_display = datetime.strptime(end_time[:5], "%H:%M").strftime(
+                    "%-I:%M %p"
+                )
+            except ValueError:
+                end_display = end_time
+            time_suffix = f", from {start_display} to {end_display}"
+        else:
+            time_suffix = f", at {start_display}"
+        if display_timezone:
+            time_suffix += f" ({display_timezone})"
+    return f'"{title}"{source_suffix}{date_suffix}{time_suffix}'
+
+
+def _calendar_event_location_detail(event: dict[str, object]) -> str:
+    """Render location availability for one selected event."""
+
+    location = " ".join(str(event.get("location") or "").split())
+    return f"Location: {location}." if location else "No location is listed."
+
+
+def _calendar_related_event_conflict_note(
+    events: list[dict[str, object]],
+) -> str:
+    """Describe factual conflicts across records likely representing one event."""
+
+    time_ranges = {
+        (
+            str(
+                event.get("display_start_date")
+                or event.get("start_date")
+                or ""
+            ),
+            str(
+                event.get("display_start_time") or event.get("start_time") or ""
+            ),
+            str(event.get("display_end_date") or event.get("end_date") or ""),
+            str(event.get("display_end_time") or event.get("end_time") or ""),
+        )
+        for event in events
+    }
+    locations = {
+        " ".join(str(event.get("location") or "").split())
+        for event in events
+        if " ".join(str(event.get("location") or "").split())
+    }
+    conflicts: list[str] = []
+    if len(time_ranges) > 1:
+        conflicts.append("times")
+    if len(locations) > 1:
+        conflicts.append("locations")
+    if not conflicts:
+        return ""
+    conflict_text = " and ".join(conflicts)
+    return (
+        f"The Calendar entries list different {conflict_text}, so confirm the "
+        "intended appointment details."
+    )
 
 
 def _apply_canonical_calendar_lookup_target(
@@ -576,23 +1178,54 @@ def _current_calendar_scope(
     interpretation: CalendarActionInterpretation,
     directive: str,
 ) -> str:
-    """Broaden Calendar account scope only from explicit current-turn evidence."""
+    """Use every readable calendar for reads unless the operator narrows scope."""
 
-    if interpretation.calendar_scope != "selected_readable":
+    explicit_scope = _explicit_calendar_scope(directive)
+    if explicit_scope != "configured":
+        return explicit_scope
+    if re.search(
+        r"\b(?:primary|configured|default)\s+(?:google\s+)?calendar\b",
+        _normalize_source_text(directive),
+    ):
         return "configured"
+    if interpretation.calendar_scope not in {"selected_readable", "all_readable"}:
+        return "all_readable"
     evidence = _normalize_source_text(interpretation.calendar_scope_source_text)
     normalized_directive = _normalize_source_text(directive)
     if not evidence or evidence not in normalized_directive:
+        return "all_readable"
+    selected_scope = _explicit_calendar_scope(evidence)
+    return selected_scope if selected_scope != "configured" else "all_readable"
+
+
+def _explicit_calendar_scope(directive: str) -> str:
+    """Return only a Calendar account scope explicitly named by the operator."""
+
+    evidence = _normalize_source_text(directive)
+    if not evidence:
         return "configured"
-    explicitly_names_calendar_set = bool(
+    all_readable = bool(
         re.search(
-            r"\b(?:all|every|readable|selected|shared)\b[^.!?;]{0,80}"
-            r"\bcalendars?\b|\bcalendars?\b[^.!?;]{0,80}"
-            r"\b(?:all|every|readable|selected|shared|i\s+can\s+read)\b",
+            r"\b(?:all|every)\s+(?:(?:of\s+)?(?:my|the)\s+)?"
+            r"(?:(?:available|accessible|readable)\s+)?"
+            r"(?:google\s+)?calendars?\b"
+            r"(?:\s+(?:that\s+)?i\s+can\s+read\b)?"
+            r"|\b(?:all|every)\s+(?:google\s+)?calendars?\s+"
+            r"(?:available|accessible|readable)\b",
             evidence,
         )
     )
-    return "selected_readable" if explicitly_names_calendar_set else "configured"
+    if all_readable:
+        return "all_readable"
+    selected_or_shared = bool(
+        re.search(
+            r"\b(?:selected|shared)\b[^.!?;]{0,80}"
+            r"\bcalendars?\b|\bcalendars?\b[^.!?;]{0,80}"
+            r"\b(?:selected|shared)\b",
+            evidence,
+        )
+    )
+    return "selected_readable" if selected_or_shared else "configured"
 
 
 def _current_calendar_read_selection(
@@ -653,14 +1286,6 @@ def _calendar_time_window_plan_from_interpretation(
             blockers.append("calendar window query was not source verified")
     read_selection = _current_calendar_read_selection(interpretation, directive)
     calendar_scope = _current_calendar_scope(interpretation, directive)
-    if (
-        calendar_scope == "configured"
-        and interpretation.read_scope == "filtered_window"
-    ):
-        # Preserve the established cross-calendar default for subject-filtered
-        # reads. Generic agenda reads remain on the configured calendar unless
-        # the current turn explicitly requests a broader Calendar set.
-        calendar_scope = "selected_readable"
     warnings = tuple(
         f"Calendar interpretation note: {item}" for item in interpretation.ambiguities
     )

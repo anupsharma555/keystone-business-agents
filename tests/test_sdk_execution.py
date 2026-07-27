@@ -3653,6 +3653,11 @@ def test_high_confidence_manifest_match_resolves_preprints_without_model() -> No
         "update that same Airtable expense record",
         "create a Google Doc in Drive and verify it",
         "create a Gmail draft to myself and do not send it",
+        (
+            "list all events tomorrow from every Google Calendar I can read, "
+            "including selected shared calendars"
+        ),
+        "what is on my Google Calendar tomorrow?",
     ],
 )
 def test_chief_native_command_resolver_does_not_intercept_provider_actions(

@@ -3434,6 +3434,7 @@ def test_direct_calendar_runner_persists_rendered_result_and_semantic_context(
         provider_read_scope="bounded_collection",
         primary_target="events tomorrow",
         objective="List all my events tomorrow.",
+        ask_shape=AskShapePolicy(ask_breadth="broad"),
     )
     preflight = cli.OrchestratorPreflight(
         request_text="List all my events tomorrow.",
@@ -3496,6 +3497,142 @@ def test_direct_calendar_runner_persists_rendered_result_and_semantic_context(
     stored_output = json.loads(stored["output_json"])
     assert stored_output["tool_receipt"]["events"][0]["title"] == "Morning review"
     assert stored_output["orchestrator_preflight"]["selected_agent"] == ("chief_of_staff")
+
+
+def test_direct_calendar_runner_focuses_narrow_lookup_before_persisting(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'calendar-focused.db'}"
+    request = (
+        "find and list my medical appointment that is tomorrow. "
+        "What is the time and location? Provide what u know about it."
+    )
+    plan = CalendarActionPlan(
+        operation="read",
+        read_scope="filtered_window",
+        read_selection="all",
+        date_scope="tomorrow",
+        query="medical appointment",
+        start_date="2026-07-28",
+        calendar_scope="all_readable",
+        complete=True,
+    )
+    manual_plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        provider_system="google_calendar",
+        provider_operations=["read"],
+        provider_read_scope="bounded_collection",
+        primary_target="medical appointment tomorrow",
+        desired_count=1,
+        ask_shape=AskShapePolicy(ask_breadth="narrow"),
+    )
+    events = [
+        {
+            "event_id": "event-window",
+            "title": "Window Washing",
+            "start_date": "2026-07-28",
+            "start_time": "08:30",
+            "end_time": "09:30",
+            "start": "2026-07-28T08:30:00-04:00",
+        },
+        {
+            "event_id": "event-medical",
+            "title": "Example Family Medicine",
+            "start_date": "2026-07-28",
+            "start_time": "10:40",
+            "end_time": "11:40",
+            "start": "2026-07-28T10:40:00-04:00",
+            "source_calendar_name": "Care Appointments",
+            "source_calendar_primary": False,
+        },
+    ]
+    expected = (
+        'I found one matching event: "Example Family Medicine" on the Care Appointments '
+        "calendar on 2026-07-28, from 10:40 AM to 11:40 AM. "
+        "No location is listed in the Calendar event."
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        cli,
+        "read_google_calendar_window_impl",
+        lambda *_args, **_kwargs: {
+            "status": "success",
+            "operation": "read_calendar_window",
+            "events": events,
+            "verification": {"status": "verified_present", "passed": True},
+            "send_enabled": False,
+        },
+    )
+
+    def fake_answer(
+        request_text: str,
+        candidate_events: list[dict[str, object]],
+        **kwargs: object,
+    ) -> SimpleNamespace:
+        captured["request_text"] = request_text
+        captured["events"] = candidate_events
+        captured.update(kwargs)
+        return SimpleNamespace(
+            text=expected,
+            response_scope="focused",
+            status="matched",
+            selected_event_indexes=(1,),
+            openai_requests=1,
+            warnings=(),
+        )
+
+    monkeypatch.setattr(cli, "resolve_calendar_lookup_answer", fake_answer)
+
+    exit_code = cli.run_direct_calendar_action(
+        request,
+        plan,
+        live=True,
+        json_output=True,
+        openai_requests=2,
+        manual_plan=manual_plan,
+        database_url=database_url,
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert captured["request_text"] == request
+    assert captured["lookup_target"] == "medical appointment tomorrow"
+    assert captured["response_scope"] == "focused"
+    assert captured["events"] == events
+    assert payload["slack_display_text"] == expected
+    assert payload["public_result"]["text"] == expected
+    assert "Window Washing" not in payload["slack_display_text"]
+    assert payload["openai_requests"] == 3
+    assert payload["calendar_lookup_synthesis"] == {
+        "status": "matched",
+        "response_scope": "focused",
+        "selected_event_indexes": [1],
+        "related_event_groups": [],
+    }
+    assert payload["performance"]["provider_action_ms"] >= 0
+    assert payload["performance"]["lookup_synthesis_ms"] >= 0
+    assert payload["performance"]["direct_calendar_total_ms"] >= 0
+    assert payload["performance"]["orchestrator_preflight_ms"] == 0
+    assert payload["performance"]["pre_calendar_overhead_ms"] >= 0
+    assert (
+        payload["performance"]["ask_total_ms"]
+        >= payload["performance"]["direct_calendar_total_ms"]
+    )
+    with SQLiteStore(database_url).managed_connection() as connection:
+        stored = connection.execute(
+            "SELECT output_json FROM agent_runs WHERE id = ?",
+            (payload["agent_run_id"],),
+        ).fetchone()
+    assert stored is not None
+    stored_output = json.loads(stored["output_json"])
+    assert stored_output["slack_display_text"] == expected
+    assert stored_output["calendar_lookup_synthesis"]["selected_event_indexes"] == [1]
 
 
 def test_typed_calendar_executor_forwards_timed_event_fields_to_writer(
@@ -3899,6 +4036,8 @@ def test_direct_filtered_calendar_read_lists_shared_calendar_matches(
                 {
                     "event_id": "flight-2",
                     "title": "Flight: Atlanta (ATL) to Philadelphia (PHL)",
+                    "source_calendar_name": "Travel",
+                    "source_calendar_primary": False,
                     "start_date": "2026-07-22",
                     "start": "2026-07-22T13:00:00-04:00",
                     "end": "2026-07-22T15:00:00-04:00",
@@ -3930,7 +4069,7 @@ def test_direct_filtered_calendar_read_lists_shared_calendar_matches(
     )
 
     assert captured["calendar_scope"] == "selected_readable"
-    assert captured["query"] == "flight"
+    assert captured["query"] == ""
     assert payload["status"] == "done"
     assert payload["tool_receipt"]["found"] is True
     assert payload["tool_receipt"]["selected_event"] is None
@@ -3938,7 +4077,7 @@ def test_direct_filtered_calendar_read_lists_shared_calendar_matches(
         'Google Calendar events matching "flight":\n'
         '- "Flight to Philadelphia (DL 2131)" on 2026-07-22 '
         "from 1:00 PM to 3:00 PM\n"
-        '- "Flight: Atlanta (ATL) to Philadelphia (PHL)" on 2026-07-22 '
+        '- "Flight: Atlanta (ATL) to Philadelphia (PHL)" (Travel) on 2026-07-22 '
         "from 1:00 PM to 3:00 PM"
     )
 
@@ -4432,6 +4571,79 @@ def test_live_named_chief_calendar_read_uses_same_typed_path_as_followup(
     assert captured["direct_kwargs"]["openai_requests"] == 2
 
 
+def test_complete_calendar_read_budget_skips_redundant_interpreter_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Find my medical appointment tomorrow."
+    captured: dict[str, object] = {}
+
+    def fake_preflight(request_text: str, **_kwargs: object) -> object:
+        semantic_plan = ManualRequestPlan(
+            source="llm",
+            requested_agent="chief_of_staff",
+            target_agent="chief_of_staff",
+            intent="context_lookup",
+            task_objective="context_lookup",
+            provider_system="google_calendar",
+            provider_operations=["read"],
+            provider_read_scope="bounded_collection",
+            provider_result_mode="items",
+            primary_target="medical appointment",
+            ask_shape=AskShapePolicy(
+                ask_breadth="narrow",
+                permission_state="read_only",
+            ),
+        )
+        return cli.OrchestratorPreflight(
+            request_text=request_text,
+            requested_agent="chief_of_staff",
+            advisory_only=True,
+            selected_agent="chief_of_staff",
+            execution_allowed=True,
+            manual_request_plan=semantic_plan,
+            route_result=cli.route_request(request_text, manual_plan=semantic_plan),
+            sdk_usage_events=[{"usage": {"requests": 1}}],
+        )
+
+    def fake_direct(
+        input_text: str,
+        plan: CalendarActionPlan,
+        **kwargs: object,
+    ) -> int:
+        captured["input_text"] = input_text
+        captured["plan"] = plan
+        captured["kwargs"] = kwargs
+        return 0
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(
+        "keystone_agents.agents.calendar_action_interpreter.current_calendar_date",
+        lambda: datetime(2026, 7, 27).date(),
+    )
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(cli, "run_direct_calendar_action", fake_direct)
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "chief_of_staff",
+            "--live-sdk",
+            "--max-openai-requests",
+            "2",
+            "--json",
+            request,
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["input_text"] == request
+    assert captured["plan"].query == "medical appointment"
+    assert captured["plan"].start_date == "2026-07-28"
+    assert captured["kwargs"]["openai_requests"] == 1
+
+
 def test_continuation_provider_affinity_fills_only_unspecified_provider() -> None:
     plan = infer_manual_request_plan(
         "What date is the UT Course Orientation Session?",
@@ -4534,6 +4746,39 @@ def test_live_provider_plan_cannot_be_downgraded_to_tool_free_response() -> None
         cli._should_run_direct_supplied_response(
             request,
             requested_route="gmail_triage",
+            manual_plan=plan,
+        )
+        is False
+    )
+
+
+def test_workspace_document_plan_cannot_be_downgraded_to_tool_free_response() -> None:
+    request = (
+        "Google Workspace Context Agent, find README.doc in KNIOps, read it, and "
+        "summarize its purpose and operating model without changing anything."
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="google_workspace_context_agent",
+        target_agent="google_workspace_context_agent",
+        intent="context_lookup",
+        task_objective="context_lookup",
+        expected_artifact_type="context_summary",
+        provider_system="google_workspace",
+        provider_operations=["read"],
+        primary_target="README.doc in KNIOps",
+        target_type="business_system_context",
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(
+            source_type_preference=["google_document"],
+            permission_state="read_only",
+        ),
+    )
+
+    assert (
+        cli._should_run_direct_supplied_response(
+            request,
+            requested_route="google_workspace_context_agent",
             manual_plan=plan,
         )
         is False

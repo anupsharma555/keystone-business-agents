@@ -18,13 +18,20 @@ import traceback
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from keystone_agents.agent_mentions import AgentMention, parse_agent_mention
 from keystone_agents.agent_registry import AGENT_REGISTRY, agent_cards
-from keystone_agents.agents.calendar_action_interpreter import resolve_calendar_action_plan
+from keystone_agents.agents.calendar_action_interpreter import (
+    calendar_lookup_response_scope,
+    calendar_lookup_target_from_plan,
+    canonical_calendar_read_plan,
+    resolve_calendar_action_plan,
+    resolve_calendar_lookup_answer,
+)
 from keystone_agents.agents.chief_of_staff import (
     plan_chief_of_staff_request,
 )
@@ -710,8 +717,12 @@ def execute_direct_calendar_action(
                 time_max,
                 calendar_id=plan.calendar_id,
                 calendar_scope=plan.calendar_scope,
-                query=plan.query,
+                # Retrieve the bounded day across readable calendars before
+                # semantic selection. Provider text search cannot infer that an
+                # event on a care calendar answers a generic "medical appointment."
+                query="" if plan.read_scope == "filtered_window" else plan.query,
                 max_results=100,
+                display_timezone=plan.timezone,
                 live=live,
             )
             if not live:
@@ -733,7 +744,19 @@ def execute_direct_calendar_action(
                 }
             events = sorted(
                 (event for event in calendar_lookup.get("events", []) if isinstance(event, dict)),
-                key=lambda event: str(event.get("start") or ""),
+                key=lambda event: (
+                    str(
+                        event.get("display_start_date")
+                        or event.get("start_date")
+                        or ""
+                    ),
+                    str(
+                        event.get("display_start_time")
+                        or event.get("start_time")
+                        or ""
+                    ),
+                    str(event.get("title") or ""),
+                ),
             )
             selected_event = (
                 events[0]
@@ -758,6 +781,7 @@ def execute_direct_calendar_action(
                 plan.event_reference,
                 start_date=plan.event_reference_date or plan.start_date,
                 calendar_id=plan.calendar_id,
+                display_timezone=plan.timezone,
                 live=live,
             )
             if not live:
@@ -909,9 +933,21 @@ def _direct_calendar_human_summary(
         selected_event = result.get("selected_event")
         if isinstance(selected_event, dict):
             title = str(selected_event.get("title") or "Untitled event").strip()
-            start_date = str(selected_event.get("start_date") or plan.start_date).strip()
-            start_time = str(selected_event.get("start_time") or "").strip()
-            end_time = str(selected_event.get("end_time") or "").strip()
+            start_date = str(
+                selected_event.get("display_start_date")
+                or selected_event.get("start_date")
+                or plan.start_date
+            ).strip()
+            start_time = str(
+                selected_event.get("display_start_time")
+                or selected_event.get("start_time")
+                or ""
+            ).strip()
+            end_time = str(
+                selected_event.get("display_end_time")
+                or selected_event.get("end_time")
+                or ""
+            ).strip()
             time_suffix = _calendar_human_time_suffix(start_time, end_time)
             if plan.read_selection == "next" and plan.date_scope == "today":
                 return f'Your next Google Calendar event today is "{title}"{time_suffix}.'
@@ -928,12 +964,35 @@ def _direct_calendar_human_summary(
             lines = [f"{heading}:"]
             for event in events[:10]:
                 title = str(event.get("title") or "Untitled event").strip()
-                start_date = str(event.get("start_date") or plan.start_date).strip()
-                start_time = str(event.get("start_time") or "").strip()
-                end_time = str(event.get("end_time") or "").strip()
+                start_date = str(
+                    event.get("display_start_date")
+                    or event.get("start_date")
+                    or plan.start_date
+                ).strip()
+                start_time = str(
+                    event.get("display_start_time")
+                    or event.get("start_time")
+                    or ""
+                ).strip()
+                end_time = str(
+                    event.get("display_end_time")
+                    or event.get("end_time")
+                    or ""
+                ).strip()
                 date_suffix = f" on {start_date}" if start_date else ""
+                source_calendar = str(event.get("source_calendar_name") or "").strip()
+                source_suffix = (
+                    f" ({source_calendar})"
+                    if (
+                        source_calendar
+                        and "@" not in source_calendar
+                        and not event.get("source_calendar_primary")
+                    )
+                    else ""
+                )
                 lines.append(
-                    f'- "{title}"{date_suffix}{_calendar_human_time_suffix(start_time, end_time)}'
+                    f'- "{title}"{source_suffix}{date_suffix}'
+                    f"{_calendar_human_time_suffix(start_time, end_time)}"
                 )
             return "\n".join(lines)
         if plan.read_selection == "next" and plan.date_scope == "today":
@@ -948,10 +1007,21 @@ def _direct_calendar_human_summary(
 
     title = str(result.get("title") or plan.title or plan.event_reference).strip()
     start_date = str(
-        result.get("start_date") or plan.start_date or plan.event_reference_date
+        result.get("display_start_date")
+        or result.get("start_date")
+        or plan.start_date
+        or plan.event_reference_date
     ).strip()
-    start_time = str(result.get("start_time") or plan.start_time).strip()
-    end_time = str(result.get("end_time") or plan.end_time).strip()
+    start_time = str(
+        result.get("display_start_time")
+        or result.get("start_time")
+        or plan.start_time
+    ).strip()
+    end_time = str(
+        result.get("display_end_time")
+        or result.get("end_time")
+        or plan.end_time
+    ).strip()
     time_suffix = _calendar_human_time_suffix(start_time, end_time)
     if plan.operation == "read":
         if result.get("found") is True:
@@ -1032,7 +1102,11 @@ def run_direct_calendar_action(
     manual_plan: ManualRequestPlan | None = None,
     orchestrator_preflight: OrchestratorPreflight | None = None,
     database_url: str | None = None,
+    orchestrator_preflight_ms: float = 0.0,
+    ask_started_at: float | None = None,
 ) -> int:
+    direct_started_at = perf_counter()
+    provider_started_at = perf_counter()
     payload = execute_direct_calendar_action(
         input_text,
         plan,
@@ -1040,6 +1114,79 @@ def run_direct_calendar_action(
         openai_requests=openai_requests,
         interpretation_warnings=interpretation_warnings,
     )
+    provider_action_ms = round((perf_counter() - provider_started_at) * 1000, 3)
+    lookup_synthesis_ms = 0.0
+    if (
+        live
+        and plan.operation == "read"
+        and payload.get("status") == "done"
+        and isinstance(payload.get("tool_receipt"), dict)
+    ):
+        receipt = payload["tool_receipt"]
+        events = [
+            event
+            for event in receipt.get("events", [])
+            if isinstance(event, dict)
+        ]
+        response_scope = calendar_lookup_response_scope(manual_plan, plan)
+        lookup_started_at = perf_counter()
+        answer_resolution = resolve_calendar_lookup_answer(
+            input_text,
+            events,
+            lookup_target=calendar_lookup_target_from_plan(manual_plan),
+            response_scope=response_scope,
+            fallback=str(payload.get("human_summary") or "").strip(),
+            live=True,
+        )
+        lookup_synthesis_ms = round((perf_counter() - lookup_started_at) * 1000, 3)
+        payload["calendar_lookup_synthesis"] = {
+            "status": answer_resolution.status,
+            "response_scope": answer_resolution.response_scope,
+            "selected_event_indexes": list(answer_resolution.selected_event_indexes),
+            "related_event_groups": [
+                list(group)
+                for group in getattr(answer_resolution, "related_event_groups", ())
+            ],
+        }
+        payload["calendar_lookup_synthesis_warnings"] = list(
+            answer_resolution.warnings
+        )
+        payload["openai_requests"] = (
+            int(payload.get("openai_requests") or 0)
+            + answer_resolution.openai_requests
+        )
+        payload["human_summary"] = answer_resolution.text
+        payload["slack_display_text"] = answer_resolution.text
+        payload["display_text"] = answer_resolution.text
+        payload["summary"] = answer_resolution.text
+        public_result = payload.get("public_result")
+        if isinstance(public_result, dict):
+            public_result["text"] = answer_resolution.text
+    direct_calendar_total_ms = round(
+        (perf_counter() - direct_started_at) * 1000,
+        3,
+    )
+    ask_total_ms = (
+        round((perf_counter() - ask_started_at) * 1000, 3)
+        if ask_started_at is not None
+        else direct_calendar_total_ms
+    )
+    payload["performance"] = {
+        "orchestrator_preflight_ms": round(max(orchestrator_preflight_ms, 0.0), 3),
+        "pre_calendar_overhead_ms": round(
+            max(
+                ask_total_ms
+                - max(orchestrator_preflight_ms, 0.0)
+                - direct_calendar_total_ms,
+                0.0,
+            ),
+            3,
+        ),
+        "provider_action_ms": provider_action_ms,
+        "lookup_synthesis_ms": lookup_synthesis_ms,
+        "direct_calendar_total_ms": direct_calendar_total_ms,
+        "ask_total_ms": ask_total_ms,
+    }
     if execution_admission is not None:
         payload["execution_admission"] = execution_admission.__dict__
     if live and manual_plan is not None:
@@ -1126,6 +1273,7 @@ def _run_live_ask_with_environment(args: argparse.Namespace) -> int:
 
 
 def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
+    ask_started_at = perf_counter()
     raw_input = _ask_input(args)
     slack_context_input = _context_file_is_slack_context(args.context_file)
     linked_work_item = _validated_slack_linked_work_item(
@@ -1293,12 +1441,17 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             prior_request=execution_request.continuation.prior_request,
         )
         calendar_plan = infer_calendar_action_plan(calendar_input_text)
+    preflight_started_at = perf_counter()
     orchestrator_preflight = run_orchestrator_preflight(
         semantic_input_text,
         requested_agent=requested_route,
         live_manual_plan=live_manual_plan,
         database_url=args.database_url,
         workflow_state=direct_workflow_state,
+    )
+    orchestrator_preflight_ms = round(
+        (perf_counter() - preflight_started_at) * 1000,
+        3,
     )
     orchestrator_preflight = _apply_continuation_provider_affinity(
         orchestrator_preflight,
@@ -1365,12 +1518,37 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     )
     if calendar_interpretation_eligible:
         preflight_requests = _orchestrator_preflight_request_count(orchestrator_preflight)
+        reusable_calendar_read_plan = (
+            canonical_calendar_read_plan(
+                calendar_input_text,
+                manual_plan=manual_plan,
+            )
+            if live_sdk
+            else None
+        )
+        calendar_interpreter_requests = (
+            0 if reusable_calendar_read_plan is not None else 1 if live_sdk else 0
+        )
+        calendar_lookup_synthesis_requests = (
+            1
+            if live_sdk and manual_plan.intent == "context_lookup"
+            else 0
+        )
         calendar_request_estimate = {
-            "min": preflight_requests + (1 if live_sdk else 0),
-            "max": preflight_requests + (1 if live_sdk else 0),
+            "min": preflight_requests + calendar_interpreter_requests,
+            "max": (
+                preflight_requests
+                + calendar_interpreter_requests
+                + calendar_lookup_synthesis_requests
+            ),
             "stages": [
                 *(["manual_request_planner"] if preflight_requests else []),
-                *(["calendar_action_interpreter"] if live_sdk else []),
+                *(["calendar_action_interpreter"] if calendar_interpreter_requests else []),
+                *(
+                    ["calendar_lookup_synthesizer"]
+                    if calendar_lookup_synthesis_requests
+                    else []
+                ),
             ],
         }
         if args.max_openai_requests is not None and (
@@ -1416,6 +1594,8 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                     manual_plan=manual_plan,
                     orchestrator_preflight=orchestrator_preflight,
                     database_url=args.database_url,
+                    orchestrator_preflight_ms=orchestrator_preflight_ms,
+                    ask_started_at=ask_started_at,
                 )
     interpreted_lifecycle_route = str(manual_plan.target_agent or "").strip()
     interpreted_lifecycle_scope = _interpreted_lifecycle_scope_text(
@@ -3089,7 +3269,7 @@ def _manual_plan_is_bounded_provider_free_response(
         and manual_plan.ask_shape.source_type_preference
         and all(
             re.search(
-                r"\b(?:attached|local|file|image|pdf|document)\b",
+                r"\b(?:attached|local)\b",
                 str(source_type or ""),
                 re.IGNORECASE,
             )
@@ -3128,6 +3308,8 @@ def _should_run_direct_supplied_response(
 ) -> bool:
     """Let a live semantic plan decide whether tools/providers are unnecessary."""
 
+    if requested_route not in _DIRECT_SUPPLIED_RESPONSE_ROUTES:
+        return False
     authority = ExecutionIntentAuthority.from_value(manual_plan)
     if authority.canonical and manual_plan is not None:
         return _manual_plan_is_bounded_provider_free_response(
