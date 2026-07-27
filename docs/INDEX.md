@@ -29,6 +29,9 @@ Start here when changing or operating the repository.
 - `docs/AGENT_OPERATIONAL_VALIDATION_STATUS.md`: evidence-backed status for
   every agent family across interpretation, tool/provider execution, reasoning,
   lifecycle, safety, continuation, and next proof.
+- `docs/EXECUTION_PERFORMANCE.md`: compact planning, stable cache grouping,
+  safe exact decision reuse, request-scoped provider reads, research depth
+  modes, latency telemetry, and offline-to-live acceptance boundaries.
 - `docs/MANAGER_RWM_ACCEPTANCE.md`: low-friction manager review plus ANU-222
   advanced-scenario and ANU-223 delegation-readiness gates.
 - `docs/ANU223_LIVE_DELEGATION_PLAN.md`: proposed serial request/cost ceilings,

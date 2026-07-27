@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+interpreter="$repo_root/.venv/bin/python"
+
+if [ ! -x "$interpreter" ]; then
+    echo "KBA no-write canary interpreter is missing: $interpreter" >&2
+    exit 2
+fi
+
+if [ -n "${PYTHONPATH-}" ]; then
+    PYTHONPATH="$repo_root/src:$repo_root:$PYTHONPATH"
+else
+    PYTHONPATH="$repo_root/src:$repo_root"
+fi
+export PYTHONPATH
+
+exec "$interpreter" -m keystone_agents.canary_runtime_entrypoint "$@"
