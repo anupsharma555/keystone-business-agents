@@ -6761,6 +6761,91 @@ def test_llm_merge_restores_atomic_anchored_research_topology() -> None:
     assert merged.required_entities == ["Callyope"]
 
 
+def test_llm_merge_repairs_contradictory_open_set_research_contract() -> None:
+    request_text = (
+        "CoS, research Ellipsis Health as the anchor. Identify up to 3 closest "
+        "evidence-backed competitors specifically in voice-based or multimodal "
+        "mental-health assessment. Characterize Ellipsis Health first. Require an "
+        "official product or research source for every named company. Distinguish "
+        "direct competitors from adjacent tools, include concise source URLs and "
+        "limitations, and make no changes, drafts, contacts, or writes."
+    )
+    base = infer_manual_request_plan(
+        request_text,
+        requested_agent="chief_of_staff",
+    )
+    assert base.desired_count_scope == "additional"
+    assert base.requires_target_discovery is True
+    assert base.anchor_entity == "Ellipsis Health"
+    candidate = base.model_copy(
+        update={
+            "source": "llm",
+            "intent": "context_lookup",
+            "task_objective": "entity_research",
+            "expected_artifact_type": "research_brief",
+            "primary_target": "Ellipsis Health",
+            "target_type": "company",
+            "provider_system": "unspecified",
+            "provider_operations": [],
+            "provider_action_steps": [],
+            "provider_result_mode": "items",
+            "requires_target_discovery": True,
+            "anchor_entity": "Ellipsis Health",
+            "required_entities": ["Ellipsis Health"],
+            "desired_count": 3,
+            "desired_count_explicit": True,
+            "desired_count_mode": "maximum",
+            "desired_count_scope": "total",
+        }
+    )
+
+    merged = merge_manual_request_plan(base, candidate)
+
+    assert merged.intent == "company_research"
+    assert merged.task_objective == "entity_research"
+    assert merged.expected_artifact_type == "research_brief"
+    assert merged.desired_count == 3
+    assert merged.desired_count_mode == "maximum"
+    assert merged.desired_count_scope == "additional"
+    assert merged.requires_target_discovery is True
+    assert merged.anchor_entity == "Ellipsis Health"
+    assert merged.primary_target == "Ellipsis Health"
+    assert merged.required_entities == ["Ellipsis Health"]
+
+
+def test_provider_bound_research_shaped_context_lookup_is_not_reclassified() -> None:
+    base = infer_manual_request_plan(
+        "Research the selected source and return a source summary.",
+        requested_agent="business_research_analyst",
+    )
+    candidate = base.model_copy(
+        update={
+            "source": "llm",
+            "target_agent": "business_research_analyst",
+            "intent": "context_lookup",
+            "task_objective": "source_research",
+            "expected_artifact_type": "source_summary",
+            "provider_system": "zotero",
+            "provider_operations": ["read"],
+            "provider_action_steps": [
+                ManualProviderActionStep(
+                    operation="read",
+                    resource_type="zotero_item",
+                )
+            ],
+        }
+    )
+
+    merged = merge_manual_request_plan(base, candidate)
+
+    assert merged.intent == "context_lookup"
+    assert merged.target_agent == "zotero_context_agent"
+    assert merged.task_objective == "source_research"
+    assert merged.expected_artifact_type == "source_summary"
+    assert merged.provider_system == "zotero"
+    assert merged.provider_operations == ["read"]
+
+
 @pytest.mark.parametrize(
     "request_text",
     [

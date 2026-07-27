@@ -9,6 +9,10 @@ from typing import Any
 import pytest
 
 from keystone_agents.agents.business_research_analyst import research_company_fixture
+from keystone_agents.manual_request import (
+    infer_manual_request_plan,
+    merge_manual_request_plan,
+)
 from keystone_agents.multi_target_research import (
     CandidateTarget,
     MultiTargetResearchPlan,
@@ -58,6 +62,114 @@ def _source(source_id: str, title: str, url: str, claim: str) -> SourceRecord:
         evidence_excerpt=claim,
         confidence=0.85,
     )
+
+
+def test_repaired_anchor_discovery_plan_cannot_fall_back_to_single_company_path() -> None:
+    request_text = (
+        "CoS, research Ellipsis Health as the anchor. Identify up to 3 closest "
+        "evidence-backed competitors specifically in voice-based or multimodal "
+        "mental-health assessment. Characterize Ellipsis Health first. Require an "
+        "official product or research source for every named company. Distinguish "
+        "direct competitors from adjacent tools, include concise source URLs and "
+        "limitations, and make no changes, drafts, contacts, or writes."
+    )
+    fallback = infer_manual_request_plan(
+        request_text,
+        requested_agent="chief_of_staff",
+    )
+    candidate = fallback.model_copy(
+        update={
+            "source": "llm",
+            "target_agent": "business_research_analyst",
+            "intent": "context_lookup",
+            "task_objective": "entity_research",
+            "expected_artifact_type": "research_brief",
+            "primary_target": "Ellipsis Health",
+            "target_type": "company",
+            "provider_system": "unspecified",
+            "provider_operations": [],
+            "provider_action_steps": [],
+            "provider_result_mode": "items",
+            "desired_count": 3,
+            "desired_count_explicit": True,
+            "desired_count_mode": "maximum",
+            "desired_count_scope": "total",
+            "requires_target_discovery": True,
+            "anchor_entity": "Ellipsis Health",
+            "required_entities": ["Ellipsis Health"],
+            "required_terms": [
+                "voice-based",
+                "multimodal",
+                "mental-health assessment",
+            ],
+            "requires_live_search": True,
+        }
+    )
+    merged = merge_manual_request_plan(fallback, candidate)
+    payload = merged.model_dump(mode="json")
+
+    assert should_run_multi_target_research(
+        request_text=request_text,
+        manual_plan=payload,
+        target=merged.primary_target,
+    )
+    execution_plan = build_multi_target_research_plan(
+        request_text=request_text,
+        manual_plan=payload,
+        target=merged.primary_target,
+        cost_profile="balanced",
+    )
+    assert execution_plan.anchor_target == "Ellipsis Health"
+    assert execution_plan.desired_count_scope == "additional"
+    assert execution_plan.peer_goal == 3
+
+
+@pytest.mark.parametrize(
+    "count_wording",
+    [
+        "up to 3 companies including Ellipsis Health",
+        "up to 3 companies in total",
+    ],
+)
+def test_explicit_total_count_includes_the_anchor(count_wording: str) -> None:
+    request_text = (
+        "Research Ellipsis Health as the anchor, then identify "
+        f"{count_wording} for a source-backed comparison. "
+        "Use official product sources for every company."
+    )
+    fallback = infer_manual_request_plan(
+        request_text,
+        requested_agent="business_research_analyst",
+    )
+    candidate = fallback.model_copy(
+        update={
+            "source": "llm",
+            "target_agent": "business_research_analyst",
+            "intent": "company_research",
+            "task_objective": "entity_research",
+            "expected_artifact_type": "research_brief",
+            "primary_target": "Ellipsis Health",
+            "target_type": "company",
+            "requires_target_discovery": True,
+            "anchor_entity": "Ellipsis Health",
+            "required_entities": ["Ellipsis Health"],
+            "desired_count": 3,
+            "desired_count_explicit": True,
+            "desired_count_mode": "maximum",
+            "desired_count_scope": "total",
+        }
+    )
+    merged = merge_manual_request_plan(fallback, candidate)
+    execution_plan = build_multi_target_research_plan(
+        request_text=request_text,
+        manual_plan=merged.model_dump(mode="json"),
+        target=merged.primary_target,
+        cost_profile="balanced",
+    )
+
+    assert merged.desired_count_scope == "total"
+    assert execution_plan.anchor_target == "Ellipsis Health"
+    assert execution_plan.peer_goal == 2
 
 
 def _anchor_comparison_discovery_results() -> dict[str, list[SearchResult]]:

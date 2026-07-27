@@ -410,6 +410,13 @@ _ANCHORED_RESEARCH_TARGET_RE = re.compile(
     r"\s*,?\s+(?i:then|before)\s+"
     r"(?i:identify|find|discover|compare|research)\b",
 )
+_EXPLICIT_RESEARCH_ANCHOR_RE = re.compile(
+    r"\b(?i:research|profile|analyze|investigate|assess)\s+"
+    r"(?P<name>(?:[A-Z][\w&.-]*|[A-Z]{2,})"
+    r"(?:\s+(?:[A-Z][\w&.-]*|[A-Z]{2,})){0,5})"
+    r"\s+(?i:as)\s+(?:(?i:the)\s+)?"
+    r"(?i:anchor|baseline|reference(?:\s+company)?)\b",
+)
 _OPEN_SET_COMPARISON_ANCHOR_RE = re.compile(
     r"\b(?:competitors?|alternatives?|peers?|companies\s+similar)\s+"
     r"(?:to|of|for|with)\s+"
@@ -2173,10 +2180,10 @@ def merge_manual_request_plan(
     bounded_research_topology_agreement = bool(
         llm_interpretation
         and base.target_agent == merged.target_agent == "business_research_analyst"
-        and base.intent == merged.intent
         and base.intent in {"company_research", "research_brief"}
-        and base.expected_artifact_type == merged.expected_artifact_type
+        and merged.intent in {"company_research", "research_brief"}
         and base.expected_artifact_type in {"research_brief", "source_summary"}
+        and merged.expected_artifact_type in {"research_brief", "source_summary"}
     )
     if bounded_research_topology_agreement:
         base_has_target_topology = bool(
@@ -2185,11 +2192,39 @@ def merge_manual_request_plan(
             or base.requires_target_discovery
         )
         if base_has_target_topology:
-            merged.target_type = base.target_type
-            merged.primary_target = base.primary_target
-            merged.requires_target_discovery = base.requires_target_discovery
-            merged.anchor_entity = base.anchor_entity
-            merged.required_entities = list(base.required_entities)
+            if base.requires_target_discovery:
+                candidate_anchor = (
+                    merged.anchor_entity
+                    or (
+                        merged.required_entities[0]
+                        if len(merged.required_entities) == 1
+                        else ""
+                    )
+                    or (
+                        merged.primary_target
+                        if merged.target_type == "company"
+                        else ""
+                    )
+                )
+                resolved_anchor = base.anchor_entity or candidate_anchor
+                merged.requires_target_discovery = True
+                merged.anchor_entity = resolved_anchor
+                merged.primary_target = resolved_anchor or base.primary_target
+                merged.target_type = "company" if resolved_anchor else base.target_type
+                merged.required_entities = list(
+                    dict.fromkeys(
+                        [
+                            *base.required_entities,
+                            *([resolved_anchor] if resolved_anchor else []),
+                        ]
+                    )
+                )
+            else:
+                merged.target_type = base.target_type
+                merged.primary_target = base.primary_target
+                merged.requires_target_discovery = False
+                merged.anchor_entity = base.anchor_entity
+                merged.required_entities = list(base.required_entities)
         elif merged.target_type == "unknown":
             merged.target_type = base.target_type
         merged.required_terms = list(
@@ -2413,7 +2448,15 @@ def merge_manual_request_plan(
         merged.desired_count = base.desired_count
         merged.desired_count_explicit = True
         merged.desired_count_mode = base.desired_count_mode
-        merged.desired_count_scope = base.desired_count_scope
+        merged.desired_count_scope = (
+            "additional"
+            if (
+                merged.requires_target_discovery
+                and merged.anchor_entity
+                and _desired_count_scope(base.objective) == "additional"
+            )
+            else base.desired_count_scope
+        )
     merged.desired_count = max(1, min(10, merged.desired_count or base.desired_count))
     if (
         base.ask_shape.output_form == "plan"
@@ -2751,6 +2794,20 @@ def _normalize_llm_plan_contract(candidate: ManualRequestPlan) -> ManualRequestP
     }
     updates: dict[str, Any] = {}
     warnings = list(candidate.planner_warnings)
+    unbound_research_contract = bool(
+        candidate.target_agent == "business_research_analyst"
+        and candidate.task_objective in {"entity_research", "source_research"}
+        and candidate.expected_artifact_type in {"research_brief", "source_summary"}
+        and candidate.provider_system == "unspecified"
+        and not candidate.provider_operations
+        and not candidate.provider_action_steps
+    )
+    if candidate.intent == "context_lookup" and unbound_research_contract:
+        updates["intent"] = "company_research"
+        warnings.append(
+            "Reconciled an unbound Business Research plan from context lookup to "
+            "company research; no provider-system lookup operation was present."
+        )
     if _single_owner_research_contract(candidate):
         if candidate.anchor_entity and not candidate.requires_target_discovery:
             updates["requires_target_discovery"] = True
@@ -4785,12 +4842,23 @@ def _desired_count_scope(text: str) -> str:
     ):
         return "additional"
     if re.search(
-        rf"(?:\b{count_token}\b.{{0,32}}\b(?:including|inclusive\s+of)\b|"
+        rf"(?:\b{count_token}\b.{{0,32}}\b"
+        rf"(?:including|inclusive\s+of|in\s+total)\b|"
         rf"\b(?:total|in\s+total)\b.{{0,24}}\b{count_token}\b)",
         text,
         re.IGNORECASE,
     ):
         return "total"
+    if (
+        _EXPLICIT_RESEARCH_ANCHOR_RE.search(text)
+        and re.search(
+            rf"\b{count_token}\b(?:\s+[\w-]+){{0,6}}\s+"
+            r"(?:competitors?|alternatives?|peers?)\b",
+            text,
+            re.IGNORECASE,
+        )
+    ):
+        return "additional"
     return "unspecified"
 
 
@@ -5528,6 +5596,7 @@ def _open_set_research_anchor(text: str) -> str:
         )
     )
     patterns = [
+        _EXPLICIT_RESEARCH_ANCHOR_RE,
         _ANCHORED_RESEARCH_TARGET_RE,
         _OPEN_SET_COMPARISON_ANCHOR_RE,
     ]
@@ -5656,7 +5725,11 @@ def _research_target_set_contract(
             "primary_target": open_set_anchor,
             "target_type": "company",
             "desired_count_scope": (
-                "additional" if desired_count_explicit else "unspecified"
+                desired_count_scope
+                if desired_count_scope in {"total", "additional"}
+                else "additional"
+                if desired_count_explicit
+                else "unspecified"
             ),
         }
     category_source_research = _looks_like_multi_target_source_research_request(text)
