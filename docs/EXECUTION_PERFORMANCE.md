@@ -204,6 +204,11 @@ repos have loaded their environment:
   Research, Opportunity Scout, Gmail Triage, and Outreach Composer. Arbitrary
   scripts, modules, Python expressions, mutation-oriented context agents, and
   other agents are rejected;
+- a canonical Slack continuation may omit `--agent` only when its single
+  context file is inside the isolated canary Slack directory, has verified
+  thread-history provenance, and names one prior allowed owner. The wrapper
+  does not pin that owner: the newest request still controls whether
+  Orchestrator retains or changes agents;
 - the Workspace OAuth token is copied once into the canary directory with mode
   `0600`; token refreshes update only that staged copy and never the operator's
   original token;

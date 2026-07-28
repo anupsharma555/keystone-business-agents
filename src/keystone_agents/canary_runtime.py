@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -34,6 +36,12 @@ CANARY_SCRUBBED_ENV_KEYS: Final[frozenset[str]] = frozenset(
         "SLACK_SIGNING_SECRET",
     }
 )
+CANARY_EXECUTION_ENV: Final[dict[str, str]] = {
+    # Remove any inherited global ceiling and pin the Workspace route to the
+    # search -> read -> synthesis budget proven by the live acceptance task.
+    "KEYSTONE_SDK_MAX_TURNS": "",
+    "KEYSTONE_GOOGLE_WORKSPACE_CONTEXT_AGENT_SDK_MAX_TURNS": "3",
+}
 
 # These values are deliberately applied after the Slack bridge has loaded both
 # repos' environment files. They are defense in depth around the typed Python
@@ -156,6 +164,7 @@ class CanaryRuntimeConfig:
         for key in CANARY_SCRUBBED_ENV_KEYS:
             child.pop(key, None)
         child.update(MUTATION_DISABLED_ENV)
+        child.update(CANARY_EXECUTION_ENV)
         child.update(
             {
                 "DATABASE_URL": self.database_url,
@@ -202,13 +211,57 @@ class CanaryRuntimeConfig:
             for argument in arguments
             if argument == "--agent" or argument.startswith("--agent=")
         ]
-        if len(agent_options) != 1:
-            raise ValueError("Canary execution requires exactly one --agent option.")
-        agent = _option_value(arguments, "--agent")
+        if len(agent_options) > 1:
+            raise ValueError("Canary execution allows at most one --agent option.")
+        agent = (
+            _option_value(arguments, "--agent")
+            if agent_options
+            else self._validated_continuation_owner(arguments)
+        )
         if agent not in CANARY_ALLOWED_AGENTS:
             allowed = ", ".join(sorted(CANARY_ALLOWED_AGENTS))
             raise ValueError(f"Canary --agent must be one of: {allowed}.")
         return agent
+
+    def _validated_continuation_owner(self, argv: Sequence[str]) -> str:
+        """Admit a canonical Slack continuation from confined thread context."""
+
+        context_options = [
+            argument
+            for argument in argv
+            if argument == "--context-file" or argument.startswith("--context-file=")
+        ]
+        if len(context_options) != 1:
+            raise ValueError(
+                "Canary execution without --agent requires one confined --context-file."
+            )
+        raw_path = _option_value(argv, "--context-file")
+        if not raw_path:
+            raise ValueError("Canary continuation context file is missing.")
+        context_path = Path(raw_path).expanduser().resolve()
+        context_root = (self.state_dir / "slack-context").resolve()
+        if not context_path.is_file() or not context_path.is_relative_to(context_root):
+            raise ValueError("Canary continuation context must be inside canary Slack state.")
+        if context_path.stat().st_size > 1_000_000:
+            raise ValueError("Canary continuation context exceeds the bounded size limit.")
+        try:
+            payload = json.loads(context_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("Canary continuation context is not valid JSON.") from exc
+        if (
+            payload.get("schema") != "keystone.slack.history_context.v1"
+            or payload.get("source") != "slack_app_mention_history"
+            or payload.get("thread_fetch_status") != "ok"
+        ):
+            raise ValueError("Canary continuation context is not a verified Slack thread.")
+        request_text = str(payload.get("request_text") or "")
+        owner_match = re.search(
+            r"\bPrior task owner \(advisory\): ([a-z][a-z0-9_]*)\b",
+            request_text,
+        )
+        if owner_match is None or "Current user request (authoritative):" not in request_text:
+            raise ValueError("Canary continuation context has no bounded prior owner.")
+        return owner_match.group(1)
 
     def rewrite_python_arguments(self, argv: Sequence[str]) -> list[str]:
         """Confine bridge-supplied storage and request ceilings."""
@@ -266,6 +319,7 @@ class CanaryRuntimeConfig:
             "database_name": Path(self.database_url.removeprefix("sqlite:///")).name,
             "max_openai_requests": self.max_openai_requests,
             "allowed_agents": sorted(CANARY_ALLOWED_AGENTS),
+            "execution_environment": dict(CANARY_EXECUTION_ENV),
             "mutation_disabled_keys": sorted(MUTATION_DISABLED_ENV),
             "scrubbed_secret_keys": sorted(CANARY_SCRUBBED_ENV_KEYS),
             "provider_read_receipt_contains_raw_content": False,
@@ -353,6 +407,7 @@ def _canary_pythonpath(repo_root: Path, current: str) -> str:
 
 
 __all__ = [
+    "CANARY_EXECUTION_ENV",
     "CANARY_MAX_OPENAI_REQUESTS_ENV",
     "CANARY_ALLOWED_AGENTS",
     "CANARY_RUNTIME_SCHEMA",

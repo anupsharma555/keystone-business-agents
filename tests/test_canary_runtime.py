@@ -10,6 +10,7 @@ import pytest
 from keystone_agents import canary_runtime_entrypoint
 from keystone_agents.canary_runtime import (
     CANARY_ALLOWED_AGENTS,
+    CANARY_EXECUTION_ENV,
     CANARY_MAX_OPENAI_REQUESTS_ENV,
     CANARY_SCRUBBED_ENV_KEYS,
     CANARY_STATE_DIR_ENV,
@@ -48,6 +49,8 @@ def test_canary_environment_forces_mutations_off_and_isolates_state(
     )
 
     for key, expected in MUTATION_DISABLED_ENV.items():
+        assert child[key] == expected
+    for key, expected in CANARY_EXECUTION_ENV.items():
         assert child[key] == expected
     assert child["KEYSTONE_ENABLE_LIVE_RESEARCH"] == "true"
     assert child["KEYSTONE_OPENAI_API_KEY"] == "secret-not-serialized"
@@ -168,6 +171,65 @@ def test_canary_adds_request_ceiling_to_canonical_ask(tmp_path: Path) -> None:
         "--max-openai-requests",
         "6",
     ]
+
+
+def test_canary_admits_confined_canonical_thread_continuation(tmp_path: Path) -> None:
+    config = _config(tmp_path, ceiling=6)
+    context_dir = config.state_dir / "slack-context"
+    context_dir.mkdir(parents=True)
+    context_path = context_dir / "thread.json"
+    context_path.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "source": "slack_app_mention_history",
+                "thread_fetch_status": "ok",
+                "request_text": (
+                    "continue this prior Slack thread. "
+                    "Current user request (authoritative): Count the folders. "
+                    "Prior task owner (advisory): google_workspace_context_agent "
+                    "Continue the same agent task."
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    arguments = [
+        "-m",
+        "keystone_agents.cli",
+        "ask",
+        "--context-file",
+        str(context_path),
+        "continue this prior Slack thread",
+    ]
+
+    assert config.validate_python_arguments(arguments) == "google_workspace_context_agent"
+    rewritten = config.rewrite_python_arguments(arguments)
+    assert "--agent" not in rewritten
+    assert rewritten[rewritten.index("ask") + 1 : rewritten.index("ask") + 3] == [
+        "--max-openai-requests",
+        "6",
+    ]
+
+
+def test_canary_rejects_unconfined_or_unverified_continuation_context(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    outside_path = tmp_path / "outside.json"
+    outside_path.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="inside canary Slack state"):
+        config.validate_python_arguments(
+            [
+                "-m",
+                "keystone_agents.cli",
+                "ask",
+                "--context-file",
+                str(outside_path),
+                "continue this prior Slack thread",
+            ]
+        )
 
 
 def test_canary_state_must_be_specific_temp_child(tmp_path: Path) -> None:
