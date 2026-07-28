@@ -79,6 +79,54 @@ def test_short_brand_official_domain_requires_two_corroborating_results() -> Non
     assert two_results == "https://hyro.ai"
 
 
+def test_ambiguous_brand_prefers_context_matching_expanded_official_domain() -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    inferred = live_retrieval.infer_official_company_url(
+        company="Kintsugi",
+        request_text="Compare voice-based mental-health assessment products.",
+        search_results=[
+            SearchResult(
+                title="Kintsugi Art repair workshops",
+                link="https://www.kintsugi.art/en",
+                snippet="Traditional Japanese repair supplies and courses.",
+                source="searxng",
+            ),
+            SearchResult(
+                title="Kintsugi Art shop",
+                link="https://www.kintsugi.art/en/shop",
+                snippet="Traditional repair materials.",
+                source="searxng",
+            ),
+            SearchResult(
+                title="Kintsugi Health voice biomarkers",
+                link="https://www.kintsugihealth.com/technology",
+                snippet="Voice-based mental health assessment technology.",
+                source="searxng",
+            ),
+        ],
+    )
+
+    assert inferred == "https://kintsugihealth.com"
+
+
+def test_company_queries_put_request_focus_before_generic_brand_discovery() -> None:
+    from keystone_agents.agents.business_research_analyst import (
+        build_company_research_queries,
+    )
+
+    queries = build_company_research_queries(
+        "Kintsugi",
+        request_text=(
+            "Compare Callyope and Kintsugi for voice-based mental-health assessment. "
+            "Give five substantive bullets."
+        ),
+    )
+
+    assert queries[0].startswith("Kintsugi voice mental health assessment")
+    assert queries[1] == "Kintsugi official website"
+
+
 def test_compact_official_extraction_excludes_aggregator_pages() -> None:
     import keystone_agents.live_retrieval as live_retrieval
 

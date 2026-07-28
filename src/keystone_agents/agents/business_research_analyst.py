@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
@@ -173,6 +174,10 @@ def build_company_research_queries(
         company_url=company_url,
         request_text=request_text,
     )
+    request_focus_terms = _company_request_focus_terms(
+        company=normalized_company,
+        request_text=request_text,
+    )
     lane_queries: list[str] = []
     if "careers_jobs" in required_lanes:
         lane_queries.extend(
@@ -196,6 +201,13 @@ def build_company_research_queries(
 
     queries = [
         *lane_queries,
+        *(
+            [
+                f"{normalized_company} {' '.join(request_focus_terms)} official"
+            ]
+            if request_focus_terms
+            else []
+        ),
         f"{normalized_company} official website",
         f"{normalized_company} about product platform",
         f"{normalized_company} LinkedIn company profile",
@@ -231,6 +243,75 @@ def build_company_research_queries(
         )
         queries.insert(3, f"site:{company_domain} {normalized_company} contact leadership")
     return list(dict.fromkeys(query for query in queries if query.strip()))
+
+
+def _company_request_focus_terms(
+    *,
+    company: str,
+    request_text: str,
+    limit: int = 6,
+) -> list[str]:
+    """Extract compact domain terms that disambiguate a company search."""
+
+    company_terms = {
+        re.sub(r"[^a-z0-9]", "", token.lower())
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9-]*", str(company or ""))
+    }
+    generic_terms = {
+        "about",
+        "agent",
+        "analyst",
+        "answer",
+        "based",
+        "brief",
+        "bullet",
+        "bullets",
+        "business",
+        "claim",
+        "claims",
+        "clearest",
+        "company",
+        "compare",
+        "concise",
+        "covering",
+        "create",
+        "difference",
+        "directly",
+        "each",
+        "exactly",
+        "give",
+        "include",
+        "information",
+        "modify",
+        "official",
+        "product",
+        "research",
+        "source",
+        "sources",
+        "substantive",
+        "uncertain",
+        "uncertainty",
+        "url",
+        "urls",
+        "verified",
+        "what",
+        "without",
+    }
+    terms: list[str] = []
+    for raw_token in re.findall(r"[A-Za-z][A-Za-z0-9]{2,}", str(request_text or "")):
+        token = re.sub(r"[^a-z0-9]", "", raw_token.lower())
+        if (
+            len(token) < 4
+            or token in company_terms
+            or token in generic_terms
+            or raw_token[:1].isupper()
+        ):
+            continue
+        if token not in terms:
+            terms.append(token)
+        if len(terms) >= max(1, limit):
+            break
+    return terms
 
 
 def _company_domain_for_search(company_url: str | None) -> str:

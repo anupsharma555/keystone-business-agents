@@ -953,47 +953,127 @@ def infer_official_company_url(
     *,
     company: str,
     search_results: Sequence[Any],
+    request_text: str = "",
 ) -> str:
-    """Infer a first-party base URL only from an exact normalized brand domain."""
+    """Infer a first-party base URL from brand identity plus request context."""
 
     company_slug = re.sub(r"[^a-z0-9]", "", str(company or "").lower())
     if len(company_slug) < 3:
         return ""
-    candidates: dict[str, tuple[int, str, int]] = {}
+    request_focus_terms = {
+        term
+        for term in re.findall(r"[a-z0-9]{4,}", str(request_text or "").lower())
+        if term
+        not in {
+            "about",
+            "agent",
+            "analyst",
+            "answer",
+            "brief",
+            "bullet",
+            "bullets",
+            "business",
+            "company",
+            "compare",
+            "concise",
+            "create",
+            "directly",
+            "include",
+            "modify",
+            "official",
+            "research",
+            "source",
+            "sources",
+            "substantive",
+            "verified",
+        }
+    }
+    candidates: dict[str, dict[str, Any]] = {}
     for result in search_results:
         if isinstance(result, Mapping):
             raw_url = str(result.get("link") or result.get("url") or "").strip()
+            title = str(result.get("title") or "")
+            snippet = str(result.get("snippet") or result.get("content") or "")
         else:
             raw_url = str(
                 getattr(result, "link", "") or getattr(result, "url", "") or ""
             ).strip()
+            title = str(getattr(result, "title", "") or "")
+            snippet = str(
+                getattr(result, "snippet", "")
+                or getattr(result, "content", "")
+                or ""
+            )
         if not raw_url:
             continue
-        parsed = urlparse(raw_url)
-        host = (parsed.hostname or "").lower().removeprefix("www.")
+        try:
+            parsed = urlparse(raw_url)
+            _ = parsed.port
+            host = (parsed.hostname or "").lower().removeprefix("www.")
+        except ValueError:
+            continue
         registrable_domain = _registrable_domain(host)
         if not registrable_domain:
             continue
         registrable_label = registrable_domain.split(".", 1)[0]
-        if re.sub(r"[^a-z0-9]", "", registrable_label) != company_slug:
+        label_slug = re.sub(r"[^a-z0-9]", "", registrable_label)
+        exact_brand_domain = label_slug == company_slug
+        expanded_brand_domain = (
+            label_slug.startswith(company_slug)
+            and len(label_slug) >= len(company_slug) + 3
+        )
+        if not exact_brand_domain and not expanded_brand_domain:
             continue
-        existing = candidates.get(registrable_domain)
-        result_count = (existing[2] if existing else 0) + 1
-        candidate_url = f"https://{registrable_domain}"
-        candidates[registrable_domain] = (
-            len(registrable_domain.split(".")),
-            candidate_url,
-            result_count,
+        result_text = " ".join((title, snippet, raw_url)).lower()
+        context_matches = {
+            term for term in request_focus_terms if term in result_text
+        }
+        suffix = label_slug[len(company_slug) :] if expanded_brand_domain else ""
+        suffix_matches_request = bool(
+            suffix and any(term in suffix or suffix in term for term in request_focus_terms)
+        )
+        candidate = candidates.setdefault(
+            registrable_domain,
+            {
+                "url": f"https://{registrable_domain}",
+                "result_count": 0,
+                "context_matches": set(),
+                "exact_brand_domain": exact_brand_domain,
+                "suffix_matches_request": False,
+            },
+        )
+        candidate["result_count"] += 1
+        candidate["context_matches"].update(context_matches)
+        candidate["suffix_matches_request"] = bool(
+            candidate["suffix_matches_request"] or suffix_matches_request
         )
     if not candidates:
         return ""
-    ranked = sorted(
-        candidates.values(),
-        key=lambda item: (-item[2], item[0], len(item[1]), item[1]),
-    )
-    if len(company_slug) < 5 and ranked[0][2] < 2:
+    eligible = [
+        candidate
+        for candidate in candidates.values()
+        if candidate["exact_brand_domain"]
+        or (
+            candidate["context_matches"]
+            and candidate["suffix_matches_request"]
+        )
+    ]
+    if not eligible:
         return ""
-    return ranked[0][1]
+    ranked = sorted(
+        eligible,
+        key=lambda item: (
+            -len(item["context_matches"]),
+            -int(item["suffix_matches_request"]),
+            -item["result_count"],
+            -int(item["exact_brand_domain"]),
+            len(item["url"]),
+            item["url"],
+        ),
+    )
+    if len(company_slug) < 5 and ranked[0]["result_count"] < 2:
+        return ""
+    return str(ranked[0]["url"])
 
 
 def company_source_matches_official_url(source_url: str, official_url: str) -> bool:
@@ -1206,7 +1286,11 @@ def retrieve_company_profile_live(
     inferred_company_url = (
         ""
         if company_url
-        else infer_official_company_url(company=company, search_results=search_results)
+        else infer_official_company_url(
+            company=company,
+            search_results=search_results,
+            request_text=request_text,
+        )
     )
     resolved_company_url = company_url or inferred_company_url or None
     profile_search_results = (
