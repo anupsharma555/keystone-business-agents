@@ -105,6 +105,10 @@ from keystone_agents.instruction_following import (
     output_constraints_from_plan,
     resolve_instruction_following_response,
 )
+from keystone_agents.live_retrieval import (
+    company_source_matches_official_url,
+    infer_official_company_url,
+)
 from keystone_agents.local_file_inputs import local_file_input_bundle_from_text
 from keystone_agents.model_provider import get_runtime_agent_model_config
 from keystone_agents.models import RunMode
@@ -9687,14 +9691,63 @@ def _direct_company_research_quick_retrieval(
     if manual_plan is None:
         return False
     ask_shape = manual_plan.ask_shape
+    if ask_shape.evidence_depth == "deep":
+        return False
     if ask_shape.evidence_depth == "quick" or ask_shape.cost_mode == "minimize":
         return True
     constraints = output_constraints_from_plan(manual_plan)
     if constraints.word_count is not None:
         return constraints.word_count <= 100
+    compact_source_contract = (
+        constraints.source_url_count is not None
+        and constraints.source_url_count <= 3
+        and (
+            str(ask_shape.output_form or "") in {"brief", "bullets"}
+            or constraints.maximum_items is not None
+            and constraints.maximum_items <= 4
+        )
+    )
+    if compact_source_contract:
+        return True
     stop_condition = str(ask_shape.stop_condition or "")
     match = re.search(r"\bstop_after_([1-9]\d{0,3})_word_summary\b", stop_condition)
     return bool(match and int(match.group(1)) <= 100)
+
+
+def _official_source_response_violations(
+    script_payload: dict[str, Any],
+    manual_plan: ManualRequestPlan | None,
+    response_text: str,
+) -> list[str]:
+    """Verify repaired visible URLs against the child's official-domain evidence."""
+
+    if manual_plan is None or "official" not in manual_plan.ask_shape.source_type_preference:
+        return []
+    visible_urls = re.findall(r"https?://[^\s)>]+", str(response_text or ""), flags=re.I)
+    if not visible_urls:
+        return []
+    retrieval = script_payload.get("retrieval")
+    official_url = (
+        str(retrieval.get("resolved_company_url") or "").strip()
+        if isinstance(retrieval, dict)
+        else ""
+    )
+    output = script_payload.get("output")
+    if not official_url and isinstance(output, dict):
+        official_url = infer_official_company_url(
+            company=str(output.get("company_name") or "").strip(),
+            search_results=(
+                output.get("sources") if isinstance(output.get("sources"), list) else []
+            ),
+        )
+    if not official_url:
+        return ["official company source domain could not be verified"]
+    if any(
+        not company_source_matches_official_url(url, official_url)
+        for url in visible_urls
+    ):
+        return ["visible source URL is outside the verified official company domain"]
+    return []
 
 
 def _manual_plan_url_target(manual_plan: ManualRequestPlan | None) -> str:
@@ -11384,15 +11437,42 @@ def _run_ask_script_live(
             ),
             live=True,
         )
+        final_validation = instruction_resolution.validation
+        provenance_violations = _official_source_response_violations(
+            script_payload,
+            manual_plan,
+            instruction_resolution.response_text,
+        )
+        if provenance_violations:
+            final_validation = final_validation.model_copy(
+                update={
+                    "passed": False,
+                    "violations": list(
+                        dict.fromkeys(
+                            [
+                                *final_validation.violations,
+                                *provenance_violations,
+                            ]
+                        )
+                    ),
+                }
+            )
         human_summary = (
             instruction_resolution.response_text
-            if instruction_resolution.validation.passed
-            else instruction_following_blocker_text(instruction_resolution.validation)
+            if final_validation.passed
+            else instruction_following_blocker_text(final_validation)
         )
-        payload["instruction_following"] = instruction_resolution.metadata()
+        instruction_metadata = instruction_resolution.metadata()
+        instruction_metadata["validation"] = final_validation.model_dump(
+            mode="json",
+            exclude={"checked_text", "source_url_count"}
+            if final_validation.source_url_count is None
+            else {"checked_text"},
+        )
+        payload["instruction_following"] = instruction_metadata
         if (
-            instruction_resolution.validation.applicable
-            and not instruction_resolution.validation.passed
+            final_validation.applicable
+            and not final_validation.passed
         ):
             payload["status"] = "blocked"
             payload["block_kind"] = "instruction_following_constraint_failed"

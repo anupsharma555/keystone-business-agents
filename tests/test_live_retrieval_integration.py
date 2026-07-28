@@ -13,6 +13,228 @@ from keystone_agents.schemas.opportunity import OpportunityScoutResult
 from keystone_agents.tools.search_provider import SearchResult
 
 
+def test_official_company_url_inference_requires_exact_brand_domain() -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    inferred = live_retrieval.infer_official_company_url(
+        company="Callyope",
+        search_results=[
+            SearchResult(
+                title="Callyope listing",
+                link="https://elion.health/products/callyope",
+                source="searxng",
+            ),
+            SearchResult(
+                title="Callyope FAQ",
+                link="https://www.callyope.com/faq",
+                source="searxng",
+            ),
+        ],
+    )
+    ambiguous = live_retrieval.infer_official_company_url(
+        company="Callyope",
+        search_results=[
+            SearchResult(
+                title="Callyope listing",
+                link="https://callyope.example.com/profile",
+                source="searxng",
+            )
+        ],
+    )
+
+    assert inferred == "https://callyope.com"
+    assert ambiguous == ""
+
+
+def test_short_brand_official_domain_requires_two_corroborating_results() -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    one_result = live_retrieval.infer_official_company_url(
+        company="Hyro",
+        search_results=[
+            SearchResult(
+                title="Hyro",
+                link="https://www.hyro.ai/",
+                source="searxng",
+            )
+        ],
+    )
+    two_results = live_retrieval.infer_official_company_url(
+        company="Hyro",
+        search_results=[
+            SearchResult(
+                title="Hyro",
+                link="https://www.hyro.ai/",
+                source="searxng",
+            ),
+            SearchResult(
+                title="Hyro healthcare",
+                link="https://www.hyro.ai/healthcare/",
+                source="searxng",
+            ),
+        ],
+    )
+
+    assert one_result == ""
+    assert two_results == "https://hyro.ai"
+
+
+def test_compact_official_extraction_excludes_aggregator_pages() -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    urls = live_retrieval._company_website_extraction_urls(
+        company="Callyope",
+        company_url="https://callyope.com",
+        search_results=[
+            SearchResult(
+                title="Callyope directory listing",
+                link="https://elion.health/products/callyope",
+                snippet="Third-party listing.",
+                source="searxng",
+            ),
+            SearchResult(
+                title="Callyope FAQ",
+                link="https://www.callyope.com/faq",
+                snippet="Official company FAQ.",
+                source="searxng",
+            ),
+        ],
+        queries=["Callyope FAQ modalities"],
+        max_pages=2,
+        official_company_only=True,
+    )
+
+    assert "https://elion.health/products/callyope" not in urls
+    assert urls
+    assert all(
+        live_retrieval.company_source_matches_official_url(
+            url,
+            "https://callyope.com",
+        )
+        for url in urls
+    )
+    assert urls[0] == "https://www.callyope.com/faq"
+
+
+def test_official_extraction_fails_closed_without_verified_company_domain() -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    urls = live_retrieval._company_website_extraction_urls(
+        company="Hyro",
+        company_url=None,
+        search_results=[
+            SearchResult(
+                title="Hyro directory listing",
+                link="https://elion.health/products/hyro",
+                snippet="Third-party listing.",
+                source="searxng",
+            )
+        ],
+        max_pages=2,
+        official_company_only=True,
+    )
+
+    assert urls == []
+
+
+@pytest.mark.parametrize(
+    "malformed_url",
+    [
+        "https://example.test:abc/path",
+        "https://example.test:99999/path",
+        "https://[example.test/path",
+    ],
+)
+def test_official_domain_match_rejects_malformed_urls(malformed_url: str) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    assert (
+        live_retrieval.company_source_matches_official_url(
+            malformed_url,
+            "https://example.test",
+        )
+        is False
+    )
+
+
+def test_company_retrieval_uses_inferred_official_domain_for_profile_and_quality(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    captured: dict[str, object] = {}
+
+    class FakeProvider:
+        provider_name = "searxng"
+        dry_run = False
+
+        def validate_configuration(self) -> None:
+            return None
+
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            return [
+                SearchResult(
+                    title="Callyope directory listing",
+                    link="https://elion.health/products/callyope",
+                    snippet="Third-party directory.",
+                    source="searxng",
+                ),
+                SearchResult(
+                    title="Callyope FAQ",
+                    link="https://www.callyope.com/faq",
+                    snippet="Official company FAQ.",
+                    source="searxng",
+                ),
+                SearchResult(
+                    title="Callyope technology",
+                    link="https://www.callyope.com/technology",
+                    snippet="Official company technology page.",
+                    source="searxng",
+                ),
+            ]
+
+    def profile_builder(**kwargs: object) -> CompanyProfile:
+        captured.update(kwargs)
+        return CompanyProfile(
+            name="Callyope",
+            website=str(kwargs.get("company_url") or ""),
+        )
+
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", "false")
+    profile, metadata = live_retrieval.retrieve_company_profile_live(
+        company="Callyope",
+        request_text="Use exactly two official Callyope sources with URLs.",
+        requested_provider="searxng",
+        max_results=2,
+        agents_web_search_parallel=False,
+        tavily_search_fallback=False,
+        exa_search_fallback=False,
+        extract_selected_pages=False,
+        official_company_sources_only=True,
+        max_queries=1,
+        settings_loader=lambda: SimpleNamespace(
+            search_provider="searxng",
+            serper_enabled=False,
+            website_extractor="trafilatura",
+        ),
+        query_builder=lambda _company, _url: ["Callyope official website"],
+        search_provider_builder=lambda provider=None, *, live=False: FakeProvider(),
+        profile_builder=profile_builder,
+    )
+
+    assert captured["company_url"] == "https://callyope.com"
+    assert profile.website == "https://callyope.com"
+    assert metadata["resolved_company_url"] == "https://callyope.com"
+    assert metadata["company_url_inferred"] is True
+    assert metadata["search_quality"]["official_source_present"] is True
+    assert metadata["raw_search_result_count"] == 3
+    assert metadata["profile_search_result_count"] == 2
+    assert all(
+        "callyope.com" in result.link
+        for result in captured["search_results"]
+    )
+
+
 def test_company_website_extraction_prioritizes_query_focused_company_pages() -> None:
     import keystone_agents.live_retrieval as live_retrieval
 

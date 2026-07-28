@@ -224,6 +224,86 @@ def test_direct_specialist_routes_share_one_llm_constraint_repair(
     assert payload["instruction_following"]["repair_succeeded"] is True
 
 
+def test_company_research_repair_cannot_promote_unofficial_source_url(
+    monkeypatch,
+    capsys,
+    tmp_path,
+) -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="business_research_analyst",
+        ask_shape=AskShapePolicy(
+            source_type_preference=["official"],
+            output_constraints=InterpretedOutputConstraints(
+                interpretation="exactly two official source URLs",
+                source_url_count_mode="exact",
+                source_url_count=2,
+                include_source_urls=True,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_isolated_child_process",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "output_type": "CompanyResearchFocusedBrief",
+                    "send_enabled": False,
+                    "retrieval": {"resolved_company_url": "https://callyope.com"},
+                    "human_summary": "Source: https://www.callyope.com/faq",
+                    "output": {
+                        "company_name": "Callyope",
+                        "answer": "Source-backed company summary.",
+                        "sources": [
+                            {
+                                "title": "Callyope FAQ",
+                                "url": "https://www.callyope.com/faq",
+                            }
+                        ],
+                    },
+                }
+            ),
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        "keystone_agents.instruction_following.run_typed_sdk_agent",
+        lambda **_kwargs: SimpleNamespace(
+            output=InstructionFollowingRepairOutput(
+                response_text=(
+                    "Sources: https://www.callyope.com/faq "
+                    "https://elion.health/products/callyope"
+                )
+            ),
+            usage={},
+            cost={},
+            request_cache={},
+        ),
+    )
+
+    exit_code = cli._run_ask_script_live(
+        "business_research_analyst",
+        "Use exactly two official Callyope sources with URLs.",
+        ["unused-child-command"],
+        json_output=True,
+        manual_plan=plan,
+        database_url=f"sqlite:///{tmp_path / 'official-repair.db'}",
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "blocked"
+    assert payload["block_kind"] == "instruction_following_constraint_failed"
+    assert payload["instruction_following"]["validation"]["passed"] is False
+    assert (
+        "visible source URL is outside the verified official company domain"
+        in payload["instruction_following"]["validation"]["violations"]
+    )
+    assert "elion.health" not in payload["human_summary"]
+
+
 def test_direct_specialist_provider_blocker_skips_llm_constraint_repair(
     monkeypatch,
     capsys,
@@ -5252,6 +5332,121 @@ def test_company_research_quick_retrieval_receives_raw_operator_request(
     assert captured["exa_search_fallback"] is False
     assert captured["extract_selected_pages"] is False
     assert captured["max_queries"] == 2
+
+
+def test_company_research_typed_compact_source_contract_enables_quick_retrieval() -> None:
+    import scripts.run_company_research as company_cli
+
+    request_text = (
+        "Research Callyope and give me exactly 4 concise bullets. "
+        "Use exactly 2 official Callyope sources with URLs."
+    )
+    args = company_cli.build_parser().parse_args(
+        [
+            "--company",
+            "Callyope",
+            "--request-text",
+            request_text,
+            "--live-search",
+            "--live-search-plan",
+            "--no-dry-run",
+        ]
+    )
+
+    args = company_cli._apply_interpreted_retrieval_mode(
+        company_cli._apply_manual_request_plan(args)
+    )
+
+    assert args.quick_retrieval is True
+    assert args.live_search_plan is True
+    assert args.max_results == 2
+    assert company_cli._compact_official_source_page_limit(args) == 2
+
+
+def test_direct_company_research_compact_source_contract_skips_search_planner() -> None:
+    request_text = (
+        "Research Callyope and give me exactly 4 concise bullets. "
+        "Use exactly 2 official Callyope sources with URLs."
+    )
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="business_research_analyst",
+    )
+
+    assert cli._direct_company_research_quick_retrieval(plan) is True
+
+
+def test_company_research_compact_official_lane_reads_two_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.run_company_research as company_cli
+
+    captured: dict[str, object] = {}
+
+    def fake_retrieve_company_profile_live(**kwargs: object):
+        captured.update(kwargs)
+        return company_cli.CompanyProfile(name="Callyope"), {"mode": "live_search"}
+
+    monkeypatch.setattr(
+        company_cli,
+        "retrieve_company_profile_live",
+        fake_retrieve_company_profile_live,
+    )
+    monkeypatch.setattr(
+        company_cli,
+        "require_cli_live_confirmation",
+        lambda **_kwargs: None,
+    )
+    args = company_cli.build_parser().parse_args(
+        [
+            "--company",
+            "Callyope",
+            "--request-text",
+            (
+                "Research Callyope and give me exactly 4 concise bullets. "
+                "Use exactly 2 official Callyope sources with URLs."
+            ),
+            "--live-search",
+            "--no-dry-run",
+        ]
+    )
+    args = company_cli._apply_interpreted_retrieval_mode(
+        company_cli._apply_manual_request_plan(args)
+    )
+
+    company_cli._retrieve_company_profile(args)
+
+    assert captured["extract_selected_pages"] is True
+    assert captured["website_extraction_max_pages"] == 2
+    assert captured["discover_internal_company_pages"] is False
+    assert captured["official_company_sources_only"] is True
+    assert captured["max_queries"] == 2
+    assert captured["exa_search_fallback"] is False
+    assert captured["tavily_search_fallback"] is False
+
+
+def test_company_research_deep_request_keeps_full_retrieval() -> None:
+    import scripts.run_company_research as company_cli
+
+    args = company_cli.build_parser().parse_args(
+        [
+            "--company",
+            "Callyope",
+            "--request-text",
+            "Research Callyope deeply and return a concise four-bullet brief.",
+            "--live-search",
+            "--live-search-plan",
+            "--no-dry-run",
+        ]
+    )
+
+    args = company_cli._apply_interpreted_retrieval_mode(
+        company_cli._apply_manual_request_plan(args)
+    )
+
+    assert args.quick_retrieval is False
+    assert args.live_search_plan is True
+    assert args.max_results == 5
 
 
 def test_cli_ask_context_agent_override_live_sdk_runs_typed_agent(

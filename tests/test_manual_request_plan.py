@@ -3057,6 +3057,82 @@ def test_manual_plan_preserves_supplied_context_bullet_count(
     assert plan.ask_shape.output_constraints.maximum_items == 3
 
 
+def test_manual_plan_preserves_official_source_and_url_count_contract() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "Business Research Analyst, research Callyope and give me 4 concise "
+            "bullets: what it does, which modalities it uses, which claims are "
+            "directly verified, and what remains uncertain. Use exactly 2 official "
+            "Callyope sources with URLs. Do not create or modify anything."
+        ),
+        requested_agent="business_research_analyst",
+    )
+
+    constraints = plan.ask_shape.output_constraints
+    assert plan.ask_shape.source_type_preference == ["official"]
+    assert plan.ask_shape.evidence_depth == "unspecified"
+    assert plan.ask_shape.output_form == "bullets"
+    assert constraints.item_count_mode == "exact"
+    assert constraints.minimum_items == 4
+    assert constraints.maximum_items == 4
+    assert constraints.source_url_count_mode == "exact"
+    assert constraints.source_url_count == 2
+    assert constraints.include_source_urls is True
+
+
+@pytest.mark.parametrize(
+    "source_request",
+    [
+        "Use exactly 2 recent official Callyope sources with URLs.",
+        "Use exactly 2 Callyope official sources with URLs.",
+        "Use exactly 2 first-party sources with URLs.",
+        "Use exactly 2 official sources from Callyope with URLs.",
+    ],
+)
+def test_manual_plan_preserves_natural_official_source_phrasings(
+    source_request: str,
+) -> None:
+    plan = infer_manual_request_plan(
+        f"Research Callyope. {source_request}",
+        requested_agent="business_research_analyst",
+    )
+
+    constraints = plan.ask_shape.output_constraints
+    assert plan.ask_shape.source_type_preference == ["official"]
+    assert constraints.source_url_count_mode == "exact"
+    assert constraints.source_url_count == 2
+    assert constraints.include_source_urls is True
+
+
+def test_manual_plan_deep_research_is_not_downgraded_by_concise_output() -> None:
+    plan = infer_manual_request_plan(
+        "Research Callyope deeply and return a concise four-bullet brief.",
+        requested_agent="business_research_analyst",
+    )
+
+    assert plan.ask_shape.evidence_depth == "deep"
+
+
+def test_manual_plan_does_not_turn_reason_count_into_source_url_count() -> None:
+    plan = infer_manual_request_plan(
+        "Give at least two reasons to use official sources with URLs.",
+        requested_agent="chief_of_staff",
+    )
+
+    constraints = plan.ask_shape.output_constraints
+    assert constraints.source_url_count_mode == "unspecified"
+    assert constraints.source_url_count is None
+
+
+def test_manual_plan_honors_negated_official_source_preference() -> None:
+    plan = infer_manual_request_plan(
+        "Research Callyope, but do not use official Callyope sources.",
+        requested_agent="business_research_analyst",
+    )
+
+    assert "official" not in plan.ask_shape.source_type_preference
+
+
 def test_supplied_context_fact_named_provider_write_is_not_outreach_command() -> None:
     plan = infer_manual_request_plan(
         (

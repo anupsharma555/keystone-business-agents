@@ -949,6 +949,91 @@ def company_research_request_text(company: str, company_url: str | None = None) 
     return base
 
 
+def infer_official_company_url(
+    *,
+    company: str,
+    search_results: Sequence[Any],
+) -> str:
+    """Infer a first-party base URL only from an exact normalized brand domain."""
+
+    company_slug = re.sub(r"[^a-z0-9]", "", str(company or "").lower())
+    if len(company_slug) < 3:
+        return ""
+    candidates: dict[str, tuple[int, str, int]] = {}
+    for result in search_results:
+        if isinstance(result, Mapping):
+            raw_url = str(result.get("link") or result.get("url") or "").strip()
+        else:
+            raw_url = str(
+                getattr(result, "link", "") or getattr(result, "url", "") or ""
+            ).strip()
+        if not raw_url:
+            continue
+        parsed = urlparse(raw_url)
+        host = (parsed.hostname or "").lower().removeprefix("www.")
+        registrable_domain = _registrable_domain(host)
+        if not registrable_domain:
+            continue
+        registrable_label = registrable_domain.split(".", 1)[0]
+        if re.sub(r"[^a-z0-9]", "", registrable_label) != company_slug:
+            continue
+        existing = candidates.get(registrable_domain)
+        result_count = (existing[2] if existing else 0) + 1
+        candidate_url = f"https://{registrable_domain}"
+        candidates[registrable_domain] = (
+            len(registrable_domain.split(".")),
+            candidate_url,
+            result_count,
+        )
+    if not candidates:
+        return ""
+    ranked = sorted(
+        candidates.values(),
+        key=lambda item: (-item[2], item[0], len(item[1]), item[1]),
+    )
+    if len(company_slug) < 5 and ranked[0][2] < 2:
+        return ""
+    return ranked[0][1]
+
+
+def company_source_matches_official_url(source_url: str, official_url: str) -> bool:
+    """Return whether two URLs share the same registrable company domain."""
+
+    try:
+        source_parsed = urlparse(source_url)
+        official_parsed = urlparse(official_url)
+        # Accessing ``port`` validates malformed/non-numeric and out-of-range
+        # values that ``hostname`` alone intentionally tolerates.
+        _validated_ports = (source_parsed.port, official_parsed.port)
+        source_domain = _registrable_domain(
+            (source_parsed.hostname or "").lower()
+        )
+        official_domain = _registrable_domain(
+            (official_parsed.hostname or "").lower()
+        )
+    except ValueError:
+        return False
+    return bool(source_domain and official_domain and source_domain == official_domain)
+
+
+def _registrable_domain(host: str) -> str:
+    labels = [
+        label
+        for label in str(host or "").lower().removeprefix("www.").split(".")
+        if label
+    ]
+    if len(labels) < 2:
+        return ""
+    if len(labels) >= 3 and ".".join(labels[-2:]) in {
+        "co.jp",
+        "co.nz",
+        "co.uk",
+        "com.au",
+    }:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
 def retrieve_company_profile_live(
     *,
     company: str,
@@ -962,6 +1047,9 @@ def retrieve_company_profile_live(
     tavily_search_fallback: bool | None = None,
     exa_search_fallback: bool | None = None,
     extract_selected_pages: bool = True,
+    website_extraction_max_pages: int | None = None,
+    discover_internal_company_pages: bool = True,
+    official_company_sources_only: bool = False,
     max_queries: int | None = None,
     retrieval_hint: RetrievalHint | None = None,
     settings_loader: Callable[[], Any] | None = None,
@@ -1115,11 +1203,30 @@ def retrieve_company_profile_live(
                 search_results.extend(results)
 
         search_seconds = perf_counter() - search_started_at
+    inferred_company_url = (
+        ""
+        if company_url
+        else infer_official_company_url(company=company, search_results=search_results)
+    )
+    resolved_company_url = company_url or inferred_company_url or None
+    profile_search_results = (
+        [
+            result
+            for result in search_results
+            if resolved_company_url
+            and company_source_matches_official_url(
+                str(_jsonable_search_result(result).get("url") or ""),
+                resolved_company_url,
+            )
+        ]
+        if official_company_sources_only
+        else search_results
+    )
     quality_started_at = perf_counter()
     search_quality = assess_company_search_quality(
         results=search_results,
         company_name=company,
-        company_url=company_url,
+        company_url=resolved_company_url,
         request_text=request_text,
         autonomy_hint=autonomy_hint,
     )
@@ -1132,12 +1239,15 @@ def retrieve_company_profile_live(
     if extract_selected_pages:
         website_inputs, website_errors, website_stats = _extract_company_website_inputs(
             company=company,
-            company_url=company_url,
+            company_url=resolved_company_url,
             search_results=search_results,
             queries=queries,
             provider=str(
                 getattr(settings, "website_extractor", "trafilatura") or "trafilatura"
             ),
+            max_pages=website_extraction_max_pages,
+            discover_internal_pages=discover_internal_company_pages,
+            official_company_only=official_company_sources_only,
         )
     else:
         website_inputs, website_errors, website_stats = [], [], {
@@ -1151,8 +1261,8 @@ def retrieve_company_profile_live(
     profile_started_at = perf_counter()
     profile_kwargs: dict[str, Any] = {
         "company_name": company,
-        "company_url": company_url,
-        "search_results": search_results,
+        "company_url": resolved_company_url,
+        "search_results": profile_search_results,
         "website_inputs": website_inputs,
     }
     if _profile_builder_accepts_request_focus(profile_builder):
@@ -1165,7 +1275,7 @@ def retrieve_company_profile_live(
     )
     retrieved_source_candidates = _company_source_triage_candidates(
         profile=profile,
-        search_results=search_results,
+        search_results=profile_search_results,
         limit=max(12, max_results * 4),
     )
     source_triage = triage_source_candidates(
@@ -1185,6 +1295,9 @@ def retrieve_company_profile_live(
             "retrieved_source_candidates": retrieved_source_candidates,
             "source_triage": source_triage.model_dump(mode="json"),
             "raw_search_result_count": len(search_results),
+            "profile_search_result_count": len(profile_search_results),
+            "resolved_company_url": resolved_company_url or "",
+            "company_url_inferred": bool(inferred_company_url),
             "max_results": max_results,
             "searxng_transient_runtime": dict(searxng_runtime),
             "search_quality": search_quality.to_dict(),
@@ -1249,6 +1362,9 @@ def _extract_company_website_inputs(
     search_results: list[Any],
     queries: list[str] | None = None,
     provider: str,
+    max_pages: int | None = None,
+    discover_internal_pages: bool = True,
+    official_company_only: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
     provider_sequence = website_extraction_provider_sequence(primary_provider=provider)
     fallback_provider = ",".join(provider_sequence[1:])
@@ -1273,16 +1389,19 @@ def _extract_company_website_inputs(
         company_url=company_url,
         search_results=search_results,
         queries=queries or [],
+        max_pages=max_pages,
+        official_company_only=official_company_only,
     )
-    if company_url:
+    resolved_max_pages = max_pages or _website_extraction_max_pages()
+    if company_url and discover_internal_pages:
         discovered_urls = discover_company_page_urls(
             company_url,
             company_name=company,
             live=True,
-            max_urls=_website_extraction_max_pages(),
+            max_urls=resolved_max_pages,
         )
         base_stats["internal_page_discovery_count"] = len(discovered_urls)
-        urls = list(dict.fromkeys([*discovered_urls, *urls]))[: _website_extraction_max_pages()]
+        urls = list(dict.fromkeys([*discovered_urls, *urls]))[:resolved_max_pages]
     base_stats["pages_considered"] = len(urls)
     website_inputs: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -1388,8 +1507,12 @@ def _company_website_extraction_urls(
     company_url: str | None,
     search_results: list[Any],
     queries: list[str] | None = None,
+    max_pages: int | None = None,
+    official_company_only: bool = False,
 ) -> list[str]:
-    max_pages = _website_extraction_max_pages()
+    resolved_max_pages = max_pages or _website_extraction_max_pages()
+    if official_company_only and not company_url:
+        return []
     candidates: list[tuple[str, int, int]] = []
     if company_url:
         for position, url in enumerate(default_company_page_urls(company_url)):
@@ -1400,7 +1523,18 @@ def _company_website_extraction_urls(
         url = str(item.get("url") or "").strip()
         if not url or not _looks_like_company_page(url, company=company):
             continue
+        if (
+            official_company_only
+            and company_url
+            and not company_source_matches_official_url(url, company_url)
+        ):
+            continue
         score = _company_page_focus_score(item, query_terms=query_terms)
+        if official_company_only:
+            # Prefer discovered official pages that match the request over
+            # generic homepage/about guesses. Default URLs remain bounded
+            # fallbacks when search does not expose enough official pages.
+            score += 1000
         candidates.append((url, score, position))
     deduped: dict[str, tuple[str, int, int]] = {}
     for url, score, position in candidates:
@@ -1409,7 +1543,7 @@ def _company_website_extraction_urls(
         if existing is None or (score, -position) > (existing[1], -existing[2]):
             deduped[key] = (url, score, position)
     ordered = sorted(deduped.values(), key=lambda item: (-item[1], item[2]))
-    return [url for url, _score, _position in ordered[:max_pages]]
+    return [url for url, _score, _position in ordered[:resolved_max_pages]]
 
 
 def _company_extraction_query_terms(*, company: str, queries: list[str]) -> list[str]:

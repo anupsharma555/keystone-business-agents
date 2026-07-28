@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import BaseModel, field_validator
 
@@ -19,6 +20,16 @@ from keystone_agents.sdk import build_model_settings, build_sdk_agent, compose_i
 
 _WORD_RE = re.compile(r"\b[\w]+(?:['\u2019-][\w]+)*\b", re.UNICODE)
 _URL_RE = re.compile(r"https?://[^\s)>]+", re.I)
+_TRACKING_QUERY_KEYS = frozenset(
+    {
+        "fbclid",
+        "gclid",
+        "mc_cid",
+        "mc_eid",
+        "ref",
+        "source",
+    }
+)
 _SECTION_BOUNDARY_RE = re.compile(
     r"(?im)^\s*(?:\*{0,2})(?:detailed summary|useful references?|source evidence|"
     r"terms|recommended actions?|run notes|metadata|next step|review notes|"
@@ -78,9 +89,15 @@ class InstructionFollowingResolution:
     error: str = ""
 
     def metadata(self) -> dict[str, Any]:
+        validation_payload = self.validation.model_dump(
+            mode="json",
+            exclude={"checked_text"},
+        )
+        if validation_payload.get("source_url_count") is None:
+            validation_payload.pop("source_url_count", None)
         payload: dict[str, Any] = {
             "schema": "keystone.instruction_following.v1",
-            "validation": self.validation.model_dump(mode="json", exclude={"checked_text"}),
+            "validation": validation_payload,
             "repair_attempted": self.repair_attempted,
             "repair_succeeded": self.repair_succeeded,
         }
@@ -167,6 +184,13 @@ def validate_output_constraints(
     word_count = len(_WORD_RE.findall(checked))
     sentence_count = _sentence_count(checked)
     item_count = _item_count(checked)
+    source_urls = list(
+        dict.fromkeys(
+            canonical
+            for raw_url in _URL_RE.findall(checked)
+            if (canonical := _canonical_source_url(raw_url))
+        )
+    )
 
     _validate_count(
         label="word count",
@@ -198,6 +222,14 @@ def validate_output_constraints(
             )
         else:
             satisfied.append(f"maximum item count {constraints.maximum_items}")
+    _validate_count(
+        label="source URL count",
+        actual=len(source_urls),
+        mode=constraints.source_url_count_mode,
+        expected=constraints.source_url_count,
+        violations=violations,
+        satisfied=satisfied,
+    )
 
     response_lower = response_text.lower()
     for section in (
@@ -241,8 +273,58 @@ def validate_output_constraints(
             if constraints.minimum_items is not None or constraints.maximum_items is not None
             else None
         ),
+        source_url_count=(
+            len(source_urls)
+            if constraints.source_url_count_mode != "unspecified"
+            else None
+        ),
         satisfied_constraints=satisfied,
         violations=violations,
+    )
+
+
+def _canonical_source_url(raw_url: str) -> str:
+    """Canonicalize one visible URL for source-identity counting."""
+
+    cleaned = str(raw_url or "").rstrip(".,;:!?]}>'\"")
+    if not cleaned:
+        return ""
+    try:
+        parsed = urlsplit(cleaned)
+    except ValueError:
+        return ""
+    original_scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    if original_scheme not in {"http", "https"} or not hostname:
+        return ""
+    scheme = "https"
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+    netloc = hostname
+    if port and not (
+        (original_scheme == "http" and port == 80)
+        or (original_scheme == "https" and port == 443)
+    ):
+        netloc = f"{hostname}:{port}"
+    query_items = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() not in _TRACKING_QUERY_KEYS
+        and not key.lower().startswith("utm_")
+    ]
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+    return urlunsplit(
+        (
+            scheme,
+            netloc,
+            path,
+            urlencode(sorted(query_items)),
+            "",
+        )
     )
 
 

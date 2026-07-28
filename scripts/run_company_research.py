@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -61,6 +62,8 @@ from keystone_agents.live_retrieval import (
     company_research_request_text as _live_company_research_request_text,
 )
 from keystone_agents.live_retrieval import (
+    company_source_matches_official_url,
+    infer_official_company_url,
     retrieval_diagnostics_from_metadata,
     retrieve_company_profile_live,
 )
@@ -327,6 +330,74 @@ def _manual_plan_objective(args: argparse.Namespace) -> str:
     return ""
 
 
+def _apply_interpreted_retrieval_mode(args: argparse.Namespace) -> argparse.Namespace:
+    """Select the compact lane from typed ask shape, including bridge-owned runs."""
+
+    if args.quick_retrieval or args.compare_company:
+        return args
+    plan = getattr(args, "manual_request_plan", None)
+    if not isinstance(plan, dict):
+        return args
+    ask_shape = plan.get("ask_shape")
+    if not isinstance(ask_shape, dict):
+        return args
+    evidence_depth = str(ask_shape.get("evidence_depth") or "unspecified")
+    if evidence_depth == "deep":
+        return args
+    constraints = output_constraints_from_plan(plan)
+    explicit_quick = (
+        evidence_depth == "quick"
+        or str(ask_shape.get("cost_mode") or "unspecified") == "minimize"
+    )
+    bounded_compact_output = (
+        str(ask_shape.get("ask_breadth") or "unspecified") in {"narrow", "bounded"}
+        and str(ask_shape.get("output_form") or "unspecified") in {"brief", "bullets"}
+        and (
+            (
+                constraints.source_url_count is not None
+                and constraints.source_url_count <= 3
+            )
+            or (
+                constraints.word_count is not None
+                and constraints.word_count <= 100
+            )
+            or (
+                constraints.maximum_items is not None
+                and constraints.maximum_items <= 4
+                and constraints.include_source_urls
+            )
+        )
+    )
+    if explicit_quick or bounded_compact_output:
+        args.quick_retrieval = True
+        args.max_results = min(int(args.max_results), 2)
+    return args
+
+
+def _compact_official_source_page_limit(args: argparse.Namespace) -> int | None:
+    """Return a tiny first-party extraction cap for compact official-source asks."""
+
+    if not args.quick_retrieval:
+        return None
+    plan = getattr(args, "manual_request_plan", None)
+    if not isinstance(plan, dict):
+        return None
+    ask_shape = plan.get("ask_shape")
+    if not isinstance(ask_shape, dict):
+        return None
+    source_types = {
+        str(item)
+        for item in (ask_shape.get("source_type_preference") or [])
+        if str(item)
+    }
+    constraints = output_constraints_from_plan(plan)
+    if "official" not in source_types:
+        return None
+    if constraints.source_url_count is None:
+        return None
+    return max(1, min(3, constraints.source_url_count))
+
+
 def _orchestrator_review_request_summary(
     args: argparse.Namespace,
     *,
@@ -527,6 +598,7 @@ def _retrieve_company_profile(
             flag_name="--live-search",
             live_action="live company research network search",
         )
+        compact_official_page_limit = _compact_official_source_page_limit(args)
         profile, metadata = retrieve_company_profile_live(
             company=resolved_company,
             company_url=resolved_company_url,
@@ -545,7 +617,12 @@ def _retrieve_company_profile(
             agents_web_search_max_calls=1 if args.quick_retrieval else None,
             tavily_search_fallback=False if args.quick_retrieval else None,
             exa_search_fallback=False if args.quick_retrieval else None,
-            extract_selected_pages=not args.quick_retrieval,
+            extract_selected_pages=(
+                not args.quick_retrieval or compact_official_page_limit is not None
+            ),
+            website_extraction_max_pages=compact_official_page_limit,
+            discover_internal_company_pages=compact_official_page_limit is None,
+            official_company_sources_only=compact_official_page_limit is not None,
             max_queries=2 if args.quick_retrieval else None,
             retrieval_hint=_explicit_retrieval_hint(args),
             settings_loader=load_settings,
@@ -874,6 +951,17 @@ def _company_research_sdk_human_summary(payload: dict[str, Any]) -> str:
     facts = _summary_facts(output.get("facts"), limit=4)
     sources = _summary_sources(output.get("sources"), limit=5)
     output_constraints = output_constraints_from_plan(payload.get("manual_request_plan"))
+    ask_shape = (
+        payload.get("manual_request_plan", {}).get("ask_shape", {})
+        if isinstance(payload.get("manual_request_plan"), dict)
+        else {}
+    )
+    output_form = str(ask_shape.get("output_form") or "unspecified")
+    source_type_preference = {
+        str(item)
+        for item in (ask_shape.get("source_type_preference") or [])
+        if str(item)
+    }
 
     narrow_answer_requested = output_constraints.scope == "answer" and (
         output_constraints.word_count_mode != "unspecified"
@@ -902,6 +990,40 @@ def _company_research_sdk_human_summary(payload: dict[str, Any]) -> str:
         answer_parts.append(f"{company} has source-backed context available for review.")
     if traction and not structured_answer:
         answer_parts.append(f"Key signal: {_truncate_summary(traction, 220)}")
+
+    if output_form == "bullets" and structured_answer:
+        official_only = "official" in source_type_preference
+        official_company_url = _official_company_url_for_payload(
+            payload,
+            company=company,
+            sources=output.get("sources"),
+        )
+        visible_answer = _format_structured_bullet_answer(
+            structured_answer,
+            strip_urls=official_only,
+        )
+        compact_sources = _summary_sources_compact(
+            output.get("sources"),
+            limit=output_constraints.source_url_count or 5,
+            official_only=official_only,
+            official_company_url=official_company_url if official_only else "",
+        )
+        if output_constraints.include_source_urls:
+            requested_count = output_constraints.source_url_count
+            if requested_count is not None and len(compact_sources) < requested_count:
+                source_note = (
+                    f"Sources: only {len(compact_sources)} of {requested_count} requested "
+                    f"{'official ' if official_only else ''}source URLs were verified."
+                )
+                if compact_sources:
+                    source_note += " " + " | ".join(compact_sources)
+                return f"{visible_answer}\n\n{source_note}".strip()
+            if compact_sources:
+                return (
+                    f"{visible_answer}\n\nSources: "
+                    + " | ".join(compact_sources)
+                ).strip()
+        return visible_answer
 
     detail_lines: list[str] = []
     if product:
@@ -950,9 +1072,50 @@ def _attach_company_research_output_constraint_validation(payload: dict[str, Any
         return
     display_text = str(payload.get("human_summary") or "")
     validation = validate_output_constraints(display_text, constraints)
-    payload["output_constraint_validation"] = validation.model_dump(
+    validation_payload = validation.model_dump(
         mode="json", exclude={"checked_text"}
     )
+    if validation_payload.get("source_url_count") is None:
+        validation_payload.pop("source_url_count", None)
+    ask_shape = (
+        payload.get("manual_request_plan", {}).get("ask_shape", {})
+        if isinstance(payload.get("manual_request_plan"), dict)
+        else {}
+    )
+    source_types = {
+        str(item)
+        for item in (ask_shape.get("source_type_preference") or [])
+        if str(item)
+    }
+    if "official" in source_types:
+        output = payload.get("output")
+        company = (
+            _summary_text(output.get("company_name"))
+            if isinstance(output, dict)
+            else ""
+        )
+        official_url = _official_company_url_for_payload(
+            payload,
+            company=company,
+            sources=output.get("sources") if isinstance(output, dict) else [],
+        )
+        visible_urls = re.findall(r"https?://[^\s)>]+", display_text, flags=re.I)
+        invalid_urls = [
+            url
+            for url in visible_urls
+            if not official_url
+            or not company_source_matches_official_url(url, official_url)
+        ]
+        if invalid_urls:
+            validation_payload["passed"] = False
+            validation_payload.setdefault("violations", []).append(
+                "visible source URL is outside the verified official company domain"
+            )
+        elif visible_urls:
+            validation_payload.setdefault("satisfied_constraints", []).append(
+                "official company source domains"
+            )
+    payload["output_constraint_validation"] = validation_payload
 
 
 def _summary_text(value: Any) -> str:
@@ -1011,6 +1174,78 @@ def _summary_sources(value: Any, *, limit: int) -> list[str]:
         if len(lines) >= limit:
             break
     return lines
+
+
+def _summary_sources_compact(
+    value: Any,
+    *,
+    limit: int,
+    official_only: bool,
+    official_company_url: str,
+) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    if official_only and not str(official_company_url).strip():
+        return []
+    lines: list[str] = []
+    seen_urls: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        url = _summary_text(item.get("url"))
+        if not url or url in seen_urls:
+            continue
+        if official_only and not company_source_matches_official_url(
+            url,
+            official_company_url,
+        ):
+            continue
+        title = _summary_text(item.get("title")) or url
+        lines.append(f"{title}: {url}")
+        seen_urls.add(url)
+        if len(lines) >= max(1, limit):
+            break
+    return lines
+
+
+def _official_company_url_for_payload(
+    payload: dict[str, Any],
+    *,
+    company: str,
+    sources: Any,
+) -> str:
+    retrieval = payload.get("retrieval")
+    if isinstance(retrieval, dict):
+        resolved = _summary_text(retrieval.get("resolved_company_url"))
+        if resolved:
+            return resolved
+    return infer_official_company_url(
+        company=company,
+        search_results=sources if isinstance(sources, list) else [],
+    )
+
+
+def _format_structured_bullet_answer(answer: str, *, strip_urls: bool) -> str:
+    visible = str(answer or "").strip()
+    if strip_urls:
+        visible = re.sub(
+            r"\[([^\]]+)\]\(https?://[^)\s]+\)",
+            r"\1",
+            visible,
+            flags=re.I,
+        )
+        visible = re.sub(r"https?://[^\s)>]+", "", visible, flags=re.I)
+        visible = re.sub(r"\(\s*\)|\[\s*\]", "", visible)
+        visible = re.sub(r"[ \t]+([.,;:!?])", r"\1", visible)
+        visible = re.sub(r"[ \t]{2,}", " ", visible)
+    formatted: list[str] = []
+    for line in visible.splitlines():
+        match = re.match(r"^\s*[-*]\s+([^:\n]{1,60}):\s*(.+)$", line)
+        if match:
+            formatted.append(f"- *{match.group(1).strip()}:* {match.group(2).strip()}")
+        else:
+            formatted.append(line.rstrip())
+    return "\n".join(formatted).strip()
 
 
 def _truncate_summary(text: str, limit: int) -> str:
@@ -1074,6 +1309,7 @@ def main() -> int:
             raw_argv,
         )
     )
+    args = _apply_interpreted_retrieval_mode(args)
 
     if args.improvement_case and not sdk_execution_requested(args):
         raise SystemExit("--improvement-case requires --run-sdk or --live-sdk.")

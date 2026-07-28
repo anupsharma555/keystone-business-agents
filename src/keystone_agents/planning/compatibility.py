@@ -1249,6 +1249,8 @@ def _ask_shape_policy(text: str) -> AskShapePolicy:
         for phrase, label in (
             ("official sources", "official"),
             ("official source", "official"),
+            ("first-party sources", "official"),
+            ("first-party source", "official"),
             ("primary sources", "primary"),
             ("primary source", "primary"),
             ("selected sources", "selected"),
@@ -1260,8 +1262,23 @@ def _ask_shape_policy(text: str) -> AskShapePolicy:
             ("local sources", "local"),
             ("local source", "local"),
         )
-        if phrase in lower
+        if phrase in positive_lower
     ]
+    if re.search(
+        r"\bofficial(?:\s+[a-z0-9][\w&.-]*){0,3}\s+sources?\b",
+        positive_lower,
+    ):
+        source_types.append("official")
+    if re.search(
+        r"\b(?:[a-z0-9][\w&.-]*\s+){1,3}(?:official|first-party)\s+sources?\b",
+        positive_lower,
+    ):
+        source_types.append("official")
+    if re.search(
+        r"\bprimary(?:\s+[a-z0-9][\w&.-]*){0,3}\s+sources?\b",
+        positive_lower,
+    ):
+        source_types.append("primary")
     if local_attachment_context:
         source_types.append("local_attachment")
     source_types = list(dict.fromkeys(source_types))
@@ -1312,10 +1329,10 @@ def _ask_shape_policy(text: str) -> AskShapePolicy:
             else "unspecified"
         ),
         evidence_depth=(
-            "quick"
-            if re.search(r"\b(quick|brief|concise|do not deepen)\b", lower)
-            else "deep"
-            if re.search(r"\b(deep|comprehensive|thorough|detailed)\b", lower)
+            "deep"
+            if re.search(r"\b(deep(?:ly)?|comprehensive|thorough|detailed)\b", lower)
+            else "quick"
+            if re.search(r"\b(quick|fast|lightweight|do not deepen)\b", lower)
             else "unspecified"
         ),
         source_type_preference=source_types,
@@ -1366,7 +1383,7 @@ def _ask_shape_policy(text: str) -> AskShapePolicy:
         audience_scope=_explicit_audience_scope(lower),
         cost_mode=(
             "minimize"
-            if re.search(r"\b(low[- ]cost|minimi[sz]e cost|quick|cheap)\b", lower)
+            if re.search(r"\b(low[- ]cost|minimi[sz]e cost|quick|fast|cheap)\b", lower)
             else "quality"
             if re.search(r"\b(best quality|deep|thorough)\b", lower)
             else "unspecified"
@@ -1385,6 +1402,7 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
 
     normalized = " ".join(str(text or "").split())
     lower = normalized.lower()
+    positive_lower = " ".join(positive_capability_text(text).lower().split())
     word_match = re.search(
         r"\b(?P<mode>exactly|in|no\s+more\s+than|at\s+most|under|within|"
         r"max(?:imum)?(?:\s+of)?|minimum(?:\s+of)?|at\s+least)\s+"
@@ -1563,6 +1581,34 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
             return "minimum"
         return "maximum"
 
+    source_url_count_match = re.search(
+        r"\b(?P<mode>exactly|no\s+more\s+than|at\s+most|under|within|"
+        r"max(?:imum)?(?:\s+of)?|minimum(?:\s+of)?|at\s+least)\s+"
+        r"(?P<count>[1-9]\d?|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+        r"(?:(?:recent|current)\s+)?"
+        r"(?:(?:official|primary|first-party|selected|provided|supplied|local)"
+        r"(?:\s+[a-z0-9][\w&.-]*){0,3}\s+|"
+        r"[a-z0-9][\w&.-]*\s+(?:official|primary|first-party)\s+)?"
+        r"(?:source\s+urls?|sources?(?:\s+from(?:\s+[a-z0-9][\w&.-]*){1,3})?"
+        r"\s+(?:with|including)\s+(?:visible\s+)?"
+        r"(?:urls?|links?))\b",
+        positive_lower,
+    )
+    source_url_count = (
+        parsed_count(source_url_count_match) if source_url_count_match else None
+    )
+    source_urls_requested = bool(
+        source_url_count_match
+        or re.search(
+            r"\b(?:cite|include|show|provide)\b[^.]{0,60}\b(?:urls?|links?)\b",
+            positive_lower,
+        )
+        or re.search(
+            r"\bsources?\s+(?:with|including)\s+(?:visible\s+)?(?:urls?|links?)\b",
+            positive_lower,
+        )
+    )
+
     required_sections: list[str] = []
     section_match = re.search(r"\breturn\s+exactly\s*:\s*(?P<sections>[^.\n]+)", normalized, re.I)
     if section_match:
@@ -1614,10 +1660,11 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
         or sentence_match
         or item_range
         or authoritative_item_exact
+        or source_url_count_match
         or required_sections
         or forbidden_phrases
         or re.search(r"\b(?:no|do not use|avoid)\s+em\s+dashes?\b", lower)
-        or re.search(r"\b(?:cite|include|show|provide)\b[^.]{0,60}\b(?:urls?|links?)\b", lower)
+        or source_urls_requested
     )
     scope = (
         "answer"
@@ -1640,6 +1687,11 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
         interpretation_parts.append(
             f"item count {minimum_items if minimum_items is not None else 0}"
             f"-{maximum_items if maximum_items is not None else 'unbounded'}"
+        )
+    if source_url_count is not None:
+        interpretation_parts.append(
+            f"{count_mode(source_url_count_match.group('mode'))} "
+            f"{source_url_count} source URLs"
         )
     if required_sections:
         interpretation_parts.append("required sections: " + ", ".join(required_sections))
@@ -1667,13 +1719,17 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
         ),
         minimum_items=minimum_items,
         maximum_items=maximum_items,
+        source_url_count_mode=(
+            count_mode(source_url_count_match.group("mode"))
+            if source_url_count_match
+            else "unspecified"
+        ),
+        source_url_count=source_url_count,
         required_sections=required_sections,
         require_section_headings=bool(required_sections),
         forbidden_phrases=forbidden_phrases,
         forbid_em_dash=bool(re.search(r"\b(?:no|do not use|avoid)\s+em\s+dashes?\b", lower)),
-        include_source_urls=bool(
-            re.search(r"\b(?:cite|include|show|provide)\b[^.]{0,60}\b(?:urls?|links?)\b", lower)
-        ),
+        include_source_urls=source_urls_requested,
     )
 
 
@@ -1743,6 +1799,7 @@ def _reconcile_current_turn_ask_shape(
         for mode_field, count_field in (
             ("word_count_mode", "word_count"),
             ("sentence_count_mode", "sentence_count"),
+            ("source_url_count_mode", "source_url_count"),
         ):
             base_count = getattr(base_constraints, count_field)
             if base_count is None:
@@ -1769,6 +1826,8 @@ def _reconcile_current_turn_ask_shape(
                 "item_count_mode": base_constraints.item_count_mode,
                 "minimum_items": base_constraints.minimum_items,
                 "maximum_items": base_constraints.maximum_items,
+                "source_url_count_mode": base_constraints.source_url_count_mode,
+                "source_url_count": base_constraints.source_url_count,
                 "required_sections": retained_required_sections,
                 "require_section_headings": bool(
                     retained_required_sections
@@ -1804,6 +1863,7 @@ def _planner_hard_output_contract_differs(
         "sentence_count",
         "minimum_items",
         "maximum_items",
+        "source_url_count",
     )
     if any(
         getattr(candidate, field_name) is not None

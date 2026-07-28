@@ -255,6 +255,119 @@ def test_company_research_focused_brief_preserves_structured_answer_in_slack() -
     assert business_agent_result_display_text(payload) == summary
 
 
+def test_company_research_bullet_contract_preserves_answer_and_exact_official_sources() -> None:
+    import scripts.run_company_research as run_company_research
+
+    payload = {
+        "output_type": "CompanyResearchFocusedBrief",
+        "manual_request_plan": {
+            "ask_shape": {
+                "output_form": "bullets",
+                "source_type_preference": ["official"],
+                "output_constraints": {
+                    "interpretation": "four bullets and exactly two official URLs",
+                    "scope": "entire_response",
+                    "item_count_mode": "exact",
+                    "minimum_items": 4,
+                    "maximum_items": 4,
+                    "source_url_count_mode": "exact",
+                    "source_url_count": 2,
+                    "include_source_urls": True,
+                },
+            }
+        },
+        "output": {
+            "company_name": "Callyope",
+            "answer": (
+                "- What it does: supports mental-health assessment "
+                "(https://elion.health/products/callyope).\n"
+                "- Modalities: voice and language signals.\n"
+                "- Verified: the official product pages describe those inputs.\n"
+                "- Uncertain: independent clinical validation remains unclear."
+            ),
+            "product": "This generic field must not replace the answer.",
+            "facts": [
+                {
+                    "text": "Internal source identifiers must stay hidden.",
+                    "source_ids": ["searxng:13"],
+                }
+            ],
+            "sources": [
+                {
+                    "title": "Callyope FAQ",
+                    "url": "https://www.callyope.com/faq",
+                    "source_type": "company_site",
+                },
+                {
+                    "title": "Callyope technology",
+                    "url": "https://www.callyope.com/technology",
+                    "source_type": "company_site",
+                },
+                {
+                    "title": "Directory listing",
+                    "url": "https://elion.health/products/callyope",
+                    "source_type": "company_site",
+                },
+            ],
+        },
+    }
+
+    summary = run_company_research._company_research_sdk_human_summary(payload)
+    run_company_research._attach_company_research_display_text(payload, summary)
+    run_company_research._attach_company_research_output_constraint_validation(payload)
+
+    assert summary.count("\n- ") + int(summary.startswith("- ")) == 4
+    assert "https://www.callyope.com/faq" in summary
+    assert "https://www.callyope.com/technology" in summary
+    assert "elion.health" not in summary
+    assert "()." not in summary
+    assert "searxng:13" not in summary
+    assert "- *What it does:*" in summary
+    assert "- *Modalities:*" in summary
+    assert "*Detailed Summary:*" not in summary
+    assert payload["output_constraint_validation"]["passed"] is True
+    assert payload["output_constraint_validation"]["source_url_count"] == 2
+
+
+def test_company_research_uses_resolved_official_domain_for_short_brand() -> None:
+    import scripts.run_company_research as run_company_research
+
+    payload = {
+        "output_type": "CompanyResearchFocusedBrief",
+        "manual_request_plan": {
+            "ask_shape": {
+                "output_form": "bullets",
+                "source_type_preference": ["official"],
+                "output_constraints": {
+                    "item_count_mode": "exact",
+                    "minimum_items": 2,
+                    "maximum_items": 2,
+                    "source_url_count_mode": "exact",
+                    "source_url_count": 1,
+                    "include_source_urls": True,
+                },
+            }
+        },
+        "retrieval": {"resolved_company_url": "https://hyro.ai"},
+        "output": {
+            "company_name": "Hyro",
+            "answer": "- Product: healthcare assistant.\n- Unknown: validation evidence.",
+            "sources": [
+                {
+                    "title": "Hyro healthcare",
+                    "url": "https://www.hyro.ai/healthcare/",
+                    "source_type": "company_site",
+                }
+            ],
+        },
+    }
+
+    summary = run_company_research._company_research_sdk_human_summary(payload)
+
+    assert "https://www.hyro.ai/healthcare/" in summary
+    assert "only 0 of 1" not in summary
+
+
 def test_company_research_focused_brief_honors_requested_summary_word_limit() -> None:
     import scripts.run_company_research as run_company_research
 
