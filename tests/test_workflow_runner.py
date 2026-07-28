@@ -13623,6 +13623,83 @@ def test_live_supplied_fact_outreach_contract_surfaces_unmet_dimensions() -> Non
     assert any("Implementation timeline was not addressed" in item for item in mismatches)
 
 
+@pytest.mark.parametrize(
+    "context_label",
+    ["facts", "context", "evidence", "background", "grounding"],
+)
+def test_live_supplied_context_labels_repair_deficient_draft_before_retention(
+    context_label: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    request_text = (
+        "Outreach Composer, using only the following provided "
+        f"{context_label}, draft an email under 100 words. "
+        f"{context_label.title()}: Northstar Behavioral Health operates two "
+        "outpatient clinics; it is exploring a fall pilot for multimodal symptom "
+        "monitoring; it wants to discuss validation evidence, implementation "
+        "effort, and timeline. Invite a 20-minute call. Do not access Gmail, "
+        "create a provider draft, send, post, search, or modify anything."
+    )
+    compose_calls: list[bool] = []
+
+    def fake_compose(**kwargs: object) -> tuple[object, str, None, dict[str, object]]:
+        review_feedback = list(kwargs.get("review_feedback") or [])
+        compose_calls.append(bool(review_feedback))
+        body = (
+            "Hello Northstar, I would welcome a conversation."
+            if not review_feedback
+            else (
+                "Hello Northstar team, I understand Northstar Behavioral Health "
+                "operates two outpatient clinics and is exploring a fall pilot for "
+                "multimodal symptom monitoring. Could we use a 20-minute call to "
+                "discuss validation evidence, implementation effort, and timeline?"
+            )
+        )
+        return (
+            workflow_runner.OutreachDraft(
+                company_name="Northstar Behavioral Health",
+                email_subject="Northstar pilot discussion",
+                email_body=body,
+                personalization_rationale="Used only the supplied material.",
+                request_coverage=RequestCoverage(status="complete"),
+            ),
+            "Outreach Composer live SDK draft created; no send side effect occurred.",
+            None,
+            {
+                "reply_recommended": False,
+                "recommended_next_step": "Review the draft.",
+                "additional_information_needed": [],
+                "collaboration_ideas": [],
+                "deferral_reason": "External sending remains approval-gated.",
+            },
+        )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "_compose_outreach_draft_for_work_item",
+        fake_compose,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=database_url,
+            live_sdk=True,
+            save=True,
+        )
+    )
+
+    assert compose_calls == [False, True]
+    assert result.status == WorkItemStatus.NEEDS_APPROVAL
+    assert result.artifact_refs[0].artifact_type == "outreach_draft"
+    assert "20-minute call" in result.human_summary
+    assert "validation evidence" in result.human_summary
+    assert result.artifact_refs[0].metadata["gmail_draft_created"] is False
+    assert result.artifact_refs[0].metadata["external_write_performed"] is False
+
+
 def test_bounded_supplied_fact_draft_can_repair_model_deferral() -> None:
     request = WorkflowRunRequest(
         request_text=(

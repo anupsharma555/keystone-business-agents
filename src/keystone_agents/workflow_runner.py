@@ -22051,7 +22051,8 @@ def _outreach_draft_contract_mismatches(
         return []
     request_text = " ".join(str(request.request_text or "").split())
     if not re.search(
-        r"\b(?:supplied|provided)\s+(?:facts?|context)\b",
+        r"\b(?:supplied|provided)\s+"
+        r"(?:facts?|context|evidence|background|grounding)\b",
         request_text,
         flags=re.I,
     ):
@@ -22447,7 +22448,8 @@ def _inline_outreach_context_from_request(request_text: str) -> dict[str, Any] |
     if not re.search(r"\b(?:outreach|email|linkedin|message|note)\b", text, flags=re.I):
         return None
     if not re.search(
-        r"\b(?:approved|source-backed|source backed|sources?|facts?|context)\b",
+        r"\b(?:approved|source-backed|source backed|sources?|facts?|context|"
+        r"evidence|background|grounding)\b",
         text,
         flags=re.I,
     ):
