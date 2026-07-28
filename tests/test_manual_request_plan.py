@@ -3080,6 +3080,56 @@ def test_manual_plan_preserves_official_source_and_url_count_contract() -> None:
     assert constraints.include_source_urls is True
 
 
+def test_manual_plan_preserves_bounded_comparison_output_contract() -> None:
+    request = (
+        "Compare Callyope and Kintsugi. Give me 5 concise but substantive bullets. "
+        "Include one official source URL for each company."
+    )
+    plan = infer_manual_request_plan(
+        request,
+        requested_agent="business_research_analyst",
+    )
+
+    constraints = plan.ask_shape.output_constraints
+    assert constraints.item_count_mode == "exact"
+    assert constraints.minimum_items == 5
+    assert constraints.maximum_items == 5
+    assert constraints.source_url_count_mode == "exact"
+    assert constraints.source_url_count == 2
+
+
+def test_cached_planner_cannot_deepen_or_contextualize_fresh_bounded_comparison() -> None:
+    request = (
+        "Compare Callyope and Kintsugi. Give me 5 concise but substantive bullets. "
+        "Include one official source URL for each company."
+    )
+    base = infer_manual_request_plan(
+        request,
+        requested_agent="business_research_analyst",
+    )
+    cached_candidate = base.model_copy(
+        update={
+            "source": "llm",
+            "ask_shape": base.ask_shape.model_copy(
+                update={
+                    "evidence_depth": "deep",
+                    "prior_context_dependency": "selected_context",
+                }
+            ),
+        }
+    )
+
+    merged = merge_manual_request_plan(
+        base,
+        cached_candidate,
+    )
+
+    assert merged.ask_shape.evidence_depth == "unspecified"
+    assert merged.ask_shape.prior_context_dependency == "unspecified"
+    assert merged.ask_shape.output_constraints.minimum_items == 5
+    assert merged.ask_shape.output_constraints.source_url_count == 2
+
+
 @pytest.mark.parametrize(
     "source_request",
     [

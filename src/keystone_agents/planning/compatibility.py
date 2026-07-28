@@ -1224,6 +1224,15 @@ def _ask_shape_policy(text: str) -> AskShapePolicy:
     lower = " ".join(str(text or "").lower().split())
     positive_lower = " ".join(positive_capability_text(text).lower().split())
     output_constraints = _interpreted_output_constraints(text)
+    per_company_source_count = _per_company_source_url_count(text)
+    if per_company_source_count is not None:
+        output_constraints = output_constraints.model_copy(
+            update={
+                "source_url_count_mode": "exact",
+                "source_url_count": per_company_source_count,
+                "include_source_urls": True,
+            }
+        )
     local_attachment_context = has_explicit_local_attachment_context(text)
     exact = bool(
         re.search(
@@ -1513,7 +1522,8 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
         re.finditer(
             r"\b(?:exactly\s+)?"
             r"(?P<count>[1-9]\d?|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
-            r"(?:[a-z][\w-]*\s+){0,2}"
+            r"(?:(?:concise|short|brief|substantive|detailed|actionable|clear|"
+            r"distinct|labeled|separate|but)\s+){0,4}"
             r"(?P<item_kind>bullets?|items?|results?|options?|recommendations?|"
             r"points?|talking\s+points?)\b",
             lower,
@@ -1733,6 +1743,38 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
     )
 
 
+def _per_company_source_url_count(text: str) -> int | None:
+    """Resolve an exact per-company URL contract for a bounded comparison."""
+
+    positive_text = " ".join(positive_capability_text(text).lower().split())
+    match = re.search(
+        r"\b(?P<count>[1-9]\d?|one|two|three|four|five)\s+"
+        r"(?:(?:official|first-party|primary)\s+)?"
+        r"(?:source\s+)?(?:urls?|links?)\s+"
+        r"(?:for\s+each|per)\s+compan(?:y|ies)\b",
+        positive_text,
+    )
+    if match is None:
+        return None
+    raw_count = match.group("count")
+    per_company = int(raw_count) if raw_count.isdigit() else _COUNT_WORDS.get(raw_count)
+    comparison_target = _company_comparison_target(text)
+    if per_company is None or not comparison_target:
+        return None
+    entities = [
+        item.strip(" ,.;:")
+        for item in re.split(
+            r"\s+(?:vs\.?|versus|and)\s+",
+            comparison_target,
+            flags=re.I,
+        )
+        if item.strip(" ,.;:")
+    ]
+    if len(entities) < 2:
+        return None
+    return min(10, per_company * len(entities))
+
+
 def _reconcile_current_turn_ask_shape(
     base: AskShapePolicy,
     candidate: AskShapePolicy,
@@ -1770,6 +1812,12 @@ def _reconcile_current_turn_ask_shape(
         base_value = getattr(base, field_name)
         if base_value != "unspecified":
             values[field_name] = base_value
+    # Evidence depth and prior-context dependence shape execution rather than
+    # response style. The authoritative current turn must ground both, including
+    # the absence of a deep-research or thread-reference cue. This keeps a cached
+    # planner decision from turning a fresh bounded ask into a deep/contextual run.
+    values["evidence_depth"] = base.evidence_depth
+    values["prior_context_dependency"] = base.prior_context_dependency
     # A plainly stated internal/external audience belongs to the authoritative
     # current turn even when the LLM owns the rest of semantic interpretation.
     # This field may relax an external-drafting prerequisite, but it cannot
