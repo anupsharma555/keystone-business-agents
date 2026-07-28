@@ -3444,16 +3444,16 @@ def _direct_specialist_runtime_profile(
     authority = ExecutionIntentAuthority.from_value(manual_plan)
     semantic_authority = authority.canonical
     plan = manual_plan or infer_manual_request_plan(input_text, requested_agent=route)
+    deterministic_current_turn_plan = infer_manual_request_plan(
+        input_text,
+        requested_agent=route,
+    )
     normalized = " ".join(str(input_text or "").lower().split())
-    deep_request = bool(
-        plan.ask_shape.evidence_depth == "deep"
-        or (
-            not semantic_authority
-            and re.search(
-                r"\b(?:deep|comprehensive|exhaustive|multi-stage|full landscape|"
-                r"all available sources|systematic review)\b",
-                normalized,
-            )
+    explicit_deep_wording = bool(
+        re.search(
+            r"\b(?:deep|comprehensive|exhaustive|multi-stage|full landscape|"
+            r"all available sources|systematic review)\b",
+            normalized,
         )
     )
     bounded_composite_lifecycle = _is_bounded_composite_lifecycle_request(
@@ -3497,8 +3497,21 @@ def _direct_specialist_runtime_profile(
     )
     explicitly_bounded_research_selection = bool(
         route in {"business_research_analyst", "opportunity_scout"}
-        and plan.desired_count_explicit
-        and 0 < plan.desired_count <= compact_item_limit
+        and (
+            plan.desired_count_explicit
+            and 0 < plan.desired_count <= compact_item_limit
+            or deterministic_current_turn_plan.desired_count_explicit
+            and 0
+            < deterministic_current_turn_plan.desired_count
+            <= compact_item_limit
+        )
+    )
+    deep_request = bool(
+        explicit_deep_wording
+        or (
+            plan.ask_shape.evidence_depth == "deep"
+            and not explicitly_bounded_research_selection
+        )
     )
     compact = bool(
         plan.desired_count <= compact_item_limit

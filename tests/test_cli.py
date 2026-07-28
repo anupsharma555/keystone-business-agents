@@ -5498,8 +5498,10 @@ def test_explicit_one_result_opportunity_stays_compact_when_search_domain_is_bro
         requested_agent="opportunity_scout",
     ).model_copy(
         update={
+            "desired_count_explicit": False,
             "ask_shape": AskShapePolicy(
                 ask_breadth="broad",
+                evidence_depth="deep",
                 strict_filter_mode="exact",
                 permission_state="read_only",
             )
