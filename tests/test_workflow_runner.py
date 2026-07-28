@@ -13623,6 +13623,56 @@ def test_live_supplied_fact_outreach_contract_surfaces_unmet_dimensions() -> Non
     assert any("Implementation timeline was not addressed" in item for item in mismatches)
 
 
+def test_bounded_supplied_fact_draft_can_repair_model_deferral() -> None:
+    request = WorkflowRunRequest(
+        request_text=(
+            "Using only these supplied facts, draft an outreach email. Facts: "
+            "Northstar Behavioral Health operates two clinics. Do not send or "
+            "modify anything."
+        ),
+        live_sdk=True,
+        allow_manager_loop_repair=True,
+    )
+
+    assert workflow_runner._operator_requested_bounded_outreach_draft(request) is True
+    assert (
+        workflow_runner._should_repair_outreach_with_model(
+            request,
+            recommendation={"reply_recommended": False},
+            mismatches=["The draft omitted the requested 20-minute call."],
+        )
+        is True
+    )
+    assert (
+        workflow_runner._outreach_draft_should_be_retained(
+            request,
+            recommendation={"reply_recommended": False},
+            mismatches=[],
+        )
+        is True
+    )
+    assert (
+        workflow_runner._outreach_draft_should_be_retained(
+            request,
+            recommendation={"reply_recommended": False},
+            mismatches=["The draft still omitted the requested 20-minute call."],
+        )
+        is False
+    )
+
+
+def test_affirmative_send_is_not_a_bounded_supplied_fact_draft() -> None:
+    request = WorkflowRunRequest(
+        request_text=(
+            "Using only these supplied facts, draft and send an outreach email. "
+            "Facts: Northstar Behavioral Health operates two clinics."
+        ),
+        live_sdk=True,
+    )
+
+    assert workflow_runner._operator_requested_bounded_outreach_draft(request) is False
+
+
 def test_manager_loop_ignores_negated_crm_record_creation() -> None:
     assert workflow_runner._manager_loop_requests_opportunity_record(
         "prepare a draft-only email paragraph. do not send email, create a gmail "

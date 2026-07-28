@@ -19727,7 +19727,11 @@ def _advance_outreach(
             "Deterministic review withheld optional reply copy without a second model call; "
             "the recommendation and evidence-bounded next step were retained."
         )
-    reply_recommended = recommendation.get("reply_recommended") is not False
+    reply_recommended = _outreach_draft_should_be_retained(
+        request,
+        recommendation=recommendation,
+        mismatches=recommendation_mismatches,
+    )
     if not reply_recommended:
         draft = draft.model_copy(
             update={
@@ -22152,7 +22156,53 @@ def _should_repair_outreach_with_model(
     return bool(
         mismatches
         and request.allow_manager_loop_repair
-        and recommendation.get("reply_recommended") is not False
+        and (
+            recommendation.get("reply_recommended") is not False
+            or _operator_requested_bounded_outreach_draft(request)
+        )
+    )
+
+
+def _operator_requested_bounded_outreach_draft(
+    request: WorkflowRunRequest,
+) -> bool:
+    """Keep a safe direct draft ask from being reclassified as no-reply advice."""
+
+    text = " ".join(str(request.request_text or "").split())
+    return bool(
+        re.search(r"\b(?:draft|write|compose|prepare)\b", text, flags=re.I)
+        and re.search(
+            r"\b(?:supplied|provided)\s+(?:facts?|context|evidence|background|grounding)\b",
+            text,
+            flags=re.I,
+        )
+        and (
+            re.search(r"\b(?:no send|draft-only|draft only)\b", text, flags=re.I)
+            or re.search(
+                r"\b(?:do\s+not|don't|dont|never|without)\b"
+                r"[^.;\n]{0,200}\b(?:send|post|publish|share)\b",
+                text,
+                flags=re.I,
+            )
+        )
+        and not looks_like_send_side_effect(text)
+    )
+
+
+def _outreach_draft_should_be_retained(
+    request: WorkflowRunRequest,
+    *,
+    recommendation: dict[str, Any],
+    mismatches: list[str],
+) -> bool:
+    """Honor the operator's direct draft contract after deterministic review passes."""
+
+    return bool(
+        recommendation.get("reply_recommended") is not False
+        or (
+            _operator_requested_bounded_outreach_draft(request)
+            and not mismatches
+        )
     )
 
 
