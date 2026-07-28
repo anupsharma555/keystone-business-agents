@@ -1523,7 +1523,7 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
             r"\b(?:exactly\s+)?"
             r"(?P<count>[1-9]\d?|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
             r"(?:(?:concise|short|brief|substantive|detailed|actionable|clear|"
-            r"distinct|labeled|separate|but)\s+){0,4}"
+            r"distinct|labeled|separate|useful|key|but)\s+){0,4}"
             r"(?P<item_kind>bullets?|items?|results?|options?|recommendations?|"
             r"points?|talking\s+points?)\b",
             lower,
@@ -1812,12 +1812,13 @@ def _reconcile_current_turn_ask_shape(
         base_value = getattr(base, field_name)
         if base_value != "unspecified":
             values[field_name] = base_value
-    # Evidence depth and prior-context dependence shape execution rather than
-    # response style. The authoritative current turn must ground both, including
-    # the absence of a deep-research or thread-reference cue. This keeps a cached
-    # planner decision from turning a fresh bounded ask into a deep/contextual run.
-    values["evidence_depth"] = base.evidence_depth
-    values["prior_context_dependency"] = base.prior_context_dependency
+    # A fresh bounded comparison has enough typed execution shape to reject
+    # stale cache-only depth or thread dependence. Do not apply that absence rule
+    # to arbitrary asks: the semantic planner may correctly distinguish an
+    # incidental depth word in supplied content from the requested work.
+    if _is_fresh_bounded_comparison_shape(base, request_text=request_text):
+        values["evidence_depth"] = base.evidence_depth
+        values["prior_context_dependency"] = base.prior_context_dependency
     # A plainly stated internal/external audience belongs to the authoritative
     # current turn even when the LLM owns the rest of semantic interpretation.
     # This field may relax an external-drafting prerequisite, but it cannot
@@ -1898,6 +1899,22 @@ def _reconcile_current_turn_ask_shape(
     elif base_constraints.is_explicit():
         values["output_constraints"] = base_constraints.model_dump(mode="json")
     return AskShapePolicy.model_validate(values)
+
+
+def _is_fresh_bounded_comparison_shape(
+    ask_shape: AskShapePolicy,
+    *,
+    request_text: str,
+) -> bool:
+    constraints = ask_shape.output_constraints
+    return bool(
+        _company_comparison_target(request_text)
+        and ask_shape.output_form in {"brief", "bullets"}
+        and constraints.maximum_items is not None
+        and constraints.maximum_items <= 6
+        and constraints.source_url_count is not None
+        and constraints.source_url_count <= 3
+    )
 
 
 def _planner_hard_output_contract_differs(

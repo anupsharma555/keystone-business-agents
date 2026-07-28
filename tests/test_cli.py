@@ -304,6 +304,83 @@ def test_company_research_repair_cannot_promote_unofficial_source_url(
     assert "elion.health" not in payload["human_summary"]
 
 
+def test_company_comparison_accepts_one_verified_official_url_per_company() -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="business_research_analyst",
+        target_type="company",
+        primary_target="Callyope vs Kintsugi",
+        required_entities=["Callyope", "Kintsugi"],
+        ask_shape=AskShapePolicy(
+            source_type_preference=["official"],
+            output_constraints=InterpretedOutputConstraints(
+                interpretation="one official source URL for each company",
+                source_url_count_mode="exact",
+                source_url_count=2,
+                include_source_urls=True,
+            ),
+        ),
+    )
+    script_payload = {
+        "comparison_entities": ["Callyope", "Kintsugi"],
+        "verified_source_evidence": [
+            {
+                "entity": "Callyope",
+                "resolved_official_url": "https://www.callyope.com",
+                "sources": [{"url": "https://www.callyope.com/faq"}],
+                "official_sources": [{"url": "https://www.callyope.com/faq"}],
+            },
+            {
+                "entity": "Kintsugi",
+                "resolved_official_url": "https://www.kintsugihealth.com",
+                "sources": [{"url": "https://www.kintsugihealth.com/technology"}],
+                "official_sources": [
+                    {"url": "https://www.kintsugihealth.com/technology"}
+                ],
+            },
+        ],
+        "retrieval": {
+            "primary": {"resolved_company_url": "https://www.callyope.com"},
+            "comparison": {"resolved_company_url": "https://www.kintsugihealth.com"},
+        },
+        "output": {
+            "company_name": "Callyope vs Kintsugi",
+            "sources": [
+                {"url": "https://www.callyope.com/faq"},
+                {"url": "https://www.kintsugihealth.com/technology"},
+            ],
+        },
+    }
+
+    assert (
+        cli._official_source_response_violations(
+            script_payload,
+            plan,
+            (
+                "Sources: https://www.callyope.com/faq "
+                "https://www.kintsugihealth.com/technology"
+            ),
+        )
+        == []
+    )
+    assert cli._official_source_response_violations(
+        script_payload,
+        plan,
+        (
+            "Sources: https://www.callyope.com/faq "
+            "https://www.callyope.com/about"
+        ),
+    ) == ["visible source URL was not present in deterministic retrieved evidence"]
+    assert cli._official_source_response_violations(
+        script_payload,
+        plan,
+        (
+            "Sources: https://www.callyope.com/faq "
+            "https://www.kintsugihealth.com/invented"
+        ),
+    ) == ["visible source URL was not present in deterministic retrieved evidence"]
+
+
 def test_direct_specialist_provider_blocker_skips_llm_constraint_repair(
     monkeypatch,
     capsys,

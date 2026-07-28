@@ -9,6 +9,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from keystone_agents.agents.business_research_analyst import (
     build_business_research_analyst_agent,
@@ -16,6 +17,7 @@ from keystone_agents.agents.business_research_analyst import (
     build_business_research_analyst_focused_brief_agent,
     build_company_research_queries,
     compare_company_profiles_for_decision,
+    comparison_context_from_result,
     comparison_input_from_result,
     focused_brief_input_from_profile,
     research_account_from_search_results,
@@ -300,9 +302,13 @@ def _apply_manual_request_plan(args: argparse.Namespace) -> argparse.Namespace:
     if getattr(args, "manual_request_plan", None):
         plan = args.manual_request_plan
         if isinstance(plan, dict) and plan.get("target_agent") == "business_research_analyst":
-            primary_target = str(plan.get("primary_target") or "").strip()
-            if primary_target:
-                args.company = primary_target
+            comparison_targets = _manual_plan_comparison_targets(plan)
+            if comparison_targets is not None:
+                args.company, args.compare_company = comparison_targets
+            else:
+                primary_target = str(plan.get("primary_target") or "").strip()
+                if primary_target:
+                    args.company = primary_target
         return args
     request_text = str(args.request_text or "").strip()
     args.manual_request_plan = None
@@ -316,11 +322,63 @@ def _apply_manual_request_plan(args: argparse.Namespace) -> argparse.Namespace:
         live=bool(args.live_manual_plan),
     )
     args.manual_request_plan = plan.model_dump(mode="json")
-    if plan.target_agent == "business_research_analyst" and plan.primary_target:
-        args.company = plan.primary_target
+    if plan.target_agent == "business_research_analyst":
+        comparison_targets = _manual_plan_comparison_targets(args.manual_request_plan)
+        if comparison_targets is not None:
+            args.company, args.compare_company = comparison_targets
+        elif plan.primary_target:
+            args.company = plan.primary_target
     if plan.objective and not args.output_format:
         args.output_format = None
     return args
+
+
+def _manual_plan_comparison_targets(
+    plan: dict[str, Any],
+) -> tuple[str, str] | None:
+    """Resolve exactly two named companies from the typed planner contract."""
+
+    if (
+        plan.get("target_agent") != "business_research_analyst"
+        or plan.get("intent") not in {"company_research", "research_brief"}
+        or plan.get("target_type") != "company"
+    ):
+        return None
+    target_parts = [
+        _clean_comparison_target_name(item)
+        for item in re.split(
+            r"\s+(?:vs\.?|versus)\s+",
+            str(plan.get("primary_target") or ""),
+            flags=re.I,
+        )
+    ]
+    target_parts = [item for item in target_parts if item]
+    if len(target_parts) == 2:
+        return target_parts[0], target_parts[1]
+    entities = list(
+        dict.fromkeys(
+            cleaned
+            for item in plan.get("required_entities") or []
+            if (cleaned := _clean_comparison_target_name(item))
+        )
+    )
+    target_context = " ".join(
+        str(plan.get(key) or "") for key in ("primary_target", "objective")
+    ).lower()
+    if len(entities) == 2 and all(entity.lower() in target_context for entity in entities):
+        return entities[0], entities[1]
+    return None
+
+
+def _clean_comparison_target_name(value: Any) -> str:
+    cleaned = " ".join(str(value or "").split()).strip(" .,:;-[]")
+    cleaned = re.split(
+        r"\b(?:as|for|with|using|about|relevant|possible|potential)\b",
+        cleaned,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip(" .,:;-[]")
+    return cleaned[:120]
 
 
 def _manual_plan_objective(args: argparse.Namespace) -> str:
@@ -333,7 +391,7 @@ def _manual_plan_objective(args: argparse.Namespace) -> str:
 def _apply_interpreted_retrieval_mode(args: argparse.Namespace) -> argparse.Namespace:
     """Select the compact lane from typed ask shape, including bridge-owned runs."""
 
-    if args.quick_retrieval or args.compare_company:
+    if args.quick_retrieval:
         return args
     plan = getattr(args, "manual_request_plan", None)
     if not isinstance(plan, dict):
@@ -350,8 +408,16 @@ def _apply_interpreted_retrieval_mode(args: argparse.Namespace) -> argparse.Name
         or str(ask_shape.get("cost_mode") or "unspecified") == "minimize"
     )
     bounded_compact_output = (
-        str(ask_shape.get("ask_breadth") or "unspecified") in {"narrow", "bounded"}
-        and str(ask_shape.get("output_form") or "unspecified") in {"brief", "bullets"}
+        str(ask_shape.get("output_form") or "unspecified") in {"brief", "bullets"}
+        and (
+            str(ask_shape.get("ask_breadth") or "unspecified")
+            in {"narrow", "bounded"}
+            or (
+                bool(args.compare_company)
+                and constraints.maximum_items is not None
+                and constraints.maximum_items <= 6
+            )
+        )
         and (
             (
                 constraints.source_url_count is not None
@@ -494,6 +560,46 @@ def _retrieval_metadata(
         payload.update(hybrid_metadata)
     payload["retrieval_diagnostics"] = retrieval_diagnostics_from_metadata(payload)
     return payload
+
+
+def _verified_source_evidence_entry(
+    profile: CompanyProfile,
+    retrieval: Any,
+) -> dict[str, Any]:
+    """Capture deterministic source URLs before model synthesis."""
+
+    metadata = retrieval if isinstance(retrieval, dict) else {}
+    source_payloads = [
+        {
+            "source_id": source.source_id,
+            "title": source.title,
+            "url": source.url,
+            "source_type": source.source_type,
+        }
+        for source in profile.sources
+    ]
+    resolved_official_url = (
+        _summary_text(metadata.get("resolved_company_url"))
+        or _summary_text(profile.website)
+        or infer_official_company_url(
+            company=profile.name,
+            search_results=source_payloads,
+        )
+    )
+    return {
+        "entity": profile.name,
+        "resolved_official_url": resolved_official_url,
+        "sources": source_payloads,
+        "official_sources": [
+            source
+            for source in source_payloads
+            if resolved_official_url
+            and company_source_matches_official_url(
+                str(source.get("url") or ""),
+                resolved_official_url,
+            )
+        ],
+    }
 
 
 def _company_research_request_text(args: argparse.Namespace) -> str:
@@ -661,12 +767,25 @@ def _retrieve_company_comparison(
         linkedin_url=args.compare_linkedin_url,
         fixture=args.compare_fixture,
     )
+    primary_profile = _namespace_company_profile_sources(
+        primary_profile,
+        namespace="company_a",
+    )
+    comparison_profile = _namespace_company_profile_sources(
+        comparison_profile,
+        namespace="company_b",
+    )
     criteria = parse_company_research_comparison_criteria(args.decision_criteria)
     comparison = compare_company_profiles_for_decision(
         primary_profile,
         comparison_profile,
         decision_goal=(
-            "Compare both companies as possible partners or advisory targets for Keystone."
+            _manual_plan_objective(args)
+            or str(args.request_text or "").strip()
+            or (
+                "Compare both companies as possible partners or advisory targets "
+                "for Keystone."
+            )
         ),
         criteria=criteria,
         requested_output_format=args.output_format,
@@ -679,6 +798,64 @@ def _retrieve_company_comparison(
     )
 
 
+def _namespace_company_profile_sources(
+    profile: CompanyProfile,
+    *,
+    namespace: str,
+) -> CompanyProfile:
+    """Keep independently retrieved profile evidence identities collision-free."""
+
+    prefix = re.sub(r"[^a-z0-9_-]+", "-", namespace.lower()).strip("-") or "company"
+    source_id_map = {
+        source.source_id: f"{prefix}:{source.source_id}" for source in profile.sources
+    }
+    return CompanyProfile.model_validate(
+        profile.model_copy(
+            update={
+                "sources": [
+                    source.model_copy(
+                        update={"source_id": source_id_map[source.source_id]}
+                    )
+                    for source in profile.sources
+                ],
+                "claims": [
+                    claim.model_copy(
+                        update={
+                            "source_id": source_id_map.get(
+                                claim.source_id,
+                                f"{prefix}:{claim.source_id}",
+                            )
+                        }
+                    )
+                    for claim in profile.claims
+                ],
+                "features": [
+                    feature.model_copy(
+                        update={
+                            "source_id": source_id_map.get(
+                                feature.source_id,
+                                f"{prefix}:{feature.source_id}",
+                            )
+                        }
+                    )
+                    for feature in profile.features
+                ],
+                "research_data_points": [
+                    data_point.model_copy(
+                        update={
+                            "source_ids": [
+                                source_id_map.get(source_id, f"{prefix}:{source_id}")
+                                for source_id in data_point.source_ids
+                            ]
+                        }
+                    )
+                    for data_point in profile.research_data_points
+                ],
+            }
+        ).model_dump(mode="json")
+    )
+
+
 def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
     run_config, live = resolve_sdk_execution(
         args,
@@ -688,24 +865,46 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
     focused_brief_requested = (
         bool(args.focused_brief) or args.improvement_case == CR1_IMPROVEMENT_CASE_ID
     )
+    focused_comparison_requested = comparison_requested and focused_brief_requested
+    structured_comparison_requested = (
+        comparison_requested and not focused_comparison_requested
+    )
     founder_profile = load_founder_fit_profile(args.founder_fit_profile)
     founder_context = founder_search_context(founder_profile) if founder_profile else ""
     preflight_context = orchestrator_preflight_context_text(args)
 
     retrieval_state: dict[str, Any] = {}
+    verified_source_evidence_state: list[dict[str, Any]] = []
 
     def retrieve() -> CompanyProfile | CompanyResearchComparison:
         if comparison_requested:
-            comparison, metadata, _primary_profile, _comparison_profile = (
+            comparison, metadata, primary_profile, comparison_profile = (
                 _retrieve_company_comparison(args)
             )
             retrieval_state.clear()
             retrieval_state.update(metadata)
+            verified_source_evidence_state.clear()
+            verified_source_evidence_state.extend(
+                [
+                    _verified_source_evidence_entry(
+                        primary_profile,
+                        metadata.get("primary"),
+                    ),
+                    _verified_source_evidence_entry(
+                        comparison_profile,
+                        metadata.get("comparison"),
+                    ),
+                ]
+            )
             return comparison
 
         profile, metadata = _retrieve_company_profile(args)
         retrieval_state.clear()
         retrieval_state.update(metadata)
+        verified_source_evidence_state.clear()
+        verified_source_evidence_state.append(
+            _verified_source_evidence_entry(profile, metadata)
+        )
         return profile
 
     def normalize_profile(profile: CompanyProfile) -> BusinessResearchSDKInput:
@@ -721,16 +920,33 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
             retrieval_hint=_explicit_retrieval_hint(args),
         )
 
-    def normalize_brief(profile: CompanyProfile) -> BusinessResearchFocusedBriefSDKInput:
+    def normalize_brief(
+        profile: CompanyProfile | CompanyResearchComparison,
+    ) -> BusinessResearchFocusedBriefSDKInput:
         manual_objective = _manual_plan_objective(args)
-        typed_input = focused_brief_input_from_profile(
-            profile,
-            brief_goal=(
-                CR1_IMPROVEMENT_PROMPT
-                if args.improvement_case == CR1_IMPROVEMENT_CASE_ID
-                else manual_objective or None
-            ),
-        )
+        if isinstance(profile, CompanyResearchComparison):
+            typed_input = BusinessResearchFocusedBriefSDKInput(
+                company_name=f"{profile.company_a.name} vs {profile.company_b.name}",
+                source_context=comparison_context_from_result(profile),
+                brief_goal=(
+                    manual_objective
+                    or str(args.request_text or "").strip()
+                    or (
+                        "Prepare a concise, source-backed comparison that directly "
+                        "answers the operator's requested facets."
+                    )
+                ),
+                retrieval_hint=_explicit_retrieval_hint(args),
+            )
+        else:
+            typed_input = focused_brief_input_from_profile(
+                profile,
+                brief_goal=(
+                    CR1_IMPROVEMENT_PROMPT
+                    if args.improvement_case == CR1_IMPROVEMENT_CASE_ID
+                    else manual_objective or None
+                ),
+            )
         if founder_context:
             return BusinessResearchFocusedBriefSDKInput(
                 company_name=typed_input.company_name,
@@ -809,7 +1025,7 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
     output_type: (
         type[CompanyProfile] | type[CompanyResearchFocusedBrief] | type[CompanyResearchComparison]
     )
-    if comparison_requested:
+    if structured_comparison_requested:
         output_type = CompanyResearchComparison
         agent = build_business_research_analyst_comparison_agent(
             attach_tools=not args.compact_instructions,
@@ -896,6 +1112,9 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
         retrieval_mode="live_search" if args.live_search else "fixture",
     )
     payload["retrieval_diagnostics"] = payload["retrieval"].get("retrieval_diagnostics")
+    if comparison_requested:
+        payload["comparison_entities"] = [args.company, args.compare_company]
+    payload["verified_source_evidence"] = list(verified_source_evidence_state)
     if getattr(args, "manual_request_plan", None):
         payload["manual_request_plan"] = args.manual_request_plan
     human_summary = _company_research_sdk_human_summary(payload)
@@ -949,7 +1168,9 @@ def _company_research_sdk_human_summary(payload: dict[str, Any]) -> str:
     why_it_matters = _summary_text(output.get("why_it_matters"))
     unknowns = _summary_list(output.get("unknowns"), limit=4)
     facts = _summary_facts(output.get("facts"), limit=4)
-    sources = _summary_sources(output.get("sources"), limit=5)
+    verified_sources = _verified_sources_for_payload(payload)
+    source_value = verified_sources or output.get("sources")
+    sources = _summary_sources(source_value, limit=5)
     output_constraints = output_constraints_from_plan(payload.get("manual_request_plan"))
     ask_shape = (
         payload.get("manual_request_plan", {}).get("ask_shape", {})
@@ -993,7 +1214,7 @@ def _company_research_sdk_human_summary(payload: dict[str, Any]) -> str:
 
     if output_form == "bullets" and structured_answer:
         official_only = "official" in source_type_preference
-        official_company_url = _official_company_url_for_payload(
+        official_company_urls = _official_company_urls_for_payload(
             payload,
             company=company,
             sources=output.get("sources"),
@@ -1003,10 +1224,11 @@ def _company_research_sdk_human_summary(payload: dict[str, Any]) -> str:
             strip_urls=official_only,
         )
         compact_sources = _summary_sources_compact(
-            output.get("sources"),
+            source_value,
             limit=output_constraints.source_url_count or 5,
             official_only=official_only,
-            official_company_url=official_company_url if official_only else "",
+            official_company_urls=official_company_urls if official_only else [],
+            required_entities=list(_verified_source_evidence_by_entity(payload)),
         )
         if output_constraints.include_source_urls:
             requested_count = output_constraints.source_url_count
@@ -1094,27 +1316,72 @@ def _attach_company_research_output_constraint_validation(payload: dict[str, Any
             if isinstance(output, dict)
             else ""
         )
-        official_url = _official_company_url_for_payload(
+        official_urls = _official_company_urls_for_payload(
             payload,
             company=company,
             sources=output.get("sources") if isinstance(output, dict) else [],
         )
         visible_urls = re.findall(r"https?://[^\s)>]+", display_text, flags=re.I)
+        verified_source_urls = {
+            canonical
+            for item in _verified_sources_for_payload(payload)
+            if (canonical := _canonical_source_url(item.get("url")))
+        }
         invalid_urls = [
             url
             for url in visible_urls
-            if not official_url
-            or not company_source_matches_official_url(url, official_url)
+            if (
+                verified_source_urls
+                and _canonical_source_url(url) not in verified_source_urls
+            )
+            or not official_urls
+            or not any(
+                company_source_matches_official_url(url, official_url)
+                for official_url in official_urls
+            )
         ]
         if invalid_urls:
             validation_payload["passed"] = False
+            violation = (
+                "visible source URL was not present in deterministic retrieved evidence"
+                if verified_source_urls
+                and any(
+                    _canonical_source_url(url) not in verified_source_urls
+                    for url in visible_urls
+                )
+                else "visible source URL is outside the verified official company domain"
+            )
             validation_payload.setdefault("violations", []).append(
-                "visible source URL is outside the verified official company domain"
+                violation
             )
         elif visible_urls:
             validation_payload.setdefault("satisfied_constraints", []).append(
                 "official company source domains"
             )
+        entity_evidence = _verified_source_evidence_by_entity(payload)
+        if len(entity_evidence) == 2:
+            missing_entities = [
+                entity
+                for entity, evidence in entity_evidence.items()
+                if not any(
+                    _canonical_source_url(url)
+                    in {
+                        canonical
+                        for source in evidence.get("official_sources") or []
+                        if (canonical := _canonical_source_url(source.get("url")))
+                    }
+                    for url in visible_urls
+                )
+            ]
+            if missing_entities:
+                validation_payload["passed"] = False
+                validation_payload.setdefault("violations", []).append(
+                    "visible sources do not include an official URL for each company"
+                )
+            else:
+                validation_payload.setdefault("satisfied_constraints", []).append(
+                    "one official source domain per comparison company"
+                )
     payload["output_constraint_validation"] = validation_payload
 
 
@@ -1181,13 +1448,14 @@ def _summary_sources_compact(
     *,
     limit: int,
     official_only: bool,
-    official_company_url: str,
+    official_company_urls: list[str],
+    required_entities: list[str] | None = None,
 ) -> list[str]:
     if not isinstance(value, list):
         return []
-    if official_only and not str(official_company_url).strip():
+    if official_only and not official_company_urls:
         return []
-    lines: list[str] = []
+    candidates: list[tuple[str, str, str]] = []
     seen_urls: set[str] = set()
     for item in value:
         if not isinstance(item, dict):
@@ -1195,33 +1463,151 @@ def _summary_sources_compact(
         url = _summary_text(item.get("url"))
         if not url or url in seen_urls:
             continue
-        if official_only and not company_source_matches_official_url(
-            url,
-            official_company_url,
+        if official_only and not any(
+            company_source_matches_official_url(url, official_url)
+            for official_url in official_company_urls
         ):
             continue
         title = _summary_text(item.get("title")) or url
-        lines.append(f"{title}: {url}")
+        candidates.append(
+            (
+                url,
+                f"{title}: {url}",
+                _summary_text(item.get("entity")),
+            )
+        )
         seen_urls.add(url)
-        if len(lines) >= max(1, limit):
-            break
+    ordered: list[tuple[str, str, str]] = []
+    for entity in required_entities or []:
+        match = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate not in ordered and candidate[2] == entity
+            ),
+            None,
+        )
+        if match is not None:
+            ordered.append(match)
+    if official_only:
+        for official_url in official_company_urls:
+            match = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate not in ordered
+                    and company_source_matches_official_url(
+                        candidate[0],
+                        official_url,
+                    )
+                ),
+                None,
+            )
+            if match is not None:
+                ordered.append(match)
+    ordered.extend(candidate for candidate in candidates if candidate not in ordered)
+    lines = [line for _url, line, _entity in ordered[: max(1, limit)]]
     return lines
 
 
-def _official_company_url_for_payload(
+def _official_company_urls_for_payload(
     payload: dict[str, Any],
     *,
     company: str,
     sources: Any,
-) -> str:
+) -> list[str]:
+    entity_evidence = _verified_source_evidence_by_entity(payload)
+    if entity_evidence:
+        return list(
+            dict.fromkeys(
+                resolved
+                for evidence in entity_evidence.values()
+                if (resolved := _summary_text(evidence.get("resolved_official_url")))
+            )
+        )
+    urls: list[str] = []
     retrieval = payload.get("retrieval")
     if isinstance(retrieval, dict):
-        resolved = _summary_text(retrieval.get("resolved_company_url"))
-        if resolved:
-            return resolved
-    return infer_official_company_url(
-        company=company,
-        search_results=sources if isinstance(sources, list) else [],
+        retrieval_lanes = [retrieval]
+        retrieval_lanes.extend(
+            lane
+            for key in ("primary", "comparison")
+            if isinstance((lane := retrieval.get(key)), dict)
+        )
+        urls.extend(
+            resolved
+            for lane in retrieval_lanes
+            if (resolved := _summary_text(lane.get("resolved_company_url")))
+        )
+    entities = [
+        str(item).strip()
+        for item in payload.get("comparison_entities") or []
+        if str(item).strip()
+    ]
+    if not urls:
+        entities = entities or [company]
+        for entity in entities:
+            inferred = infer_official_company_url(
+                company=entity,
+                search_results=sources if isinstance(sources, list) else [],
+            )
+            if inferred:
+                urls.append(inferred)
+    return list(dict.fromkeys(urls))
+
+
+def _verified_source_evidence_by_entity(
+    payload: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    entries = payload.get("verified_source_evidence")
+    if not isinstance(entries, list):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        entity = _summary_text(item.get("entity"))
+        if entity:
+            result[entity] = item
+    return result
+
+
+def _verified_sources_for_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for entity, evidence in _verified_source_evidence_by_entity(payload).items():
+        for item in evidence.get("sources") or []:
+            if not isinstance(item, dict):
+                continue
+            canonical = _canonical_source_url(item.get("url"))
+            if not canonical or canonical in seen_urls:
+                continue
+            sources.append({**item, "entity": entity})
+            seen_urls.add(canonical)
+    return sources
+
+
+def _canonical_source_url(value: Any) -> str:
+    raw = _summary_text(value)
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+        _ = parsed.port
+    except (TypeError, ValueError):
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return ""
+    host = parsed.hostname.lower().removeprefix("www.")
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    return urlunsplit(
+        (
+            parsed.scheme.lower(),
+            f"{host}{port}",
+            parsed.path.rstrip("/") or "/",
+            parsed.query,
+            "",
+        )
     )
 
 

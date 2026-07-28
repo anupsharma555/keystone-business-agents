@@ -9732,28 +9732,111 @@ def _official_source_response_violations(
     visible_urls = re.findall(r"https?://[^\s)>]+", str(response_text or ""), flags=re.I)
     if not visible_urls:
         return []
+    verified_entries = [
+        item
+        for item in script_payload.get("verified_source_evidence") or []
+        if isinstance(item, dict)
+    ]
+    verified_source_urls = {
+        canonical
+        for entry in verified_entries
+        for source in entry.get("sources") or []
+        if isinstance(source, dict)
+        if (canonical := _canonical_verified_source_url(source.get("url")))
+    }
+    if verified_source_urls and any(
+        _canonical_verified_source_url(url) not in verified_source_urls
+        for url in visible_urls
+    ):
+        return ["visible source URL was not present in deterministic retrieved evidence"]
     retrieval = script_payload.get("retrieval")
-    official_url = (
-        str(retrieval.get("resolved_company_url") or "").strip()
-        if isinstance(retrieval, dict)
-        else ""
-    )
-    output = script_payload.get("output")
-    if not official_url and isinstance(output, dict):
-        official_url = infer_official_company_url(
-            company=str(output.get("company_name") or "").strip(),
-            search_results=(
-                output.get("sources") if isinstance(output.get("sources"), list) else []
-            ),
+    official_urls: list[str] = []
+    if isinstance(retrieval, dict):
+        retrieval_lanes = [retrieval]
+        retrieval_lanes.extend(
+            lane
+            for key in ("primary", "comparison")
+            if isinstance((lane := retrieval.get(key)), dict)
         )
-    if not official_url:
+        official_urls.extend(
+            resolved
+            for lane in retrieval_lanes
+            if (resolved := str(lane.get("resolved_company_url") or "").strip())
+        )
+    output = script_payload.get("output")
+    comparison_entities = [
+        str(item).strip()
+        for item in script_payload.get("comparison_entities") or []
+        if str(item).strip()
+    ]
+    if not official_urls and isinstance(output, dict):
+        source_results = (
+            output.get("sources") if isinstance(output.get("sources"), list) else []
+        )
+        entities = comparison_entities or [str(output.get("company_name") or "").strip()]
+        official_urls.extend(
+            inferred
+            for entity in entities
+            if (
+                inferred := infer_official_company_url(
+                    company=entity,
+                    search_results=source_results,
+                )
+            )
+        )
+    official_urls = list(dict.fromkeys(official_urls))
+    if not official_urls:
         return ["official company source domain could not be verified"]
     if any(
-        not company_source_matches_official_url(url, official_url)
+        not any(
+            company_source_matches_official_url(url, official_url)
+            for official_url in official_urls
+        )
         for url in visible_urls
     ):
         return ["visible source URL is outside the verified official company domain"]
+    if len(verified_entries) == 2 and any(
+        not any(
+            _canonical_verified_source_url(url)
+            in {
+                canonical
+                for source in entry.get("official_sources") or []
+                if isinstance(source, dict)
+                if (canonical := _canonical_verified_source_url(source.get("url")))
+            }
+            for url in visible_urls
+        )
+        for entry in verified_entries
+    ):
+        return ["visible sources do not include an official URL for each company"]
+    if len(comparison_entities) == 2 and len(official_urls) == 2 and any(
+        not any(
+            company_source_matches_official_url(url, official_url)
+            for url in visible_urls
+        )
+        for official_url in official_urls
+    ):
+        return ["visible sources do not include an official URL for each company"]
     return []
+
+
+def _canonical_verified_source_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+        _ = parsed.port
+    except (TypeError, ValueError):
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return ""
+    host = parsed.hostname.lower().removeprefix("www.")
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    path = parsed.path.rstrip("/") or "/"
+    return f"{parsed.scheme.lower()}://{host}{port}{path}" + (
+        f"?{parsed.query}" if parsed.query else ""
+    )
 
 
 def _manual_plan_url_target(manual_plan: ManualRequestPlan | None) -> str:
