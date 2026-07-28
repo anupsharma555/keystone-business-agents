@@ -5291,7 +5291,7 @@ def test_natural_business_research_alias_normalizes_to_specialist() -> None:
     assert plan.target_agent == "business_research_analyst"
 
 
-def test_forbidden_provider_owner_is_pruned_across_named_entry_surfaces() -> None:
+def test_explicit_gmail_owner_is_retained_without_forbidden_provider_access() -> None:
     request = (
         "Using only the pasted note, summarize the supported facts. "
         "Do not use Gmail or any provider tools."
@@ -5315,13 +5315,17 @@ def test_forbidden_provider_owner_is_pruned_across_named_entry_surfaces() -> Non
     merged = merge_manual_request_plan(fallback, candidate)
 
     assert merged.requested_agent == "gmail_triage"
-    assert merged.target_agent == "chief_of_staff"
-    assert merged.intent == "route_request"
+    assert merged.target_agent == "gmail_triage"
+    assert merged.intent == "gmail_triage"
     assert merged.provider_system == "unspecified"
     assert merged.provider_operations == []
     assert merged.provider_action_steps == []
     assert merged.workflow == []
     assert merged.requires_durable_state is False
+    assert any(
+        "retaining the explicitly named Gmail Triage owner" in item
+        for item in merged.planner_warnings
+    )
 
 
 def test_llm_external_outreach_still_requires_approved_context() -> None:

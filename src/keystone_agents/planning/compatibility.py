@@ -2799,11 +2799,18 @@ def _prune_forbidden_llm_capabilities(
         or candidate_owner_provider in forbidden_provider_access
     )
     if provider_access_forbidden:
+        retain_explicit_provider_free_owner = bool(
+            base.requested_agent == candidate.target_agent == "gmail_triage"
+        )
         base_owner_provider = owner_provider.get(base.target_agent)
         recovery_owner = (
-            base.target_agent
-            if base.target_agent not in {"clarification", "orchestrator"}
-            and base_owner_provider not in forbidden_provider_access
+            candidate.target_agent
+            if retain_explicit_provider_free_owner
+            else base.target_agent
+            if (
+                base.target_agent not in {"clarification", "orchestrator"}
+                and base_owner_provider not in forbidden_provider_access
+            )
             else "chief_of_staff"
         )
         retained_workflow = [
@@ -2822,9 +2829,21 @@ def _prune_forbidden_llm_capabilities(
                 ),
                 "provider_operations": [],
                 "provider_action_steps": [],
-                "intent": "route_request",
-                "task_objective": "route_or_continue",
-                "expected_artifact_type": "none",
+                "intent": (
+                    candidate.intent
+                    if retain_explicit_provider_free_owner
+                    else "route_request"
+                ),
+                "task_objective": (
+                    candidate.task_objective
+                    if retain_explicit_provider_free_owner
+                    else "route_or_continue"
+                ),
+                "expected_artifact_type": (
+                    candidate.expected_artifact_type
+                    if retain_explicit_provider_free_owner
+                    else "none"
+                ),
                 "requires_durable_state": bool(
                     base.requires_durable_state or len(retained_workflow) > 1
                 ),
@@ -2835,10 +2854,16 @@ def _prune_forbidden_llm_capabilities(
                 "side_effect_policy": "draft_or_read_only",
             }
         )
-        warnings.append(
-            "Removed a provider owner because the operator explicitly prohibited "
-            "access to that provider; the remaining provider-free task stays executable."
-        )
+        if retain_explicit_provider_free_owner:
+            warnings.append(
+                "Removed prohibited Gmail access while retaining the explicitly "
+                "named Gmail Triage owner; the supplied-context task stays tool-free."
+            )
+        else:
+            warnings.append(
+                "Removed a provider owner because the operator explicitly prohibited "
+                "access to that provider; the remaining provider-free task stays executable."
+            )
     if candidate.requires_live_search and any(
         _negative_constraint_forbids_live_search(item) for item in explicit_constraints
     ):
