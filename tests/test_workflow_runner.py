@@ -13627,8 +13627,8 @@ def test_bounded_supplied_fact_draft_can_repair_model_deferral() -> None:
     request = WorkflowRunRequest(
         request_text=(
             "Using only these supplied facts, draft an outreach email. Facts: "
-            "Northstar Behavioral Health operates two clinics. Do not send or "
-            "modify anything."
+            "Northstar Behavioral Health operates two clinics. Do not access Gmail, "
+            "create a provider draft, send, post, search, or modify anything."
         ),
         live_sdk=True,
         allow_manager_loop_repair=True,

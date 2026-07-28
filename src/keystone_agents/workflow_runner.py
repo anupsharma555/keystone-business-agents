@@ -22185,7 +22185,7 @@ def _operator_requested_bounded_outreach_draft(
                 flags=re.I,
             )
         )
-        and not looks_like_send_side_effect(text)
+        and not looks_like_send_side_effect(positive_capability_text(text))
     )
 
 
