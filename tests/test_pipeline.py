@@ -203,6 +203,49 @@ def test_company_research_focused_brief_payload_exposes_clean_slack_summary() ->
     assert business_agent_result_display_text(payload) == summary
 
 
+def test_company_research_focused_brief_preserves_structured_answer_in_slack() -> None:
+    import scripts.run_company_research as run_company_research
+
+    payload = {
+        "output_type": "CompanyResearchFocusedBrief",
+        "output": {
+            "company_name": "Anchor Health",
+            "answer": (
+                "Anchor Health is multimodal. Direct competitor: Signal Health "
+                "(https://signal.example/product). Adjacent tool: Notes Health "
+                "(https://notes.example/product)."
+            ),
+            "product": "A multimodal behavioral-health assessment platform.",
+            "traction_signals": "No deployment evidence was verified.",
+            "why_it_matters": "Anchor Health may be relevant to Keystone.",
+            "sources": [
+                {
+                    "title": "Anchor Health",
+                    "url": "https://anchor.example/product",
+                },
+                {
+                    "title": "Signal Health",
+                    "url": "https://signal.example/product",
+                },
+                {
+                    "title": "Notes Health",
+                    "url": "https://notes.example/product",
+                },
+            ],
+        },
+    }
+
+    summary = run_company_research._company_research_sdk_human_summary(payload)
+
+    answer = summary.split("\n\n*Detailed Summary:*", 1)[0]
+    assert "Direct competitor: Signal Health" in answer
+    assert "Adjacent tool: Notes Health" in answer
+    assert "Anchor Health may be relevant to Keystone" not in answer
+    assert "Key signal:" not in answer
+    assert "*Detailed Summary:*" in summary
+    assert "*Useful references:*" in summary
+
+
 def test_company_research_focused_brief_honors_requested_summary_word_limit() -> None:
     import scripts.run_company_research as run_company_research
 

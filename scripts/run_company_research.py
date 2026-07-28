@@ -879,8 +879,9 @@ def _company_research_sdk_human_summary(payload: dict[str, Any]) -> str:
         output_constraints.word_count_mode != "unspecified"
         or output_constraints.sentence_count_mode != "unspecified"
     )
+    structured_answer = _summary_text(output.get("answer"))
     if narrow_answer_requested:
-        answer = _summary_text(output.get("answer"))
+        answer = structured_answer
         if not answer:
             answer = product or why_it_matters or traction
         if not answer:
@@ -891,13 +892,15 @@ def _company_research_sdk_human_summary(payload: dict[str, Any]) -> str:
         return "\n\n".join(sections)
 
     answer_parts = []
-    if why_it_matters:
+    if structured_answer:
+        answer_parts.append(structured_answer)
+    elif why_it_matters:
         answer_parts.append(_truncate_summary(why_it_matters, 360))
     elif product:
         answer_parts.append(f"{company} appears relevant based on its product/workflow context.")
     else:
         answer_parts.append(f"{company} has source-backed context available for review.")
-    if traction:
+    if traction and not structured_answer:
         answer_parts.append(f"Key signal: {_truncate_summary(traction, 220)}")
 
     detail_lines: list[str] = []
