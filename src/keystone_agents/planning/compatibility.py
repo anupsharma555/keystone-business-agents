@@ -1460,11 +1460,18 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
             return False
         request_verb = (
             r"(?:answer|respond|reply|return|give(?:\s+me)?|provide|write|"
-            r"summari[sz]e|explain|describe|keep|limit|shorten|condense|"
+            r"draft|compose|prepare|summari[sz]e|explain|describe|keep|limit|"
+            r"shorten|condense|"
             r"turn|convert|reformat|combine)"
         )
         prefix_clause = re.split(r"[.;:!?\n]", prefix)[-1]
         if re.search(rf"\b{request_verb}\b[^.;:!?\n]{{0,45}}$", prefix_clause):
+            return True
+        if re.search(
+            rf"\b{request_verb}\b[^.;:!?\n]{{0,100}}\b"
+            r"(?:answer|response|summary|email|draft|message|note|reply)\s*$",
+            prefix_clause,
+        ):
             return True
         if re.match(r"\s+only\b", suffix):
             return True

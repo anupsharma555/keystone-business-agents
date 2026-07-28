@@ -811,18 +811,45 @@ def _request_has_inline_approved_outreach_context(text: str) -> bool:
         return False
     if not re.search(r"\b(?:draft|write|compose|prepare)\b", cleaned, flags=re.I):
         return False
-    approved_context_label = re.search(
+    context_label = re.search(
         r"\b(?:"
         r"(?:these\s+|the\s+following\s+)?approved"
         r"(?:\s+(?:inline|source|source-backed|source backed))?\s+"
         r"(?:context|facts|evidence|background|grounding|rationale)"
         r"|source[-\s]+backed\s+(?:context|facts|evidence|background|grounding)"
+        r"|(?:these\s+|the\s+following\s+)?(?:operator[-\s]+)?"
+        r"(?:supplied|provided)(?:\s+(?:inline|source[-\s]+backed))?\s+"
+        r"(?:context|facts|evidence|background|grounding)"
         r"|context\s+approved\s+for\s+(?:drafting|draft-only\s+use|draft\s+only\s+use)"
         r")\s*:",
         cleaned,
         flags=re.I,
     )
-    if not approved_context_label:
+    if context_label is None:
+        bare_context_label = re.search(
+            r"\b(?:facts|context|evidence|background|grounding)\s*:",
+            cleaned,
+            flags=re.I,
+        )
+        supplied_context_authority = re.search(
+            r"\b(?:use|using)\s+only\s+(?:these\s+|the\s+following\s+)?"
+            r"(?:operator[-\s]+)?(?:supplied|provided)\s+"
+            r"(?:facts|context|evidence|background|grounding)\b",
+            cleaned,
+            flags=re.I,
+        )
+        if bare_context_label is None or supplied_context_authority is None:
+            return False
+        context_label = bare_context_label
+    context_block = cleaned[context_label.end() :]
+    context_block = re.split(
+        r"\b(?:return|invite|keep|caveats?|constraints?|instructions?|"
+        r"do\s+not|don't|dont|never)\b",
+        context_block,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip(" .;,:")
+    if len(re.findall(r"[A-Za-z][A-Za-z'-]*", context_block)) < 5:
         return False
     return bool(
         re.search(r"\b(?:no send|draft-only|draft only)\b", cleaned, flags=re.I)
@@ -1150,9 +1177,10 @@ def _send_refusal(
     *,
     approved_context_present: bool,
     workflow_state: Mapping[str, Any],
+    owning_route: RouteName = "clarification",
 ) -> OrchestratorResult:
     return _result(
-        route="clarification",
+        route=owning_route,
         rationale=(
             "The request asks for an external send, post, or live action, which is outside "
             "the v1 safety boundary without explicit approval."
@@ -3408,6 +3436,11 @@ def route_request(
             _send_refusal(
                 approved_context_present=approved_context_present,
                 workflow_state=state_context,
+                owning_route=(
+                    "outreach_composer"
+                    if _OUTREACH_RE.search(route_lower_text)
+                    else "clarification"
+                ),
             )
         )
 

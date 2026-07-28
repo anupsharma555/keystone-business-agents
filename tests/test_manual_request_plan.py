@@ -2539,6 +2539,18 @@ def test_manual_plan_captures_plain_in_word_limit_for_company_summary() -> None:
     assert plan.ask_shape.output_constraints.word_count == 20
 
 
+def test_manual_plan_captures_word_limit_after_described_outreach_artifact() -> None:
+    plan = infer_manual_request_plan(
+        "Outreach Composer, using only these supplied facts, draft a concise "
+        "internal-ready outreach email under 100 words.",
+        requested_agent="outreach_composer",
+    )
+
+    assert plan.ask_shape.output_constraints.scope == "answer"
+    assert plan.ask_shape.output_constraints.word_count_mode == "under"
+    assert plan.ask_shape.output_constraints.word_count == 100
+
+
 def test_manual_plan_keeps_meeting_speaking_request_as_opportunity_record() -> None:
     plan = infer_manual_request_plan(
         "Find APA 2026 meeting speaking or abstract opportunities in San Francisco",

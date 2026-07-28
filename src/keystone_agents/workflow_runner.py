@@ -57,7 +57,9 @@ from keystone_agents.gmail_triage.priority_grouping import (
 )
 from keystone_agents.instruction_following import (
     instruction_following_blocker_text,
+    output_constraints_from_plan,
     resolve_instruction_following_response,
+    validate_output_constraints,
 )
 from keystone_agents.live_retrieval import (
     retrieve_company_profile_live,
@@ -19635,11 +19637,14 @@ def _advance_outreach(
     draft_audit_notes = [draft_audit_note]
     if request.live_sdk and "live SDK draft created" in draft_audit_note:
         draft_audit_notes.append("Live user-facing response synthesis executed.")
-    recommendation_mismatches = _gmail_thread_recommendation_mismatches(
-        draft,
-        recommendation=recommendation,
-        gmail_thread_context=gmail_thread_context,
-    )
+    recommendation_mismatches = [
+        *_gmail_thread_recommendation_mismatches(
+            draft,
+            recommendation=recommendation,
+            gmail_thread_context=gmail_thread_context,
+        ),
+        *_outreach_draft_contract_mismatches(draft, request=request),
+    ]
     should_repair_with_model = _should_repair_outreach_with_model(
         request,
         recommendation=recommendation,
@@ -19675,11 +19680,14 @@ def _advance_outreach(
                 repair_audit_note,
             ]
         )
-        recommendation_mismatches = _gmail_thread_recommendation_mismatches(
-            draft,
-            recommendation=recommendation,
-            gmail_thread_context=gmail_thread_context,
-        )
+        recommendation_mismatches = [
+            *_gmail_thread_recommendation_mismatches(
+                draft,
+                recommendation=recommendation,
+                gmail_thread_context=gmail_thread_context,
+            ),
+            *_outreach_draft_contract_mismatches(draft, request=request),
+        ]
         if recommendation_mismatches:
             recommendation = {
                 **recommendation,
@@ -22028,6 +22036,111 @@ def _gmail_thread_recommendation_mismatches(
     return mismatches
 
 
+def _outreach_draft_contract_mismatches(
+    draft: OutreachDraft,
+    *,
+    request: WorkflowRunRequest,
+) -> list[str]:
+    """Validate explicit supplied-fact draft requirements before rendering."""
+
+    if not request.live_sdk:
+        return []
+    request_text = " ".join(str(request.request_text or "").split())
+    if not re.search(
+        r"\b(?:supplied|provided)\s+(?:facts?|context)\b",
+        request_text,
+        flags=re.I,
+    ):
+        return []
+
+    fallback_plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="outreach_composer",
+    ).model_dump(mode="json")
+    planned_constraints = output_constraints_from_plan(request.manual_request_plan)
+    raw_request_constraints = output_constraints_from_plan(fallback_plan)
+    constraints = (
+        raw_request_constraints
+        if raw_request_constraints.has_deterministic_requirements()
+        else planned_constraints
+    )
+    validation = validate_output_constraints(
+        draft.email_body,
+        constraints,
+    )
+    mismatches = list(validation.violations)
+
+    body = " ".join(str(draft.email_body or "").split())
+    body_tokens = set(re.findall(r"[a-z0-9]+", body.lower()))
+    fact_stopwords = {
+        "about",
+        "after",
+        "also",
+        "anything",
+        "before",
+        "could",
+        "discuss",
+        "does",
+        "from",
+        "have",
+        "into",
+        "only",
+        "that",
+        "their",
+        "these",
+        "they",
+        "this",
+        "using",
+        "wants",
+        "with",
+        "would",
+    }
+    for fact in _extract_inline_outreach_facts(request_text):
+        fact_tokens = [
+            token
+            for token in re.findall(r"[a-z0-9]+", fact.lower())
+            if len(token) >= 4 and token not in fact_stopwords
+        ]
+        if len(fact_tokens) < 2:
+            continue
+        required_overlap = min(3, max(2, (len(set(fact_tokens)) + 2) // 3))
+        if len(set(fact_tokens) & body_tokens) < required_overlap:
+            mismatches.append(
+                "The draft does not retain enough detail from supplied fact: "
+                + fact[:180]
+            )
+
+    call_match = re.search(
+        r"\b(?P<minutes>\d{1,3})[-\s]+minute\s+"
+        r"(?P<meeting>call|conversation|meeting)\b",
+        request_text,
+        flags=re.I,
+    )
+    if call_match:
+        minutes = call_match.group("minutes")
+        meeting = call_match.group("meeting").lower()
+        has_duration = bool(
+            re.search(rf"\b{re.escape(minutes)}[-\s]+minute\b", body, flags=re.I)
+        )
+        has_meeting = bool(
+            re.search(r"\b(?:call|conversation|meeting)\b", body, flags=re.I)
+        )
+        if not (has_duration and has_meeting):
+            mismatches.append(
+                f"The draft does not include the requested {minutes}-minute {meeting} CTA."
+            )
+
+    unmet_dimensions = list(
+        getattr(getattr(draft, "request_coverage", None), "unmet_dimensions", []) or []
+    )
+    if unmet_dimensions:
+        mismatches.append(
+            "The draft reports unmet request dimensions: "
+            + "; ".join(str(item) for item in unmet_dimensions[:4])
+        )
+    return list(dict.fromkeys(item for item in mismatches if item))
+
+
 def _should_repair_outreach_with_model(
     request: WorkflowRunRequest,
     *,
@@ -22290,6 +22403,35 @@ def _inline_outreach_context_from_request(request_text: str) -> dict[str, Any] |
     ):
         return None
 
+    source_url = _extract_inline_source_url(text)
+    source_label = _extract_inline_outreach_value(text, _INLINE_OUTREACH_SOURCE_LABELS)
+    facts = _extract_inline_outreach_facts(text)
+    if not facts:
+        return None
+    explicitly_supplied_for_drafting = bool(
+        re.search(
+            r"\b(?:use|using)\s+only\s+(?:these\s+|the\s+following\s+)?"
+            r"(?:operator[-\s]+)?(?:supplied|provided)\s+"
+            r"(?:facts|context|evidence|background|grounding)\b",
+            text,
+            flags=re.I,
+        )
+        and (
+            re.search(r"\b(?:no send|draft-only|draft only)\b", text, flags=re.I)
+            or re.search(
+                r"\b(?:do\s+not|don't|dont|never|without)\b"
+                r"[^.;\n]{0,200}\b(?:send|post|publish|share)\b",
+                text,
+                flags=re.I,
+            )
+        )
+    )
+    has_source_basis = bool(source_url or source_label) or bool(
+        re.search(r"\b(?:approved|source-backed|source backed)\b", text, flags=re.I)
+    ) or explicitly_supplied_for_drafting
+    if not has_source_basis:
+        return None
+
     company = _extract_inline_outreach_value(
         text,
         _INLINE_OUTREACH_COMPANY_LABELS,
@@ -22302,27 +22444,19 @@ def _inline_outreach_context_from_request(request_text: str) -> dict[str, Any] |
         company = _company_from_inline_recipient_label(recipient_name)
     if not company:
         company = _extract_outreach_company_from_request(text)
+    if not company:
+        company = _company_from_inline_outreach_facts(facts)
     company = _clean_inline_outreach_company(company)
     if not company:
         return None
 
-    source_url = _extract_inline_source_url(text)
-    source_label = _extract_inline_outreach_value(text, _INLINE_OUTREACH_SOURCE_LABELS)
-    facts = _extract_inline_outreach_facts(text)
-    if not facts:
-        return None
-    has_source_basis = bool(source_url or source_label) or bool(
-        re.search(r"\b(?:approved|source-backed|source backed)\b", text, flags=re.I)
-    )
-    if not has_source_basis:
-        return None
     recipient_email = ""
     if recipient_name and "@" in recipient_name:
         _, recipient_email = parseaddr(recipient_name)
     return {
         "company": company,
         "source_url": source_url or "user-provided://outreach-context",
-        "source_label": source_label or "User-provided approved outreach context",
+        "source_label": source_label or "Operator-supplied outreach facts",
         "facts": facts,
         "recipient_name": recipient_name,
         "recipient_email": recipient_email,
@@ -22379,6 +22513,26 @@ def _company_from_inline_recipient_label(value: str) -> str:
     return ""
 
 
+def _company_from_inline_outreach_facts(facts: list[str]) -> str:
+    candidates: list[str] = []
+    for fact in facts:
+        match = re.match(
+            r"(?P<company>[A-Za-z][A-Za-z0-9&.' -]{1,120}?)"
+            r"(?:,\s+[^,]{1,80},)?\s+"
+            r"(?:operates?|runs?|provides?|offers?|serves?|has|wants?|plans?|"
+            r"seeks?|asked|requested|is|are)\b",
+            str(fact or "").strip(),
+        )
+        if not match:
+            continue
+        candidate = match.group("company").strip(" .;,:")
+        if candidate.lower() in {"he", "her", "it", "she", "they", "we"}:
+            continue
+        candidates.append(candidate)
+    unique = list(dict.fromkeys(candidate for candidate in candidates if candidate))
+    return unique[0] if len(unique) == 1 else ""
+
+
 def _extract_inline_source_url(text: str) -> str:
     match = re.search(r"\bhttps?://[^\s,;)]+", text)
     if match:
@@ -22415,7 +22569,8 @@ def _strip_inline_outreach_instruction_tail(text: str) -> str:
         flags=re.I,
     )
     cleaned = re.sub(
-        r"\b(?:Return|Keep|Caveats?|Constraints?|Instructions?|Do not|Don't|Dont|Never)\b"
+        r"\b(?:Return|Invite|Keep|Caveats?|Constraints?|Instructions?|"
+        r"Do not|Don't|Dont|Never)\b"
         r"[\s\S]*$",
         "",
         cleaned,
@@ -22722,6 +22877,18 @@ def _compose_outreach_draft_for_work_item(
                 ),
             )
             if part
+        )[:4000]
+    elif review_feedback:
+        objective = " ".join(
+            (
+                objective,
+                "Manager review feedback from the prior attempt:",
+                "; ".join(review_feedback),
+                (
+                    "Revise the structured draft so every item is resolved while using "
+                    "only the same approved facts and preserving the no-send boundary."
+                ),
+            )
         )[:4000]
     if not request.live_sdk:
         return (

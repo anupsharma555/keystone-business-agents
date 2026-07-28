@@ -13155,6 +13155,29 @@ def test_natural_slack_cross_agent_envelope_admits_provider_free_composition() -
     assert preflight.composition_admission.composition_allowed is True
 
 
+def test_natural_supplied_facts_outreach_preflight_executes_without_provider_access() -> None:
+    request = (
+        "Outreach Composer, using only these supplied facts, draft a concise "
+        "internal-ready outreach email under 100 words. Facts: Northstar Behavioral "
+        "Health operates two outpatient clinics; it is exploring a fall pilot for "
+        "multimodal symptom monitoring; it wants to discuss validation evidence, "
+        "implementation effort, and timeline. Invite a 20-minute call. Do not access "
+        "Gmail, create a provider draft, send, post, search, or modify anything."
+    )
+    execution_request = cli.build_execution_request(request)
+    preflight = cli.run_orchestrator_preflight(
+        cli.execution_request_planning_text(execution_request),
+        requested_agent=execution_request.requested_agent,
+        live_manual_plan=False,
+    )
+
+    assert execution_request.requested_agent == "outreach_composer"
+    assert preflight.execution_allowed is True
+    assert preflight.selected_agent == "outreach_composer"
+    assert preflight.route_result.approved_context_present is True
+    assert preflight.route_result.send_enabled is False
+
+
 def test_slack_continuation_generic_block_does_not_admit_advisory_owner() -> None:
     request = (
         "continue this prior Slack thread. "

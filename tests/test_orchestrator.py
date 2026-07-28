@@ -1362,6 +1362,56 @@ def test_outreach_request_accepts_flexible_approved_context_labels() -> None:
     assert result.external_use_approval_required is True
 
 
+def test_outreach_request_accepts_explicitly_supplied_facts_for_draft_only_use() -> None:
+    result = route_request(
+        "Outreach Composer, using only these supplied facts, draft a concise "
+        "internal-ready outreach email under 100 words. Facts: Northstar Behavioral "
+        "Health operates two outpatient clinics; it is exploring a fall pilot for "
+        "multimodal symptom monitoring; it wants to discuss validation evidence, "
+        "implementation effort, and timeline. Invite a 20-minute call. Do not access "
+        "Gmail, create a provider draft, send, post, search, or modify anything."
+    )
+
+    assert result.route == "outreach_composer"
+    assert result.refused is False
+    assert result.approved_context_present is True
+    assert result.send_enabled is False
+    assert result.external_use_approval_required is True
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Outreach Composer, draft an email. Facts: Do not send it.",
+        (
+            "Outreach Composer, draft an email from these supplied facts. "
+            "Facts: Example Health is exploring a pilot."
+        ),
+    ],
+)
+def test_supplied_outreach_facts_require_substance_and_no_side_effect_boundary(
+    request_text: str,
+) -> None:
+    result = route_request(request_text)
+
+    assert result.route == "outreach_composer"
+    assert result.refused is True
+    assert result.approved_context_present is False
+    assert result.send_enabled is False
+
+
+def test_supplied_outreach_facts_do_not_authorize_an_affirmative_send() -> None:
+    result = route_request(
+        "Outreach Composer, using only these supplied facts, draft and send an email. "
+        "Facts: Example Health is exploring a fall pilot."
+    )
+
+    assert result.send_enabled is False
+    assert result.approved_context_present is False
+    assert result.route == "outreach_composer"
+    assert result.refused is True
+
+
 def test_orchestrator_can_attach_optional_operator_feedback_request() -> None:
     profile = CompanyProfile(
         name="NeuroFlow",

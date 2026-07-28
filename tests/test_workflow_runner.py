@@ -50,6 +50,7 @@ from keystone_agents.schemas.opportunity import (
     OpportunityScoutResult,
     OpportunitySource,
 )
+from keystone_agents.schemas.request_coverage import RequestCoverage
 from keystone_agents.schemas.research import (
     ResearchArticleSummary,
     ResearchBrief,
@@ -13409,6 +13410,217 @@ def test_advance_work_item_outreach_accepts_flexible_inline_context_labels(
     assert "Source basis:" not in email_section
     assert "Safety:" not in email_section
     assert store.count("outreach_drafts") == 1
+
+
+def test_advance_work_item_outreach_accepts_supplied_fact_block(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "Outreach Composer, using only these supplied facts, draft a concise "
+                "internal-ready outreach email under 100 words. Facts: Northstar "
+                "Behavioral Health operates two outpatient clinics; it is exploring a "
+                "fall pilot for multimodal symptom monitoring; it wants to discuss "
+                "validation evidence, implementation effort, and timeline. Invite a "
+                "20-minute call. Do not access Gmail, create a provider draft, send, "
+                "post, search, or modify anything."
+            ),
+            database_url=database_url,
+            save=True,
+        )
+    )
+
+    assert result.advanced is True
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.status == WorkItemStatus.NEEDS_APPROVAL
+    assert result.blockers == []
+    profile_refs = [
+        ref for ref in result.work_item.artifact_refs if ref.artifact_type == "company_profile"
+    ]
+    assert profile_refs
+    assert profile_refs[0].title == "Northstar Behavioral Health"
+    assert profile_refs[0].metadata["inline_natural_language_context"] is True
+    assert store.count("outreach_drafts") == 1
+    profile = store.load_company_profile(int(profile_refs[0].artifact_id))
+    supported_facts = " ".join(
+        claim
+        for source in profile.sources
+        for claim in source.supported_claims
+    )
+    assert "two outpatient clinics" in supported_facts
+    assert "multimodal symptom monitoring" in supported_facts
+    assert "validation evidence, implementation effort, and timeline" in supported_facts
+    assert "Invite a 20-minute call" not in supported_facts
+    draft_payload = json.loads(store.fetch_all("outreach_drafts")[0]["draft_json"])
+    assert draft_payload["send_enabled"] is False
+    assert draft_payload["sent"] is False
+    assert draft_payload["can_send_email"] is False
+    draft_ref = next(
+        ref for ref in result.artifact_refs if ref.artifact_type == "outreach_draft"
+    )
+    assert draft_ref.metadata["gmail_draft_created"] is False
+    assert draft_ref.metadata["external_write_performed"] is False
+    assert "What should this outreach focus on?" not in result.human_summary
+
+
+@pytest.mark.parametrize(
+    ("facts", "expected"),
+    [
+        (
+            [
+                "eClinicalWorks operates a behavioral-health product team.",
+                "It is exploring an external validation review.",
+            ],
+            "eClinicalWorks",
+        ),
+        (
+            ["Northstar Behavioral Health, based in Philadelphia, operates two clinics."],
+            "Northstar Behavioral Health",
+        ),
+        (
+            [
+                "Jordan Lee wants to discuss a pilot.",
+                "Northstar Behavioral Health operates two clinics.",
+            ],
+            "",
+        ),
+        (
+            [
+                "Northstar Behavioral Health operates two clinics.",
+                "Example Health runs a separate hospital program.",
+            ],
+            "",
+        ),
+    ],
+)
+def test_inline_outreach_company_resolution_fails_closed_on_ambiguous_subjects(
+    facts: list[str],
+    expected: str,
+) -> None:
+    assert workflow_runner._company_from_inline_outreach_facts(facts) == expected
+
+
+def test_live_supplied_fact_outreach_contract_detects_word_limit_and_cta() -> None:
+    request_text = (
+        "Outreach Composer, using only these supplied facts, draft a concise "
+        "internal-ready outreach email under 100 words. Facts: Northstar "
+        "Behavioral Health operates two outpatient clinics. Invite a 20-minute "
+        "call. Do not access Gmail, create a provider draft, send, post, search, "
+        "or modify anything."
+    )
+    request = WorkflowRunRequest(
+        request_text=request_text,
+        live_sdk=True,
+        manual_request_plan=infer_manual_request_plan(
+            request_text,
+            requested_agent="outreach_composer",
+        ).model_dump(mode="json"),
+    )
+    draft = workflow_runner.OutreachDraft(
+        email_body=" ".join(["word"] * 110),
+        request_coverage=RequestCoverage(status="complete"),
+    )
+
+    mismatches = workflow_runner._outreach_draft_contract_mismatches(
+        draft,
+        request=request,
+    )
+
+    assert any("word count" in item for item in mismatches)
+    assert any("20-minute call CTA" in item for item in mismatches)
+
+
+def test_live_supplied_fact_outreach_contract_accepts_detailed_bounded_draft() -> None:
+    request_text = (
+        "Outreach Composer, using only these supplied facts, draft a concise "
+        "internal-ready outreach email under 100 words. Facts: Northstar "
+        "Behavioral Health operates two outpatient clinics; it is exploring a "
+        "fall pilot for multimodal symptom monitoring; it wants to discuss "
+        "validation evidence, implementation effort, and timeline. Invite a "
+        "20-minute call. Do not access Gmail, create a provider draft, send, post, "
+        "search, or modify anything."
+    )
+    request = WorkflowRunRequest(
+        request_text=request_text,
+        live_sdk=True,
+        manual_request_plan=infer_manual_request_plan(
+            request_text,
+            requested_agent="outreach_composer",
+        ).model_dump(mode="json"),
+    )
+    draft = workflow_runner.OutreachDraft(
+        email_body=(
+            "Hello, Northstar Behavioral Health's two outpatient clinics and fall "
+            "multimodal symptom-monitoring pilot sound well aligned with a focused "
+            "readiness discussion. We can discuss validation evidence, implementation "
+            "effort, and timeline. Would a 20-minute call next week be useful?"
+        ),
+        request_coverage=RequestCoverage(
+            status="complete",
+            output_form_status="satisfied",
+            stop_condition_status="satisfied",
+        ),
+    )
+
+    assert (
+        workflow_runner._outreach_draft_contract_mismatches(
+            draft,
+            request=request,
+        )
+        == []
+    )
+
+
+def test_live_supplied_fact_outreach_contract_detects_missing_material_detail() -> None:
+    request_text = (
+        "Outreach Composer, using only these supplied facts, draft an email under "
+        "100 words. Facts: Northstar Behavioral Health operates two outpatient "
+        "clinics; it is exploring a fall pilot for multimodal symptom monitoring; "
+        "it wants to discuss validation evidence, implementation effort, and "
+        "timeline. Invite a 20-minute call. Do not send or modify anything."
+    )
+    request = WorkflowRunRequest(request_text=request_text, live_sdk=True)
+    draft = workflow_runner.OutreachDraft(
+        email_body=(
+            "Hello Northstar Behavioral Health, I understand you operate two outpatient "
+            "clinics. Would a 20-minute call be useful?"
+        ),
+        request_coverage=RequestCoverage(status="complete"),
+    )
+
+    mismatches = workflow_runner._outreach_draft_contract_mismatches(
+        draft,
+        request=request,
+    )
+
+    assert any("fall pilot for multimodal symptom monitoring" in item for item in mismatches)
+    assert any("validation evidence, implementation effort" in item for item in mismatches)
+
+
+def test_live_supplied_fact_outreach_contract_surfaces_unmet_dimensions() -> None:
+    request_text = (
+        "Using only these supplied facts, draft an outreach email. Facts: "
+        "Northstar Behavioral Health operates two clinics. Do not send or modify anything."
+    )
+    request = WorkflowRunRequest(request_text=request_text, live_sdk=True)
+    draft = workflow_runner.OutreachDraft(
+        email_body="Hello, I would welcome a conversation about the two clinics.",
+        request_coverage=RequestCoverage(
+            status="partial",
+            unmet_dimensions=["Implementation timeline was not addressed."],
+        ),
+    )
+
+    mismatches = workflow_runner._outreach_draft_contract_mismatches(
+        draft,
+        request=request,
+    )
+
+    assert any("Implementation timeline was not addressed" in item for item in mismatches)
 
 
 def test_manager_loop_ignores_negated_crm_record_creation() -> None:

@@ -1669,7 +1669,12 @@ def build_outreach_composer_compact_synthesis_agent(
                 "source_ids_used only "
                 "from the approved source IDs in the prompt. Do not include send, approval, "
                 "context, facts_used, or other workflow fields; Python will validate and "
-                "wrap the compact payload into the full OutreachDraft schema."
+                "wrap the compact payload into the full OutreachDraft schema. Treat the raw "
+                "operator request as the deliverable contract: honor any stricter requested "
+                "word limit, retain each supplied fact that is material to the requested "
+                "message, include the requested call to action, and record any unmet request "
+                "dimension in request_coverage. Do not replace concrete approved details with "
+                "a generic compare-notes summary."
             ),
             (
                 "Inbound thread-state priority: the supplied chronological conversation state "
