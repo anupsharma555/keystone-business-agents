@@ -341,6 +341,25 @@ def test_direct_response_prompt_keeps_current_request_authoritative() -> None:
     assert "Oakline supplies no baseline or sample." in prompt
 
 
+def test_direct_response_contract_excludes_anchor_from_comparators() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "Keep Anchor Health as the anchor. Return only direct competitors "
+            "supported by the selected context."
+        ),
+        requested_agent="business_research_analyst",
+    )
+    agent = build_direct_supplied_response_agent(
+        "business_research_analyst",
+        request_text="Keep Anchor Health as the anchor and return only direct competitors.",
+        manual_request_plan=plan,
+    )
+
+    instructions = str(agent.instructions)
+    assert "never return that entity as its own competitor or comparator" in instructions
+    assert "If the supplied evidence supports no non-anchor match" in instructions
+
+
 def test_direct_response_executor_includes_context_in_model_input(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

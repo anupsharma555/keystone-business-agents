@@ -205,6 +205,8 @@ def test_company_research_focused_brief_payload_exposes_clean_slack_summary() ->
 
 def test_company_research_focused_brief_preserves_structured_answer_in_slack() -> None:
     import scripts.run_company_research as run_company_research
+    from keystone_agents.presentation.public_result import attach_execution_public_result
+    from keystone_agents.slack_action_contract import business_agent_result_display_text
 
     payload = {
         "output_type": "CompanyResearchFocusedBrief",
@@ -244,6 +246,13 @@ def test_company_research_focused_brief_preserves_structured_answer_in_slack() -
     assert "Key signal:" not in answer
     assert "*Detailed Summary:*" in summary
     assert "*Useful references:*" in summary
+
+    run_company_research._attach_company_research_display_text(payload, summary)
+    attach_execution_public_result(payload)
+    for field in ("human_summary", "slack_display_text", "display_text", "summary"):
+        assert payload[field] == summary
+    assert payload["public_result"]["text"] == summary
+    assert business_agent_result_display_text(payload) == summary
 
 
 def test_company_research_focused_brief_honors_requested_summary_word_limit() -> None:
