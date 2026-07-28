@@ -3489,8 +3489,14 @@ def _direct_specialist_runtime_profile(
             )
         )
     )
+    compact_item_limit = (
+        5
+        if route == "business_research_analyst"
+        and plan.ask_shape.output_form == "bullets"
+        else 3
+    )
     compact = bool(
-        plan.desired_count <= 3
+        plan.desired_count <= compact_item_limit
         and plan.ask_shape.ask_breadth != "broad"
         and not deep_request
         and not multi_operation

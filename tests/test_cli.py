@@ -5376,6 +5376,40 @@ def test_direct_company_research_compact_source_contract_skips_search_planner() 
     assert cli._direct_company_research_quick_retrieval(plan) is True
 
 
+def test_bounded_five_bullet_company_comparison_uses_compact_runtime_profile() -> None:
+    request_text = (
+        "Business Research Analyst, compare Callyope and Kintsugi. "
+        "Give me 5 concise but substantive bullets and include official source URLs."
+    )
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="business_research_analyst",
+    )
+
+    profile = cli._direct_specialist_runtime_profile(
+        "business_research_analyst",
+        input_text=request_text,
+        manual_plan=plan,
+    )
+    estimate = cli._estimate_ask_openai_requests(
+        SimpleNamespace(
+            agent="business_research_analyst",
+            context_file="",
+            live_search=True,
+            max_manager_steps=3,
+        ),
+        input_text=request_text,
+        live_sdk=True,
+        live_manual_plan=True,
+        requested_route="business_research_analyst",
+        manual_plan=plan,
+        effective_live_search=True,
+    )
+
+    assert profile["compact_instructions"] is True
+    assert estimate["max"] == 4
+
+
 def test_company_research_compact_official_lane_reads_two_pages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
