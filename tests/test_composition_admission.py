@@ -139,4 +139,3 @@ def test_provider_or_stateful_plan_never_uses_composition_admission(
 
     assert admission.composition_allowed is False
     assert admission.reason == "plan_not_provider_free_composition"
-

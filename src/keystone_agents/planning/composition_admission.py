@@ -98,4 +98,3 @@ def resolve_provider_free_composition_admission(
         same_thread_verified=saw_same_thread,
         reason=reason,
     )
-

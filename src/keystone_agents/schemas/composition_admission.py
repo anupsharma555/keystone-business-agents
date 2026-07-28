@@ -28,4 +28,3 @@ class ProviderFreeCompositionAdmission(BaseModel):
     source_run_id: str = ""
     context_kind: str = ""
     reason: CompositionAdmissionReason = "plan_not_provider_free_composition"
-
