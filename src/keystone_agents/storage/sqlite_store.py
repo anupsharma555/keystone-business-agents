@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 from keystone_agents.config import default_database_url
 from keystone_agents.costing import compare_estimated_to_actual_cost
+from keystone_agents.execution_telemetry import compact_execution_telemetry
 from keystone_agents.schemas.announcement_feed import (
     AnnouncementFeedEvidence,
     AnnouncementFeedItem,
@@ -1899,9 +1900,7 @@ class SQLiteStore:
                     reviewable_statuses,
                 ).fetchone()[0]
             )
-        status_counts = {
-            str(row["status"]): int(row["row_count"]) for row in status_rows
-        }
+        status_counts = {str(row["status"]): int(row["row_count"]) for row in status_rows}
         archived_count = sum(
             int(row["row_count"]) for row in archived_rows if bool(row["archived"])
         )
@@ -2235,7 +2234,9 @@ class SQLiteStore:
                 (canonical_key,),
             ).fetchone()
             first_seen = (
-                str(existing["first_seen_at_utc"] or now["utc"]) if existing is not None else now["utc"]
+                str(existing["first_seen_at_utc"] or now["utc"])
+                if existing is not None
+                else now["utc"]
             )
             seen_count = int(existing["seen_count"] or 0) + 1 if existing is not None else 1
             stored = record.model_copy(
@@ -2333,7 +2334,9 @@ class SQLiteStore:
                     first_seen,
                     now["utc"],
                     seen_count,
-                    first_seen if existing is None else str(existing["first_seen_at_utc"] or now["utc"]),
+                    first_seen
+                    if existing is None
+                    else str(existing["first_seen_at_utc"] or now["utc"]),
                     now["et"],
                     now["date_et"],
                     now["utc"],
@@ -2512,8 +2515,7 @@ class SQLiteStore:
     ) -> AnnouncementFeedItem:
         payload = _json_dict(row.get("item_json"))
         evidence_rows = connection.execute(
-            "SELECT evidence_json FROM announcement_feed_evidence "
-            "WHERE item_key = ? ORDER BY id",
+            "SELECT evidence_json FROM announcement_feed_evidence WHERE item_key = ? ORDER BY id",
             (row["canonical_key"],),
         ).fetchall()
         payload.update(
@@ -2925,6 +2927,38 @@ class SQLiteStore:
                 ),
             )
             return int(cursor.lastrowid)
+
+    def annotate_agent_run_execution_telemetry(
+        self,
+        run_id: str | int,
+        *,
+        telemetry: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Attach one compact, content-free entry timing projection."""
+
+        row_id = int(run_id)
+        compact = compact_execution_telemetry(telemetry)
+        if not compact:
+            raise ValueError("Execution telemetry must match the compact telemetry contract.")
+        with self.managed_connection() as connection:
+            row = connection.execute(
+                "SELECT output_json FROM agent_runs WHERE id = ?",
+                (row_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"agent_run not found: {run_id}")
+            output = _json_dict(row["output_json"])
+            output["_entry_execution_telemetry"] = compact
+            connection.execute(
+                "UPDATE agent_runs SET output_json = ? WHERE id = ?",
+                (stable_json(output, summarize_email_content=True), row_id),
+            )
+        return {
+            "status": "updated",
+            "table": "agent_runs",
+            "id": row_id,
+            "telemetry_schema": compact.get("schema"),
+        }
 
     def annotate_agent_run_actual_cost(
         self,

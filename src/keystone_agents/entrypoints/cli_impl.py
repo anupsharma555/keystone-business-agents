@@ -15,7 +15,8 @@ import subprocess
 import sys
 import tempfile
 import traceback
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -77,6 +78,10 @@ from keystone_agents.execution_request import (
     latest_slack_operator_request,
     slack_work_item_control_requested,
 )
+from keystone_agents.execution_telemetry import (
+    ExecutionTelemetryRecorder,
+    compact_execution_telemetry,
+)
 from keystone_agents.file_search import local_file_search_config_summary
 from keystone_agents.finance_expense_receipts import (
     finance_expense_receipt_field_hints,
@@ -99,6 +104,10 @@ from keystone_agents.instruction_following import (
     interpreted_output_constraints_text,
     output_constraints_from_plan,
     resolve_instruction_following_response,
+)
+from keystone_agents.live_retrieval import (
+    company_source_matches_official_url,
+    infer_official_company_url,
 )
 from keystone_agents.local_file_inputs import local_file_input_bundle_from_text
 from keystone_agents.model_provider import get_runtime_agent_model_config
@@ -130,6 +139,9 @@ from keystone_agents.planning.compatibility import (
     positive_capability_text,
     request_forbids_live_research,
     resolve_manual_request_owner,
+)
+from keystone_agents.planning.composition_admission import (
+    is_provider_free_selected_context_draft_plan,
 )
 from keystone_agents.presentation.public_result import attach_execution_public_result
 from keystone_agents.presentation.renderers import (
@@ -241,6 +253,44 @@ from keystone_agents.workflows import (
     run_keystone_pipeline,
     run_opportunity_to_outreach_loop,
 )
+
+
+class _CLIEntryTelemetryScope:
+    """Request-local CLI timing state with content-free persistence targets."""
+
+    def __init__(self, *, database_url: str | None) -> None:
+        self.recorder = ExecutionTelemetryRecorder()
+        self.database_url = database_url
+        self.store: SQLiteStore | None = None
+        self.agent_run_id: int | None = None
+        self.work_item_id = ""
+
+
+class _ObservedCLIStream:
+    """Delegate output byte-for-byte while observing its first write."""
+
+    def __init__(self, stream: Any, recorder: ExecutionTelemetryRecorder) -> None:
+        self._stream = stream
+        self._recorder = recorder
+
+    def write(self, value: str) -> int:
+        written = self._stream.write(value)
+        if value:
+            self._recorder.mark_first_feedback()
+        return written
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+_ASK_ENTRY_TELEMETRY: ContextVar[_CLIEntryTelemetryScope | None] = ContextVar(
+    "keystone_cli_ask_entry_telemetry",
+    default=None,
+)
+
 
 CONTEXT_AGENT_ROUTES = {
     "airtable_context_agent",
@@ -1074,6 +1124,7 @@ def _persist_direct_calendar_run(
 
 
 def _print_direct_calendar_payload(payload: dict[str, Any], *, json_output: bool) -> int:
+    _register_entry_agent_run(payload.get("agent_run_id"))
     if json_output:
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
@@ -1104,10 +1155,121 @@ def _route_with_manual_plan_advice(route: str, manual_plan: ManualRequestPlan) -
     return resolved
 
 
+def _run_with_entry_telemetry(
+    args: argparse.Namespace,
+    handler: Callable[[], int],
+) -> int:
+    """Measure one CLI entry without changing its stdout or stderr contract."""
+
+    if _ASK_ENTRY_TELEMETRY.get() is not None:
+        return int(handler())
+    scope = _CLIEntryTelemetryScope(
+        database_url=str(getattr(args, "database_url", "") or "") or None,
+    )
+    token = _ASK_ENTRY_TELEMETRY.set(scope)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    observed_stdout = _ObservedCLIStream(original_stdout, scope.recorder)
+    observed_stderr = _ObservedCLIStream(original_stderr, scope.recorder)
+    telemetry_status = "completed"
+    result: int | None = None
+    failure: BaseException | None = None
+    try:
+        sys.stdout = observed_stdout
+        sys.stderr = observed_stderr
+        try:
+            with scope.recorder.span(
+                "entry.dispatch",
+                attributes={"source": "cli"},
+            ):
+                result = int(handler())
+        except BaseException as exc:
+            telemetry_status = "failed"
+            failure = exc
+        observed_stdout.flush()
+        observed_stderr.flush()
+        if failure is None:
+            scope.recorder.mark_final_response()
+        else:
+            failed_snapshot = scope.recorder.snapshot(status="failed")
+            if failed_snapshot.first_feedback_ms is not None:
+                scope.recorder.mark_final_response()
+        telemetry = compact_execution_telemetry(
+            scope.recorder.snapshot(status=telemetry_status)
+        )
+        _persist_entry_execution_telemetry(scope, telemetry)
+        if failure is not None:
+            raise failure
+        return int(result or 0)
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        _ASK_ENTRY_TELEMETRY.reset(token)
+
+
+def _register_entry_agent_run(run_id: object) -> None:
+    scope = _ASK_ENTRY_TELEMETRY.get()
+    if scope is None:
+        return
+    try:
+        scope.agent_run_id = int(run_id)
+    except (TypeError, ValueError):
+        return
+
+
+def _register_entry_work_item(work_item_id: object) -> None:
+    scope = _ASK_ENTRY_TELEMETRY.get()
+    if scope is not None:
+        scope.work_item_id = str(work_item_id or "").strip()
+
+
+def _register_entry_store(store: SQLiteStore) -> None:
+    scope = _ASK_ENTRY_TELEMETRY.get()
+    if scope is not None:
+        scope.store = store
+
+
+def _persist_entry_execution_telemetry(
+    scope: _CLIEntryTelemetryScope,
+    telemetry: dict[str, Any],
+) -> None:
+    """Persist only the compact timing projection, never rendered content."""
+
+    if not telemetry:
+        return
+    try:
+        store = scope.store or SQLiteStore(
+            scope.database_url or database_url_from_env()
+        )
+        if scope.agent_run_id is not None:
+            store.annotate_agent_run_execution_telemetry(
+                scope.agent_run_id,
+                telemetry=telemetry,
+            )
+        if scope.work_item_id:
+            item = store.get_work_item(scope.work_item_id)
+            if item is not None:
+                record_event(
+                    item,
+                    event_type="entrypoint_execution_telemetry",
+                    summary="Recorded content-free CLI entry timing.",
+                    metadata={"execution_telemetry": telemetry},
+                    store=store,
+                )
+    except Exception:
+        # Performance telemetry is advisory and must not change task execution.
+        return
+
+
 def _run_ask(args: argparse.Namespace) -> int:
-    if args.live_sdk is True:
-        return _run_live_ask_with_environment(args)
-    return _run_ask_with_current_environment(args)
+    return _run_with_entry_telemetry(
+        args,
+        lambda: (
+            _run_live_ask_with_environment(args)
+            if args.live_sdk is True
+            else _run_ask_with_current_environment(args)
+        ),
+    )
 
 
 @with_cli_environment(force_dotenv=True)
@@ -1271,7 +1433,10 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     if slack_continuation:
         direct_workflow_state = _merge_direct_workflow_state(
             direct_workflow_state,
-            _slack_continuation_workflow_state(raw_input),
+            _slack_continuation_workflow_state(
+                raw_input,
+                prior_agent=execution_request.continuation.prior_agent,
+            ),
         )
         direct_workflow_state = _merge_direct_workflow_state(
             direct_workflow_state,
@@ -1450,6 +1615,9 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             requested_route=requested_route or semantic_direct_route,
             manual_plan=manual_plan,
             effective_live_search=live_search,
+            provider_free_composition_allowed=bool(
+                orchestrator_preflight.composition_admission.composition_allowed
+            ),
         )
     if args.max_openai_requests is not None and (
         args.max_openai_requests < 0 or resolved_request_estimate["max"] > args.max_openai_requests
@@ -1842,12 +2010,19 @@ def _latest_slack_operator_request(text: str) -> str:
     return latest_slack_operator_request(text)
 
 
-def _slack_continuation_workflow_state(text: str) -> dict[str, Any]:
+def _slack_continuation_workflow_state(
+    text: str,
+    *,
+    prior_agent: str = "",
+) -> dict[str, Any]:
     """Recover bounded prior-result identity when Slack omits a context file."""
 
     raw = html.unescape(str(text or "").strip())
     if "continue this prior slack thread" not in raw.lower():
         return {}
+    advisory_route = str(prior_agent or "").strip().lower()
+    if advisory_route not in AGENT_REGISTRY:
+        advisory_route = ""
     prior_runs: list[dict[str, str]] = []
     allow_failed_context = slack_work_item_control_requested(_latest_slack_operator_request(raw))
     pattern = re.compile(
@@ -1855,7 +2030,8 @@ def _slack_continuation_workflow_state(text: str) -> dict[str, Any]:
         r"(?=\s+(?:User follow-up:|Previous result title:)|$)",
         flags=re.IGNORECASE | re.DOTALL,
     )
-    for index, match in enumerate(pattern.finditer(raw), start=1):
+    matches = list(pattern.finditer(raw))
+    for index, match in enumerate(matches, start=1):
         result_label = _bounded_redacted_text(match.group(1), max_chars=180)
         summary = _bounded_redacted_text(match.group(2), max_chars=900)
         result_status = _slack_result_status(result_label)
@@ -1866,6 +2042,11 @@ def _slack_continuation_workflow_state(text: str) -> dict[str, Any]:
         ):
             continue
         route = _route_from_slack_result_label(result_label)
+        if not route and result_status == "completed" and index == len(matches):
+            # The Slack renderer intentionally uses generic success headings.
+            # Recover the latest completed result's owner from the adapter's
+            # separate advisory field instead of guessing from result prose.
+            route = advisory_route
         object_title = _object_title_from_slack_result(summary)
         prior_runs.append(
             {
@@ -1874,6 +2055,7 @@ def _slack_continuation_workflow_state(text: str) -> dict[str, Any]:
                     "id": f"slack-envelope-{index}",
                     "route": route,
                     "status": result_status,
+                    "thread_correlation": "same_thread",
                     "title": object_title or result_label,
                     "summary": summary,
                 }.items()
@@ -1890,6 +2072,18 @@ def _slack_result_status(result_label: str) -> str:
     if "running" in normalized:
         return "running"
     if "need input" in normalized or "needs context" in normalized:
+        return "needs_input"
+    if any(
+        marker in normalized
+        for marker in (
+            "awaiting approval",
+            "approval required",
+            "need review",
+            "needs review",
+            "pending approval",
+            "run update",
+        )
+    ):
         return "needs_input"
     if any(marker in normalized for marker in ("failed", "blocked", "completion not confirmed")):
         return "blocked"
@@ -2599,6 +2793,7 @@ def _estimate_ask_openai_requests(
     requested_route: str | None = None,
     manual_plan: ManualRequestPlan | None = None,
     effective_live_search: bool | None = None,
+    provider_free_composition_allowed: bool = False,
 ) -> dict[str, Any]:
     if not live_sdk and not live_manual_plan:
         return {"min": 0, "max": 0, "stages": []}
@@ -2626,6 +2821,7 @@ def _estimate_ask_openai_requests(
         _manual_plan_is_bounded_provider_free_response(
             manual_plan,
             route=direct_supplied_route,
+            provider_free_composition_allowed=provider_free_composition_allowed,
         )
         or (
             manual_plan is None
@@ -3065,6 +3261,7 @@ def _manual_plan_is_bounded_provider_free_response(
     manual_plan: ManualRequestPlan | None,
     *,
     route: str,
+    provider_free_composition_allowed: bool = False,
 ) -> bool:
     """Classify post-plan direct answers without inspecting request wording."""
 
@@ -3094,6 +3291,10 @@ def _manual_plan_is_bounded_provider_free_response(
         and (
             not manual_plan.requires_approved_context
             or is_internal_slack_composition_plan(manual_plan)
+            or (
+                provider_free_composition_allowed
+                and is_provider_free_selected_context_draft_plan(manual_plan)
+            )
         )
         and (
             (manual_plan.provider_system == "unspecified" and not manual_plan.provider_operations)
@@ -3115,6 +3316,7 @@ def _should_run_direct_supplied_response(
     *,
     requested_route: str,
     manual_plan: ManualRequestPlan | None,
+    provider_free_composition_allowed: bool = False,
 ) -> bool:
     """Let a live semantic plan decide whether tools/providers are unnecessary."""
 
@@ -3123,6 +3325,7 @@ def _should_run_direct_supplied_response(
         return _manual_plan_is_bounded_provider_free_response(
             manual_plan,
             route=requested_route,
+            provider_free_composition_allowed=provider_free_composition_allowed,
         )
     if authority.invalid:
         return False
@@ -3190,15 +3393,15 @@ def _direct_specialist_request_estimate(
         ):
             # The ordered provider read is acquired before the specialist call.
             return 1
+        if _is_bounded_composite_lifecycle_request(
+            route,
+            input_text=input_text,
+            manual_plan=plan,
+        ):
+            # One guarded provider helper owns the complete marked lifecycle;
+            # reserve one model turn for the call and one for synthesis.
+            return 2
         if plan.intent == "business_system_write":
-            if _is_bounded_composite_lifecycle_request(
-                route,
-                input_text=input_text,
-                manual_plan=plan,
-            ):
-                # One guarded provider helper owns the complete marked lifecycle;
-                # reserve one model turn for the call and one for synthesis.
-                return 2
             if (
                 route == "airtable_context_agent"
                 and resolve_finance_expense_receipt_target(
@@ -3212,6 +3415,12 @@ def _direct_specialist_request_estimate(
                 # call. Reserve one model turn for the call and one for synthesis.
                 return 2
             # Allow a separate target/schema read, mutation, and final synthesis.
+            return 3
+        if route == "google_workspace_context_agent":
+            # A bounded provider-backed read may need one model turn to resolve
+            # an exact target, one to read it, and one to synthesize the answer.
+            # This is a ceiling rather than a required number of calls, so exact
+            # reads that finish earlier keep their fast path.
             return 3
         # One model request may select a bounded read tool; the second synthesizes
         # its result. Provider calls do not count as OpenAI requests.
@@ -3235,16 +3444,16 @@ def _direct_specialist_runtime_profile(
     authority = ExecutionIntentAuthority.from_value(manual_plan)
     semantic_authority = authority.canonical
     plan = manual_plan or infer_manual_request_plan(input_text, requested_agent=route)
+    deterministic_current_turn_plan = infer_manual_request_plan(
+        input_text,
+        requested_agent=route,
+    )
     normalized = " ".join(str(input_text or "").lower().split())
-    deep_request = bool(
-        plan.ask_shape.evidence_depth == "deep"
-        or (
-            not semantic_authority
-            and re.search(
-                r"\b(?:deep|comprehensive|exhaustive|multi-stage|full landscape|"
-                r"all available sources|systematic review)\b",
-                normalized,
-            )
+    explicit_deep_wording = bool(
+        re.search(
+            r"\b(?:deep|comprehensive|exhaustive|multi-stage|full landscape|"
+            r"all available sources|systematic review)\b",
+            normalized,
         )
     )
     bounded_composite_lifecycle = _is_bounded_composite_lifecycle_request(
@@ -3280,9 +3489,36 @@ def _direct_specialist_runtime_profile(
             )
         )
     )
+    compact_item_limit = (
+        5
+        if route == "business_research_analyst"
+        and plan.ask_shape.output_form == "bullets"
+        else 3
+    )
+    explicitly_bounded_research_selection = bool(
+        route in {"business_research_analyst", "opportunity_scout"}
+        and (
+            plan.desired_count_explicit
+            and 0 < plan.desired_count <= compact_item_limit
+            or deterministic_current_turn_plan.desired_count_explicit
+            and 0
+            < deterministic_current_turn_plan.desired_count
+            <= compact_item_limit
+        )
+    )
+    deep_request = bool(
+        explicit_deep_wording
+        or (
+            plan.ask_shape.evidence_depth == "deep"
+            and not explicitly_bounded_research_selection
+        )
+    )
     compact = bool(
-        plan.desired_count <= 3
-        and plan.ask_shape.ask_breadth != "broad"
+        plan.desired_count <= compact_item_limit
+        and (
+            plan.ask_shape.ask_breadth != "broad"
+            or explicitly_bounded_research_selection
+        )
         and not deep_request
         and not multi_operation
     )
@@ -4085,9 +4321,14 @@ def _slack_prior_runs_for_planner(
         if not isinstance(run, dict):
             continue
         status = str(run.get("status") or "completed").strip().lower()
-        if status not in {"completed", "done", "recovered"} and not allow_failed_context:
+        completed = status in {"completed", "done", "recovered", "success"}
+        if not completed and not allow_failed_context:
             continue
-        admitted.append(dict(run))
+        compact = dict(run)
+        if completed:
+            compact["status"] = "completed"
+        compact["thread_correlation"] = "same_thread"
+        admitted.append(compact)
     return admitted
 
 
@@ -4285,7 +4526,15 @@ def _direct_specialist_execution_context(
                 key: value
                 for key, value in {
                     key: _bounded_redacted_text(item.get(key), max_chars=480)
-                    for key in ("id", "route", "status", "object_id", "title", "summary")
+                    for key in (
+                        "id",
+                        "route",
+                        "status",
+                        "thread_correlation",
+                        "object_id",
+                        "title",
+                        "summary",
+                    )
                 }.items()
                 if value
             }
@@ -7036,6 +7285,10 @@ def _run_ask_specialist_live(
         input_text,
         requested_route=route,
         manual_plan=manual_plan,
+        provider_free_composition_allowed=bool(
+            orchestrator_preflight
+            and orchestrator_preflight.composition_admission.composition_allowed
+        ),
     ):
         return _run_direct_supplied_context_response_live(
             route,
@@ -9465,14 +9718,146 @@ def _direct_company_research_quick_retrieval(
     if manual_plan is None:
         return False
     ask_shape = manual_plan.ask_shape
+    if ask_shape.evidence_depth == "deep":
+        return False
     if ask_shape.evidence_depth == "quick" or ask_shape.cost_mode == "minimize":
         return True
     constraints = output_constraints_from_plan(manual_plan)
     if constraints.word_count is not None:
         return constraints.word_count <= 100
+    compact_source_contract = (
+        constraints.source_url_count is not None
+        and constraints.source_url_count <= 3
+        and (
+            str(ask_shape.output_form or "") in {"brief", "bullets"}
+            or constraints.maximum_items is not None
+            and constraints.maximum_items <= 4
+        )
+    )
+    if compact_source_contract:
+        return True
     stop_condition = str(ask_shape.stop_condition or "")
     match = re.search(r"\bstop_after_([1-9]\d{0,3})_word_summary\b", stop_condition)
     return bool(match and int(match.group(1)) <= 100)
+
+
+def _official_source_response_violations(
+    script_payload: dict[str, Any],
+    manual_plan: ManualRequestPlan | None,
+    response_text: str,
+) -> list[str]:
+    """Verify repaired visible URLs against the child's official-domain evidence."""
+
+    if manual_plan is None or "official" not in manual_plan.ask_shape.source_type_preference:
+        return []
+    visible_urls = re.findall(r"https?://[^\s)>]+", str(response_text or ""), flags=re.I)
+    if not visible_urls:
+        return []
+    verified_entries = [
+        item
+        for item in script_payload.get("verified_source_evidence") or []
+        if isinstance(item, dict)
+    ]
+    verified_source_urls = {
+        canonical
+        for entry in verified_entries
+        for source in entry.get("sources") or []
+        if isinstance(source, dict)
+        if (canonical := _canonical_verified_source_url(source.get("url")))
+    }
+    if verified_source_urls and any(
+        _canonical_verified_source_url(url) not in verified_source_urls
+        for url in visible_urls
+    ):
+        return ["visible source URL was not present in deterministic retrieved evidence"]
+    retrieval = script_payload.get("retrieval")
+    official_urls: list[str] = []
+    if isinstance(retrieval, dict):
+        retrieval_lanes = [retrieval]
+        retrieval_lanes.extend(
+            lane
+            for key in ("primary", "comparison")
+            if isinstance((lane := retrieval.get(key)), dict)
+        )
+        official_urls.extend(
+            resolved
+            for lane in retrieval_lanes
+            if (resolved := str(lane.get("resolved_company_url") or "").strip())
+        )
+    output = script_payload.get("output")
+    comparison_entities = [
+        str(item).strip()
+        for item in script_payload.get("comparison_entities") or []
+        if str(item).strip()
+    ]
+    if not official_urls and isinstance(output, dict):
+        source_results = (
+            output.get("sources") if isinstance(output.get("sources"), list) else []
+        )
+        entities = comparison_entities or [str(output.get("company_name") or "").strip()]
+        official_urls.extend(
+            inferred
+            for entity in entities
+            if (
+                inferred := infer_official_company_url(
+                    company=entity,
+                    search_results=source_results,
+                )
+            )
+        )
+    official_urls = list(dict.fromkeys(official_urls))
+    if not official_urls:
+        return ["official company source domain could not be verified"]
+    if any(
+        not any(
+            company_source_matches_official_url(url, official_url)
+            for official_url in official_urls
+        )
+        for url in visible_urls
+    ):
+        return ["visible source URL is outside the verified official company domain"]
+    if len(verified_entries) == 2 and any(
+        not any(
+            _canonical_verified_source_url(url)
+            in {
+                canonical
+                for source in entry.get("official_sources") or []
+                if isinstance(source, dict)
+                if (canonical := _canonical_verified_source_url(source.get("url")))
+            }
+            for url in visible_urls
+        )
+        for entry in verified_entries
+    ):
+        return ["visible sources do not include an official URL for each company"]
+    if len(comparison_entities) == 2 and len(official_urls) == 2 and any(
+        not any(
+            company_source_matches_official_url(url, official_url)
+            for url in visible_urls
+        )
+        for official_url in official_urls
+    ):
+        return ["visible sources do not include an official URL for each company"]
+    return []
+
+
+def _canonical_verified_source_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+        _ = parsed.port
+    except (TypeError, ValueError):
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return ""
+    host = parsed.hostname.lower().removeprefix("www.")
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    path = parsed.path.rstrip("/") or "/"
+    return f"{parsed.scheme.lower()}://{host}{port}{path}" + (
+        f"?{parsed.query}" if parsed.query else ""
+    )
 
 
 def _manual_plan_url_target(manual_plan: ManualRequestPlan | None) -> str:
@@ -11162,15 +11547,42 @@ def _run_ask_script_live(
             ),
             live=True,
         )
+        final_validation = instruction_resolution.validation
+        provenance_violations = _official_source_response_violations(
+            script_payload,
+            manual_plan,
+            instruction_resolution.response_text,
+        )
+        if provenance_violations:
+            final_validation = final_validation.model_copy(
+                update={
+                    "passed": False,
+                    "violations": list(
+                        dict.fromkeys(
+                            [
+                                *final_validation.violations,
+                                *provenance_violations,
+                            ]
+                        )
+                    ),
+                }
+            )
         human_summary = (
             instruction_resolution.response_text
-            if instruction_resolution.validation.passed
-            else instruction_following_blocker_text(instruction_resolution.validation)
+            if final_validation.passed
+            else instruction_following_blocker_text(final_validation)
         )
-        payload["instruction_following"] = instruction_resolution.metadata()
+        instruction_metadata = instruction_resolution.metadata()
+        instruction_metadata["validation"] = final_validation.model_dump(
+            mode="json",
+            exclude={"checked_text", "source_url_count"}
+            if final_validation.source_url_count is None
+            else {"checked_text"},
+        )
+        payload["instruction_following"] = instruction_metadata
         if (
-            instruction_resolution.validation.applicable
-            and not instruction_resolution.validation.passed
+            final_validation.applicable
+            and not final_validation.passed
         ):
             payload["status"] = "blocked"
             payload["block_kind"] = "instruction_following_constraint_failed"
@@ -11423,6 +11835,7 @@ def _print_ask_clarification(
 
 
 def _print_ask_live_payload(payload: dict[str, object], *, json_output: bool) -> int:
+    _register_entry_agent_run(payload.get("agent_run_id"))
     attach_execution_public_result(payload)
     if json_output:
         print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
@@ -11783,7 +12196,17 @@ def _run_automations_audit(args: argparse.Namespace) -> int:
 
 
 def _run_work_items_advance(args: argparse.Namespace) -> int:
+    return _run_with_entry_telemetry(
+        args,
+        lambda: _run_work_items_advance_with_current_environment(args),
+    )
+
+
+def _run_work_items_advance_with_current_environment(
+    args: argparse.Namespace,
+) -> int:
     store = SQLiteStore(args.database_url or database_url_from_env())
+    _register_entry_store(store)
     input_text = _read_input(args.input)
     work_item_id = _resolve_continue_work_item_id(
         store,
@@ -12142,6 +12565,7 @@ def _print_work_item_result(
 ) -> int:
     result = _shape_work_item_result_for_requested_output(result)
     result, user_facing_result_verified = _ensure_work_item_user_facing_summary(result)
+    _register_entry_work_item(getattr(result.work_item, "id", ""))
     if json_output:
         payload = result.model_dump(mode="json")
         result_status = str(getattr(result.status, "value", result.status))

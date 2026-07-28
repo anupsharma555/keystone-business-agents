@@ -5,12 +5,15 @@ from typing import Any
 from keystone_agents.agents.business_research_analyst import research_company_fixture
 from keystone_agents.multi_target_research import (
     MultiTargetResearchPlan,
+    build_multi_target_research_plan,
     candidate_targets_from_search_results,
     discover_candidate_targets,
     rank_candidate_targets,
+    render_multi_target_research_summary,
     run_multi_target_research,
     should_run_multi_target_research,
 )
+from keystone_agents.quality_budget import AgentQualityBudget, QualityMode
 from keystone_agents.schemas.company_profile import SourceRecord
 from keystone_agents.tools.search_provider import SearchResult
 
@@ -50,8 +53,7 @@ def _source(source_id: str, title: str, url: str, claim: str) -> SourceRecord:
 def test_category_comparison_triggers_multi_target_branch() -> None:
     assert should_run_multi_target_research(
         request_text=(
-            "Compare how three public AI companion products describe teen safety "
-            "and escalation."
+            "Compare how three public AI companion products describe teen safety and escalation."
         ),
         manual_plan={
             "desired_count": 3,
@@ -113,6 +115,276 @@ def test_canonical_multi_target_plan_does_not_need_trigger_words_downstream() ->
     )
 
 
+def test_plan_preserves_explicit_company_as_comparison_anchor() -> None:
+    plan = build_multi_target_research_plan(
+        request_text="Compare Northstar with two competing workflow platforms.",
+        manual_plan={
+            "source": "llm",
+            "target_agent": "business_research_analyst",
+            "intent": "company_research",
+            "primary_target": "Northstar",
+            "target_type": "company",
+            "desired_count": 2,
+            "desired_count_explicit": True,
+            "required_entities": ["Northstar"],
+            "required_terms": ["audit trail"],
+        },
+        target="Northstar",
+        cost_profile="standard",
+    )
+
+    assert plan.anchor_target == "Northstar"
+    assert plan.desired_count == 2
+
+
+def test_plan_does_not_invent_anchor_for_multiple_named_entities() -> None:
+    plan = build_multi_target_research_plan(
+        request_text="Compare Northstar, Beacon, and Harbor.",
+        manual_plan={
+            "source": "llm",
+            "target_agent": "business_research_analyst",
+            "intent": "company_research",
+            "primary_target": "Northstar",
+            "target_type": "company",
+            "desired_count": 3,
+            "desired_count_explicit": True,
+            "required_entities": ["Northstar", "Beacon", "Harbor"],
+        },
+        target="Northstar",
+        cost_profile="standard",
+    )
+
+    assert plan.anchor_target == ""
+    assert plan.desired_count == 3
+
+
+def test_anchor_is_researched_first_excluded_from_candidates_and_rendered() -> None:
+    plan = MultiTargetResearchPlan(
+        topic="workflow platforms",
+        anchor_target="Northstar",
+        desired_count=2,
+        requested_dimensions=["audit trail"],
+        request_text="Compare Northstar with two competing workflow platforms.",
+    )
+    results_by_marker = {
+        "competitors alternatives": [
+            SearchResult(
+                title="Northstar audit trail",
+                link="https://northstar.example/audit",
+                snippet="Northstar describes its audit trail.",
+                source="searxng",
+            ),
+            SearchResult(
+                title="Beacon audit trail",
+                link="https://beacon.example/audit",
+                snippet="Beacon describes its audit trail.",
+                source="searxng",
+            ),
+            SearchResult(
+                title="Harbor audit trail",
+                link="https://harbor.example/audit",
+                snippet="Harbor describes its audit trail.",
+                source="searxng",
+            ),
+        ]
+    }
+    retrieval_order: list[str] = []
+    events: list[str] = []
+
+    class OrderedSearchProvider(_FakeSearchProvider):
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            events.append("candidate_search")
+            return super().search_web(query, num_results)
+
+    def ordered_provider_builder(**_kwargs: Any) -> OrderedSearchProvider:
+        return OrderedSearchProvider(results_by_marker)
+
+    def retrieve_profile(**kwargs: Any):
+        company = str(kwargs["company"])
+        retrieval_order.append(company)
+        events.append(f"profile:{company}")
+        domain = company.lower().replace(" ", "")
+        profile = research_company_fixture(company_name=company).model_copy(
+            update={
+                "sources": [
+                    _source(
+                        f"{domain}:audit",
+                        f"{company} audit trail",
+                        f"https://{domain}.example/audit",
+                        f"{company} describes its audit trail.",
+                    )
+                ]
+            }
+        )
+        return profile, {"retrieval_diagnostics": {"provider_summary": "fake"}}
+
+    result = run_multi_target_research(
+        plan,
+        live_search=True,
+        search_provider_builder=ordered_provider_builder,
+        retrieve_profile=retrieve_profile,
+    )
+    rendered = render_multi_target_research_summary(result)
+    from keystone_agents.workflow_runner import _multi_target_work_item_sources
+
+    work_item_sources = _multi_target_work_item_sources(result)
+
+    assert retrieval_order[0] == "Northstar"
+    assert events[0] == "profile:Northstar"
+    assert events.index("candidate_search") < events.index("profile:Beacon")
+    assert events.index("candidate_search") < events.index("profile:Harbor")
+    assert {candidate.name for candidate in result.candidate_targets} == {
+        "Beacon",
+        "Harbor",
+    }
+    assert result.selected_targets == ["Beacon", "Harbor"]
+    assert result.anchor_packet is not None
+    assert result.anchor_packet.target_name == "Northstar"
+    assert [packet.target_name for packet in result.packets] == ["Beacon", "Harbor"]
+    assert result.comparison_ready
+    assert result.diagnostics["anchor_source_sufficient"] is True
+    assert result.diagnostics["total_comparison_packet_count"] == 3
+    assert result.anchor_packet.source_refs[0]["source_id"] == "northstar:audit"
+    assert "| anchor | Northstar | sufficient |" in rendered
+    assert {source.url for source in work_item_sources} == {
+        "https://northstar.example/audit",
+        "https://beacon.example/audit",
+        "https://harbor.example/audit",
+    }
+
+
+def test_anchor_source_gap_blocks_otherwise_ready_competitor_comparison() -> None:
+    plan = MultiTargetResearchPlan(
+        topic="workflow platforms",
+        anchor_target="Northstar",
+        desired_count=2,
+        requested_dimensions=["audit trail"],
+        request_text="Compare Northstar with two competing workflow platforms.",
+    )
+    results_by_marker = {
+        "competitors alternatives": [
+            SearchResult(
+                title="Northstar audit trail",
+                link="https://northstar.example/audit",
+                snippet="Northstar describes its audit trail.",
+                source="searxng",
+            ),
+            SearchResult(
+                title="Beacon audit trail",
+                link="https://beacon.example/audit",
+                snippet="Beacon describes its audit trail.",
+                source="searxng",
+            ),
+            SearchResult(
+                title="Harbor audit trail",
+                link="https://harbor.example/audit",
+                snippet="Harbor describes its audit trail.",
+                source="searxng",
+            ),
+        ]
+    }
+
+    def retrieve_profile(**kwargs: Any):
+        company = str(kwargs["company"])
+        sources = []
+        if company != "Northstar":
+            domain = company.lower()
+            sources = [
+                _source(
+                    f"{domain}:audit",
+                    f"{company} audit trail",
+                    f"https://{domain}.example/audit",
+                    f"{company} describes its audit trail.",
+                )
+            ]
+        profile = research_company_fixture(company_name=company).model_copy(
+            update={"sources": sources}
+        )
+        return profile, {"retrieval_diagnostics": {"provider_summary": "fake"}}
+
+    result = run_multi_target_research(
+        plan,
+        live_search=True,
+        search_provider_builder=_provider_builder(results_by_marker),
+        retrieve_profile=retrieve_profile,
+    )
+
+    assert not result.comparison_ready
+    assert result.diagnostics["ready_packet_count"] == 2
+    assert result.diagnostics["anchor_source_sufficient"] is False
+    assert any(blocker.startswith("Northstar:") for blocker in result.blockers)
+
+
+def test_multi_target_uses_retrieval_max_results_quality_budget_field() -> None:
+    plan = MultiTargetResearchPlan(
+        topic="workflow platforms",
+        desired_count=2,
+        requested_dimensions=["audit trail"],
+    )
+    search_limits: list[int] = []
+    profile_limits: list[int] = []
+    search_results = [
+        SearchResult(
+            title="Beacon audit trail",
+            link="https://beacon.example/audit",
+            snippet="Beacon describes its audit trail.",
+            source="searxng",
+        ),
+        SearchResult(
+            title="Harbor audit trail",
+            link="https://harbor.example/audit",
+            snippet="Harbor describes its audit trail.",
+            source="searxng",
+        ),
+    ]
+
+    class RecordingSearchProvider:
+        provider_name = "fake"
+
+        def search_web(self, _query: str, num_results: int = 5) -> list[SearchResult]:
+            search_limits.append(num_results)
+            return search_results[:num_results]
+
+    provider = RecordingSearchProvider()
+
+    def provider_builder(**_kwargs: Any) -> RecordingSearchProvider:
+        return provider
+
+    def retrieve_profile(**kwargs: Any):
+        company = str(kwargs["company"])
+        profile_limits.append(int(kwargs["max_results"]))
+        domain = company.lower()
+        profile = research_company_fixture(company_name=company).model_copy(
+            update={
+                "sources": [
+                    _source(
+                        f"{domain}:audit",
+                        f"{company} audit trail",
+                        f"https://{domain}.example/audit",
+                        f"{company} describes its audit trail.",
+                    )
+                ]
+            }
+        )
+        return profile, {"retrieval_diagnostics": {"provider_summary": "fake"}}
+
+    result = run_multi_target_research(
+        plan,
+        live_search=True,
+        quality_budget=AgentQualityBudget(
+            agent_name="business_research_analyst",
+            mode=QualityMode.FAST,
+            retrieval_max_results=3,
+        ),
+        search_provider_builder=provider_builder,
+        retrieve_profile=retrieve_profile,
+    )
+
+    assert result.comparison_ready
+    assert search_limits and set(search_limits) == {3}
+    assert profile_limits and set(profile_limits) == {3}
+
+
 def test_parallel_discovery_keeps_candidates_from_productive_lane() -> None:
     plan = MultiTargetResearchPlan(
         topic="public AI companion products",
@@ -152,9 +424,7 @@ def test_parallel_discovery_keeps_candidates_from_productive_lane() -> None:
         search_provider_builder=_provider_builder(results_by_marker),
     )
 
-    assert {"Character.AI", "Nomi", "Replika"} <= {
-        candidate.name for candidate in candidates[:5]
-    }
+    assert {"Character.AI", "Nomi", "Replika"} <= {candidate.name for candidate in candidates[:5]}
     assert all(candidate.ranking_score > 0 for candidate in candidates[:3])
 
 
@@ -338,6 +608,7 @@ def test_generic_listicle_seeds_candidate_but_not_sufficient_feature_evidence() 
             ),
         ]
     }
+
     def retrieve_profile(**kwargs: Any):
         company = str(kwargs["company"])
         claim = (
@@ -696,7 +967,7 @@ def test_depth_packet_preserves_selected_candidate_name_when_profile_drifts() ->
                 link="https://replika.com/safety",
                 snippet="Replika describes teen safety protections.",
                 source="searxng",
-            )
+            ),
         ]
     }
 

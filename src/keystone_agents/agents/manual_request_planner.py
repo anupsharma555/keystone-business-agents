@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import sqlite3
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -21,6 +22,13 @@ from keystone_agents.planning.compatibility import (
     normalize_manual_agent,
     reconcile_manual_request_followup,
 )
+from keystone_agents.planning.decision_cache import (
+    PlannerDecisionCache,
+    build_planner_decision_cache_identity,
+    planner_decision_cache_eligibility,
+    planner_decision_cache_enabled,
+    planner_profile_fingerprint,
+)
 from keystone_agents.run import run_typed_sdk_agent
 from keystone_agents.schemas.manual_request_plan import (
     ManualProviderResultSetScope,
@@ -28,6 +36,8 @@ from keystone_agents.schemas.manual_request_plan import (
 )
 from keystone_agents.sdk import Agent, build_sdk_agent, compose_instructions
 
+MANUAL_REQUEST_PLANNER_PROMPTS = ("manual_request_planner.md",)
+MANUAL_REQUEST_PLANNER_MAX_INSTRUCTION_CHARS = 40_000
 _MAX_PLANNER_THREAD_MESSAGES = 8
 _MAX_PLANNER_PRIOR_RUNS = 5
 _MAX_PLANNER_TRANSCRIPT_CHARS = 6000
@@ -82,13 +92,24 @@ class ManualRequestPlannerInput:
 
 
 def build_manual_request_planner_agent(model: str | None = None) -> Agent:
+    instructions = compose_instructions(
+        *MANUAL_REQUEST_PLANNER_PROMPTS,
+        # The planner is tool-free and returns a typed routing plan. Its
+        # dedicated prompt already owns route, authority, safety, provider,
+        # follow-up, and output-constraint behavior. General memory, Slack
+        # rendering, operator biography, and business-positioning prompts are
+        # irrelevant static prefix for this stage.
+        shared_prompt_files=(),
+    )
+    if len(instructions) > MANUAL_REQUEST_PLANNER_MAX_INSTRUCTION_CHARS:
+        raise ValueError(
+            "Manual request planner instructions exceed the compact planning "
+            f"profile limit of {MANUAL_REQUEST_PLANNER_MAX_INSTRUCTION_CHARS} "
+            f"characters: {len(instructions)}."
+        )
     return build_sdk_agent(
         name="manual_request_planner",
-        instructions=compose_instructions(
-            "keystone_profile.md",
-            "safety_policy.md",
-            "manual_request_planner.md",
-        ),
+        instructions=instructions,
         output_type=ManualRequestPlan,
         tools=[],
         model=model,
@@ -108,6 +129,9 @@ def resolve_manual_request_plan(
     session: Any | None = None,
     workflow_state: Mapping[str, Any] | None = None,
     cost_callback: Callable[[Any], None] | None = None,
+    database_url: str | None = None,
+    planner_cache: PlannerDecisionCache | None = None,
+    use_planner_cache: bool | None = None,
 ) -> ManualRequestPlan:
     """Return an LLM manual-request plan when requested, otherwise local fallback."""
 
@@ -120,13 +144,47 @@ def resolve_manual_request_plan(
     )
     if not live and run_config is None:
         return fallback
+    cache = _active_planner_decision_cache(
+        live=live,
+        run_config=run_config,
+        database_url=database_url,
+        planner_cache=planner_cache,
+        use_planner_cache=use_planner_cache,
+    )
     errors: list[str] = []
     for config in _planner_model_configs(requested_agent=requested_agent, model=model):
+        agent = build_manual_request_planner_agent(model=config.model)
+        cache_identity = None
+        if cache is not None:
+            cache_identity = build_planner_decision_cache_identity(
+                request_text=str(request_text or ""),
+                requested_agent=requested_agent,
+                workflow_context=workflow_context,
+                profile_fingerprint=planner_profile_fingerprint(
+                    instructions=str(agent.instructions),
+                    output_type=ManualRequestPlan,
+                    provider=config.provider,
+                    model=config.model,
+                ),
+            )
+            try:
+                cached_plan = cache.get(cache_identity)
+            except (OSError, sqlite3.Error, ValueError):
+                cached_plan = None
+            if cached_plan is not None:
+                resolved = _resolve_planner_candidate(
+                    fallback=fallback,
+                    candidate=cached_plan.model_copy(update={"source": "llm"}),
+                    workflow_context=workflow_context,
+                )
+                return resolved.model_copy(
+                    update={"source": "canonical:planner_cache"}
+                )
         stdout_capture = io.StringIO()
         try:
             with contextlib.redirect_stdout(stdout_capture):
                 result = run_typed_sdk_agent(
-                    agent=build_manual_request_planner_agent(model=config.model),
+                    agent=agent,
                     typed_input=ManualRequestPlannerInput(
                         request_text=str(request_text or ""),
                         requested_agent=requested_agent,
@@ -148,14 +206,23 @@ def resolve_manual_request_plan(
             continue
         if cost_callback is not None:
             cost_callback(result)
-        return reconcile_manual_request_followup(
-            merge_manual_request_plan(
-                fallback,
-                result.output.model_copy(update={"source": "llm"}),
-                allow_contextual_delegation=bool(workflow_context),
-            ),
+        resolved = _resolve_planner_candidate(
+            fallback=fallback,
+            candidate=result.output.model_copy(update={"source": "llm"}),
             workflow_context=workflow_context,
         )
+        if cache is not None and cache_identity is not None:
+            eligibility = planner_decision_cache_eligibility(
+                str(request_text or ""),
+                resolved,
+                context_hash=cache_identity.context_hash,
+            )
+            if eligibility.eligible:
+                try:
+                    cache.put(cache_identity, resolved)
+                except (OSError, sqlite3.Error, ValueError):
+                    pass
+        return resolved
     return fallback.model_copy(
         update={
             "planner_warnings": [
@@ -164,6 +231,50 @@ def resolve_manual_request_plan(
             ]
         }
     )
+
+
+def _resolve_planner_candidate(
+    *,
+    fallback: ManualRequestPlan,
+    candidate: ManualRequestPlan,
+    workflow_context: Mapping[str, Any],
+) -> ManualRequestPlan:
+    """Apply the same deterministic reconciliation to live and cached advice."""
+
+    return reconcile_manual_request_followup(
+        merge_manual_request_plan(
+            fallback,
+            candidate,
+            allow_contextual_delegation=bool(workflow_context),
+        ),
+        workflow_context=workflow_context,
+    )
+
+
+def _active_planner_decision_cache(
+    *,
+    live: bool,
+    run_config: Any | None,
+    database_url: str | None,
+    planner_cache: PlannerDecisionCache | None,
+    use_planner_cache: bool | None,
+) -> PlannerDecisionCache | None:
+    """Return an opt-in test cache or the safe default live cache.
+
+    Injected SDK run configurations are commonly test doubles, so they do not
+    activate persistent caching unless the caller also injects a cache.
+    """
+
+    if planner_cache is not None:
+        return planner_cache if use_planner_cache is not False else None
+    enabled = (
+        planner_decision_cache_enabled()
+        if use_planner_cache is None
+        else bool(use_planner_cache)
+    )
+    if not enabled or not live or run_config is not None:
+        return None
+    return PlannerDecisionCache(database_url)
 
 
 def _compact_manual_planner_context(

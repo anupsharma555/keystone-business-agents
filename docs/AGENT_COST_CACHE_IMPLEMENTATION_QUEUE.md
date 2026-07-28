@@ -5,6 +5,53 @@ The objective is to maximize cached input tokens for repeated Slack follow-ups
 while preserving deterministic safety gates, dry-run defaults, structured
 outputs, source attribution, and agent quality.
 
+## 2026-07-27 Execution-Performance Checkpoint
+
+- The manual request planner now uses a dedicated compact prompt profile rather
+  than the full shared memory, company, renderer, and writing prompt stack.
+- OpenAI requests use a stable operator-scoped prompt-cache key derived from
+  static execution structure rather than request, thread, session, or provider
+  content.
+- An advisory exact planner-decision cache can reuse eligible plans across
+  identical asks while bypassing temporal, sensitive, mutating, approval,
+  clarification, outreach, durable multi-owner, and unresolved-context work.
+- Redacted per-turn/per-attempt telemetry now projects compact stage timing into
+  direct runs, Orchestrator preflight, WorkItem events, trace summaries, and
+  local audit reports without entering normal Slack answer copy.
+- A content-free CLI output observer now measures the first delegated write and
+  the post-flush final boundary without changing stdout or stderr. Direct runs
+  persist the compact projection internally; WorkItems record a dedicated
+  entrypoint timing event. Slack-visible timing remains owned by the parent
+  Slack bridge.
+- The first request-scoped fast-read adoption reuses Gmail and Google Workspace
+  provider clients only within a bounded model attempt. Gmail plus core Google
+  Workspace Drive/Docs reads now consume read-call budgets and emit
+  content-free receipts. They do not cache provider results across requests or
+  weaken provider gates.
+- WorkItem and LangGraph lifecycle coverage proves one request-scoped Gmail
+  client and snapshot are reused and then cleared. Calendar adoption remains a
+  later incremental slice.
+- Canonical research plans now select `FAST`, `BALANCED`, or `DEEP`, and
+  multi-target research characterizes an explicit anchor company before
+  discovering comparison targets. Direct research wrappers use the same plan,
+  FAST remains strictly bounded while BALANCED preserves the established
+  deeper initial-query floor for time-sensitive company research.
+- Offline proof passes 4,714 tests with 17 intentional skips, repository-wide
+  Ruff, and `git diff --check`. Live Slack/provider latency and paid-model cache
+  behavior remain the next acceptance boundary.
+- The first paid-model probes confirmed stable-key cacheability and exact
+  planner-decision reuse, but did not pass user-answer acceptance. One repeated
+  Google Workspace plan reported about 95% cached input before a provider-scope
+  reconciliation defect removed Drive tools; one repeated public-research plan
+  reused the exact planner decision before a direct-route defect omitted the
+  competitor set. Both defects are fixed offline and await post-fix live proof.
+- A zero-call degraded replay now preserves Business Research ownership, the
+  explicit comparison anchor, the requested competitor count, the
+  multi-target artifact, and DEEP budgets even under a conservative Slack
+  transport profile.
+
+See `docs/EXECUTION_PERFORMANCE.md` for the current contract.
+
 ## Principles
 
 - Keep the static prefix stable: repo/developer guidance, shared Keystone

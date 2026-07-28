@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
@@ -51,6 +52,7 @@ from keystone_agents.schemas.company_profile import (
     research_data_point_label,
 )
 from keystone_agents.schemas.contact_context import ContactRecord, CRMAccountContext
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.research import ResearchBrief
 from keystone_agents.sdk import (
     Agent,
@@ -172,6 +174,10 @@ def build_company_research_queries(
         company_url=company_url,
         request_text=request_text,
     )
+    request_focus_terms = _company_request_focus_terms(
+        company=normalized_company,
+        request_text=request_text,
+    )
     lane_queries: list[str] = []
     if "careers_jobs" in required_lanes:
         lane_queries.extend(
@@ -195,6 +201,13 @@ def build_company_research_queries(
 
     queries = [
         *lane_queries,
+        *(
+            [
+                f"{normalized_company} {' '.join(request_focus_terms)} official"
+            ]
+            if request_focus_terms
+            else []
+        ),
         f"{normalized_company} official website",
         f"{normalized_company} about product platform",
         f"{normalized_company} LinkedIn company profile",
@@ -230,6 +243,75 @@ def build_company_research_queries(
         )
         queries.insert(3, f"site:{company_domain} {normalized_company} contact leadership")
     return list(dict.fromkeys(query for query in queries if query.strip()))
+
+
+def _company_request_focus_terms(
+    *,
+    company: str,
+    request_text: str,
+    limit: int = 6,
+) -> list[str]:
+    """Extract compact domain terms that disambiguate a company search."""
+
+    company_terms = {
+        re.sub(r"[^a-z0-9]", "", token.lower())
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9-]*", str(company or ""))
+    }
+    generic_terms = {
+        "about",
+        "agent",
+        "analyst",
+        "answer",
+        "based",
+        "brief",
+        "bullet",
+        "bullets",
+        "business",
+        "claim",
+        "claims",
+        "clearest",
+        "company",
+        "compare",
+        "concise",
+        "covering",
+        "create",
+        "difference",
+        "directly",
+        "each",
+        "exactly",
+        "give",
+        "include",
+        "information",
+        "modify",
+        "official",
+        "product",
+        "research",
+        "source",
+        "sources",
+        "substantive",
+        "uncertain",
+        "uncertainty",
+        "url",
+        "urls",
+        "verified",
+        "what",
+        "without",
+    }
+    terms: list[str] = []
+    for raw_token in re.findall(r"[A-Za-z][A-Za-z0-9]{2,}", str(request_text or "")):
+        token = re.sub(r"[^a-z0-9]", "", raw_token.lower())
+        if (
+            len(token) < 4
+            or token in company_terms
+            or token in generic_terms
+            or raw_token[:1].isupper()
+        ):
+            continue
+        if token not in terms:
+            terms.append(token)
+        if len(terms) >= max(1, limit):
+            break
+    return terms
 
 
 def _company_domain_for_search(company_url: str | None) -> str:
@@ -985,6 +1067,7 @@ def run_business_research_analyst_sdk(
     context_flags: Mapping[str, bool] | None = None,
     tool_tier: str | int | None = None,
     max_turns: int | None = None,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
     attach_tools: bool = True,
     compact_instructions: bool = False,
 ) -> TypedAgentRunResult[CompanyProfile]:
@@ -993,12 +1076,14 @@ def run_business_research_analyst_sdk(
     resolved_tool_tier = tool_tier or _default_business_research_sdk_tool_tier(
         typed_input,
         live=live,
+        manual_request_plan=manual_request_plan,
     )
     typed_input_for_run = _with_runtime_source_layer_policy(typed_input)
     turn_policy = resolve_sdk_turn_policy(
         "business_research_analyst",
         request_text=skill_request_text(typed_input),
         live_search=live,
+        manual_request_plan=manual_request_plan,
         explicit_max_turns=max_turns,
     )
     return run_typed_sdk_agent(
@@ -1028,6 +1113,7 @@ def run_business_research_analyst_focused_brief_sdk(
     session: Any | None = None,
     tool_tier: str | int | None = None,
     max_turns: int | None = None,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
     attach_tools: bool = True,
     compact_instructions: bool = False,
 ) -> TypedAgentRunResult[CompanyResearchFocusedBrief]:
@@ -1036,12 +1122,14 @@ def run_business_research_analyst_focused_brief_sdk(
     resolved_tool_tier = tool_tier or _default_business_research_sdk_tool_tier(
         typed_input,
         live=live,
+        manual_request_plan=manual_request_plan,
     )
     typed_input_for_run = _with_runtime_source_layer_policy(typed_input)
     turn_policy = resolve_sdk_turn_policy(
         "business_research_analyst",
         request_text=skill_request_text(typed_input),
         live_search=live,
+        manual_request_plan=manual_request_plan,
         explicit_max_turns=max_turns,
     )
     return run_typed_sdk_agent(
@@ -1070,6 +1158,7 @@ def run_business_research_analyst_research_brief_sdk(
     session: Any | None = None,
     tool_tier: str | int | None = None,
     max_turns: int | None = None,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
     attach_tools: bool = True,
     compact_instructions: bool = False,
 ) -> TypedAgentRunResult[ResearchBrief]:
@@ -1078,12 +1167,14 @@ def run_business_research_analyst_research_brief_sdk(
     resolved_tool_tier = tool_tier or _default_business_research_sdk_tool_tier(
         typed_input,
         live=live,
+        manual_request_plan=manual_request_plan,
     )
     typed_input_for_run = _with_runtime_source_layer_policy(typed_input)
     turn_policy = resolve_sdk_turn_policy(
         "business_research_analyst",
         request_text=skill_request_text(typed_input),
         live_search=live,
+        manual_request_plan=manual_request_plan,
         explicit_max_turns=max_turns,
     )
     return run_typed_sdk_agent(
@@ -1152,11 +1243,13 @@ def _default_business_research_sdk_tool_tier(
     | str,
     *,
     live: bool,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
 ) -> str:
     """Infer a read-only tool tier for default Business Research SDK runs."""
 
     budget = business_research_quality_budget(
         request_text=skill_request_text(typed_input),
         live_search=live,
+        manual_request_plan=manual_request_plan,
     )
     return budget.tool_tier or "core_read"

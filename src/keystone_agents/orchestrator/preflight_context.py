@@ -7,6 +7,7 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
+from keystone_agents.execution_telemetry import compact_execution_telemetry
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.temporal_policy import temporal_depth_policy
 
@@ -103,6 +104,19 @@ def compact_orchestrator_preflight_payload(preflight: Any | None) -> dict[str, A
     route_result = _compact_route_result(payload.get("route_result"))
     if route_result:
         compact["route_result"] = route_result
+    composition_admission = payload.get("composition_admission")
+    if composition_admission:
+        admission_payload = (
+            composition_admission.model_dump(mode="json")
+            if hasattr(composition_admission, "model_dump")
+            else dict(composition_admission)
+            if isinstance(composition_admission, Mapping)
+            else {}
+        )
+        if admission_payload.get("composition_allowed") or admission_payload.get(
+            "reason"
+        ) not in {None, "", "plan_not_provider_free_composition"}:
+            compact["composition_admission"] = admission_payload
     sdk_usage_events = _compact_sdk_usage_events(payload.get("sdk_usage_events"))
     if sdk_usage_events:
         compact["sdk_usage_events"] = sdk_usage_events
@@ -126,6 +140,9 @@ def _compact_sdk_usage_events(events: Any | None) -> list[dict[str, Any]]:
             value = event.get(key)
             if isinstance(value, Mapping):
                 compact[key] = dict(value)
+        telemetry = compact_execution_telemetry(event.get("execution_telemetry"))
+        if telemetry:
+            compact["execution_telemetry"] = telemetry
         if compact:
             compact_events.append(compact)
     return compact_events

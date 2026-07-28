@@ -21,6 +21,9 @@ from keystone_agents.orchestrator.preflight_context import (
     ORCHESTRATOR_PREFLIGHT_ENV,
     ORCHESTRATOR_ROUTE_RESULT_ENV,
 )
+from keystone_agents.planning.composition_admission import (
+    resolve_provider_free_composition_admission,
+)
 from keystone_agents.schemas.manual_request_plan import (
     AskShapePolicy,
     ManualProviderActionStep,
@@ -219,6 +222,163 @@ def test_direct_specialist_routes_share_one_llm_constraint_repair(
     assert payload["human_summary"] == "Agents follow natural instructions accurately."
     assert payload["instruction_following"]["repair_attempted"] is True
     assert payload["instruction_following"]["repair_succeeded"] is True
+
+
+def test_company_research_repair_cannot_promote_unofficial_source_url(
+    monkeypatch,
+    capsys,
+    tmp_path,
+) -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="business_research_analyst",
+        ask_shape=AskShapePolicy(
+            source_type_preference=["official"],
+            output_constraints=InterpretedOutputConstraints(
+                interpretation="exactly two official source URLs",
+                source_url_count_mode="exact",
+                source_url_count=2,
+                include_source_urls=True,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_isolated_child_process",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "output_type": "CompanyResearchFocusedBrief",
+                    "send_enabled": False,
+                    "retrieval": {"resolved_company_url": "https://callyope.com"},
+                    "human_summary": "Source: https://www.callyope.com/faq",
+                    "output": {
+                        "company_name": "Callyope",
+                        "answer": "Source-backed company summary.",
+                        "sources": [
+                            {
+                                "title": "Callyope FAQ",
+                                "url": "https://www.callyope.com/faq",
+                            }
+                        ],
+                    },
+                }
+            ),
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        "keystone_agents.instruction_following.run_typed_sdk_agent",
+        lambda **_kwargs: SimpleNamespace(
+            output=InstructionFollowingRepairOutput(
+                response_text=(
+                    "Sources: https://www.callyope.com/faq "
+                    "https://elion.health/products/callyope"
+                )
+            ),
+            usage={},
+            cost={},
+            request_cache={},
+        ),
+    )
+
+    exit_code = cli._run_ask_script_live(
+        "business_research_analyst",
+        "Use exactly two official Callyope sources with URLs.",
+        ["unused-child-command"],
+        json_output=True,
+        manual_plan=plan,
+        database_url=f"sqlite:///{tmp_path / 'official-repair.db'}",
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "blocked"
+    assert payload["block_kind"] == "instruction_following_constraint_failed"
+    assert payload["instruction_following"]["validation"]["passed"] is False
+    assert (
+        "visible source URL is outside the verified official company domain"
+        in payload["instruction_following"]["validation"]["violations"]
+    )
+    assert "elion.health" not in payload["human_summary"]
+
+
+def test_company_comparison_accepts_one_verified_official_url_per_company() -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="business_research_analyst",
+        target_type="company",
+        primary_target="Callyope vs Kintsugi",
+        required_entities=["Callyope", "Kintsugi"],
+        ask_shape=AskShapePolicy(
+            source_type_preference=["official"],
+            output_constraints=InterpretedOutputConstraints(
+                interpretation="one official source URL for each company",
+                source_url_count_mode="exact",
+                source_url_count=2,
+                include_source_urls=True,
+            ),
+        ),
+    )
+    script_payload = {
+        "comparison_entities": ["Callyope", "Kintsugi"],
+        "verified_source_evidence": [
+            {
+                "entity": "Callyope",
+                "resolved_official_url": "https://www.callyope.com",
+                "sources": [{"url": "https://www.callyope.com/faq"}],
+                "official_sources": [{"url": "https://www.callyope.com/faq"}],
+            },
+            {
+                "entity": "Kintsugi",
+                "resolved_official_url": "https://www.kintsugihealth.com",
+                "sources": [{"url": "https://www.kintsugihealth.com/technology"}],
+                "official_sources": [
+                    {"url": "https://www.kintsugihealth.com/technology"}
+                ],
+            },
+        ],
+        "retrieval": {
+            "primary": {"resolved_company_url": "https://www.callyope.com"},
+            "comparison": {"resolved_company_url": "https://www.kintsugihealth.com"},
+        },
+        "output": {
+            "company_name": "Callyope vs Kintsugi",
+            "sources": [
+                {"url": "https://www.callyope.com/faq"},
+                {"url": "https://www.kintsugihealth.com/technology"},
+            ],
+        },
+    }
+
+    assert (
+        cli._official_source_response_violations(
+            script_payload,
+            plan,
+            (
+                "Sources: https://www.callyope.com/faq "
+                "https://www.kintsugihealth.com/technology"
+            ),
+        )
+        == []
+    )
+    assert cli._official_source_response_violations(
+        script_payload,
+        plan,
+        (
+            "Sources: https://www.callyope.com/faq "
+            "https://www.callyope.com/about"
+        ),
+    ) == ["visible source URL was not present in deterministic retrieved evidence"]
+    assert cli._official_source_response_violations(
+        script_payload,
+        plan,
+        (
+            "Sources: https://www.callyope.com/faq "
+            "https://www.kintsugihealth.com/invented"
+        ),
+    ) == ["visible source URL was not present in deterministic retrieved evidence"]
 
 
 def test_direct_specialist_provider_blocker_skips_llm_constraint_repair(
@@ -5251,6 +5411,200 @@ def test_company_research_quick_retrieval_receives_raw_operator_request(
     assert captured["max_queries"] == 2
 
 
+def test_company_research_typed_compact_source_contract_enables_quick_retrieval() -> None:
+    import scripts.run_company_research as company_cli
+
+    request_text = (
+        "Research Callyope and give me exactly 4 concise bullets. "
+        "Use exactly 2 official Callyope sources with URLs."
+    )
+    args = company_cli.build_parser().parse_args(
+        [
+            "--company",
+            "Callyope",
+            "--request-text",
+            request_text,
+            "--live-search",
+            "--live-search-plan",
+            "--no-dry-run",
+        ]
+    )
+
+    args = company_cli._apply_interpreted_retrieval_mode(
+        company_cli._apply_manual_request_plan(args)
+    )
+
+    assert args.quick_retrieval is True
+    assert args.live_search_plan is True
+    assert args.max_results == 2
+    assert company_cli._compact_official_source_page_limit(args) == 2
+
+
+def test_direct_company_research_compact_source_contract_skips_search_planner() -> None:
+    request_text = (
+        "Research Callyope and give me exactly 4 concise bullets. "
+        "Use exactly 2 official Callyope sources with URLs."
+    )
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="business_research_analyst",
+    )
+
+    assert cli._direct_company_research_quick_retrieval(plan) is True
+
+
+def test_bounded_five_bullet_company_comparison_uses_compact_runtime_profile() -> None:
+    request_text = (
+        "Business Research Analyst, compare Callyope and Kintsugi. "
+        "Give me 5 concise but substantive bullets and include official source URLs."
+    )
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="business_research_analyst",
+    )
+
+    profile = cli._direct_specialist_runtime_profile(
+        "business_research_analyst",
+        input_text=request_text,
+        manual_plan=plan,
+    )
+    estimate = cli._estimate_ask_openai_requests(
+        SimpleNamespace(
+            agent="business_research_analyst",
+            context_file="",
+            live_search=True,
+            max_manager_steps=3,
+        ),
+        input_text=request_text,
+        live_sdk=True,
+        live_manual_plan=True,
+        requested_route="business_research_analyst",
+        manual_plan=plan,
+        effective_live_search=True,
+    )
+
+    assert profile["compact_instructions"] is True
+    assert estimate["max"] == 4
+
+
+def test_explicit_one_result_opportunity_stays_compact_when_search_domain_is_broad() -> None:
+    request_text = (
+        "Opportunity Scout, find one current U.S. grant, RFP, or partnership "
+        "opportunity relevant to a small behavioral-health AI research consultancy. "
+        "Give the sponsor, deadline, fit, eligibility caveat, and official URL."
+    )
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="opportunity_scout",
+    ).model_copy(
+        update={
+            "desired_count_explicit": False,
+            "ask_shape": AskShapePolicy(
+                ask_breadth="broad",
+                evidence_depth="deep",
+                strict_filter_mode="exact",
+                permission_state="read_only",
+            )
+        }
+    )
+
+    profile = cli._direct_specialist_runtime_profile(
+        "opportunity_scout",
+        input_text=request_text,
+        manual_plan=plan,
+    )
+    estimate = cli._estimate_ask_openai_requests(
+        SimpleNamespace(
+            agent="opportunity_scout",
+            context_file="",
+            live_search=True,
+            max_manager_steps=3,
+        ),
+        input_text=request_text,
+        live_sdk=True,
+        live_manual_plan=True,
+        requested_route="opportunity_scout",
+        manual_plan=plan,
+        effective_live_search=True,
+    )
+
+    assert profile["compact_instructions"] is True
+    assert estimate["max"] == 3
+
+
+def test_company_research_compact_official_lane_reads_two_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.run_company_research as company_cli
+
+    captured: dict[str, object] = {}
+
+    def fake_retrieve_company_profile_live(**kwargs: object):
+        captured.update(kwargs)
+        return company_cli.CompanyProfile(name="Callyope"), {"mode": "live_search"}
+
+    monkeypatch.setattr(
+        company_cli,
+        "retrieve_company_profile_live",
+        fake_retrieve_company_profile_live,
+    )
+    monkeypatch.setattr(
+        company_cli,
+        "require_cli_live_confirmation",
+        lambda **_kwargs: None,
+    )
+    args = company_cli.build_parser().parse_args(
+        [
+            "--company",
+            "Callyope",
+            "--request-text",
+            (
+                "Research Callyope and give me exactly 4 concise bullets. "
+                "Use exactly 2 official Callyope sources with URLs."
+            ),
+            "--live-search",
+            "--no-dry-run",
+        ]
+    )
+    args = company_cli._apply_interpreted_retrieval_mode(
+        company_cli._apply_manual_request_plan(args)
+    )
+
+    company_cli._retrieve_company_profile(args)
+
+    assert captured["extract_selected_pages"] is True
+    assert captured["website_extraction_max_pages"] == 2
+    assert captured["discover_internal_company_pages"] is False
+    assert captured["official_company_sources_only"] is True
+    assert captured["max_queries"] == 2
+    assert captured["exa_search_fallback"] is False
+    assert captured["tavily_search_fallback"] is False
+
+
+def test_company_research_deep_request_keeps_full_retrieval() -> None:
+    import scripts.run_company_research as company_cli
+
+    args = company_cli.build_parser().parse_args(
+        [
+            "--company",
+            "Callyope",
+            "--request-text",
+            "Research Callyope deeply and return a concise four-bullet brief.",
+            "--live-search",
+            "--live-search-plan",
+            "--no-dry-run",
+        ]
+    )
+
+    args = company_cli._apply_interpreted_retrieval_mode(
+        company_cli._apply_manual_request_plan(args)
+    )
+
+    assert args.quick_retrieval is False
+    assert args.live_search_plan is True
+    assert args.max_results == 5
+
+
 def test_cli_ask_context_agent_override_live_sdk_runs_typed_agent(
     monkeypatch,
     capsys,
@@ -9644,6 +9998,7 @@ def test_cli_google_workspace_context_live_sdk_enables_live_read_default(
     def fake_run_typed_sdk_sync(agent, prompt, output_type, **kwargs):
         captured["agent_name"] = agent.name
         captured["live_reads_env"] = os.environ.get(cli.GOOGLE_WORKSPACE_LIVE_READS_ENV)
+        captured["max_turns"] = kwargs.get("max_turns")
         return (
             SimpleNamespace(final_output=None, usage=None),
             cli.GoogleWorkspaceContextResult(
@@ -9681,6 +10036,7 @@ def test_cli_google_workspace_context_live_sdk_enables_live_read_default(
     assert captured == {
         "agent_name": "google_workspace_context_agent",
         "live_reads_env": "true",
+        "max_turns": 3,
     }
     assert os.environ.get(cli.GOOGLE_WORKSPACE_LIVE_READS_ENV) is None
     assert payload["selected_agent"] == "google_workspace_context_agent"
@@ -11790,7 +12146,8 @@ def test_bounded_direct_specialists_use_compact_request_estimate(
     )
 
     conditional_repair = "words" in request_text
-    assert estimate["max"] == 3 + int(conditional_repair)
+    context_read_turn = int(route == "google_workspace_context_agent")
+    assert estimate["max"] == 3 + context_read_turn + int(conditional_repair)
     assert estimate["min"] == 2
     assert estimate["stages"] == [
         "manual_request_planner",
@@ -12691,12 +13048,16 @@ def test_slack_continuation_without_history_file_keeps_latest_ask_and_prior_obje
     execution_request = cli.build_execution_request(request)
     assert execution_request.requested_agent == ""
     assert execution_request.continuation.prior_agent == "business_research_analyst"
-    state = cli._slack_continuation_workflow_state(request)
+    state = cli._slack_continuation_workflow_state(
+        request,
+        prior_agent=execution_request.continuation.prior_agent,
+    )
     assert state["prior_agent_runs"] == [
         {
             "id": "slack-envelope-1",
             "route": "zotero_context_agent",
             "status": "completed",
+            "thread_correlation": "same_thread",
             "title": "Using AI to Detect Psychosis Relapse: Scoping Review.",
             "summary": (
                 "Title: Using AI to Detect Psychosis Relapse: Scoping Review. Summary: "
@@ -12704,6 +13065,168 @@ def test_slack_continuation_without_history_file_keeps_latest_ask_and_prior_obje
             ),
         }
     ]
+
+
+def test_slack_continuation_generic_success_uses_advisory_prior_owner() -> None:
+    request = (
+        "continue this prior Slack thread. "
+        "Current user request (authoritative): Outreach Composer, turn the reply "
+        "outline into a draft of no more than 70 words using only the supplied "
+        "email facts. Show it here for review. Do not access Gmail, create a "
+        "provider draft, send, or modify anything. "
+        "Prior task owner (advisory): gmail_triage "
+        "Provider affinity: gmail "
+        "Previous request: Gmail Triage, analyze only this supplied sanitized email. "
+        "Previous result title: Business Agents Result Ready "
+        "Previous result: Reply outline: acknowledge interest, confirm the fall "
+        "pilot request, and offer a short call. "
+        "User follow-up: Outreach Composer, turn the reply outline into a draft "
+        "using only the supplied email facts. Show it here for review. "
+        "Continue the same agent task."
+    )
+
+    execution_request = cli.build_execution_request(request)
+    state = cli._slack_continuation_workflow_state(
+        request,
+        prior_agent=execution_request.continuation.prior_agent,
+    )
+
+    assert state["prior_agent_runs"] == [
+        {
+            "id": "slack-envelope-1",
+            "route": "gmail_triage",
+            "status": "completed",
+            "thread_correlation": "same_thread",
+            "title": "Business Agents Result Ready",
+            "summary": (
+                "Reply outline: acknowledge interest, confirm the fall pilot "
+                "request, and offer a short call."
+            ),
+        }
+    ]
+
+
+def test_natural_slack_cross_agent_envelope_admits_provider_free_composition() -> None:
+    request = (
+        "continue this prior Slack thread. "
+        "Current user request (authoritative): Outreach Composer, turn the reply "
+        "outline into a draft of no more than 70 words using only the supplied "
+        "email facts. Show it here for review. Do not access Gmail, create a "
+        "provider draft, send, or modify anything. "
+        "Prior task owner (advisory): gmail_triage "
+        "Provider affinity: gmail "
+        "Previous request: Gmail Triage, analyze only this supplied sanitized email. "
+        "Previous result title: Business Agents Result Ready "
+        "Previous result: Reply outline: acknowledge interest, confirm the fall "
+        "pilot request, and offer a short call. "
+        "User follow-up: Outreach Composer, turn the reply outline into a draft "
+        "using only the supplied email facts. Show it here for review. Do not access "
+        "Gmail, create a provider draft, send, or modify anything. "
+        "Continue the same agent task."
+    )
+    execution_request = cli.build_execution_request(request)
+    plan = infer_manual_request_plan(
+        execution_request.current_request,
+        requested_agent=execution_request.requested_agent,
+    )
+    state = cli._slack_continuation_workflow_state(
+        request,
+        prior_agent=execution_request.continuation.prior_agent,
+    )
+
+    admission = resolve_provider_free_composition_admission(
+        plan,
+        workflow_state=state,
+    )
+    preflight = cli.run_orchestrator_preflight(
+        cli.execution_request_planning_text(execution_request),
+        requested_agent=execution_request.requested_agent,
+        live_manual_plan=False,
+        workflow_state=state,
+    )
+
+    assert execution_request.requested_agent == "outreach_composer"
+    assert admission.composition_allowed is True
+    assert admission.source_route == "gmail_triage"
+    assert admission.provider_action_allowed is False
+    assert admission.external_use_approval_required is True
+    assert preflight.execution_allowed is True
+    assert preflight.selected_agent == "outreach_composer"
+    assert preflight.composition_admission.composition_allowed is True
+
+
+def test_natural_supplied_facts_outreach_preflight_executes_without_provider_access() -> None:
+    request = (
+        "Outreach Composer, using only these supplied facts, draft a concise "
+        "internal-ready outreach email under 100 words. Facts: Northstar Behavioral "
+        "Health operates two outpatient clinics; it is exploring a fall pilot for "
+        "multimodal symptom monitoring; it wants to discuss validation evidence, "
+        "implementation effort, and timeline. Invite a 20-minute call. Do not access "
+        "Gmail, create a provider draft, send, post, search, or modify anything."
+    )
+    execution_request = cli.build_execution_request(request)
+    preflight = cli.run_orchestrator_preflight(
+        cli.execution_request_planning_text(execution_request),
+        requested_agent=execution_request.requested_agent,
+        live_manual_plan=False,
+    )
+
+    assert execution_request.requested_agent == "outreach_composer"
+    assert preflight.execution_allowed is True
+    assert preflight.selected_agent == "outreach_composer"
+    assert preflight.route_result.approved_context_present is True
+    assert preflight.route_result.send_enabled is False
+
+
+def test_slack_continuation_generic_block_does_not_admit_advisory_owner() -> None:
+    request = (
+        "continue this prior Slack thread. "
+        "Current user request (authoritative): Outreach Composer, draft a reply. "
+        "Prior task owner (advisory): gmail_triage "
+        "Previous result title: Business Agents Blocked "
+        "Previous result: No completed Gmail result is available. "
+        "User follow-up: Outreach Composer, draft a reply. "
+        "Continue the same agent task."
+    )
+
+    assert (
+        cli._slack_continuation_workflow_state(
+            request,
+            prior_agent="gmail_triage",
+        )
+        == {}
+    )
+
+
+@pytest.mark.parametrize(
+    "result_label",
+    (
+        "Business Agents Awaiting Approval",
+        "Business Agents Need Review",
+        "Business Agents Run Update",
+    ),
+)
+def test_slack_continuation_nonterminal_result_does_not_admit_advisory_owner(
+    result_label: str,
+) -> None:
+    request = (
+        "continue this prior Slack thread. "
+        "Current user request (authoritative): Outreach Composer, draft a reply. "
+        "Prior task owner (advisory): gmail_triage "
+        f"Previous result title: {result_label} "
+        "Previous result: A draft is waiting for review. "
+        "User follow-up: Outreach Composer, draft a reply. "
+        "Continue the same agent task."
+    )
+
+    assert cli._slack_result_status(result_label) == "needs_input"
+    assert (
+        cli._slack_continuation_workflow_state(
+            request,
+            prior_agent="gmail_triage",
+        )
+        == {}
+    )
 
 
 def test_slack_continuation_state_merge_deduplicates_prior_results() -> None:
@@ -12720,6 +13243,30 @@ def test_slack_continuation_state_merge_deduplicates_prior_results() -> None:
 
     assert merged["slack_context"] == {"thread_ts": "123.456"}
     assert merged["prior_agent_runs"] == [prior]
+
+
+def test_slack_prior_run_projection_normalizes_success_and_same_thread() -> None:
+    admitted = cli._slack_prior_runs_for_planner(
+        [
+            {
+                "id": "run-1",
+                "route": "gmail_triage",
+                "status": "success",
+                "summary": "Bounded completed result.",
+            }
+        ],
+        allow_failed_context=False,
+    )
+
+    assert admitted == [
+        {
+            "id": "run-1",
+            "route": "gmail_triage",
+            "status": "completed",
+            "thread_correlation": "same_thread",
+            "summary": "Bounded completed result.",
+        }
+    ]
 
 
 def test_slack_operator_request_strips_rendered_quote_and_lone_mention_marker() -> None:

@@ -25,7 +25,7 @@ from keystone_agents.orchestrator.routing import looks_like_send_side_effect
 from keystone_agents.run import run_agent_dry
 from keystone_agents.schemas.approval import ApprovalQueueItem
 from keystone_agents.schemas.company_profile import CompanyProfile
-from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
+from keystone_agents.schemas.manual_request_plan import AskShapePolicy, ManualRequestPlan
 from keystone_agents.schemas.orchestrator import (
     OrchestratorDecision,
     OrchestratorOutputReview,
@@ -1121,6 +1121,93 @@ def test_outreach_request_without_approved_profile_refuses() -> None:
     assert "blocked" in result.approval_rationale
 
 
+def test_selected_completed_thread_result_is_approved_for_provider_free_drafting() -> None:
+    request = (
+        "Outreach Composer, turn the reply outline into a draft using only the "
+        "supplied email facts. Show it here for review. Do not access Gmail, "
+        "create a provider draft, send, or modify anything."
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="outreach_composer",
+        target_agent="outreach_composer",
+        intent="outreach_draft",
+        task_objective="outreach_draft",
+        expected_artifact_type="outreach_draft",
+        provider_system="unspecified",
+        provider_operations=[],
+        requires_approved_context=True,
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(
+            output_form="draft",
+            prior_context_dependency="selected_context",
+            permission_state="draft_only",
+            audience_scope="external",
+        ),
+    )
+
+    result = route_request(
+        request,
+        manual_plan=plan,
+        workflow_state={
+            "prior_agent_runs": [
+                {
+                    "route": "gmail_triage",
+                    "status": "completed",
+                    "thread_correlation": "same_thread",
+                    "title": "Business Agents Result Ready",
+                    "summary": "Reply outline: acknowledge interest and offer a short call.",
+                }
+            ]
+        },
+    )
+
+    assert result.route == "outreach_composer"
+    assert result.refused is False
+    assert result.approved_context_present is True
+    assert result.send_enabled is False
+    assert result.external_use_approval_required is True
+
+
+def test_selected_failed_thread_result_does_not_approve_outreach_context() -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="outreach_composer",
+        target_agent="outreach_composer",
+        intent="outreach_draft",
+        task_objective="outreach_draft",
+        expected_artifact_type="outreach_draft",
+        provider_system="unspecified",
+        provider_operations=[],
+        requires_approved_context=True,
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(
+            output_form="draft",
+            prior_context_dependency="selected_context",
+            permission_state="draft_only",
+            audience_scope="external",
+        ),
+    )
+
+    result = route_request(
+        "Draft from the selected thread context for review only.",
+        manual_plan=plan,
+        workflow_state={
+            "prior_agent_runs": [
+                {
+                    "route": "gmail_triage",
+                    "status": "blocked",
+                    "thread_correlation": "same_thread",
+                    "summary": "No completed result is available.",
+                }
+            ]
+        },
+    )
+
+    assert result.refused is True
+    assert result.approved_context_present is False
+
+
 def test_outreach_request_without_approved_profile_has_sectioned_operator_summary() -> None:
     result = route_request("draft outreach to NeuroFlow")
 
@@ -1273,6 +1360,56 @@ def test_outreach_request_accepts_flexible_approved_context_labels() -> None:
     assert result.approved_context_present is True
     assert result.send_enabled is False
     assert result.external_use_approval_required is True
+
+
+def test_outreach_request_accepts_explicitly_supplied_facts_for_draft_only_use() -> None:
+    result = route_request(
+        "Outreach Composer, using only these supplied facts, draft a concise "
+        "internal-ready outreach email under 100 words. Facts: Northstar Behavioral "
+        "Health operates two outpatient clinics; it is exploring a fall pilot for "
+        "multimodal symptom monitoring; it wants to discuss validation evidence, "
+        "implementation effort, and timeline. Invite a 20-minute call. Do not access "
+        "Gmail, create a provider draft, send, post, search, or modify anything."
+    )
+
+    assert result.route == "outreach_composer"
+    assert result.refused is False
+    assert result.approved_context_present is True
+    assert result.send_enabled is False
+    assert result.external_use_approval_required is True
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Outreach Composer, draft an email. Facts: Do not send it.",
+        (
+            "Outreach Composer, draft an email from these supplied facts. "
+            "Facts: Example Health is exploring a pilot."
+        ),
+    ],
+)
+def test_supplied_outreach_facts_require_substance_and_no_side_effect_boundary(
+    request_text: str,
+) -> None:
+    result = route_request(request_text)
+
+    assert result.route == "outreach_composer"
+    assert result.refused is True
+    assert result.approved_context_present is False
+    assert result.send_enabled is False
+
+
+def test_supplied_outreach_facts_do_not_authorize_an_affirmative_send() -> None:
+    result = route_request(
+        "Outreach Composer, using only these supplied facts, draft and send an email. "
+        "Facts: Example Health is exploring a fall pilot."
+    )
+
+    assert result.send_enabled is False
+    assert result.approved_context_present is False
+    assert result.route == "outreach_composer"
+    assert result.refused is True
 
 
 def test_orchestrator_can_attach_optional_operator_feedback_request() -> None:

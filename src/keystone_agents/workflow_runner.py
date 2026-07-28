@@ -42,6 +42,7 @@ from keystone_agents.company_research import research_company_fixture
 from keystone_agents.config import cli_default_live_gmail, load_settings
 from keystone_agents.contact_enrichment import build_contact_enrichment_artifact
 from keystone_agents.cost_tracking import parse_cost_tracking_directive
+from keystone_agents.execution_telemetry import compact_execution_telemetry
 from keystone_agents.finance_expense_receipts import (
     extract_finance_receipt_evidence,
     infer_finance_expense_receipt_target,
@@ -56,7 +57,9 @@ from keystone_agents.gmail_triage.priority_grouping import (
 )
 from keystone_agents.instruction_following import (
     instruction_following_blocker_text,
+    output_constraints_from_plan,
     resolve_instruction_following_response,
+    validate_output_constraints,
 )
 from keystone_agents.live_retrieval import (
     retrieve_company_profile_live,
@@ -101,6 +104,7 @@ from keystone_agents.provider_side_effect_policy import (
 )
 from keystone_agents.quality_budget import (
     AgentQualityBudget,
+    QualityMode,
     business_research_quality_budget,
     opportunity_scout_quality_budget,
     quality_mode_from_cost_profile,
@@ -1341,6 +1345,11 @@ def _workflow_execution_steps(events: list[WorkItemEvent]) -> list[WorkflowExecu
             if isinstance(metadata.get("aggregate_usage"), dict)
             else {}
         )
+        execution_telemetry = (
+            metadata.get("execution_telemetry")
+            if isinstance(metadata.get("execution_telemetry"), dict)
+            else {}
+        )
         category = _workflow_event_category(event.event_type)
         status = _workflow_event_status(event.event_type, metadata)
         provider = _safe_execution_label(
@@ -1355,7 +1364,9 @@ def _workflow_execution_steps(events: list[WorkItemEvent]) -> list[WorkflowExecu
                 name=_safe_execution_label(event.event_type) or "work_item_event",
                 status=status,
                 duration_ms=_nonnegative_float(
-                    metadata.get("duration_ms") or metadata.get("time_to_response_ms")
+                    metadata.get("duration_ms")
+                    or metadata.get("time_to_response_ms")
+                    or execution_telemetry.get("total_duration_ms")
                 ),
                 error_kind=_safe_execution_label(
                     metadata.get("error_type")
@@ -5905,6 +5916,9 @@ def _maybe_synthesize_user_facing_response(
                     cost=instruction_resolution.repair_cost or {},
                     request_cache=instruction_resolution.repair_request_cache or {},
                     store=store,
+                    execution_telemetry=(
+                        instruction_resolution.repair_execution_telemetry or {}
+                    ),
                 )
             text = (
                 instruction_resolution.response_text
@@ -6038,6 +6052,7 @@ def _maybe_synthesize_user_facing_response(
             cost=sdk_result.cost,
             request_cache=sdk_result.request_cache,
             store=store,
+            execution_telemetry=getattr(sdk_result, "execution_telemetry", None),
         )
     text = format_user_response_synthesis(
         synthesis,
@@ -6107,6 +6122,9 @@ def _maybe_synthesize_user_facing_response(
             cost=instruction_resolution.repair_cost or {},
             request_cache=instruction_resolution.repair_request_cache or {},
             store=store,
+            execution_telemetry=(
+                instruction_resolution.repair_execution_telemetry or {}
+            ),
         )
     text = (
         instruction_resolution.response_text
@@ -8179,10 +8197,12 @@ def _record_workflow_sdk_cost_event(
     request_cache: dict[str, Any] | None,
     store: SQLiteStore,
     run_stage: str = "",
+    execution_telemetry: dict[str, Any] | None = None,
 ) -> None:
     usage_payload = dict(usage or {})
     cost_payload = dict(cost or {})
     cache_payload = dict(request_cache or {})
+    telemetry_payload = compact_execution_telemetry(execution_telemetry)
     record_event(
         work_item,
         event_type=event_type,
@@ -8271,6 +8291,11 @@ def _record_workflow_sdk_cost_event(
                 )
                 if cache_payload.get(key) is not None
             },
+            **(
+                {"execution_telemetry": telemetry_payload}
+                if telemetry_payload
+                else {}
+            ),
         },
         store=store,
     )
@@ -8316,6 +8341,11 @@ def _record_preflight_sdk_cost_events(
             request_cache=request_cache,
             store=store,
             run_stage=run_stage,
+            execution_telemetry=(
+                event.get("execution_telemetry")
+                if isinstance(event.get("execution_telemetry"), dict)
+                else None
+            ),
         )
         existing_keys.add(event_key)
 
@@ -10932,6 +10962,11 @@ def _try_live_gmail_thread_retrieval(
             request_cache=semantic_ranking.outcome.request_cache,
             store=store,
             run_stage="gmail_semantic_candidate_ranking",
+            execution_telemetry=getattr(
+                semantic_ranking.outcome,
+                "execution_telemetry",
+                None,
+            ),
         )
     return WorkflowRunResult(
         work_item=updated,
@@ -11080,6 +11115,11 @@ def _no_suitable_gmail_outreach_candidate_result(
             request_cache=semantic_ranking.outcome.request_cache,
             store=store,
             run_stage="gmail_semantic_candidate_ranking",
+            execution_telemetry=getattr(
+                semantic_ranking.outcome,
+                "execution_telemetry",
+                None,
+            ),
         )
     no_candidate_reason = (
         "The Gmail specialist did not identify a relevant urgent or important "
@@ -13296,6 +13336,11 @@ def _advance_chief_of_staff(
                     request_cache=typed_result.request_cache,
                     store=store,
                     run_stage="chief_of_staff.live_sdk",
+                    execution_telemetry=getattr(
+                        typed_result,
+                        "execution_telemetry",
+                        None,
+                    ),
                 )
         except Exception as exc:
             if not _recoverable_live_chief_of_staff_output_error(exc):
@@ -15097,6 +15142,7 @@ def _advance_research(
             request_text=f"{request.request_text} {work_item.request_text}",
             live_search=live_research_allowed,
             cost_profile=request.cost_profile,
+            manual_request_plan=manual_plan,
         )
         max_results = _quality_budgeted_max_results(request, quality_budget)
         hosted_web_search_max_calls = _quality_budgeted_hosted_web_search_max_calls(
@@ -15109,7 +15155,11 @@ def _advance_research(
         profile, metadata = retrieve_company_profile_live(
             company=target,
             request_text=request.request_text or work_item.request_text,
-            max_results=(max(max_results, 8) if query_builder is not None else max_results),
+            max_results=(
+                max(max_results, 8)
+                if query_builder is not None and quality_budget.mode != QualityMode.FAST
+                else max_results
+            ),
             query_builder=query_builder,
             agents_web_search_max_calls=hosted_web_search_max_calls,
             agents_web_search_parallel=not _is_slack_conservative_cost_profile(request),
@@ -16184,6 +16234,7 @@ def _advance_multi_target_research(
         request_text=f"{request_text} {work_item.request_text}",
         live_search=request.live_search,
         cost_profile=request.cost_profile,
+        manual_request_plan=manual_plan,
     )
     plan = build_multi_target_research_plan(
         request_text=request_text,
@@ -16324,7 +16375,11 @@ def _multi_target_work_item_sources(
 ) -> list[WorkItemSourceRef]:
     refs: list[WorkItemSourceRef] = []
     seen_urls: set[str] = set()
-    for packet in result.packets:
+    packets = [
+        *([result.anchor_packet] if result.anchor_packet is not None else []),
+        *result.packets,
+    ]
+    for packet in packets:
         for raw_source in packet.source_refs[:6]:
             if not isinstance(raw_source, dict):
                 continue
@@ -17272,6 +17327,7 @@ def _advance_opportunity(
             cost_profile=request.cost_profile,
             formal_opportunity=formal_opportunity_request,
             source_context_required=source_context_required,
+            manual_request_plan=request.manual_request_plan,
         )
         max_results = _quality_budgeted_max_results(
             request,
@@ -17300,6 +17356,7 @@ def _advance_opportunity(
                 cost=getattr(sdk_result, "cost", None),
                 request_cache=getattr(sdk_result, "request_cache", None),
                 store=store,
+                execution_telemetry=getattr(sdk_result, "execution_telemetry", None),
             )
 
         search_plan = (
@@ -19580,11 +19637,14 @@ def _advance_outreach(
     draft_audit_notes = [draft_audit_note]
     if request.live_sdk and "live SDK draft created" in draft_audit_note:
         draft_audit_notes.append("Live user-facing response synthesis executed.")
-    recommendation_mismatches = _gmail_thread_recommendation_mismatches(
-        draft,
-        recommendation=recommendation,
-        gmail_thread_context=gmail_thread_context,
-    )
+    recommendation_mismatches = [
+        *_gmail_thread_recommendation_mismatches(
+            draft,
+            recommendation=recommendation,
+            gmail_thread_context=gmail_thread_context,
+        ),
+        *_outreach_draft_contract_mismatches(draft, request=request),
+    ]
     should_repair_with_model = _should_repair_outreach_with_model(
         request,
         recommendation=recommendation,
@@ -19602,6 +19662,7 @@ def _advance_outreach(
                 request_cache=sdk_usage_event.get("request_cache"),
                 store=store,
                 run_stage="work_item_outreach_composer",
+                execution_telemetry=sdk_usage_event.get("execution_telemetry"),
             )
         draft, repair_audit_note, sdk_usage_event, recommendation = (
             _compose_outreach_draft_for_work_item(
@@ -19619,11 +19680,14 @@ def _advance_outreach(
                 repair_audit_note,
             ]
         )
-        recommendation_mismatches = _gmail_thread_recommendation_mismatches(
-            draft,
-            recommendation=recommendation,
-            gmail_thread_context=gmail_thread_context,
-        )
+        recommendation_mismatches = [
+            *_gmail_thread_recommendation_mismatches(
+                draft,
+                recommendation=recommendation,
+                gmail_thread_context=gmail_thread_context,
+            ),
+            *_outreach_draft_contract_mismatches(draft, request=request),
+        ]
         if recommendation_mismatches:
             recommendation = {
                 **recommendation,
@@ -19663,7 +19727,11 @@ def _advance_outreach(
             "Deterministic review withheld optional reply copy without a second model call; "
             "the recommendation and evidence-bounded next step were retained."
         )
-    reply_recommended = recommendation.get("reply_recommended") is not False
+    reply_recommended = _outreach_draft_should_be_retained(
+        request,
+        recommendation=recommendation,
+        mismatches=recommendation_mismatches,
+    )
     if not reply_recommended:
         draft = draft.model_copy(
             update={
@@ -19788,6 +19856,7 @@ def _advance_outreach(
             request_cache=sdk_usage_event.get("request_cache"),
             store=store,
             run_stage="work_item_outreach_composer",
+            execution_telemetry=sdk_usage_event.get("execution_telemetry"),
         )
     return WorkflowRunResult(
         work_item=work_item,
@@ -20264,6 +20333,7 @@ def _advance_thread_local_outreach_draft(
             request_cache=sdk_usage_event.get("request_cache"),
             store=store,
             run_stage="thread_local_outreach_composer",
+            execution_telemetry=sdk_usage_event.get("execution_telemetry"),
         )
     summary = _format_outreach_draft_work_item_summary(
         draft,
@@ -20610,6 +20680,9 @@ def _compose_thread_local_outreach_draft_for_work_item(
                 "usage": dict(getattr(outcome, "usage", None) or {}),
                 "cost": dict(getattr(outcome, "cost", None) or {}),
                 "request_cache": dict(getattr(outcome, "request_cache", None) or {}),
+                "execution_telemetry": dict(
+                    getattr(outcome, "execution_telemetry", None) or {}
+                ),
             },
             recommendation,
         )
@@ -21967,6 +22040,112 @@ def _gmail_thread_recommendation_mismatches(
     return mismatches
 
 
+def _outreach_draft_contract_mismatches(
+    draft: OutreachDraft,
+    *,
+    request: WorkflowRunRequest,
+) -> list[str]:
+    """Validate explicit supplied-fact draft requirements before rendering."""
+
+    if not request.live_sdk:
+        return []
+    request_text = " ".join(str(request.request_text or "").split())
+    if not re.search(
+        r"\b(?:supplied|provided)\s+"
+        r"(?:facts?|context|evidence|background|grounding)\b",
+        request_text,
+        flags=re.I,
+    ):
+        return []
+
+    fallback_plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="outreach_composer",
+    ).model_dump(mode="json")
+    planned_constraints = output_constraints_from_plan(request.manual_request_plan)
+    raw_request_constraints = output_constraints_from_plan(fallback_plan)
+    constraints = (
+        raw_request_constraints
+        if raw_request_constraints.has_deterministic_requirements()
+        else planned_constraints
+    )
+    validation = validate_output_constraints(
+        draft.email_body,
+        constraints,
+    )
+    mismatches = list(validation.violations)
+
+    body = " ".join(str(draft.email_body or "").split())
+    body_tokens = set(re.findall(r"[a-z0-9]+", body.lower()))
+    fact_stopwords = {
+        "about",
+        "after",
+        "also",
+        "anything",
+        "before",
+        "could",
+        "discuss",
+        "does",
+        "from",
+        "have",
+        "into",
+        "only",
+        "that",
+        "their",
+        "these",
+        "they",
+        "this",
+        "using",
+        "wants",
+        "with",
+        "would",
+    }
+    for fact in _extract_inline_outreach_facts(request_text):
+        fact_tokens = [
+            token
+            for token in re.findall(r"[a-z0-9]+", fact.lower())
+            if len(token) >= 4 and token not in fact_stopwords
+        ]
+        if len(fact_tokens) < 2:
+            continue
+        required_overlap = min(3, max(2, (len(set(fact_tokens)) + 2) // 3))
+        if len(set(fact_tokens) & body_tokens) < required_overlap:
+            mismatches.append(
+                "The draft does not retain enough detail from supplied fact: "
+                + fact[:180]
+            )
+
+    call_match = re.search(
+        r"\b(?P<minutes>\d{1,3})[-\s]+minute\s+"
+        r"(?P<meeting>call|conversation|meeting)\b",
+        request_text,
+        flags=re.I,
+    )
+    if call_match:
+        minutes = call_match.group("minutes")
+        meeting = call_match.group("meeting").lower()
+        has_duration = bool(
+            re.search(rf"\b{re.escape(minutes)}[-\s]+minute\b", body, flags=re.I)
+        )
+        has_meeting = bool(
+            re.search(r"\b(?:call|conversation|meeting)\b", body, flags=re.I)
+        )
+        if not (has_duration and has_meeting):
+            mismatches.append(
+                f"The draft does not include the requested {minutes}-minute {meeting} CTA."
+            )
+
+    unmet_dimensions = list(
+        getattr(getattr(draft, "request_coverage", None), "unmet_dimensions", []) or []
+    )
+    if unmet_dimensions:
+        mismatches.append(
+            "The draft reports unmet request dimensions: "
+            + "; ".join(str(item) for item in unmet_dimensions[:4])
+        )
+    return list(dict.fromkeys(item for item in mismatches if item))
+
+
 def _should_repair_outreach_with_model(
     request: WorkflowRunRequest,
     *,
@@ -21978,7 +22157,53 @@ def _should_repair_outreach_with_model(
     return bool(
         mismatches
         and request.allow_manager_loop_repair
-        and recommendation.get("reply_recommended") is not False
+        and (
+            recommendation.get("reply_recommended") is not False
+            or _operator_requested_bounded_outreach_draft(request)
+        )
+    )
+
+
+def _operator_requested_bounded_outreach_draft(
+    request: WorkflowRunRequest,
+) -> bool:
+    """Keep a safe direct draft ask from being reclassified as no-reply advice."""
+
+    text = " ".join(str(request.request_text or "").split())
+    return bool(
+        re.search(r"\b(?:draft|write|compose|prepare)\b", text, flags=re.I)
+        and re.search(
+            r"\b(?:supplied|provided)\s+(?:facts?|context|evidence|background|grounding)\b",
+            text,
+            flags=re.I,
+        )
+        and (
+            re.search(r"\b(?:no send|draft-only|draft only)\b", text, flags=re.I)
+            or re.search(
+                r"\b(?:do\s+not|don't|dont|never|without)\b"
+                r"[^.;\n]{0,200}\b(?:send|post|publish|share)\b",
+                text,
+                flags=re.I,
+            )
+        )
+        and not looks_like_send_side_effect(positive_capability_text(text))
+    )
+
+
+def _outreach_draft_should_be_retained(
+    request: WorkflowRunRequest,
+    *,
+    recommendation: dict[str, Any],
+    mismatches: list[str],
+) -> bool:
+    """Honor the operator's direct draft contract after deterministic review passes."""
+
+    return bool(
+        recommendation.get("reply_recommended") is not False
+        or (
+            _operator_requested_bounded_outreach_draft(request)
+            and not mismatches
+        )
     )
 
 
@@ -22223,10 +22448,40 @@ def _inline_outreach_context_from_request(request_text: str) -> dict[str, Any] |
     if not re.search(r"\b(?:outreach|email|linkedin|message|note)\b", text, flags=re.I):
         return None
     if not re.search(
-        r"\b(?:approved|source-backed|source backed|sources?|facts?|context)\b",
+        r"\b(?:approved|source-backed|source backed|sources?|facts?|context|"
+        r"evidence|background|grounding)\b",
         text,
         flags=re.I,
     ):
+        return None
+
+    source_url = _extract_inline_source_url(text)
+    source_label = _extract_inline_outreach_value(text, _INLINE_OUTREACH_SOURCE_LABELS)
+    facts = _extract_inline_outreach_facts(text)
+    if not facts:
+        return None
+    explicitly_supplied_for_drafting = bool(
+        re.search(
+            r"\b(?:use|using)\s+only\s+(?:these\s+|the\s+following\s+)?"
+            r"(?:operator[-\s]+)?(?:supplied|provided)\s+"
+            r"(?:facts|context|evidence|background|grounding)\b",
+            text,
+            flags=re.I,
+        )
+        and (
+            re.search(r"\b(?:no send|draft-only|draft only)\b", text, flags=re.I)
+            or re.search(
+                r"\b(?:do\s+not|don't|dont|never|without)\b"
+                r"[^.;\n]{0,200}\b(?:send|post|publish|share)\b",
+                text,
+                flags=re.I,
+            )
+        )
+    )
+    has_source_basis = bool(source_url or source_label) or bool(
+        re.search(r"\b(?:approved|source-backed|source backed)\b", text, flags=re.I)
+    ) or explicitly_supplied_for_drafting
+    if not has_source_basis:
         return None
 
     company = _extract_inline_outreach_value(
@@ -22241,27 +22496,19 @@ def _inline_outreach_context_from_request(request_text: str) -> dict[str, Any] |
         company = _company_from_inline_recipient_label(recipient_name)
     if not company:
         company = _extract_outreach_company_from_request(text)
+    if not company:
+        company = _company_from_inline_outreach_facts(facts)
     company = _clean_inline_outreach_company(company)
     if not company:
         return None
 
-    source_url = _extract_inline_source_url(text)
-    source_label = _extract_inline_outreach_value(text, _INLINE_OUTREACH_SOURCE_LABELS)
-    facts = _extract_inline_outreach_facts(text)
-    if not facts:
-        return None
-    has_source_basis = bool(source_url or source_label) or bool(
-        re.search(r"\b(?:approved|source-backed|source backed)\b", text, flags=re.I)
-    )
-    if not has_source_basis:
-        return None
     recipient_email = ""
     if recipient_name and "@" in recipient_name:
         _, recipient_email = parseaddr(recipient_name)
     return {
         "company": company,
         "source_url": source_url or "user-provided://outreach-context",
-        "source_label": source_label or "User-provided approved outreach context",
+        "source_label": source_label or "Operator-supplied outreach facts",
         "facts": facts,
         "recipient_name": recipient_name,
         "recipient_email": recipient_email,
@@ -22318,6 +22565,26 @@ def _company_from_inline_recipient_label(value: str) -> str:
     return ""
 
 
+def _company_from_inline_outreach_facts(facts: list[str]) -> str:
+    candidates: list[str] = []
+    for fact in facts:
+        match = re.match(
+            r"(?P<company>[A-Za-z][A-Za-z0-9&.' -]{1,120}?)"
+            r"(?:,\s+[^,]{1,80},)?\s+"
+            r"(?:operates?|runs?|provides?|offers?|serves?|has|wants?|plans?|"
+            r"seeks?|asked|requested|is|are)\b",
+            str(fact or "").strip(),
+        )
+        if not match:
+            continue
+        candidate = match.group("company").strip(" .;,:")
+        if candidate.lower() in {"he", "her", "it", "she", "they", "we"}:
+            continue
+        candidates.append(candidate)
+    unique = list(dict.fromkeys(candidate for candidate in candidates if candidate))
+    return unique[0] if len(unique) == 1 else ""
+
+
 def _extract_inline_source_url(text: str) -> str:
     match = re.search(r"\bhttps?://[^\s,;)]+", text)
     if match:
@@ -22354,7 +22621,8 @@ def _strip_inline_outreach_instruction_tail(text: str) -> str:
         flags=re.I,
     )
     cleaned = re.sub(
-        r"\b(?:Return|Keep|Caveats?|Constraints?|Instructions?|Do not|Don't|Dont|Never)\b"
+        r"\b(?:Return|Invite|Keep|Caveats?|Constraints?|Instructions?|"
+        r"Do not|Don't|Dont|Never)\b"
         r"[\s\S]*$",
         "",
         cleaned,
@@ -22662,6 +22930,18 @@ def _compose_outreach_draft_for_work_item(
             )
             if part
         )[:4000]
+    elif review_feedback:
+        objective = " ".join(
+            (
+                objective,
+                "Manager review feedback from the prior attempt:",
+                "; ".join(review_feedback),
+                (
+                    "Revise the structured draft so every item is resolved while using "
+                    "only the same approved facts and preserving the no-send boundary."
+                ),
+            )
+        )[:4000]
     if not request.live_sdk:
         return (
             compose_outreach_draft_fixture(
@@ -22756,6 +23036,9 @@ def _compose_outreach_draft_for_work_item(
                 "usage": dict(getattr(outcome, "usage", None) or {}),
                 "cost": dict(getattr(outcome, "cost", None) or {}),
                 "request_cache": dict(getattr(outcome, "request_cache", None) or {}),
+                "execution_telemetry": dict(
+                    getattr(outcome, "execution_telemetry", None) or {}
+                ),
             },
             recommendation,
         )

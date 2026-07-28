@@ -1224,6 +1224,15 @@ def _ask_shape_policy(text: str) -> AskShapePolicy:
     lower = " ".join(str(text or "").lower().split())
     positive_lower = " ".join(positive_capability_text(text).lower().split())
     output_constraints = _interpreted_output_constraints(text)
+    per_company_source_count = _per_company_source_url_count(text)
+    if per_company_source_count is not None:
+        output_constraints = output_constraints.model_copy(
+            update={
+                "source_url_count_mode": "exact",
+                "source_url_count": per_company_source_count,
+                "include_source_urls": True,
+            }
+        )
     local_attachment_context = has_explicit_local_attachment_context(text)
     exact = bool(
         re.search(
@@ -1249,6 +1258,8 @@ def _ask_shape_policy(text: str) -> AskShapePolicy:
         for phrase, label in (
             ("official sources", "official"),
             ("official source", "official"),
+            ("first-party sources", "official"),
+            ("first-party source", "official"),
             ("primary sources", "primary"),
             ("primary source", "primary"),
             ("selected sources", "selected"),
@@ -1260,8 +1271,23 @@ def _ask_shape_policy(text: str) -> AskShapePolicy:
             ("local sources", "local"),
             ("local source", "local"),
         )
-        if phrase in lower
+        if phrase in positive_lower
     ]
+    if re.search(
+        r"\bofficial(?:\s+[a-z0-9][\w&.-]*){0,3}\s+sources?\b",
+        positive_lower,
+    ):
+        source_types.append("official")
+    if re.search(
+        r"\b(?:[a-z0-9][\w&.-]*\s+){1,3}(?:official|first-party)\s+sources?\b",
+        positive_lower,
+    ):
+        source_types.append("official")
+    if re.search(
+        r"\bprimary(?:\s+[a-z0-9][\w&.-]*){0,3}\s+sources?\b",
+        positive_lower,
+    ):
+        source_types.append("primary")
     if local_attachment_context:
         source_types.append("local_attachment")
     source_types = list(dict.fromkeys(source_types))
@@ -1312,10 +1338,10 @@ def _ask_shape_policy(text: str) -> AskShapePolicy:
             else "unspecified"
         ),
         evidence_depth=(
-            "quick"
-            if re.search(r"\b(quick|brief|concise|do not deepen)\b", lower)
-            else "deep"
-            if re.search(r"\b(deep|comprehensive|thorough|detailed)\b", lower)
+            "deep"
+            if re.search(r"\b(deep(?:ly)?|comprehensive|thorough|detailed)\b", lower)
+            else "quick"
+            if re.search(r"\b(quick|fast|lightweight|do not deepen)\b", lower)
             else "unspecified"
         ),
         source_type_preference=source_types,
@@ -1366,7 +1392,7 @@ def _ask_shape_policy(text: str) -> AskShapePolicy:
         audience_scope=_explicit_audience_scope(lower),
         cost_mode=(
             "minimize"
-            if re.search(r"\b(low[- ]cost|minimi[sz]e cost|quick|cheap)\b", lower)
+            if re.search(r"\b(low[- ]cost|minimi[sz]e cost|quick|fast|cheap)\b", lower)
             else "quality"
             if re.search(r"\b(best quality|deep|thorough)\b", lower)
             else "unspecified"
@@ -1385,6 +1411,7 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
 
     normalized = " ".join(str(text or "").split())
     lower = normalized.lower()
+    positive_lower = " ".join(positive_capability_text(text).lower().split())
     word_match = re.search(
         r"\b(?P<mode>exactly|in|no\s+more\s+than|at\s+most|under|within|"
         r"max(?:imum)?(?:\s+of)?|minimum(?:\s+of)?|at\s+least)\s+"
@@ -1433,11 +1460,18 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
             return False
         request_verb = (
             r"(?:answer|respond|reply|return|give(?:\s+me)?|provide|write|"
-            r"summari[sz]e|explain|describe|keep|limit|shorten|condense|"
+            r"draft|compose|prepare|summari[sz]e|explain|describe|keep|limit|"
+            r"shorten|condense|"
             r"turn|convert|reformat|combine)"
         )
         prefix_clause = re.split(r"[.;:!?\n]", prefix)[-1]
         if re.search(rf"\b{request_verb}\b[^.;:!?\n]{{0,45}}$", prefix_clause):
+            return True
+        if re.search(
+            rf"\b{request_verb}\b[^.;:!?\n]{{0,100}}\b"
+            r"(?:answer|response|summary|email|draft|message|note|reply)\s*$",
+            prefix_clause,
+        ):
             return True
         if re.match(r"\s+only\b", suffix):
             return True
@@ -1495,7 +1529,8 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
         re.finditer(
             r"\b(?:exactly\s+)?"
             r"(?P<count>[1-9]\d?|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
-            r"(?:[a-z][\w-]*\s+){0,2}"
+            r"(?:(?:concise|short|brief|substantive|detailed|actionable|clear|"
+            r"distinct|labeled|separate|useful|key|but)\s+){0,4}"
             r"(?P<item_kind>bullets?|items?|results?|options?|recommendations?|"
             r"points?|talking\s+points?)\b",
             lower,
@@ -1563,6 +1598,34 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
             return "minimum"
         return "maximum"
 
+    source_url_count_match = re.search(
+        r"\b(?P<mode>exactly|no\s+more\s+than|at\s+most|under|within|"
+        r"max(?:imum)?(?:\s+of)?|minimum(?:\s+of)?|at\s+least)\s+"
+        r"(?P<count>[1-9]\d?|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+        r"(?:(?:recent|current)\s+)?"
+        r"(?:(?:official|primary|first-party|selected|provided|supplied|local)"
+        r"(?:\s+[a-z0-9][\w&.-]*){0,3}\s+|"
+        r"[a-z0-9][\w&.-]*\s+(?:official|primary|first-party)\s+)?"
+        r"(?:source\s+urls?|sources?(?:\s+from(?:\s+[a-z0-9][\w&.-]*){1,3})?"
+        r"\s+(?:with|including)\s+(?:visible\s+)?"
+        r"(?:urls?|links?))\b",
+        positive_lower,
+    )
+    source_url_count = (
+        parsed_count(source_url_count_match) if source_url_count_match else None
+    )
+    source_urls_requested = bool(
+        source_url_count_match
+        or re.search(
+            r"\b(?:cite|include|show|provide)\b[^.]{0,60}\b(?:urls?|links?)\b",
+            positive_lower,
+        )
+        or re.search(
+            r"\bsources?\s+(?:with|including)\s+(?:visible\s+)?(?:urls?|links?)\b",
+            positive_lower,
+        )
+    )
+
     required_sections: list[str] = []
     section_match = re.search(r"\breturn\s+exactly\s*:\s*(?P<sections>[^.\n]+)", normalized, re.I)
     if section_match:
@@ -1614,10 +1677,11 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
         or sentence_match
         or item_range
         or authoritative_item_exact
+        or source_url_count_match
         or required_sections
         or forbidden_phrases
         or re.search(r"\b(?:no|do not use|avoid)\s+em\s+dashes?\b", lower)
-        or re.search(r"\b(?:cite|include|show|provide)\b[^.]{0,60}\b(?:urls?|links?)\b", lower)
+        or source_urls_requested
     )
     scope = (
         "answer"
@@ -1640,6 +1704,11 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
         interpretation_parts.append(
             f"item count {minimum_items if minimum_items is not None else 0}"
             f"-{maximum_items if maximum_items is not None else 'unbounded'}"
+        )
+    if source_url_count is not None:
+        interpretation_parts.append(
+            f"{count_mode(source_url_count_match.group('mode'))} "
+            f"{source_url_count} source URLs"
         )
     if required_sections:
         interpretation_parts.append("required sections: " + ", ".join(required_sections))
@@ -1667,14 +1736,50 @@ def _interpreted_output_constraints(text: str) -> InterpretedOutputConstraints:
         ),
         minimum_items=minimum_items,
         maximum_items=maximum_items,
+        source_url_count_mode=(
+            count_mode(source_url_count_match.group("mode"))
+            if source_url_count_match
+            else "unspecified"
+        ),
+        source_url_count=source_url_count,
         required_sections=required_sections,
         require_section_headings=bool(required_sections),
         forbidden_phrases=forbidden_phrases,
         forbid_em_dash=bool(re.search(r"\b(?:no|do not use|avoid)\s+em\s+dashes?\b", lower)),
-        include_source_urls=bool(
-            re.search(r"\b(?:cite|include|show|provide)\b[^.]{0,60}\b(?:urls?|links?)\b", lower)
-        ),
+        include_source_urls=source_urls_requested,
     )
+
+
+def _per_company_source_url_count(text: str) -> int | None:
+    """Resolve an exact per-company URL contract for a bounded comparison."""
+
+    positive_text = " ".join(positive_capability_text(text).lower().split())
+    match = re.search(
+        r"\b(?P<count>[1-9]\d?|one|two|three|four|five)\s+"
+        r"(?:(?:official|first-party|primary)\s+)?"
+        r"(?:source\s+)?(?:urls?|links?)\s+"
+        r"(?:for\s+each|per)\s+compan(?:y|ies)\b",
+        positive_text,
+    )
+    if match is None:
+        return None
+    raw_count = match.group("count")
+    per_company = int(raw_count) if raw_count.isdigit() else _COUNT_WORDS.get(raw_count)
+    comparison_target = _company_comparison_target(text)
+    if per_company is None or not comparison_target:
+        return None
+    entities = [
+        item.strip(" ,.;:")
+        for item in re.split(
+            r"\s+(?:vs\.?|versus|and)\s+",
+            comparison_target,
+            flags=re.I,
+        )
+        if item.strip(" ,.;:")
+    ]
+    if len(entities) < 2:
+        return None
+    return min(10, per_company * len(entities))
 
 
 def _reconcile_current_turn_ask_shape(
@@ -1714,6 +1819,13 @@ def _reconcile_current_turn_ask_shape(
         base_value = getattr(base, field_name)
         if base_value != "unspecified":
             values[field_name] = base_value
+    # A fresh bounded comparison has enough typed execution shape to reject
+    # stale cache-only depth or thread dependence. Do not apply that absence rule
+    # to arbitrary asks: the semantic planner may correctly distinguish an
+    # incidental depth word in supplied content from the requested work.
+    if _is_fresh_bounded_comparison_shape(base, request_text=request_text):
+        values["evidence_depth"] = base.evidence_depth
+        values["prior_context_dependency"] = base.prior_context_dependency
     # A plainly stated internal/external audience belongs to the authoritative
     # current turn even when the LLM owns the rest of semantic interpretation.
     # This field may relax an external-drafting prerequisite, but it cannot
@@ -1743,6 +1855,7 @@ def _reconcile_current_turn_ask_shape(
         for mode_field, count_field in (
             ("word_count_mode", "word_count"),
             ("sentence_count_mode", "sentence_count"),
+            ("source_url_count_mode", "source_url_count"),
         ):
             base_count = getattr(base_constraints, count_field)
             if base_count is None:
@@ -1769,6 +1882,8 @@ def _reconcile_current_turn_ask_shape(
                 "item_count_mode": base_constraints.item_count_mode,
                 "minimum_items": base_constraints.minimum_items,
                 "maximum_items": base_constraints.maximum_items,
+                "source_url_count_mode": base_constraints.source_url_count_mode,
+                "source_url_count": base_constraints.source_url_count,
                 "required_sections": retained_required_sections,
                 "require_section_headings": bool(
                     retained_required_sections
@@ -1793,6 +1908,22 @@ def _reconcile_current_turn_ask_shape(
     return AskShapePolicy.model_validate(values)
 
 
+def _is_fresh_bounded_comparison_shape(
+    ask_shape: AskShapePolicy,
+    *,
+    request_text: str,
+) -> bool:
+    constraints = ask_shape.output_constraints
+    return bool(
+        _company_comparison_target(request_text)
+        and ask_shape.output_form in {"brief", "bullets"}
+        and constraints.maximum_items is not None
+        and constraints.maximum_items <= 6
+        and constraints.source_url_count is not None
+        and constraints.source_url_count <= 3
+    )
+
+
 def _planner_hard_output_contract_differs(
     grounded: InterpretedOutputConstraints,
     candidate: InterpretedOutputConstraints,
@@ -1804,6 +1935,7 @@ def _planner_hard_output_contract_differs(
         "sentence_count",
         "minimum_items",
         "maximum_items",
+        "source_url_count",
     )
     if any(
         getattr(candidate, field_name) is not None
@@ -2799,11 +2931,18 @@ def _prune_forbidden_llm_capabilities(
         or candidate_owner_provider in forbidden_provider_access
     )
     if provider_access_forbidden:
+        retain_explicit_provider_free_owner = bool(
+            base.requested_agent == candidate.target_agent == "gmail_triage"
+        )
         base_owner_provider = owner_provider.get(base.target_agent)
         recovery_owner = (
-            base.target_agent
-            if base.target_agent not in {"clarification", "orchestrator"}
-            and base_owner_provider not in forbidden_provider_access
+            candidate.target_agent
+            if retain_explicit_provider_free_owner
+            else base.target_agent
+            if (
+                base.target_agent not in {"clarification", "orchestrator"}
+                and base_owner_provider not in forbidden_provider_access
+            )
             else "chief_of_staff"
         )
         retained_workflow = [
@@ -2822,9 +2961,21 @@ def _prune_forbidden_llm_capabilities(
                 ),
                 "provider_operations": [],
                 "provider_action_steps": [],
-                "intent": "route_request",
-                "task_objective": "route_or_continue",
-                "expected_artifact_type": "none",
+                "intent": (
+                    candidate.intent
+                    if retain_explicit_provider_free_owner
+                    else "route_request"
+                ),
+                "task_objective": (
+                    candidate.task_objective
+                    if retain_explicit_provider_free_owner
+                    else "route_or_continue"
+                ),
+                "expected_artifact_type": (
+                    candidate.expected_artifact_type
+                    if retain_explicit_provider_free_owner
+                    else "none"
+                ),
                 "requires_durable_state": bool(
                     base.requires_durable_state or len(retained_workflow) > 1
                 ),
@@ -2835,10 +2986,16 @@ def _prune_forbidden_llm_capabilities(
                 "side_effect_policy": "draft_or_read_only",
             }
         )
-        warnings.append(
-            "Removed a provider owner because the operator explicitly prohibited "
-            "access to that provider; the remaining provider-free task stays executable."
-        )
+        if retain_explicit_provider_free_owner:
+            warnings.append(
+                "Removed prohibited Gmail access while retaining the explicitly "
+                "named Gmail Triage owner; the supplied-context task stays tool-free."
+            )
+        else:
+            warnings.append(
+                "Removed a provider owner because the operator explicitly prohibited "
+                "access to that provider; the remaining provider-free task stays executable."
+            )
     if candidate.requires_live_search and any(
         _negative_constraint_forbids_live_search(item) for item in explicit_constraints
     ):
@@ -3368,11 +3525,13 @@ def _has_supplied_context_boundary(text: str) -> bool:
             r"(?:this|the|these|those|provided|supplied|operator[- ]supplied)\s+"
             r"(?:(?:approved|provided|supplied|operator[- ]supplied)\s+)?"
             r"(?:(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+)?"
+            r"(?:(?:email|thread|message|source|document)\s+)?"
             r"(?:note|notes|fact|facts|text|material|information|details|context)\b"
             r"|\b(?:using|use|from|within|based on|grounded in)\s+"
             r"(?:this|the|these|those|provided|supplied|operator[- ]supplied)\s+"
             r"(?:(?:approved|provided|supplied|operator[- ]supplied)\s+)?"
             r"(?:(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+)?"
+            r"(?:(?:email|thread|message|source|document)\s+)?"
             r"(?:note|notes|fact|facts|text|material|information|details|context)"
             r"\s+only\b"
             r"|\bstay within (?:the )?(?:supplied|provided|following) text\b"

@@ -35,6 +35,11 @@ from keystone_agents.finance_expense_receipts import (
 from keystone_agents.guardrails import keystone_tool_guardrail_kwargs
 from keystone_agents.local_file_inputs import read_supported_local_file
 from keystone_agents.memory import chief_of_staff_memory_item
+from keystone_agents.provider_read import (
+    ProviderReadContextError,
+    current_provider_read_context,
+    record_provider_read_result,
+)
 from keystone_agents.schemas.airtable import (
     FINANCE_TAX_TRACKER_BASE_NAME,
     FINANCE_TAX_TRACKER_TABLES,
@@ -2577,6 +2582,7 @@ def google_doc_read_impl(
             "max_chars": bounded_chars,
             "send_enabled": False,
         }
+    _start_google_workspace_read_attempt()
     services = _google_workspace_services()
     _assert_configured_google_account(services["drive"])
     _assert_drive_file_in_folder(services["drive"], document_id, target_folder_path)
@@ -2606,13 +2612,15 @@ def google_doc_read(
 ) -> str:
     """Read an approved Google Doc for internal Chief of Staff context."""
 
+    result = google_doc_read_impl(
+        document_id_or_url,
+        folder_path=folder_path,
+        max_chars=max_chars,
+        live=live or _google_workspace_live_reads_default(),
+    )
+    record_provider_read_result("google_doc_read", result)
     return json.dumps(
-        google_doc_read_impl(
-            document_id_or_url,
-            folder_path=folder_path,
-            max_chars=max_chars,
-            live=live or _google_workspace_live_reads_default(),
-        ),
+        result,
         ensure_ascii=True,
         sort_keys=True,
         default=str,
@@ -3678,6 +3686,7 @@ def google_drive_list_folder_impl(
             "item_count": 0,
             "send_enabled": False,
         }
+    _start_google_workspace_read_attempt()
     services = _google_workspace_services()
     drive_service = services["drive"]
     _assert_configured_google_account(drive_service)
@@ -3722,12 +3731,14 @@ def google_drive_list_folder(
 ) -> str:
     """List files and subfolders inside the scoped KNIOps Google Drive folder."""
 
+    result = google_drive_list_folder_impl(
+        folder_path,
+        max_items=max_items,
+        live=live or _google_workspace_live_reads_default(),
+    )
+    record_provider_read_result("google_drive_list_folder", result)
     return json.dumps(
-        google_drive_list_folder_impl(
-            folder_path,
-            max_items=max_items,
-            live=live or _google_workspace_live_reads_default(),
-        ),
+        result,
         ensure_ascii=True,
         sort_keys=True,
         default=str,
@@ -3764,6 +3775,7 @@ def google_drive_search_files_impl(
                 "This tool returns Drive metadata only; it does not download file bytes.",
             ],
         }
+    _start_google_workspace_read_attempt()
     services = _google_workspace_services()
     drive_service = services["drive"]
     _assert_configured_google_account(drive_service)
@@ -3821,14 +3833,16 @@ def google_drive_search_files(
 ) -> str:
     """Search scoped Drive file metadata, including Docs, Sheets, PDFs, and images."""
 
+    result = google_drive_search_files_impl(
+        query,
+        folder_path=folder_path,
+        mime_type=mime_type,
+        max_items=max_items,
+        live=live or _google_workspace_live_reads_default(),
+    )
+    record_provider_read_result("google_drive_search_files", result)
     return json.dumps(
-        google_drive_search_files_impl(
-            query,
-            folder_path=folder_path,
-            mime_type=mime_type,
-            max_items=max_items,
-            live=live or _google_workspace_live_reads_default(),
-        ),
+        result,
         ensure_ascii=True,
         sort_keys=True,
         default=str,
@@ -3870,6 +3884,7 @@ def google_drive_get_file_metadata_impl(
                 "Image support includes width, height, and rotation metadata when Drive provides it.",
             ],
         }
+    _start_google_workspace_read_attempt()
     services = _google_workspace_services()
     drive_service = services["drive"]
     _assert_configured_google_account(drive_service)
@@ -3919,12 +3934,14 @@ def google_drive_get_file_metadata(
 ) -> str:
     """Read scoped Drive file metadata for Docs, Sheets, PDFs, images, and other files."""
 
+    result = google_drive_get_file_metadata_impl(
+        file_id_or_url,
+        folder_path=folder_path,
+        live=live or _google_workspace_live_reads_default(),
+    )
+    record_provider_read_result("google_drive_get_file_metadata", result)
     return json.dumps(
-        google_drive_get_file_metadata_impl(
-            file_id_or_url,
-            folder_path=folder_path,
-            live=live or _google_workspace_live_reads_default(),
-        ),
+        result,
         ensure_ascii=True,
         sort_keys=True,
         default=str,
@@ -5796,6 +5813,29 @@ def _powerpoint_slide_artifacts(
 
 
 def _google_workspace_services() -> dict[str, Any]:
+    read_context = current_provider_read_context()
+    if (
+        read_context is not None
+        and read_context.plan.provider == "google_workspace"
+    ):
+        return read_context.service(
+            "google_workspace.services",
+            _build_google_workspace_services,
+        )
+    return _build_google_workspace_services()
+
+
+def _start_google_workspace_read_attempt() -> None:
+    read_context = current_provider_read_context()
+    if read_context is None or read_context.plan.provider != "google_workspace":
+        return
+    if not read_context.try_start_attempt():
+        raise ProviderReadContextError(
+            "Google Workspace read exceeded its bounded call or deadline budget."
+        )
+
+
+def _build_google_workspace_services() -> dict[str, Any]:
     try:
         from google.auth.transport.requests import Request as GoogleAuthRequest
         from google.oauth2.credentials import Credentials
