@@ -136,6 +136,9 @@ from keystone_agents.planning.compatibility import (
     request_forbids_live_research,
     resolve_manual_request_owner,
 )
+from keystone_agents.planning.composition_admission import (
+    is_provider_free_selected_context_draft_plan,
+)
 from keystone_agents.presentation.public_result import attach_execution_public_result
 from keystone_agents.presentation.renderers import (
     render_markdown_table,
@@ -1605,6 +1608,9 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             requested_route=requested_route or semantic_direct_route,
             manual_plan=manual_plan,
             effective_live_search=live_search,
+            provider_free_composition_allowed=bool(
+                orchestrator_preflight.composition_admission.composition_allowed
+            ),
         )
     if args.max_openai_requests is not None and (
         args.max_openai_requests < 0 or resolved_request_estimate["max"] > args.max_openai_requests
@@ -2029,6 +2035,7 @@ def _slack_continuation_workflow_state(text: str) -> dict[str, Any]:
                     "id": f"slack-envelope-{index}",
                     "route": route,
                     "status": result_status,
+                    "thread_correlation": "same_thread",
                     "title": object_title or result_label,
                     "summary": summary,
                 }.items()
@@ -2754,6 +2761,7 @@ def _estimate_ask_openai_requests(
     requested_route: str | None = None,
     manual_plan: ManualRequestPlan | None = None,
     effective_live_search: bool | None = None,
+    provider_free_composition_allowed: bool = False,
 ) -> dict[str, Any]:
     if not live_sdk and not live_manual_plan:
         return {"min": 0, "max": 0, "stages": []}
@@ -2781,6 +2789,7 @@ def _estimate_ask_openai_requests(
         _manual_plan_is_bounded_provider_free_response(
             manual_plan,
             route=direct_supplied_route,
+            provider_free_composition_allowed=provider_free_composition_allowed,
         )
         or (
             manual_plan is None
@@ -3220,6 +3229,7 @@ def _manual_plan_is_bounded_provider_free_response(
     manual_plan: ManualRequestPlan | None,
     *,
     route: str,
+    provider_free_composition_allowed: bool = False,
 ) -> bool:
     """Classify post-plan direct answers without inspecting request wording."""
 
@@ -3249,6 +3259,10 @@ def _manual_plan_is_bounded_provider_free_response(
         and (
             not manual_plan.requires_approved_context
             or is_internal_slack_composition_plan(manual_plan)
+            or (
+                provider_free_composition_allowed
+                and is_provider_free_selected_context_draft_plan(manual_plan)
+            )
         )
         and (
             (manual_plan.provider_system == "unspecified" and not manual_plan.provider_operations)
@@ -3270,6 +3284,7 @@ def _should_run_direct_supplied_response(
     *,
     requested_route: str,
     manual_plan: ManualRequestPlan | None,
+    provider_free_composition_allowed: bool = False,
 ) -> bool:
     """Let a live semantic plan decide whether tools/providers are unnecessary."""
 
@@ -3278,6 +3293,7 @@ def _should_run_direct_supplied_response(
         return _manual_plan_is_bounded_provider_free_response(
             manual_plan,
             route=requested_route,
+            provider_free_composition_allowed=provider_free_composition_allowed,
         )
     if authority.invalid:
         return False
@@ -4246,9 +4262,14 @@ def _slack_prior_runs_for_planner(
         if not isinstance(run, dict):
             continue
         status = str(run.get("status") or "completed").strip().lower()
-        if status not in {"completed", "done", "recovered"} and not allow_failed_context:
+        completed = status in {"completed", "done", "recovered", "success"}
+        if not completed and not allow_failed_context:
             continue
-        admitted.append(dict(run))
+        compact = dict(run)
+        if completed:
+            compact["status"] = "completed"
+        compact["thread_correlation"] = "same_thread"
+        admitted.append(compact)
     return admitted
 
 
@@ -4446,7 +4467,15 @@ def _direct_specialist_execution_context(
                 key: value
                 for key, value in {
                     key: _bounded_redacted_text(item.get(key), max_chars=480)
-                    for key in ("id", "route", "status", "object_id", "title", "summary")
+                    for key in (
+                        "id",
+                        "route",
+                        "status",
+                        "thread_correlation",
+                        "object_id",
+                        "title",
+                        "summary",
+                    )
                 }.items()
                 if value
             }
@@ -7197,6 +7226,10 @@ def _run_ask_specialist_live(
         input_text,
         requested_route=route,
         manual_plan=manual_plan,
+        provider_free_composition_allowed=bool(
+            orchestrator_preflight
+            and orchestrator_preflight.composition_admission.composition_allowed
+        ),
     ):
         return _run_direct_supplied_context_response_live(
             route,

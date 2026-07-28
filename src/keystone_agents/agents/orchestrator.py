@@ -52,6 +52,9 @@ from keystone_agents.planning.compatibility import (
     infer_manual_request_plan,
     positive_capability_text,
 )
+from keystone_agents.planning.composition_admission import (
+    resolve_provider_free_composition_admission,
+)
 from keystone_agents.quality_budget import business_research_quality_budget
 from keystone_agents.retrieval_policy import derive_request_autonomy_hint
 from keystone_agents.run import run_typed_sdk_agent
@@ -61,6 +64,9 @@ from keystone_agents.schemas.approval import (
     state_allows_drafting,
 )
 from keystone_agents.schemas.company_profile import CompanyProfile
+from keystone_agents.schemas.composition_admission import (
+    ProviderFreeCompositionAdmission,
+)
 from keystone_agents.schemas.decision_trace import DecisionTrace
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.orchestrator import (
@@ -378,6 +384,9 @@ class OrchestratorPreflight(BaseModel):
     block_reason: str = ""
     manual_request_plan: ManualRequestPlan
     route_result: OrchestratorResult
+    composition_admission: ProviderFreeCompositionAdmission = Field(
+        default_factory=ProviderFreeCompositionAdmission
+    )
     sdk_usage_events: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -424,11 +433,16 @@ def run_orchestrator_preflight(
         cost_callback=record_planner_cost,
         database_url=database_url,
     )
+    composition_admission = resolve_provider_free_composition_admission(
+        manual_plan,
+        workflow_state=workflow_state,
+    )
     route_result = route_request(
         text,
         manual_plan=manual_plan,
         database_url=database_url,
         workflow_state=workflow_state,
+        composition_admission=composition_admission,
     )
     explicit_agent = manual_plan.requested_agent
     advisory_only = explicit_agent not in {None, "orchestrator"}
@@ -446,6 +460,7 @@ def run_orchestrator_preflight(
         block_reason=block_reason,
         manual_request_plan=manual_plan,
         route_result=route_result,
+        composition_admission=composition_admission,
         sdk_usage_events=sdk_usage_events,
     )
 
@@ -3298,6 +3313,7 @@ def route_request(
     live: bool = False,
     model: str | None = None,
     manual_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
+    composition_admission: ProviderFreeCompositionAdmission | None = None,
     use_manual_plan: bool = False,
     include_operator_feedback_request: bool = False,
 ) -> OrchestratorResult:
@@ -3342,6 +3358,21 @@ def route_request(
         provided=manual_plan,
         enabled=use_manual_plan or manual_plan is not None,
     )
+    resolved_composition_admission = (
+        composition_admission
+        if composition_admission is not None
+        else resolve_provider_free_composition_admission(
+            resolved_manual_plan,
+            workflow_state=state_context,
+        )
+        if resolved_manual_plan is not None
+        else ProviderFreeCompositionAdmission()
+    )
+    if resolved_composition_admission.composition_allowed:
+        # The authenticated operator selected the completed thread result for
+        # this exact draft-only step. This approves the bounded drafting
+        # context, not external use, provider access, posting, or sending.
+        approved_context_present = True
     send_side_effect = _looks_like_send_side_effect(text)
     read_only_context_lookup = _manual_plan_is_read_only_context_lookup(
         resolved_manual_plan,
@@ -3406,6 +3437,16 @@ def route_request(
         workflow_state=state_context,
     )
     if planned_result is not None:
+        if resolved_composition_admission.composition_allowed:
+            planned_result = planned_result.model_copy(
+                update={
+                    "audit_notes": [
+                        *planned_result.audit_notes,
+                        "Admitted completed same-thread selected context for one "
+                        "provider-free composition step; external use remains approval-gated.",
+                    ]
+                }
+            )
         return finish(planned_result)
 
     if _looks_like_chief_of_staff_operational_request(lower_text):

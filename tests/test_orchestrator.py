@@ -25,7 +25,7 @@ from keystone_agents.orchestrator.routing import looks_like_send_side_effect
 from keystone_agents.run import run_agent_dry
 from keystone_agents.schemas.approval import ApprovalQueueItem
 from keystone_agents.schemas.company_profile import CompanyProfile
-from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
+from keystone_agents.schemas.manual_request_plan import AskShapePolicy, ManualRequestPlan
 from keystone_agents.schemas.orchestrator import (
     OrchestratorDecision,
     OrchestratorOutputReview,
@@ -1119,6 +1119,93 @@ def test_outreach_request_without_approved_profile_refuses() -> None:
     assert result.send_enabled is False
     assert result.approval_scope == "drafting"
     assert "blocked" in result.approval_rationale
+
+
+def test_selected_completed_thread_result_is_approved_for_provider_free_drafting() -> None:
+    request = (
+        "Outreach Composer, turn the reply outline into a draft using only the "
+        "supplied email facts. Show it here for review. Do not access Gmail, "
+        "create a provider draft, send, or modify anything."
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="outreach_composer",
+        target_agent="outreach_composer",
+        intent="outreach_draft",
+        task_objective="outreach_draft",
+        expected_artifact_type="outreach_draft",
+        provider_system="unspecified",
+        provider_operations=[],
+        requires_approved_context=True,
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(
+            output_form="draft",
+            prior_context_dependency="selected_context",
+            permission_state="draft_only",
+            audience_scope="external",
+        ),
+    )
+
+    result = route_request(
+        request,
+        manual_plan=plan,
+        workflow_state={
+            "prior_agent_runs": [
+                {
+                    "route": "gmail_triage",
+                    "status": "completed",
+                    "thread_correlation": "same_thread",
+                    "title": "Business Agents Result Ready",
+                    "summary": "Reply outline: acknowledge interest and offer a short call.",
+                }
+            ]
+        },
+    )
+
+    assert result.route == "outreach_composer"
+    assert result.refused is False
+    assert result.approved_context_present is True
+    assert result.send_enabled is False
+    assert result.external_use_approval_required is True
+
+
+def test_selected_failed_thread_result_does_not_approve_outreach_context() -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="outreach_composer",
+        target_agent="outreach_composer",
+        intent="outreach_draft",
+        task_objective="outreach_draft",
+        expected_artifact_type="outreach_draft",
+        provider_system="unspecified",
+        provider_operations=[],
+        requires_approved_context=True,
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(
+            output_form="draft",
+            prior_context_dependency="selected_context",
+            permission_state="draft_only",
+            audience_scope="external",
+        ),
+    )
+
+    result = route_request(
+        "Draft from the selected thread context for review only.",
+        manual_plan=plan,
+        workflow_state={
+            "prior_agent_runs": [
+                {
+                    "route": "gmail_triage",
+                    "status": "blocked",
+                    "thread_correlation": "same_thread",
+                    "summary": "No completed result is available.",
+                }
+            ]
+        },
+    )
+
+    assert result.refused is True
+    assert result.approved_context_present is False
 
 
 def test_outreach_request_without_approved_profile_has_sectioned_operator_summary() -> None:

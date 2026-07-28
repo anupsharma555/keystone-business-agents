@@ -12700,6 +12700,7 @@ def test_slack_continuation_without_history_file_keeps_latest_ask_and_prior_obje
             "id": "slack-envelope-1",
             "route": "zotero_context_agent",
             "status": "completed",
+            "thread_correlation": "same_thread",
             "title": "Using AI to Detect Psychosis Relapse: Scoping Review.",
             "summary": (
                 "Title: Using AI to Detect Psychosis Relapse: Scoping Review. Summary: "
@@ -12723,6 +12724,30 @@ def test_slack_continuation_state_merge_deduplicates_prior_results() -> None:
 
     assert merged["slack_context"] == {"thread_ts": "123.456"}
     assert merged["prior_agent_runs"] == [prior]
+
+
+def test_slack_prior_run_projection_normalizes_success_and_same_thread() -> None:
+    admitted = cli._slack_prior_runs_for_planner(
+        [
+            {
+                "id": "run-1",
+                "route": "gmail_triage",
+                "status": "success",
+                "summary": "Bounded completed result.",
+            }
+        ],
+        allow_failed_context=False,
+    )
+
+    assert admitted == [
+        {
+            "id": "run-1",
+            "route": "gmail_triage",
+            "status": "completed",
+            "thread_correlation": "same_thread",
+            "summary": "Bounded completed result.",
+        }
+    ]
 
 
 def test_slack_operator_request_strips_rendered_quote_and_lone_mention_marker() -> None:

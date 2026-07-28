@@ -9,6 +9,9 @@ import pytest
 from keystone_agents import cli
 from keystone_agents.direct_response import build_direct_supplied_response_agent
 from keystone_agents.manual_request import infer_manual_request_plan, merge_manual_request_plan
+from keystone_agents.planning.composition_admission import (
+    resolve_provider_free_composition_admission,
+)
 from keystone_agents.schemas.execution_request import (
     DirectAgentResponse,
     DirectAgentResponseInput,
@@ -323,6 +326,107 @@ def test_specialist_live_dispatch_preserves_bounded_thread_context(
         == 19
     )
     assert captured["input_text"] == followup
+    assert captured["kwargs"]["execution_context"] == execution_context
+
+
+def test_outreach_selected_context_dispatches_provider_free_after_preflight_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = (
+        "Turn the reply outline into a draft using only the supplied email facts. "
+        "Show it here for review. Do not access Gmail, create a provider draft, "
+        "send, or modify anything."
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="outreach_composer",
+        target_agent="outreach_composer",
+        intent="outreach_draft",
+        task_objective="outreach_draft",
+        expected_artifact_type="outreach_draft",
+        provider_system="unspecified",
+        provider_operations=[],
+        requires_approved_context=True,
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(
+            output_form="draft",
+            prior_context_dependency="selected_context",
+            permission_state="draft_only",
+            audience_scope="external",
+        ),
+    )
+    route_result = cli.route_request(
+        request,
+        manual_plan=plan,
+        workflow_state={
+            "prior_agent_runs": [
+                {
+                    "route": "gmail_triage",
+                    "status": "completed",
+                    "thread_correlation": "same_thread",
+                    "summary": "Reply outline: acknowledge interest and offer a short call.",
+                }
+            ]
+        },
+    )
+    composition_admission = resolve_provider_free_composition_admission(
+        plan,
+        workflow_state={
+            "prior_agent_runs": [
+                {
+                    "route": "gmail_triage",
+                    "status": "completed",
+                    "thread_correlation": "same_thread",
+                    "summary": "Reply outline: acknowledge interest and offer a short call.",
+                }
+            ]
+        },
+    )
+    preflight = cli.OrchestratorPreflight(
+        request_text=request,
+        requested_agent="outreach_composer",
+        advisory_only=True,
+        selected_agent="outreach_composer",
+        manual_request_plan=plan,
+        route_result=route_result,
+        composition_admission=composition_admission,
+    )
+    execution_context = {
+        "prior_agent_runs": [
+            {
+                "route": "gmail_triage",
+                "status": "completed",
+                "thread_correlation": "same_thread",
+                "summary": "Reply outline: acknowledge interest and offer a short call.",
+            }
+        ]
+    }
+    captured: dict[str, object] = {}
+
+    def fake_direct(route: str, input_text: str, **kwargs: object) -> int:
+        captured.update(route=route, input_text=input_text, kwargs=kwargs)
+        return 23
+
+    monkeypatch.setattr(cli, "_run_direct_supplied_context_response_live", fake_direct)
+    monkeypatch.setattr(
+        cli,
+        "_run_ask_work_item",
+        lambda *_args, **_kwargs: pytest.fail(
+            "provider-free selected-context draft must not enter WorkItem execution"
+        ),
+    )
+
+    exit_code = cli._run_ask_specialist_live(
+        "outreach_composer",
+        request,
+        json_output=True,
+        manual_plan=plan,
+        orchestrator_preflight=preflight,
+        execution_context=execution_context,
+    )
+
+    assert exit_code == 23
+    assert captured["route"] == "outreach_composer"
     assert captured["kwargs"]["execution_context"] == execution_context
 
 

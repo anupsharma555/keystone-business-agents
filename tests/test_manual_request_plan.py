@@ -111,6 +111,21 @@ def test_local_attachment_does_not_cancel_an_explicit_airtable_write() -> None:
     assert plan.provider_system == "airtable"
 
 
+def test_supplied_email_facts_capture_selected_context_dependency() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "Outreach Composer, turn the reply outline into a draft using only "
+            "the supplied email facts. Show it here for review. Do not access "
+            "Gmail, create a provider draft, send, or modify anything."
+        ),
+        requested_agent="outreach_composer",
+    )
+
+    assert plan.target_agent == "outreach_composer"
+    assert plan.ask_shape.prior_context_dependency == "selected_context"
+    assert plan.ask_shape.permission_state == "draft_only"
+
+
 def test_llm_cannot_replace_selected_attachment_with_unrequested_provider_read() -> None:
     request = (
         "@KNI CoS, looking at this diagram, summarize the three main stages. "
