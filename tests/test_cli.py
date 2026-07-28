@@ -9644,6 +9644,7 @@ def test_cli_google_workspace_context_live_sdk_enables_live_read_default(
     def fake_run_typed_sdk_sync(agent, prompt, output_type, **kwargs):
         captured["agent_name"] = agent.name
         captured["live_reads_env"] = os.environ.get(cli.GOOGLE_WORKSPACE_LIVE_READS_ENV)
+        captured["max_turns"] = kwargs.get("max_turns")
         return (
             SimpleNamespace(final_output=None, usage=None),
             cli.GoogleWorkspaceContextResult(
@@ -9681,6 +9682,7 @@ def test_cli_google_workspace_context_live_sdk_enables_live_read_default(
     assert captured == {
         "agent_name": "google_workspace_context_agent",
         "live_reads_env": "true",
+        "max_turns": 3,
     }
     assert os.environ.get(cli.GOOGLE_WORKSPACE_LIVE_READS_ENV) is None
     assert payload["selected_agent"] == "google_workspace_context_agent"
@@ -11790,7 +11792,8 @@ def test_bounded_direct_specialists_use_compact_request_estimate(
     )
 
     conditional_repair = "words" in request_text
-    assert estimate["max"] == 3 + int(conditional_repair)
+    context_read_turn = int(route == "google_workspace_context_agent")
+    assert estimate["max"] == 3 + context_read_turn + int(conditional_repair)
     assert estimate["min"] == 2
     assert estimate["stages"] == [
         "manual_request_planner",

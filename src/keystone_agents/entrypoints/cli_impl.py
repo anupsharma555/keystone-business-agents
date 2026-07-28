@@ -3345,15 +3345,15 @@ def _direct_specialist_request_estimate(
         ):
             # The ordered provider read is acquired before the specialist call.
             return 1
+        if _is_bounded_composite_lifecycle_request(
+            route,
+            input_text=input_text,
+            manual_plan=plan,
+        ):
+            # One guarded provider helper owns the complete marked lifecycle;
+            # reserve one model turn for the call and one for synthesis.
+            return 2
         if plan.intent == "business_system_write":
-            if _is_bounded_composite_lifecycle_request(
-                route,
-                input_text=input_text,
-                manual_plan=plan,
-            ):
-                # One guarded provider helper owns the complete marked lifecycle;
-                # reserve one model turn for the call and one for synthesis.
-                return 2
             if (
                 route == "airtable_context_agent"
                 and resolve_finance_expense_receipt_target(
@@ -3367,6 +3367,12 @@ def _direct_specialist_request_estimate(
                 # call. Reserve one model turn for the call and one for synthesis.
                 return 2
             # Allow a separate target/schema read, mutation, and final synthesis.
+            return 3
+        if route == "google_workspace_context_agent":
+            # A bounded provider-backed read may need one model turn to resolve
+            # an exact target, one to read it, and one to synthesize the answer.
+            # This is a ceiling rather than a required number of calls, so exact
+            # reads that finish earlier keep their fast path.
             return 3
         # One model request may select a bounded read tool; the second synthesizes
         # its result. Provider calls do not count as OpenAI requests.
