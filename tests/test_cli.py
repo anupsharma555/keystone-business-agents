@@ -5487,6 +5487,49 @@ def test_bounded_five_bullet_company_comparison_uses_compact_runtime_profile() -
     assert estimate["max"] == 4
 
 
+def test_explicit_one_result_opportunity_stays_compact_when_search_domain_is_broad() -> None:
+    request_text = (
+        "Opportunity Scout, find one current U.S. grant, RFP, or partnership "
+        "opportunity relevant to a small behavioral-health AI research consultancy. "
+        "Give the sponsor, deadline, fit, eligibility caveat, and official URL."
+    )
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="opportunity_scout",
+    ).model_copy(
+        update={
+            "ask_shape": AskShapePolicy(
+                ask_breadth="broad",
+                strict_filter_mode="exact",
+                permission_state="read_only",
+            )
+        }
+    )
+
+    profile = cli._direct_specialist_runtime_profile(
+        "opportunity_scout",
+        input_text=request_text,
+        manual_plan=plan,
+    )
+    estimate = cli._estimate_ask_openai_requests(
+        SimpleNamespace(
+            agent="opportunity_scout",
+            context_file="",
+            live_search=True,
+            max_manager_steps=3,
+        ),
+        input_text=request_text,
+        live_sdk=True,
+        live_manual_plan=True,
+        requested_route="opportunity_scout",
+        manual_plan=plan,
+        effective_live_search=True,
+    )
+
+    assert profile["compact_instructions"] is True
+    assert estimate["max"] == 3
+
+
 def test_company_research_compact_official_lane_reads_two_pages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

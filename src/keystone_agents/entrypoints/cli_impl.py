@@ -3495,9 +3495,17 @@ def _direct_specialist_runtime_profile(
         and plan.ask_shape.output_form == "bullets"
         else 3
     )
+    explicitly_bounded_research_selection = bool(
+        route in {"business_research_analyst", "opportunity_scout"}
+        and plan.desired_count_explicit
+        and 0 < plan.desired_count <= compact_item_limit
+    )
     compact = bool(
         plan.desired_count <= compact_item_limit
-        and plan.ask_shape.ask_breadth != "broad"
+        and (
+            plan.ask_shape.ask_breadth != "broad"
+            or explicitly_bounded_research_selection
+        )
         and not deep_request
         and not multi_operation
     )
