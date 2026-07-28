@@ -124,8 +124,8 @@ def test_canary_rewrites_bridge_database_and_caps_existing_request_limit(
             "keystone_agents.cli",
             "ask",
             "--agent",
-            "gmail_triage",
-            "read messages",
+            "airtable_context_agent",
+            "read records",
         ],
         ["-m", "keystone_agents.cli", "ask", "missing an explicit agent"],
         [

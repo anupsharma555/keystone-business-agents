@@ -18,7 +18,10 @@ CANARY_MAX_OPENAI_REQUESTS_ENV: Final[str] = "KEYSTONE_CANARY_MAX_OPENAI_REQUEST
 CANARY_ALLOWED_AGENTS: Final[frozenset[str]] = frozenset(
     {
         "business_research_analyst",
+        "gmail_triage",
         "google_workspace_context_agent",
+        "opportunity_scout",
+        "outreach_composer",
     }
 )
 CANARY_SCRUBBED_ENV_KEYS: Final[frozenset[str]] = frozenset(

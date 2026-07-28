@@ -199,9 +199,11 @@ repos have loaded their environment:
 - every canonical `ask` receives
   `KEYSTONE_CANARY_MAX_OPENAI_REQUESTS`, and a higher bridge-supplied ceiling is
   reduced to that value;
-- only `google_workspace_context_agent` and `business_research_analyst` are
-  admitted, through the exact `-m keystone_agents.cli ask` entrypoint; arbitrary
-  scripts, modules, Python expressions, and other agents are rejected;
+- only the read-only acceptance set is admitted through the exact
+  `-m keystone_agents.cli ask` entrypoint: Google Workspace Context, Business
+  Research, Opportunity Scout, Gmail Triage, and Outreach Composer. Arbitrary
+  scripts, modules, Python expressions, mutation-oriented context agents, and
+  other agents are rejected;
 - the Workspace OAuth token is copied once into the canary directory with mode
   `0600`; token refreshes update only that staged copy and never the operator's
   original token;
