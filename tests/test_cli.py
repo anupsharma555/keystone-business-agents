@@ -21,6 +21,9 @@ from keystone_agents.orchestrator.preflight_context import (
     ORCHESTRATOR_PREFLIGHT_ENV,
     ORCHESTRATOR_ROUTE_RESULT_ENV,
 )
+from keystone_agents.planning.composition_admission import (
+    resolve_provider_free_composition_admission,
+)
 from keystone_agents.schemas.manual_request_plan import (
     AskShapePolicy,
     ManualProviderActionStep,
@@ -12694,7 +12697,10 @@ def test_slack_continuation_without_history_file_keeps_latest_ask_and_prior_obje
     execution_request = cli.build_execution_request(request)
     assert execution_request.requested_agent == ""
     assert execution_request.continuation.prior_agent == "business_research_analyst"
-    state = cli._slack_continuation_workflow_state(request)
+    state = cli._slack_continuation_workflow_state(
+        request,
+        prior_agent=execution_request.continuation.prior_agent,
+    )
     assert state["prior_agent_runs"] == [
         {
             "id": "slack-envelope-1",
@@ -12708,6 +12714,145 @@ def test_slack_continuation_without_history_file_keeps_latest_ask_and_prior_obje
             ),
         }
     ]
+
+
+def test_slack_continuation_generic_success_uses_advisory_prior_owner() -> None:
+    request = (
+        "continue this prior Slack thread. "
+        "Current user request (authoritative): Outreach Composer, turn the reply "
+        "outline into a draft of no more than 70 words using only the supplied "
+        "email facts. Show it here for review. Do not access Gmail, create a "
+        "provider draft, send, or modify anything. "
+        "Prior task owner (advisory): gmail_triage "
+        "Provider affinity: gmail "
+        "Previous request: Gmail Triage, analyze only this supplied sanitized email. "
+        "Previous result title: Business Agents Result Ready "
+        "Previous result: Reply outline: acknowledge interest, confirm the fall "
+        "pilot request, and offer a short call. "
+        "User follow-up: Outreach Composer, turn the reply outline into a draft "
+        "using only the supplied email facts. Show it here for review. "
+        "Continue the same agent task."
+    )
+
+    execution_request = cli.build_execution_request(request)
+    state = cli._slack_continuation_workflow_state(
+        request,
+        prior_agent=execution_request.continuation.prior_agent,
+    )
+
+    assert state["prior_agent_runs"] == [
+        {
+            "id": "slack-envelope-1",
+            "route": "gmail_triage",
+            "status": "completed",
+            "thread_correlation": "same_thread",
+            "title": "Business Agents Result Ready",
+            "summary": (
+                "Reply outline: acknowledge interest, confirm the fall pilot "
+                "request, and offer a short call."
+            ),
+        }
+    ]
+
+
+def test_natural_slack_cross_agent_envelope_admits_provider_free_composition() -> None:
+    request = (
+        "continue this prior Slack thread. "
+        "Current user request (authoritative): Outreach Composer, turn the reply "
+        "outline into a draft of no more than 70 words using only the supplied "
+        "email facts. Show it here for review. Do not access Gmail, create a "
+        "provider draft, send, or modify anything. "
+        "Prior task owner (advisory): gmail_triage "
+        "Provider affinity: gmail "
+        "Previous request: Gmail Triage, analyze only this supplied sanitized email. "
+        "Previous result title: Business Agents Result Ready "
+        "Previous result: Reply outline: acknowledge interest, confirm the fall "
+        "pilot request, and offer a short call. "
+        "User follow-up: Outreach Composer, turn the reply outline into a draft "
+        "using only the supplied email facts. Show it here for review. Do not access "
+        "Gmail, create a provider draft, send, or modify anything. "
+        "Continue the same agent task."
+    )
+    execution_request = cli.build_execution_request(request)
+    plan = infer_manual_request_plan(
+        execution_request.current_request,
+        requested_agent=execution_request.requested_agent,
+    )
+    state = cli._slack_continuation_workflow_state(
+        request,
+        prior_agent=execution_request.continuation.prior_agent,
+    )
+
+    admission = resolve_provider_free_composition_admission(
+        plan,
+        workflow_state=state,
+    )
+    preflight = cli.run_orchestrator_preflight(
+        cli.execution_request_planning_text(execution_request),
+        requested_agent=execution_request.requested_agent,
+        live_manual_plan=False,
+        workflow_state=state,
+    )
+
+    assert execution_request.requested_agent == "outreach_composer"
+    assert admission.composition_allowed is True
+    assert admission.source_route == "gmail_triage"
+    assert admission.provider_action_allowed is False
+    assert admission.external_use_approval_required is True
+    assert preflight.execution_allowed is True
+    assert preflight.selected_agent == "outreach_composer"
+    assert preflight.composition_admission.composition_allowed is True
+
+
+def test_slack_continuation_generic_block_does_not_admit_advisory_owner() -> None:
+    request = (
+        "continue this prior Slack thread. "
+        "Current user request (authoritative): Outreach Composer, draft a reply. "
+        "Prior task owner (advisory): gmail_triage "
+        "Previous result title: Business Agents Blocked "
+        "Previous result: No completed Gmail result is available. "
+        "User follow-up: Outreach Composer, draft a reply. "
+        "Continue the same agent task."
+    )
+
+    assert (
+        cli._slack_continuation_workflow_state(
+            request,
+            prior_agent="gmail_triage",
+        )
+        == {}
+    )
+
+
+@pytest.mark.parametrize(
+    "result_label",
+    (
+        "Business Agents Awaiting Approval",
+        "Business Agents Need Review",
+        "Business Agents Run Update",
+    ),
+)
+def test_slack_continuation_nonterminal_result_does_not_admit_advisory_owner(
+    result_label: str,
+) -> None:
+    request = (
+        "continue this prior Slack thread. "
+        "Current user request (authoritative): Outreach Composer, draft a reply. "
+        "Prior task owner (advisory): gmail_triage "
+        f"Previous result title: {result_label} "
+        "Previous result: A draft is waiting for review. "
+        "User follow-up: Outreach Composer, draft a reply. "
+        "Continue the same agent task."
+    )
+
+    assert cli._slack_result_status(result_label) == "needs_input"
+    assert (
+        cli._slack_continuation_workflow_state(
+            request,
+            prior_agent="gmail_triage",
+        )
+        == {}
+    )
 
 
 def test_slack_continuation_state_merge_deduplicates_prior_results() -> None:

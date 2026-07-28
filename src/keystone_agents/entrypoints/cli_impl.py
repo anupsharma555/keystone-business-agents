@@ -1429,7 +1429,10 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     if slack_continuation:
         direct_workflow_state = _merge_direct_workflow_state(
             direct_workflow_state,
-            _slack_continuation_workflow_state(raw_input),
+            _slack_continuation_workflow_state(
+                raw_input,
+                prior_agent=execution_request.continuation.prior_agent,
+            ),
         )
         direct_workflow_state = _merge_direct_workflow_state(
             direct_workflow_state,
@@ -2003,12 +2006,19 @@ def _latest_slack_operator_request(text: str) -> str:
     return latest_slack_operator_request(text)
 
 
-def _slack_continuation_workflow_state(text: str) -> dict[str, Any]:
+def _slack_continuation_workflow_state(
+    text: str,
+    *,
+    prior_agent: str = "",
+) -> dict[str, Any]:
     """Recover bounded prior-result identity when Slack omits a context file."""
 
     raw = html.unescape(str(text or "").strip())
     if "continue this prior slack thread" not in raw.lower():
         return {}
+    advisory_route = str(prior_agent or "").strip().lower()
+    if advisory_route not in AGENT_REGISTRY:
+        advisory_route = ""
     prior_runs: list[dict[str, str]] = []
     allow_failed_context = slack_work_item_control_requested(_latest_slack_operator_request(raw))
     pattern = re.compile(
@@ -2016,7 +2026,8 @@ def _slack_continuation_workflow_state(text: str) -> dict[str, Any]:
         r"(?=\s+(?:User follow-up:|Previous result title:)|$)",
         flags=re.IGNORECASE | re.DOTALL,
     )
-    for index, match in enumerate(pattern.finditer(raw), start=1):
+    matches = list(pattern.finditer(raw))
+    for index, match in enumerate(matches, start=1):
         result_label = _bounded_redacted_text(match.group(1), max_chars=180)
         summary = _bounded_redacted_text(match.group(2), max_chars=900)
         result_status = _slack_result_status(result_label)
@@ -2027,6 +2038,11 @@ def _slack_continuation_workflow_state(text: str) -> dict[str, Any]:
         ):
             continue
         route = _route_from_slack_result_label(result_label)
+        if not route and result_status == "completed" and index == len(matches):
+            # The Slack renderer intentionally uses generic success headings.
+            # Recover the latest completed result's owner from the adapter's
+            # separate advisory field instead of guessing from result prose.
+            route = advisory_route
         object_title = _object_title_from_slack_result(summary)
         prior_runs.append(
             {
@@ -2052,6 +2068,18 @@ def _slack_result_status(result_label: str) -> str:
     if "running" in normalized:
         return "running"
     if "need input" in normalized or "needs context" in normalized:
+        return "needs_input"
+    if any(
+        marker in normalized
+        for marker in (
+            "awaiting approval",
+            "approval required",
+            "need review",
+            "needs review",
+            "pending approval",
+            "run update",
+        )
+    ):
         return "needs_input"
     if any(marker in normalized for marker in ("failed", "blocked", "completion not confirmed")):
         return "blocked"
