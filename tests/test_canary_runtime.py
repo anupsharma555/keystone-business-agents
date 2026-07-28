@@ -173,6 +173,79 @@ def test_canary_adds_request_ceiling_to_canonical_ask(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("script", "target_option", "target", "agent", "live_flags"),
+    (
+        (
+            "scripts/run_company_research.py",
+            "--company",
+            "Callyope",
+            "business_research_analyst",
+            ["--live-search", "--no-dry-run", "--live-sdk", "--focused-brief"],
+        ),
+        (
+            "scripts/run_opportunity_scout.py",
+            "--topic",
+            "one current behavioral health grant",
+            "opportunity_scout",
+            ["--live-search", "--no-dry-run", "--live-search-plan", "--live-sdk"],
+        ),
+    ),
+)
+def test_canary_admits_bridge_owned_read_only_specialist_workflows(
+    tmp_path: Path,
+    script: str,
+    target_option: str,
+    target: str,
+    agent: str,
+    live_flags: list[str],
+) -> None:
+    config = _config(tmp_path, ceiling=6)
+    arguments = [
+        script,
+        target_option,
+        target,
+        "--max-results",
+        "2",
+        "--save",
+        "--database-url",
+        "sqlite:////unsafe/operator.sqlite3",
+        "--json",
+        *live_flags,
+    ]
+
+    assert config.validate_python_arguments(arguments) == agent
+    rewritten = config.rewrite_python_arguments(arguments)
+    assert rewritten[rewritten.index("--database-url") + 1] == config.database_url
+    assert "sqlite:////unsafe/operator.sqlite3" not in rewritten
+    assert "--max-openai-requests" not in rewritten
+
+
+def test_canary_rejects_incomplete_or_extended_specialist_workflows(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+
+    with pytest.raises(ValueError, match="missing bounded required options"):
+        config.validate_python_arguments(["scripts/run_company_research.py"])
+    with pytest.raises(ValueError, match="not approved"):
+        config.validate_python_arguments(
+            [
+                "scripts/run_company_research.py",
+                "--company",
+                "Callyope",
+                "--max-results",
+                "2",
+                "--save",
+                "--database-url",
+                config.database_url,
+                "--json",
+                "--fixture",
+                "/tmp/unreviewed.json",
+            ]
+        )
+
+
 def test_canary_admits_confined_canonical_thread_continuation(tmp_path: Path) -> None:
     config = _config(tmp_path, ceiling=6)
     context_dir = config.state_dir / "slack-context"

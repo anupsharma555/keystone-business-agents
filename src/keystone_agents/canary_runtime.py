@@ -26,6 +26,56 @@ CANARY_ALLOWED_AGENTS: Final[frozenset[str]] = frozenset(
         "outreach_composer",
     }
 )
+CANARY_ALLOWED_SCRIPT_AGENTS: Final[dict[str, str]] = {
+    "scripts/run_company_research.py": "business_research_analyst",
+    "scripts/run_opportunity_scout.py": "opportunity_scout",
+}
+CANARY_SCRIPT_VALUE_OPTIONS: Final[dict[str, frozenset[str]]] = {
+    "scripts/run_company_research.py": frozenset(
+        {
+            "--company",
+            "--database-url",
+            "--max-results",
+            "--request-text",
+            "--search-provider",
+        }
+    ),
+    "scripts/run_opportunity_scout.py": frozenset(
+        {
+            "--database-url",
+            "--fallback-search-provider",
+            "--max-results",
+            "--retrieval-hint-json",
+            "--search-provider",
+            "--topic",
+        }
+    ),
+}
+CANARY_SCRIPT_FLAG_OPTIONS: Final[dict[str, frozenset[str]]] = {
+    "scripts/run_company_research.py": frozenset(
+        {
+            "--dry-run",
+            "--focused-brief",
+            "--json",
+            "--live-manual-plan",
+            "--live-sdk",
+            "--live-search",
+            "--no-dry-run",
+            "--save",
+        }
+    ),
+    "scripts/run_opportunity_scout.py": frozenset(
+        {
+            "--dry-run",
+            "--json",
+            "--live-sdk",
+            "--live-search",
+            "--live-search-plan",
+            "--no-dry-run",
+            "--save",
+        }
+    ),
+}
 CANARY_SCRUBBED_ENV_KEYS: Final[frozenset[str]] = frozenset(
     {
         "KNI_BUSINESS_AGENT_ACTION_SECRET",
@@ -199,11 +249,17 @@ class CanaryRuntimeConfig:
         return child
 
     def validate_python_arguments(self, argv: Sequence[str]) -> str:
-        """Admit only one named-agent natural-language ask."""
+        """Admit one bounded ask or read-only specialist workflow."""
 
         arguments = [str(argument) for argument in argv]
+        script_agent = self._validated_script_agent(arguments)
+        if script_agent:
+            return script_agent
         if arguments[:3] != ["-m", "keystone_agents.cli", "ask"]:
-            raise ValueError("Canary execution only allows '-m keystone_agents.cli ask'.")
+            raise ValueError(
+                "Canary execution only allows a named-agent ask or an approved "
+                "read-only specialist workflow."
+            )
         if arguments.count("-m") != 1 or "-c" in arguments:
             raise ValueError("Canary execution does not allow alternate Python entrypoints.")
         agent_options = [
@@ -221,6 +277,70 @@ class CanaryRuntimeConfig:
         if agent not in CANARY_ALLOWED_AGENTS:
             allowed = ", ".join(sorted(CANARY_ALLOWED_AGENTS))
             raise ValueError(f"Canary --agent must be one of: {allowed}.")
+        return agent
+
+    def _validated_script_agent(self, argv: Sequence[str]) -> str:
+        """Validate the two bridge-owned research scripts used by Slack."""
+
+        if not argv:
+            return ""
+        raw_script = Path(str(argv[0])).expanduser()
+        script_path = (
+            raw_script.resolve()
+            if raw_script.is_absolute()
+            else (self.repo_root / raw_script).resolve()
+        )
+        try:
+            relative_script = script_path.relative_to(self.repo_root).as_posix()
+        except ValueError:
+            return ""
+        agent = CANARY_ALLOWED_SCRIPT_AGENTS.get(relative_script, "")
+        if not agent:
+            return ""
+        if "-m" in argv or "-c" in argv:
+            raise ValueError("Canary specialist workflows cannot use alternate entrypoints.")
+
+        value_options = CANARY_SCRIPT_VALUE_OPTIONS[relative_script]
+        flag_options = CANARY_SCRIPT_FLAG_OPTIONS[relative_script]
+        seen_values: dict[str, str] = {}
+        seen_flags: set[str] = set()
+        index = 1
+        while index < len(argv):
+            argument = str(argv[index])
+            option, separator, inline_value = argument.partition("=")
+            if option in value_options:
+                if option in seen_values:
+                    raise ValueError(f"Canary specialist option is duplicated: {option}.")
+                if separator:
+                    value = inline_value
+                    index += 1
+                else:
+                    if index + 1 >= len(argv):
+                        raise ValueError(f"Canary specialist option needs a value: {option}.")
+                    value = str(argv[index + 1])
+                    index += 2
+                if not value.strip():
+                    raise ValueError(f"Canary specialist option is empty: {option}.")
+                seen_values[option] = value
+                continue
+            if argument in flag_options:
+                if argument in seen_flags:
+                    raise ValueError(f"Canary specialist flag is duplicated: {argument}.")
+                seen_flags.add(argument)
+                index += 1
+                continue
+            raise ValueError(f"Canary specialist option is not approved: {argument}.")
+
+        target_option = (
+            "--company"
+            if relative_script == "scripts/run_company_research.py"
+            else "--topic"
+        )
+        required_values = {target_option, "--database-url", "--max-results"}
+        if not required_values.issubset(seen_values):
+            raise ValueError("Canary specialist workflow is missing bounded required options.")
+        if not {"--save", "--json"}.issubset(seen_flags):
+            raise ValueError("Canary specialist workflow requires isolated save and JSON output.")
         return agent
 
     def _validated_continuation_owner(self, argv: Sequence[str]) -> str:
@@ -410,6 +530,7 @@ __all__ = [
     "CANARY_EXECUTION_ENV",
     "CANARY_MAX_OPENAI_REQUESTS_ENV",
     "CANARY_ALLOWED_AGENTS",
+    "CANARY_ALLOWED_SCRIPT_AGENTS",
     "CANARY_RUNTIME_SCHEMA",
     "CANARY_SCRUBBED_ENV_KEYS",
     "CANARY_STATE_DIR_ENV",
