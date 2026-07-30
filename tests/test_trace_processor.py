@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import keystone_agents.run as sdk_run
@@ -16,6 +20,32 @@ def test_trace_processor_is_disabled_by_default(monkeypatch) -> None:
     monkeypatch.delenv("KEYSTONE_TRACE_PROCESSOR", raising=False)
 
     assert register_configured_trace_processor() is None
+
+
+def test_trace_processor_disabled_import_does_not_require_repo_root_package(tmp_path) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(repo_root / "src")
+    env.pop("KEYSTONE_TRACE_PROCESSOR", None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from keystone_agents.trace_processor import "
+                "register_configured_trace_processor; "
+                "assert register_configured_trace_processor() is None"
+            ),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_trace_processor_records_safe_summary_and_rejects_unsafe_metadata() -> None:

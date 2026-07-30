@@ -296,6 +296,63 @@ def run_typed_sdk_agent(
             else:
                 for tool, prior_is_enabled in temporarily_disabled_tools.values():
                     tool.is_enabled = prior_is_enabled
+                attempt_count = (
+                    rate_limit_retry_count + structured_output_retry_count + 1
+                )
+                confirmed_provider_requests = (
+                    attempt_count if _provider_response_was_observed(exc) else 0
+                )
+                failure_metadata = {
+                    "schema": "keystone.sdk_run_failure.v1",
+                    "agent_name": agent.name,
+                    "provider": model_provider,
+                    "model": model_name,
+                    "run_mode": model_run_mode,
+                    "failure_kind": _failure_kind(exc),
+                    "attempt_count": attempt_count,
+                    "usage": {
+                        "available": False,
+                        "requests": confirmed_provider_requests,
+                        "model_attempts_started": attempt_count,
+                        "provider_request_count_confirmed": bool(
+                            confirmed_provider_requests
+                        ),
+                        "note": (
+                            (
+                                "A provider response was observed, but token usage was "
+                                "unavailable because the SDK run did not return a result."
+                            )
+                            if confirmed_provider_requests
+                            else (
+                                "The SDK attempt failed before a provider response was "
+                                "observed; provider request consumption is not recorded."
+                            )
+                        ),
+                    },
+                    "cost": {
+                        "available": False,
+                        "note": (
+                            "Cost is unknown because token usage was unavailable for "
+                            "the failed SDK run."
+                        ),
+                    },
+                    "request_cache": {
+                        **request_cache,
+                        "failed_model_attempts": attempt_count,
+                    },
+                }
+                guardrail_diagnostics = _sdk_guardrail_failure_diagnostics(exc)
+                if guardrail_diagnostics:
+                    failure_metadata["guardrail"] = guardrail_diagnostics
+                if isinstance(exc, ModuleNotFoundError):
+                    missing_module = re.sub(
+                        r"[^A-Za-z0-9_.-]+",
+                        "",
+                        str(getattr(exc, "name", "") or ""),
+                    )[:160]
+                    if missing_module:
+                        failure_metadata["missing_module"] = missing_module
+                _attach_sdk_run_failure_metadata(exc, failure_metadata)
                 _record_sdk_run_summary_safely(
                     agent_name=agent.name,
                     model_provider=model_provider,
@@ -303,8 +360,8 @@ def run_typed_sdk_agent(
                     model_run_mode=model_run_mode,
                     live=live,
                     request_cache=request_cache,
-                    usage={},
-                    cost={},
+                    usage=failure_metadata["usage"],
+                    cost=failure_metadata["cost"],
                     budget_guard={},
                     search_telemetry=search_telemetry,
                     raw_result=None,
@@ -322,10 +379,15 @@ def run_typed_sdk_agent(
                         failure_code=_failure_kind(exc),
                         failure_summary=str(exc),
                     )
-                    raise ProviderPartialSuccessError(
+                    partial_error = ProviderPartialSuccessError(
                         partial_success,
                         cause=exc,
-                    ) from exc
+                    )
+                    _attach_sdk_run_failure_metadata(
+                        partial_error,
+                        failure_metadata,
+                    )
+                    raise partial_error from exc
                 raise
     for tool, prior_is_enabled in temporarily_disabled_tools.values():
         tool.is_enabled = prior_is_enabled
@@ -343,6 +405,23 @@ def run_typed_sdk_agent(
             strict_unknown_cost=live and run_config is None,
         )
     except Exception as exc:
+        _attach_sdk_run_failure_metadata(
+            exc,
+            {
+                "schema": "keystone.sdk_run_failure.v1",
+                "agent_name": agent.name,
+                "provider": model_provider,
+                "model": model_name,
+                "run_mode": model_run_mode,
+                "failure_kind": _failure_kind(exc),
+                "attempt_count": (
+                    rate_limit_retry_count + structured_output_retry_count + 1
+                ),
+                "usage": usage,
+                "cost": cost,
+                "request_cache": request_cache,
+            },
+        )
         _record_sdk_run_summary_safely(
             agent_name=agent.name,
             model_provider=model_provider,
@@ -799,6 +878,71 @@ def _orchestrator_diagnostics_from_trace_metadata(metadata: dict[str, Any]) -> d
 
 def _failure_kind(exc: BaseException) -> str:
     return re.sub(r"[^a-z0-9_]+", "_", type(exc).__name__.strip().lower()).strip("_")
+
+
+def _provider_response_was_observed(exc: BaseException) -> bool:
+    """Return whether the failure itself proves that a model request reached a response."""
+
+    failure_name = type(exc).__name__.strip().lower()
+    return failure_name in {
+        "modelbehaviorerror",
+        "outputguardrailtripwiretriggered",
+    } or any(
+        marker in failure_name
+        for marker in (
+            "apiconnection",
+            "apiresponse",
+            "badrequest",
+            "internalserver",
+            "ratelimit",
+        )
+    )
+
+
+def _sdk_guardrail_failure_diagnostics(exc: BaseException) -> dict[str, list[str]]:
+    """Extract bounded, audit-safe reasons from an SDK guardrail exception."""
+
+    guardrail_result = getattr(exc, "guardrail_result", None)
+    output = getattr(guardrail_result, "output", None)
+    output_info = getattr(output, "output_info", None)
+    if not isinstance(output_info, Mapping):
+        return {}
+
+    diagnostics: dict[str, list[str]] = {}
+    for key, max_length in (("risk_flags", 80), ("reasons", 240)):
+        raw_values = output_info.get(key)
+        if not isinstance(raw_values, Sequence) or isinstance(
+            raw_values,
+            str | bytes | bytearray,
+        ):
+            continue
+        values = [
+            re.sub(r"\s+", " ", str(value)).strip()[:max_length]
+            for value in raw_values[:12]
+            if str(value).strip()
+        ]
+        if values:
+            diagnostics[key] = list(dict.fromkeys(values))
+    return diagnostics
+
+
+def _attach_sdk_run_failure_metadata(
+    exc: BaseException,
+    metadata: Mapping[str, Any],
+) -> None:
+    """Attach audit-safe failed-attempt evidence without changing exception types."""
+
+    try:
+        exc.keystone_sdk_run_failure = dict(metadata)  # type: ignore[attr-defined]
+    except Exception:
+        return None
+
+
+def sdk_run_failure_metadata(exc: BaseException) -> dict[str, Any]:
+    """Return audit-safe failed-attempt evidence attached by the shared runner."""
+
+    metadata = getattr(exc, "keystone_sdk_run_failure", None)
+    return dict(metadata) if isinstance(metadata, Mapping) else {}
 
 
 def _session_audit_metadata(session: Any | None) -> dict[str, Any]:

@@ -107,6 +107,7 @@ from keystone_agents.run import (
     prompt_from_typed_input,
     run_retrieved_sdk_synthesis,
     run_typed_sdk_agent,
+    sdk_run_failure_metadata,
 )
 from keystone_agents.schemas.announcement_feed import AnnouncementFeedItem
 from keystone_agents.schemas.chief_of_staff import (
@@ -1190,6 +1191,114 @@ def test_run_typed_sdk_agent_retries_live_structured_output_once_without_session
     assert result.output.summary == "Recovered with valid structured output."
     assert result.request_cache["structured_output_retries"] == 1
     assert result.request_cache["structured_output_retry_session_reset"] is True
+
+
+def test_run_typed_sdk_agent_attaches_failed_attempt_count_when_usage_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KEYSTONE_SDK_RATE_LIMIT_MAX_RETRIES", "0")
+    monkeypatch.setenv("KEYSTONE_SDK_STRUCTURED_OUTPUT_MAX_RETRIES", "0")
+
+    class FakeAgent:
+        name = "chief_of_staff"
+        model = "gpt-test"
+
+    def fail_run(*_args: Any, **_kwargs: Any) -> Any:
+        raise ModelBehaviorError("invalid JSON when parsing structured output")
+
+    monkeypatch.setattr("keystone_agents.run.run_typed_sdk_sync", fail_run)
+
+    with pytest.raises(ModelBehaviorError) as raised:
+        run_typed_sdk_agent(
+            agent=FakeAgent(),
+            typed_input={"request": "return a strict result"},
+            output_type=ChiefOfStaffResult,
+            live=True,
+            config=ModelConfig(provider="openai", model="gpt-test", api_key="test-key"),
+        )
+
+    failure = sdk_run_failure_metadata(raised.value)
+    assert failure["attempt_count"] == 1
+    assert failure["usage"]["requests"] == 1
+    assert failure["usage"]["model_attempts_started"] == 1
+    assert failure["usage"]["provider_request_count_confirmed"] is True
+    assert failure["usage"]["available"] is False
+    assert failure["cost"]["available"] is False
+
+
+def test_run_typed_sdk_agent_attaches_bounded_guardrail_failure_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KEYSTONE_SDK_RATE_LIMIT_MAX_RETRIES", "0")
+    monkeypatch.setenv("KEYSTONE_SDK_STRUCTURED_OUTPUT_MAX_RETRIES", "0")
+
+    class FakeAgent:
+        name = "outreach_composer"
+        model = "gpt-test"
+
+    class FakeGuardrailOutput:
+        output_info = {
+            "risk_flags": ("unsupported_claim",),
+            "reasons": ("unsupported outreach claim: proven results",),
+        }
+
+    class FakeGuardrailResult:
+        output = FakeGuardrailOutput()
+
+    class FakeGuardrailError(Exception):
+        guardrail_result = FakeGuardrailResult()
+
+    def fail_run(*_args: Any, **_kwargs: Any) -> Any:
+        raise FakeGuardrailError("output guardrail rejected the result")
+
+    monkeypatch.setattr("keystone_agents.run.run_typed_sdk_sync", fail_run)
+
+    with pytest.raises(FakeGuardrailError) as raised:
+        run_typed_sdk_agent(
+            agent=FakeAgent(),
+            typed_input={"request": "draft grounded outreach"},
+            output_type=OutreachDraft,
+            live=True,
+            config=ModelConfig(provider="openai", model="gpt-test", api_key="test-key"),
+        )
+
+    failure = sdk_run_failure_metadata(raised.value)
+    assert failure["guardrail"] == {
+        "risk_flags": ["unsupported_claim"],
+        "reasons": ["unsupported outreach claim: proven results"],
+    }
+
+
+def test_run_typed_sdk_agent_does_not_count_pre_provider_import_failure_as_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KEYSTONE_SDK_RATE_LIMIT_MAX_RETRIES", "0")
+    monkeypatch.setenv("KEYSTONE_SDK_STRUCTURED_OUTPUT_MAX_RETRIES", "0")
+
+    class FakeAgent:
+        name = "outreach_composer"
+        model = "gpt-test"
+
+    def fail_run(*_args: Any, **_kwargs: Any) -> Any:
+        raise ModuleNotFoundError("No module named 'missing_dependency'", name="missing_dependency")
+
+    monkeypatch.setattr("keystone_agents.run.run_typed_sdk_sync", fail_run)
+
+    with pytest.raises(ModuleNotFoundError) as raised:
+        run_typed_sdk_agent(
+            agent=FakeAgent(),
+            typed_input={"request": "draft grounded outreach"},
+            output_type=OutreachDraft,
+            live=True,
+            config=ModelConfig(provider="openai", model="gpt-test", api_key="test-key"),
+        )
+
+    failure = sdk_run_failure_metadata(raised.value)
+    assert failure["attempt_count"] == 1
+    assert failure["usage"]["requests"] == 0
+    assert failure["usage"]["model_attempts_started"] == 1
+    assert failure["usage"]["provider_request_count_confirmed"] is False
+    assert failure["missing_module"] == "missing_dependency"
 
 
 def test_run_typed_sdk_agent_preserves_write_receipt_across_structured_retry(

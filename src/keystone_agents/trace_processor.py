@@ -11,10 +11,10 @@ from pathlib import Path
 from typing import Any
 
 from keystone_agents.model_provider import sanitize_trace_metadata
-from promptfoo.eval_database import DEFAULT_EVAL_DB, record_eval_trace_event
 
 _REGISTERED_PROCESSOR: KeystoneEvalTraceProcessor | None = None
 _REGISTER_LOCK = threading.Lock()
+_DEFAULT_EVAL_DB = Path(".keystone/promptfoo/human-reviews.sqlite")
 
 
 class KeystoneEvalTraceProcessor:
@@ -68,6 +68,8 @@ class KeystoneEvalTraceProcessor:
         if self._database_path is None:
             return
         try:
+            from promptfoo.eval_database import record_eval_trace_event
+
             record_eval_trace_event(
                 event_type=str(payload.get("event_type") or ""),
                 trace_id=str(payload.get("trace_id") or ""),
@@ -103,7 +105,7 @@ def register_configured_trace_processor() -> KeystoneEvalTraceProcessor | None:
 
 
 def _configured_database_path() -> Path:
-    return Path(os.environ.get("KEYSTONE_TRACE_SUMMARY_DB") or DEFAULT_EVAL_DB)
+    return Path(os.environ.get("KEYSTONE_TRACE_SUMMARY_DB") or _DEFAULT_EVAL_DB)
 
 
 def record_sdk_run_summary_trace_event(
@@ -173,6 +175,8 @@ def record_sdk_run_summary_trace_event(
         duration_ms=duration_ms,
     )
     try:
+        from promptfoo.eval_database import record_eval_trace_event
+
         return record_eval_trace_event(
             event_type="sdk_run_summary",
             trace_id=str(trace_id),
