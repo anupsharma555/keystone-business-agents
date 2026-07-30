@@ -73,6 +73,8 @@ def gate_commands(
             sys.executable,
             "scripts/run_slack_agent_expansion_gate.py",
             "--quiet",
+            "--python",
+            sys.executable,
         ],
         [
             sys.executable,

@@ -51,6 +51,7 @@ from keystone_agents.schemas.opportunity import (
     OpportunitySource,
 )
 from keystone_agents.schemas.outreach import OutreachDraft
+from keystone_agents.schemas.request_coverage import RequestCoverage
 from keystone_agents.schemas.research import (
     ResearchArticleSummary,
     ResearchBrief,
@@ -3777,6 +3778,257 @@ def test_slack_history_context_preserves_structured_root_and_speaker_roles() -> 
         "operator",
         "agent",
     ]
+
+
+def test_fresh_slack_root_persists_thread_binding_without_history(tmp_path: Path) -> None:
+    database_url = _database_url(tmp_path)
+    context_path = tmp_path / "fresh-slack-root.json"
+    context_path.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "source": "slack_app_mention_history",
+                "channel_id": "C123",
+                "thread_ts": "1770000000.000100",
+                "request_ts": "1770000000.000100",
+                "request_text": "Research Northline Imaging.",
+                "read_context": "",
+                "thread_messages": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text="Research Northline Imaging.",
+            database_url=database_url,
+            save=True,
+            context_file_path=str(context_path),
+            live_sdk=False,
+            live_search=False,
+        )
+    )
+    store = SQLiteStore(database_url)
+    persisted = store.get_work_item(result.work_item.id)
+
+    assert persisted is not None
+    slack_context = persisted.target.metadata["slack_context"]
+    assert slack_context["channel_id"] == "C123"
+    assert slack_context["thread_ts"] == "1770000000.000100"
+    assert slack_context["request_ts"] == "1770000000.000100"
+    assert slack_context["thread_fetch_status"] == "not_requested"
+    assert all(source.source_type != "slack_message" for source in persisted.sources)
+    assert all(
+        source.provider != "slack"
+        for fact in persisted.facts
+        for source in fact.source_refs
+    )
+    assert store.list_approval_items() == []
+
+
+def test_slack_history_context_refreshes_only_the_same_work_item_binding() -> None:
+    work_item = WorkItem(
+        id="wi_bound_slack_thread",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Bound Slack thread",
+        target=WorkItemTarget(
+            name="Northline Imaging",
+            metadata={
+                "slack_context": {
+                    "channel_id": "C123",
+                    "thread_ts": "1770000000.000100",
+                    "request_ts": "1770000000.000100",
+                }
+            },
+        ),
+    )
+
+    refreshed = workflow_runner._apply_slack_history_context(
+        work_item,
+        {
+            "schema": "keystone.slack.history_context.v1",
+            "channel_id": "C123",
+            "thread_ts": "1770000000.000100",
+            "request_ts": "1770000000.000200",
+            "read_context": "One bounded same-thread follow-up.",
+        },
+        context_file_path="/tmp/slack-context.json",
+    )
+
+    assert refreshed.target.metadata["slack_context"]["channel_id"] == "C123"
+    assert (
+        refreshed.target.metadata["slack_context"]["thread_ts"]
+        == "1770000000.000100"
+    )
+    assert (
+        refreshed.target.metadata["slack_context"]["request_ts"]
+        == "1770000000.000200"
+    )
+
+
+@pytest.mark.parametrize(
+    ("channel_id", "thread_ts"),
+    [
+        ("C999", "1770000000.000100"),
+        ("C123", "1770000000.000999"),
+    ],
+)
+def test_slack_history_context_rejects_conflicting_work_item_binding(
+    channel_id: str,
+    thread_ts: str,
+) -> None:
+    work_item = WorkItem(
+        id="wi_bound_slack_thread",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Bound Slack thread",
+        target=WorkItemTarget(
+            name="Northline Imaging",
+            metadata={
+                "slack_context": {
+                    "channel_id": "C123",
+                    "thread_ts": "1770000000.000100",
+                }
+            },
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="does not match the stored WorkItem thread binding",
+    ):
+        workflow_runner._apply_slack_history_context(
+            work_item,
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "channel_id": channel_id,
+                "thread_ts": thread_ts,
+                "read_context": "Conflicting thread context.",
+            },
+            context_file_path="/tmp/slack-context.json",
+        )
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        {
+            "schema": "keystone.slack.history_context.v1",
+            "thread_ts": "1770000000.000100",
+            "read_context": "Missing channel identity.",
+        },
+        {
+            "schema": "keystone.slack.history_context.v1",
+            "channel_id": "C123",
+            "read_context": "Missing thread identity.",
+        },
+        {
+            "schema": "keystone.slack.selected_message_context.v1",
+            "selected_message_ts": "1770000000.000100",
+            "selected_message": {"text": "Missing channel identity."},
+        },
+        {
+            "schema": "keystone.slack.selected_message_context.v1",
+            "channel_id": "C123",
+            "selected_message": {"text": "Missing thread identity."},
+        },
+    ],
+)
+def test_slack_context_rejects_incomplete_identity_for_bound_work_item(
+    context: dict[str, object],
+) -> None:
+    work_item = WorkItem(
+        id="wi_bound_slack_thread",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Bound Slack thread",
+        target=WorkItemTarget(
+            name="Northline Imaging",
+            metadata={
+                "slack_context": {
+                    "channel_id": "C123",
+                    "thread_ts": "1770000000.000100",
+                }
+            },
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="does not match the stored WorkItem thread binding",
+    ):
+        workflow_runner._apply_external_context(
+            work_item,
+            context,
+            context_file_path="/tmp/slack-context.json",
+        )
+
+
+def test_incomplete_slack_context_stops_before_specialist_and_preserves_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    stored_binding = {
+        "channel_id": "C123",
+        "thread_ts": "1770000000.000100",
+        "request_ts": "1770000000.000100",
+    }
+    work_item = WorkItem(
+        id="wi_bound_slack_integration",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Bound Slack thread",
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        target=WorkItemTarget(
+            name="Northline Imaging",
+            metadata={"slack_context": stored_binding},
+        ),
+    )
+    store = SQLiteStore(database_url)
+    store.save_work_item(work_item)
+    context_path = tmp_path / "incomplete-slack-context.json"
+    context_path.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "thread_ts": "1770000000.000100",
+                "read_context": "Missing channel identity.",
+            }
+        ),
+        encoding="utf-8",
+    )
+    specialist_called = False
+
+    def fail_if_specialist_runs(*_args: object, **_kwargs: object) -> object:
+        nonlocal specialist_called
+        specialist_called = True
+        raise AssertionError("specialist execution must not start")
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "run_prepared_work_item_specialist",
+        fail_if_specialist_runs,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="does not match the stored WorkItem thread binding",
+    ):
+        advance_work_item(
+            WorkflowRunRequest(
+                request_text="Continue the bound research.",
+                work_item_id=work_item.id,
+                database_url=database_url,
+                save=True,
+                context_file_path=str(context_path),
+                live_sdk=False,
+                live_search=False,
+            )
+        )
+
+    reloaded = store.get_work_item(work_item.id)
+    assert specialist_called is False
+    assert reloaded is not None
+    assert reloaded.target.metadata["slack_context"] == stored_binding
 
 
 def test_chief_link_followup_summarizes_ordered_slack_source_without_new_search(
@@ -13225,6 +13477,344 @@ def test_advance_work_item_outreach_accepts_flexible_inline_context_labels(
     assert store.count("outreach_drafts") == 1
 
 
+def test_advance_work_item_outreach_accepts_supplied_fact_block(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "Outreach Composer, using only these supplied facts, draft a concise "
+                "internal-ready outreach email under 100 words. Facts: Northstar "
+                "Behavioral Health operates two outpatient clinics; it is exploring a "
+                "fall pilot for multimodal symptom monitoring; it wants to discuss "
+                "validation evidence, implementation effort, and timeline. Invite a "
+                "20-minute call. Do not access Gmail, create a provider draft, send, "
+                "post, search, or modify anything."
+            ),
+            database_url=database_url,
+            save=True,
+        )
+    )
+
+    assert result.advanced is True
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.status == WorkItemStatus.NEEDS_APPROVAL
+    assert result.blockers == []
+    profile_refs = [
+        ref for ref in result.work_item.artifact_refs if ref.artifact_type == "company_profile"
+    ]
+    assert profile_refs
+    assert profile_refs[0].title == "Northstar Behavioral Health"
+    assert profile_refs[0].metadata["inline_natural_language_context"] is True
+    assert store.count("outreach_drafts") == 1
+    profile = store.load_company_profile(int(profile_refs[0].artifact_id))
+    supported_facts = " ".join(
+        claim
+        for source in profile.sources
+        for claim in source.supported_claims
+    )
+    assert "two outpatient clinics" in supported_facts
+    assert "multimodal symptom monitoring" in supported_facts
+    assert "validation evidence, implementation effort, and timeline" in supported_facts
+    assert "Invite a 20-minute call" not in supported_facts
+    draft_payload = json.loads(store.fetch_all("outreach_drafts")[0]["draft_json"])
+    assert draft_payload["send_enabled"] is False
+    assert draft_payload["sent"] is False
+    assert draft_payload["can_send_email"] is False
+    draft_ref = next(
+        ref for ref in result.artifact_refs if ref.artifact_type == "outreach_draft"
+    )
+    assert draft_ref.metadata["gmail_draft_created"] is False
+    assert draft_ref.metadata["external_write_performed"] is False
+    assert "What should this outreach focus on?" not in result.human_summary
+
+
+@pytest.mark.parametrize(
+    ("facts", "expected"),
+    [
+        (
+            [
+                "eClinicalWorks operates a behavioral-health product team.",
+                "It is exploring an external validation review.",
+            ],
+            "eClinicalWorks",
+        ),
+        (
+            ["Northstar Behavioral Health, based in Philadelphia, operates two clinics."],
+            "Northstar Behavioral Health",
+        ),
+        (
+            [
+                "Jordan Lee wants to discuss a pilot.",
+                "Northstar Behavioral Health operates two clinics.",
+            ],
+            "",
+        ),
+        (
+            [
+                "Northstar Behavioral Health operates two clinics.",
+                "Example Health runs a separate hospital program.",
+            ],
+            "",
+        ),
+    ],
+)
+def test_inline_outreach_company_resolution_fails_closed_on_ambiguous_subjects(
+    facts: list[str],
+    expected: str,
+) -> None:
+    assert workflow_runner._company_from_inline_outreach_facts(facts) == expected
+
+
+def test_live_supplied_fact_outreach_contract_detects_word_limit_and_cta() -> None:
+    request_text = (
+        "Outreach Composer, using only these supplied facts, draft a concise "
+        "internal-ready outreach email under 100 words. Facts: Northstar "
+        "Behavioral Health operates two outpatient clinics. Invite a 20-minute "
+        "call. Do not access Gmail, create a provider draft, send, post, search, "
+        "or modify anything."
+    )
+    request = WorkflowRunRequest(
+        request_text=request_text,
+        live_sdk=True,
+        manual_request_plan=infer_manual_request_plan(
+            request_text,
+            requested_agent="outreach_composer",
+        ).model_dump(mode="json"),
+    )
+    draft = workflow_runner.OutreachDraft(
+        email_body=" ".join(["word"] * 110),
+        request_coverage=RequestCoverage(status="complete"),
+    )
+
+    mismatches = workflow_runner._outreach_draft_contract_mismatches(
+        draft,
+        request=request,
+    )
+
+    assert any("word count" in item for item in mismatches)
+    assert any("20-minute call CTA" in item for item in mismatches)
+
+
+def test_live_supplied_fact_outreach_contract_accepts_detailed_bounded_draft() -> None:
+    request_text = (
+        "Outreach Composer, using only these supplied facts, draft a concise "
+        "internal-ready outreach email under 100 words. Facts: Northstar "
+        "Behavioral Health operates two outpatient clinics; it is exploring a "
+        "fall pilot for multimodal symptom monitoring; it wants to discuss "
+        "validation evidence, implementation effort, and timeline. Invite a "
+        "20-minute call. Do not access Gmail, create a provider draft, send, post, "
+        "search, or modify anything."
+    )
+    request = WorkflowRunRequest(
+        request_text=request_text,
+        live_sdk=True,
+        manual_request_plan=infer_manual_request_plan(
+            request_text,
+            requested_agent="outreach_composer",
+        ).model_dump(mode="json"),
+    )
+    draft = workflow_runner.OutreachDraft(
+        email_body=(
+            "Hello, Northstar Behavioral Health's two outpatient clinics and fall "
+            "multimodal symptom-monitoring pilot sound well aligned with a focused "
+            "readiness discussion. We can discuss validation evidence, implementation "
+            "effort, and timeline. Would a 20-minute call next week be useful?"
+        ),
+        request_coverage=RequestCoverage(
+            status="complete",
+            output_form_status="satisfied",
+            stop_condition_status="satisfied",
+        ),
+    )
+
+    assert (
+        workflow_runner._outreach_draft_contract_mismatches(
+            draft,
+            request=request,
+        )
+        == []
+    )
+
+
+def test_live_supplied_fact_outreach_contract_detects_missing_material_detail() -> None:
+    request_text = (
+        "Outreach Composer, using only these supplied facts, draft an email under "
+        "100 words. Facts: Northstar Behavioral Health operates two outpatient "
+        "clinics; it is exploring a fall pilot for multimodal symptom monitoring; "
+        "it wants to discuss validation evidence, implementation effort, and "
+        "timeline. Invite a 20-minute call. Do not send or modify anything."
+    )
+    request = WorkflowRunRequest(request_text=request_text, live_sdk=True)
+    draft = workflow_runner.OutreachDraft(
+        email_body=(
+            "Hello Northstar Behavioral Health, I understand you operate two outpatient "
+            "clinics. Would a 20-minute call be useful?"
+        ),
+        request_coverage=RequestCoverage(status="complete"),
+    )
+
+    mismatches = workflow_runner._outreach_draft_contract_mismatches(
+        draft,
+        request=request,
+    )
+
+    assert any("fall pilot for multimodal symptom monitoring" in item for item in mismatches)
+    assert any("validation evidence, implementation effort" in item for item in mismatches)
+
+
+def test_live_supplied_fact_outreach_contract_surfaces_unmet_dimensions() -> None:
+    request_text = (
+        "Using only these supplied facts, draft an outreach email. Facts: "
+        "Northstar Behavioral Health operates two clinics. Do not send or modify anything."
+    )
+    request = WorkflowRunRequest(request_text=request_text, live_sdk=True)
+    draft = workflow_runner.OutreachDraft(
+        email_body="Hello, I would welcome a conversation about the two clinics.",
+        request_coverage=RequestCoverage(
+            status="partial",
+            unmet_dimensions=["Implementation timeline was not addressed."],
+        ),
+    )
+
+    mismatches = workflow_runner._outreach_draft_contract_mismatches(
+        draft,
+        request=request,
+    )
+
+    assert any("Implementation timeline was not addressed" in item for item in mismatches)
+
+
+@pytest.mark.parametrize(
+    "context_label",
+    ["facts", "context", "evidence", "background", "grounding"],
+)
+def test_live_supplied_context_labels_repair_deficient_draft_before_retention(
+    context_label: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    request_text = (
+        "Outreach Composer, using only the following provided "
+        f"{context_label}, draft an email under 100 words. "
+        f"{context_label.title()}: Northstar Behavioral Health operates two "
+        "outpatient clinics; it is exploring a fall pilot for multimodal symptom "
+        "monitoring; it wants to discuss validation evidence, implementation "
+        "effort, and timeline. Invite a 20-minute call. Do not access Gmail, "
+        "create a provider draft, send, post, search, or modify anything."
+    )
+    compose_calls: list[bool] = []
+
+    def fake_compose(**kwargs: object) -> tuple[object, str, None, dict[str, object]]:
+        review_feedback = list(kwargs.get("review_feedback") or [])
+        compose_calls.append(bool(review_feedback))
+        body = (
+            "Hello Northstar, I would welcome a conversation."
+            if not review_feedback
+            else (
+                "Hello Northstar team, I understand Northstar Behavioral Health "
+                "operates two outpatient clinics and is exploring a fall pilot for "
+                "multimodal symptom monitoring. Could we use a 20-minute call to "
+                "discuss validation evidence, implementation effort, and timeline?"
+            )
+        )
+        return (
+            workflow_runner.OutreachDraft(
+                company_name="Northstar Behavioral Health",
+                email_subject="Northstar pilot discussion",
+                email_body=body,
+                personalization_rationale="Used only the supplied material.",
+                request_coverage=RequestCoverage(status="complete"),
+            ),
+            "Outreach Composer live SDK draft created; no send side effect occurred.",
+            None,
+            {
+                "reply_recommended": False,
+                "recommended_next_step": "Review the draft.",
+                "additional_information_needed": [],
+                "collaboration_ideas": [],
+                "deferral_reason": "External sending remains approval-gated.",
+            },
+        )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "_compose_outreach_draft_for_work_item",
+        fake_compose,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=database_url,
+            live_sdk=True,
+            save=True,
+        )
+    )
+
+    assert compose_calls == [False, True]
+    assert result.status == WorkItemStatus.NEEDS_APPROVAL
+    assert result.artifact_refs[0].artifact_type == "outreach_draft"
+    assert "20-minute call" in result.human_summary
+    assert "validation evidence" in result.human_summary
+    assert result.artifact_refs[0].metadata["gmail_draft_created"] is False
+    assert result.artifact_refs[0].metadata["external_write_performed"] is False
+
+
+def test_bounded_supplied_fact_draft_can_repair_model_deferral() -> None:
+    request = WorkflowRunRequest(
+        request_text=(
+            "Using only these supplied facts, draft an outreach email. Facts: "
+            "Northstar Behavioral Health operates two clinics. Do not access Gmail, "
+            "create a provider draft, send, post, search, or modify anything."
+        ),
+        live_sdk=True,
+        allow_manager_loop_repair=True,
+    )
+
+    assert workflow_runner._operator_requested_bounded_outreach_draft(request) is True
+    assert (
+        workflow_runner._should_repair_outreach_with_model(
+            request,
+            recommendation={"reply_recommended": False},
+            mismatches=["The draft omitted the requested 20-minute call."],
+        )
+        is True
+    )
+    assert (
+        workflow_runner._outreach_draft_should_be_retained(
+            request,
+            recommendation={"reply_recommended": False},
+            mismatches=[],
+        )
+        is True
+    )
+    assert (
+        workflow_runner._outreach_draft_should_be_retained(
+            request,
+            recommendation={"reply_recommended": False},
+            mismatches=["The draft still omitted the requested 20-minute call."],
+        )
+        is False
+    )
+
+
+def test_affirmative_send_is_not_a_bounded_supplied_fact_draft() -> None:
+    request = WorkflowRunRequest(
+        request_text=(
+            "Using only these supplied facts, draft and send an outreach email. "
+            "Facts: Northstar Behavioral Health operates two clinics."
+        ),
+        live_sdk=True,
+    )
+
+    assert workflow_runner._operator_requested_bounded_outreach_draft(request) is False
+
+
 def test_manager_loop_ignores_negated_crm_record_creation() -> None:
     assert workflow_runner._manager_loop_requests_opportunity_record(
         "prepare a draft-only email paragraph. do not send email, create a gmail "
@@ -13506,6 +14096,139 @@ def test_slack_context_draft_only_outreach_without_live_sdk_creates_thread_local
     assert "NeuroFlow" in result.human_summary
     assert store.count("outreach_drafts") == 1
     assert store.list_approval_items(object_type="outreach_draft") == []
+
+
+def test_source_provided_company_profile_remains_usable_for_slack_draft_revision(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    source_profile = WorkItemArtifactRef(
+        artifact_type="company_profile",
+        artifact_id="source-provided-business-research:wi_source_profile",
+        source_agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        approval_state=ApprovalState.APPROVED_FOR_DRAFTING.value,
+        title="Northline Imaging",
+        summary="Source-provided research for a bounded draft-only workflow.",
+        selected=True,
+        metadata={
+            "schema": "keystone.source_provided_business_research.v1",
+            "source_provided": True,
+            "source_refs": [
+                {
+                    "title": "Selected Slack source",
+                    "url": "fixture://source-provided/slack-context",
+                    "source_type": "fixture",
+                    "source_id": "slack:northline",
+                    "supported_claim": (
+                        "Northline Imaging is considering a review of its radiology "
+                        "scheduling dashboard before an internal pilot."
+                    ),
+                    "key_facts": [
+                        "The review should focus on dashboard metrics and validation constraints."
+                    ],
+                }
+            ],
+            "operator_approved_thread_local_drafting": True,
+        },
+    )
+    work_item = WorkItem(
+        id="wi_source_profile",
+        kind=WorkItemKind.OUTREACH,
+        title="Revise Northline Imaging draft",
+        request_text="Draft a short internal outreach note for review.",
+        current_route=WorkItemRoute.OUTREACH_COMPOSER,
+        target=WorkItemTarget(
+            name="Northline Imaging",
+            object_type="company",
+            metadata={
+                "slack_context": {
+                    "channel_id": "C123",
+                    "thread_ts": "1783194640.907069",
+                }
+            },
+        ),
+        artifact_refs=[source_profile],
+        next_action=WorkItemNextAction(
+            action="revise_thread_local_outreach_draft",
+            agent=WorkItemRoute.OUTREACH_COMPOSER,
+        ),
+    )
+    store.save_work_item(work_item)
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "Shorten the same draft to at most 65 words. Keep it draft-only, "
+                "use only the selected context, do not search, and do not send or write "
+                "to any provider."
+            ),
+            work_item_id=work_item.id,
+            requested_route=WorkItemRoute.OUTREACH_COMPOSER,
+            database_url=database_url,
+            save=True,
+        )
+    )
+
+    assert result.work_item.id == work_item.id
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.status == WorkItemStatus.NEEDS_APPROVAL
+    assert result.blockers == []
+    draft_ref = next(
+        artifact
+        for artifact in result.artifact_refs
+        if artifact.artifact_type == "outreach_draft"
+    )
+    assert draft_ref.metadata["send_enabled"] is False
+    assert draft_ref.metadata["external_write_performed"] is False
+    assert store.count("companies") == 0
+    assert store.count("outreach_drafts") == 1
+    assert len(store.list_approval_items(object_type="outreach_draft")) == 1
+
+
+def test_source_provided_company_profile_requires_drafting_approval_and_evidence(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(_database_url(tmp_path))
+    artifact = WorkItemArtifactRef(
+        artifact_type="company_profile",
+        artifact_id="source-provided-business-research:wi_unapproved",
+        source_agent=WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        approval_state=ApprovalState.APPROVED_FOR_RESEARCH.value,
+        title="Northline Imaging",
+        selected=True,
+        metadata={
+            "schema": "keystone.source_provided_business_research.v1",
+            "source_provided": True,
+            "source_refs": [
+                {
+                    "title": "Selected Slack source",
+                    "url": "fixture://source-provided/slack-context",
+                    "source_type": "fixture",
+                    "source_id": "slack:northline",
+                    "supported_claim": "A bounded source-backed company fact.",
+                }
+            ],
+        },
+    )
+
+    assert workflow_runner._resolve_company_profile_artifact(artifact, store=store) is None
+    assert (
+        workflow_runner._resolve_company_profile_artifact(
+            artifact.model_copy(
+                update={
+                    "approval_state": ApprovalState.APPROVED_FOR_DRAFTING.value,
+                    "metadata": {
+                        **artifact.metadata,
+                        "source_refs": [],
+                    },
+                }
+            ),
+            store=store,
+        )
+        is None
+    )
+    assert store.count("companies") == 0
 
 
 def test_non_slack_draft_only_outreach_without_thread_marker_remains_blocked(

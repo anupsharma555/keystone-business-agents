@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from keystone_agents.agents import manual_request_planner as planner_module
 from keystone_agents.agents.manual_request_planner import resolve_manual_request_plan
-from keystone_agents.planner_decision_cache import (
+from keystone_agents.planning.decision_cache import (
     PlannerDecisionCache,
     build_planner_decision_cache_identity,
     planner_context_revision_payload,

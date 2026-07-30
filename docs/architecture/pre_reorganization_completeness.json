@@ -1,0 +1,130 @@
+{
+  "schema_name": "keystone.architecture_completeness_baseline.v1",
+  "baseline": {
+    "tag": "kba-baseline-pre-reorganization-2026-07-25",
+    "commit_sha": "b111f9b27459938879cb47344784dbeb14554173",
+    "tree_sha": "83f20bbf4760e185064bc4bf1de76cdb6312a20e",
+    "main_merge_sha": "506f39717253496b093ed61b02bdefb1241613b1",
+    "github_pr": 20
+  },
+  "offline_proof": {
+    "pytest_passed": 4548,
+    "pytest_skipped": 1,
+    "graph_ready": "7/7",
+    "slack_expansion_passed": "36/36",
+    "live_calls": 0
+  },
+  "surface_counts": {
+    "python_files": 236,
+    "prompt_files": 39,
+    "schema_files": 43,
+    "tool_files": 29,
+    "test_files": 222,
+    "fixture_files": 37,
+    "script_files": 132
+  },
+  "project_entrypoint": "keystone_agents.cli:main",
+  "cli_commands": [
+    "agents",
+    "approvals",
+    "ask",
+    "automations",
+    "evals",
+    "health",
+    "init-db",
+    "pipeline",
+    "route",
+    "work-items"
+  ],
+  "registry_routes": [
+    "gmail_triage",
+    "business_research_analyst",
+    "opportunity_scout",
+    "outreach_composer",
+    "airtable_context_agent",
+    "google_workspace_context_agent",
+    "zotero_context_agent",
+    "rss_context_agent",
+    "preprints_context_agent",
+    "orchestrator",
+    "chief_of_staff"
+  ],
+  "public_symbols": {
+    "keystone_agents.execution_request": [
+      "attach_execution_public_result",
+      "build_execution_request",
+      "continuation_owner_advice",
+      "execution_request_planning_text",
+      "latest_slack_operator_request",
+      "slack_work_item_control_requested"
+    ],
+    "keystone_agents.provider_recovery": [
+      "ProviderPartialSuccessError",
+      "ProviderRecoveryConflictError",
+      "ProviderRecoveryError",
+      "ProviderRecoveryStore",
+      "failure_stage_from_exception"
+    ],
+    "keystone_agents.tool_receipt_journal": [
+      "instrument_agent_tools",
+      "mutation_tool_names",
+      "record_tool_output",
+      "receipt_reports_possible_write",
+      "reset_tool_receipt_journal",
+      "retry_receipt_context",
+      "tool_receipt_journal"
+    ],
+    "keystone_agents.workflow_runner": [
+      "advance_work_item",
+      "advance_work_item_manager_loop",
+      "answer_work_item_state_followup",
+      "finalize_prepared_work_item_step",
+      "normalize_workflow_request_for_graph",
+      "prepare_work_item_step",
+      "run_prepared_work_item_specialist",
+      "synthesize_terminal_work_item_response"
+    ],
+    "keystone_agents.langgraph_workflow": [
+      "run_work_item_langgraph",
+      "should_use_langgraph_for_work_item"
+    ]
+  },
+  "critical_files": {
+    "pyproject.toml": {
+      "lines": 142,
+      "sha256": "1b196c9985daa24e20290e92b3b09a2085e66c60d2c92a96dde39fe493877bdc"
+    },
+    "src/keystone_agents/cli.py": {
+      "lines": 12440,
+      "sha256": "c4025a0caa05dd55b033bea9b1b2d57b096407c3c9a4ca637fd64c385e81d49c"
+    },
+    "src/keystone_agents/workflow_runner.py": {
+      "lines": 23062,
+      "sha256": "a3ff5a831ffd4bbedaa87e39b6b248cca28beafa4aeedeb70f513044e3218226"
+    },
+    "src/keystone_agents/manual_request.py": {
+      "lines": 5792,
+      "sha256": "ebe03c20a18d02c157e3f5fc6ca90394e57d03eeb397b217d600f76d43f090ec"
+    },
+    "src/keystone_agents/langgraph_workflow.py": {
+      "lines": 4387,
+      "sha256": "a57581d66d55da61153aaba5be9cb4d14d647163f6e6fb3d3df5c47394e6a9a4"
+    },
+    "src/keystone_agents/execution_request.py": {
+      "lines": 675,
+      "sha256": "c4f988f8fa5b72b125c44123c35551a21be8c2f6dbdec9891a8e536b82f22bfd"
+    },
+    "src/keystone_agents/tool_receipt_journal.py": {
+      "lines": 199,
+      "sha256": "d8cc8e2c3fa760221c89f7992a569c5d12759eb6b0492e077e9c3d8c813d5e2d"
+    },
+    "src/keystone_agents/provider_recovery.py": {
+      "lines": 379,
+      "sha256": "4f16177180a5ba888d4d3265129fd24bf0f2b4493516fc22303d56c5ed1b433d"
+    }
+  },
+  "known_coupling_hotspots": {
+    "langgraph_private_workflow_runner_imports": 6,
+    "cli_private_workflow_runner_imports": 2
+  }
+}

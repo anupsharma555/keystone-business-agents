@@ -8,7 +8,7 @@ from keystone_agents.execution_telemetry import ExecutionTelemetryRecorder
 from keystone_agents.orchestrator.preflight_context import (
     compact_orchestrator_preflight_payload,
 )
-from keystone_agents.reporting import _agent_run_latency_label
+from keystone_agents.presentation.renderers import _agent_run_latency_label
 from keystone_agents.run import _sdk_audit_output
 from keystone_agents.schemas.work_item import (
     WorkflowRunRequest,

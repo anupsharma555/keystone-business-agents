@@ -104,6 +104,19 @@ def compact_orchestrator_preflight_payload(preflight: Any | None) -> dict[str, A
     route_result = _compact_route_result(payload.get("route_result"))
     if route_result:
         compact["route_result"] = route_result
+    composition_admission = payload.get("composition_admission")
+    if composition_admission:
+        admission_payload = (
+            composition_admission.model_dump(mode="json")
+            if hasattr(composition_admission, "model_dump")
+            else dict(composition_admission)
+            if isinstance(composition_admission, Mapping)
+            else {}
+        )
+        if admission_payload.get("composition_allowed") or admission_payload.get(
+            "reason"
+        ) not in {None, "", "plan_not_provider_free_composition"}:
+            compact["composition_admission"] = admission_payload
     sdk_usage_events = _compact_sdk_usage_events(payload.get("sdk_usage_events"))
     if sdk_usage_events:
         compact["sdk_usage_events"] = sdk_usage_events

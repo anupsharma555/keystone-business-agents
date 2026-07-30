@@ -147,6 +147,9 @@ def test_compact_synthesis_agent_omits_unused_tool_contract_prompt() -> None:
     assert agent.tools == []
     assert "Shared Web Search Contract" not in str(agent.instructions)
     assert "Compact synthesis mode" in str(agent.instructions)
+    assert "honor any stricter requested word limit" in str(agent.instructions)
+    assert "retain each supplied fact that is material" in str(agent.instructions)
+    assert "include the requested call to action" in str(agent.instructions)
     assert "<!-- outreach_composer_specialist_contracts/SKILL.md -->" in str(
         agent.instructions
     )

@@ -23,12 +23,12 @@ from keystone_agents.eval_runtime_diagnostics import (
 from keystone_agents.langgraph_workflow import (
     advance_work_item_manager_loop_with_optional_langgraph,
 )
-from keystone_agents.manual_request import (
-    infer_manual_request_plan,
-    live_search_allowed_for_execution,
-)
 from keystone_agents.orchestrator.preflight_context import (
     compact_orchestrator_preflight_payload,
+)
+from keystone_agents.planning.compatibility import (
+    infer_manual_request_plan,
+    live_search_allowed_for_execution,
 )
 from keystone_agents.schemas.execution_request import ContinuationObjectReference
 from keystone_agents.schemas.manual_request_plan import ManualProviderResultSetScope

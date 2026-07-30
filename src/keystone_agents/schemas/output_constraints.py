@@ -22,6 +22,8 @@ class InterpretedOutputConstraints(BaseModel):
     item_count_mode: CountMode = "unspecified"
     minimum_items: int | None = Field(default=None, ge=0, le=100)
     maximum_items: int | None = Field(default=None, ge=0, le=100)
+    source_url_count_mode: CountMode = "unspecified"
+    source_url_count: int | None = Field(default=None, ge=1, le=100)
     required_sections: list[str] = Field(default_factory=list)
     require_section_headings: bool = False
     forbidden_phrases: list[str] = Field(default_factory=list)
@@ -57,6 +59,10 @@ class InterpretedOutputConstraints(BaseModel):
             raise ValueError(
                 "sentence_count is required when sentence_count_mode is explicit"
             )
+        if self.source_url_count_mode != "unspecified" and self.source_url_count is None:
+            raise ValueError(
+                "source_url_count is required when source_url_count_mode is explicit"
+            )
         if (
             self.minimum_items is not None
             and self.maximum_items is not None
@@ -74,6 +80,8 @@ class InterpretedOutputConstraints(BaseModel):
             or self.item_count_mode != "unspecified"
             or self.minimum_items is not None
             or self.maximum_items is not None
+            or self.source_url_count_mode != "unspecified"
+            or self.source_url_count is not None
             or self.required_sections
             or self.require_section_headings
             or self.forbidden_phrases
@@ -91,6 +99,8 @@ class InterpretedOutputConstraints(BaseModel):
             or self.item_count_mode != "unspecified"
             or self.minimum_items is not None
             or self.maximum_items is not None
+            or self.source_url_count_mode != "unspecified"
+            or self.source_url_count is not None
             or (self.require_section_headings and self.required_sections)
             or self.forbidden_phrases
             or self.forbid_em_dash
@@ -108,6 +118,7 @@ class OutputConstraintValidation(BaseModel):
     word_count: int | None = None
     sentence_count: int | None = None
     item_count: int | None = None
+    source_url_count: int | None = None
     satisfied_constraints: list[str] = Field(default_factory=list)
     violations: list[str] = Field(default_factory=list)
 

@@ -571,7 +571,8 @@ class BusinessResearchFocusedBriefSDKInput:
         lines = [
             "Produce the Business Research Analyst BR-1 focused brief.",
             self.brief_goal,
-            "Use only the approved source-backed company profile context below.",
+            "Use only the approved source-backed company profile or bounded "
+            "named-company comparison context below.",
             "Do not invent facts, buyer segments, traction, leadership, funding, metrics, "
             "or product status.",
             "Put factual claims in facts[] with source_ids. Put judgment calls only in "
@@ -583,6 +584,11 @@ class BusinessResearchFocusedBriefSDKInput:
             "the Orchestrator preflight context. Put the direct, constraint-compliant "
             "user-facing answer in answer. Do not rely on a later formatter to shorten, "
             "reshape, or reinterpret it.",
+            "When the context contains multiple explicitly named companies, keep their "
+            "identities distinct and answer the requested similarities, differences, "
+            "verified claims, and uncertainties across all of them.",
+            "For requested bullets, make each one substantive: prefer one complete "
+            "sentence with two or three concrete supported details over a generic label.",
             "Write user-facing fields in direct operator language. Do not refer to "
             "approved context, supplied context, source bundles, or internal evidence "
             "handling; state the supported facts directly and let citations carry provenance.",

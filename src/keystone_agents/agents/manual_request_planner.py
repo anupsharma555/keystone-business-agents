@@ -12,7 +12,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from keystone_agents.manual_request import (
+from keystone_agents.model_provider import ModelConfig, get_runtime_agent_model_config
+from keystone_agents.planning.compatibility import (
     _provider_selection_order,
     _provider_selection_rank,
     _zotero_requested_fields,
@@ -21,8 +22,7 @@ from keystone_agents.manual_request import (
     normalize_manual_agent,
     reconcile_manual_request_followup,
 )
-from keystone_agents.model_provider import ModelConfig, get_runtime_agent_model_config
-from keystone_agents.planner_decision_cache import (
+from keystone_agents.planning.decision_cache import (
     PlannerDecisionCache,
     build_planner_decision_cache_identity,
     planner_decision_cache_eligibility,

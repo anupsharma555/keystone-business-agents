@@ -243,6 +243,10 @@ Before publishing local changes to GitHub, use `docs/GITHUB_UPDATE_RUNBOOK.md`.
 
 - `src/keystone_agents/`: agent builders, prompts, schemas, tools, storage,
   WorkItems, orchestration, and CLI runtime.
+- Canonical implementation subpackages under `src/keystone_agents/` coexist
+  with supported top-level compatibility facades; see
+  [Architecture internals](docs/ARCHITECTURE_REORGANIZATION.md) for ownership
+  and migration status.
 - `src/keystone_agents/prompts/`: markdown prompt surfaces loaded by agent
   builders.
 - `src/keystone_agents/skills/`: repo-local runtime skills used inside agent
@@ -269,6 +273,8 @@ Start here for deeper details:
   audit review, and cost controls.
 - `docs/LANGGRAPH_OPTION.md`: graph runtime position, node contract, backend
   selection, diagnostics, and validation.
+- `docs/ARCHITECTURE_REORGANIZATION.md`: canonical implementation ownership,
+  compatibility facades, migration status, and architecture validation.
 - `docs/SLACK_BUSINESS_AGENT_MODE.md`: Slack bridge configuration, scopes, and
   approval boundaries.
 - `docs/AGENTS_SDK_CONFORMANCE.md`: how the local folder layout maps to Agents

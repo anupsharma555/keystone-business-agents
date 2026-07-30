@@ -10,8 +10,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.schemas.work_item import WorkItemRoute
-from keystone_agents.semantic_execution import ExecutionIntentAuthority
 
 SLACK_QUERY_PROMPT_SCHEMA = "keystone.slack.query_prompt.v1"
 SLACK_QUERY_PROMPT_VERSION = "2026-06-11.v1"

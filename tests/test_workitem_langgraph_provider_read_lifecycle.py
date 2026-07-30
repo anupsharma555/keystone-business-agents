@@ -9,6 +9,10 @@ import keystone_agents.run as run_module
 import keystone_agents.tools.gmail_tool as gmail_module
 import keystone_agents.workflow_runner as workflow_runner
 from keystone_agents.model_provider import ModelConfig
+from keystone_agents.orchestration.stages import (
+    PreparedWorkItemStep,
+    run_prepared_work_item_specialist,
+)
 from keystone_agents.provider_read import current_provider_read_context
 from keystone_agents.run import run_typed_sdk_agent
 from keystone_agents.schemas.chief_of_staff import ChiefOfStaffResult
@@ -21,7 +25,6 @@ from keystone_agents.schemas.work_item import (
     WorkItemStatus,
     WorkItemTarget,
 )
-from keystone_agents.workflow_runner import PreparedWorkItemStep
 
 
 @pytest.mark.parametrize("backend", ["work_item", "langgraph"])
@@ -132,7 +135,7 @@ def test_specialist_provider_read_context_reuses_client_and_snapshot(
     )
 
     if backend == "work_item":
-        result = workflow_runner.run_prepared_work_item_specialist(prepared)
+        result = run_prepared_work_item_specialist(prepared)
     else:
         state = langgraph_workflow._run_gmail_triage_node(
             {

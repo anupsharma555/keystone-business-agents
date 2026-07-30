@@ -7,7 +7,7 @@ import json
 import os
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from email.utils import parseaddr
 from pathlib import Path
 from time import perf_counter
@@ -38,6 +38,7 @@ from keystone_agents.agents.outreach_composer import (
     load_style_profile,
 )
 from keystone_agents.agents.web_query_planner import resolve_web_query_plan
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.cli_sdk import jsonable
 from keystone_agents.company_research import research_company_fixture
 from keystone_agents.config import cli_default_live_gmail, load_settings
@@ -58,7 +59,9 @@ from keystone_agents.gmail_triage.priority_grouping import (
 )
 from keystone_agents.instruction_following import (
     instruction_following_blocker_text,
+    output_constraints_from_plan,
     resolve_instruction_following_response,
+    validate_output_constraints,
 )
 from keystone_agents.live_retrieval import (
     retrieve_company_profile_live,
@@ -69,14 +72,6 @@ from keystone_agents.local_kni_evidence import (
     local_kni_evidence_paths,
     local_kni_live_instruction,
     looks_like_local_kni_evidence_lookup,
-)
-from keystone_agents.manual_request import (
-    infer_manual_request_plan,
-    live_search_allowed_for_execution,
-    looks_like_supplied_context_synthesis_request,
-    positive_capability_text,
-    request_forbids_live_research,
-    resolve_manual_request_owner,
 )
 from keystone_agents.memory import (
     MANAGER_LOOP_EFFICIENCY_METRIC_NAME,
@@ -98,6 +93,14 @@ from keystone_agents.orchestrator.routing import (
     looks_like_send_side_effect,
     looks_like_thread_local_draft_request,
 )
+from keystone_agents.planning.compatibility import (
+    infer_manual_request_plan,
+    live_search_allowed_for_execution,
+    looks_like_supplied_context_synthesis_request,
+    positive_capability_text,
+    request_forbids_live_research,
+    resolve_manual_request_owner,
+)
 from keystone_agents.provider_side_effect_policy import (
     semantic_provider_side_effect_policy,
 )
@@ -117,6 +120,7 @@ from keystone_agents.response_synthesis import (
     synthesize_user_facing_work_item_response_sdk_result,
 )
 from keystone_agents.run import run_retrieved_sdk_synthesis, sdk_run_failure_metadata
+from keystone_agents.runtime.request import RequestRuntime
 from keystone_agents.schemas.approval import ApprovalScope, ApprovalState
 from keystone_agents.schemas.chief_context import ChiefContextEvidenceBundle
 from keystone_agents.schemas.chief_of_staff import ChiefOfStaffSourceRef
@@ -180,7 +184,6 @@ from keystone_agents.sdk_sessions import (
     context_file_session_components,
     resolve_sdk_session_spec,
 )
-from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.skill_contract_gates import evaluate_work_item_skill_gates
 from keystone_agents.skill_sets import (
     AGENT_SKILL_NAMES,
@@ -291,6 +294,7 @@ class PreparedWorkItemStep:
     route: WorkItemRoute
     input_text: str
     context_pack: dict[str, Any]
+    runtime: RequestRuntime | None = field(default=None, repr=False, compare=False)
 _KEYSTONE_APPLICABILITY_RE = re.compile(
     r"\b(?:small\s+business|for[- ]profit|commercial|company|companies|startup|vendor|"
     r"contractor|subcontract(?:or|ing)?|partner(?:ship|s)?|collaborat(?:or|ion|e)|"
@@ -920,22 +924,35 @@ def _work_item_has_slack_context(work_item: WorkItem) -> bool:
 def advance_work_item(request: WorkflowRunRequest) -> WorkflowRunResult:
     """Advance a WorkItem by one deterministic, side-effect-safe step."""
 
+    runtime = RequestRuntime.from_workflow_request(request)
     request = _normalize_workflow_request_for_context(request)
-    store = SQLiteStore(request.database_url or database_url_from_env()) if request.save else None
-    state_followup = _maybe_answer_manager_loop_state_followup(request, store=store)
+    runtime = runtime.with_request(request)
+    state_followup = _maybe_answer_manager_loop_state_followup(
+        request,
+        store=runtime.store,
+    )
     if state_followup is not None:
-        return _attach_execution_provenance(state_followup, request=request, store=store)
-    return _advance_work_item_one_step(request, synthesize_user_response=True)
+        return _attach_execution_provenance(
+            state_followup,
+            request=request,
+            store=runtime.store,
+        )
+    return _advance_work_item_one_step(
+        request,
+        synthesize_user_response=True,
+        runtime=runtime,
+    )
 
 
 def _advance_work_item_one_step(
     request: WorkflowRunRequest,
     *,
     synthesize_user_response: bool,
+    runtime: RequestRuntime | None = None,
 ) -> WorkflowRunResult:
     """Advance one WorkItem step, optionally deferring final response synthesis."""
 
-    prepared = prepare_work_item_step(request)
+    prepared = prepare_work_item_step(request, runtime=runtime)
     result = run_prepared_work_item_specialist(prepared)
     return finalize_prepared_work_item_step(
         prepared,
@@ -959,14 +976,21 @@ def answer_work_item_state_followup(request: WorkflowRunRequest) -> WorkflowRunR
     return _maybe_answer_manager_loop_state_followup(request, store=store)
 
 
-def prepare_work_item_step(request: WorkflowRunRequest) -> PreparedWorkItemStep:
+def prepare_work_item_step(
+    request: WorkflowRunRequest,
+    *,
+    runtime: RequestRuntime | None = None,
+) -> PreparedWorkItemStep:
     """Prepare WorkItem state, context, and audit records for one specialist step."""
 
-    store = SQLiteStore(request.database_url or database_url_from_env()) if request.save else None
+    runtime = runtime or RequestRuntime.from_workflow_request(request)
+    runtime = runtime.with_request(request)
+    store = runtime.store
     cost_directive = parse_cost_tracking_directive(request.request_text)
     cost_tracking_requested = bool(request.cost_tracking_requested or cost_directive.requested)
     input_text = (cost_directive.cleaned_text or request.request_text).strip()
     request = request.model_copy(update={"request_text": input_text})
+    runtime = runtime.with_request(request)
     request = _attach_inferred_manual_request_plan(request, input_text)
     route = _select_route(request, input_text, store)
     work_item = create_or_load_work_item(
@@ -1067,6 +1091,7 @@ def prepare_work_item_step(request: WorkflowRunRequest) -> PreparedWorkItemStep:
         route=route,
         input_text=input_text,
         context_pack=context_pack.model_dump(mode="json"),
+        runtime=runtime,
     )
 
 
@@ -1218,9 +1243,18 @@ def _run_prepared_work_item_specialist_unchecked(
     request = prepared.request
     work_item = prepared.work_item
     route = prepared.route
-    store = SQLiteStore(request.database_url or database_url_from_env()) if request.save else None
+    runtime = prepared.runtime or RequestRuntime.from_workflow_request(request)
+    runtime = runtime.with_request(request)
+    store = runtime.store
     sdk_session_spec = _sdk_session_spec_for_work_item(request, work_item)
-    sdk_session = build_sdk_session(sdk_session_spec) if request.live_sdk else None
+    sdk_session = (
+        runtime.service(
+            f"sdk_session:{sdk_session_spec.session_id}:{sdk_session_spec.database_path}",
+            lambda: build_sdk_session(sdk_session_spec),
+        )
+        if request.live_sdk
+        else None
+    )
 
     source_bundle_mismatch = next(
         (
@@ -1311,9 +1345,18 @@ def finalize_prepared_work_item_step(
     """Attach final context, synthesize user response, and persist one graph step."""
 
     request = prepared.request
-    store = SQLiteStore(request.database_url or database_url_from_env()) if request.save else None
+    runtime = prepared.runtime or RequestRuntime.from_workflow_request(request)
+    runtime = runtime.with_request(request)
+    store = runtime.store
     sdk_session_spec = _sdk_session_spec_for_work_item(request, result.work_item)
-    sdk_session = build_sdk_session(sdk_session_spec) if request.live_sdk else None
+    sdk_session = (
+        runtime.service(
+            f"sdk_session:{sdk_session_spec.session_id}:{sdk_session_spec.database_path}",
+            lambda: build_sdk_session(sdk_session_spec),
+        )
+        if request.live_sdk
+        else None
+    )
     final_context_pack = (
         None
         if (
@@ -1679,7 +1722,8 @@ def advance_work_item_manager_loop(
 
     step_limit = max(1, min(5, int(max_steps or DEFAULT_MANAGER_LOOP_MAX_STEPS)))
     started_at = perf_counter()
-    store = SQLiteStore(request.database_url or database_url_from_env()) if request.save else None
+    runtime = RequestRuntime.from_workflow_request(request)
+    store = runtime.store
     cost_directive = parse_cost_tracking_directive(request.request_text)
     if cost_directive.requested and not request.cost_tracking_requested:
         request = request.model_copy(
@@ -1689,6 +1733,7 @@ def advance_work_item_manager_loop(
             }
         )
     request = _normalize_workflow_request_for_context(request, store=store)
+    runtime = runtime.with_request(request)
     state_followup = _maybe_answer_manager_loop_state_followup(request, store=store)
     if state_followup is not None:
         return state_followup
@@ -1698,7 +1743,11 @@ def advance_work_item_manager_loop(
     repair_attempts_by_route: dict[str, int] = {}
 
     for step_index in range(1, step_limit + 1):
-        result = _advance_work_item_one_step(current_request, synthesize_user_response=False)
+        result = _advance_work_item_one_step(
+            current_request,
+            synthesize_user_response=False,
+            runtime=runtime,
+        )
         result = _review_manager_loop_step(
             result,
             original_request=request,
@@ -1724,6 +1773,7 @@ def advance_work_item_manager_loop(
                     step_index=step_index,
                     store=store,
                     feedback_callback=feedback_callback,
+                    runtime=runtime,
                 )
             except Exception as exc:
                 result = _manager_loop_repair_failed_result(
@@ -1776,9 +1826,20 @@ def advance_work_item_manager_loop(
         )
 
     if final_result is None:
-        final_result = _advance_work_item_one_step(request, synthesize_user_response=False)
+        final_result = _advance_work_item_one_step(
+            request,
+            synthesize_user_response=False,
+            runtime=runtime,
+        )
+    final_session_spec = _sdk_session_spec_for_work_item(
+        request,
+        final_result.work_item,
+    )
     final_sdk_session = (
-        build_sdk_session(_sdk_session_spec_for_work_item(request, final_result.work_item))
+        runtime.service(
+            f"sdk_session:{final_session_spec.session_id}:{final_session_spec.database_path}",
+            lambda: build_sdk_session(final_session_spec),
+        )
         if request.live_sdk
         else None
     )
@@ -3329,6 +3390,7 @@ def _attempt_manager_loop_repair(
     step_index: int,
     store: SQLiteStore | None,
     feedback_callback: Callable[[str, dict[str, Any]], None] | None,
+    runtime: RequestRuntime | None = None,
 ) -> WorkflowRunResult:
     review_context = _manager_loop_latest_review(result.work_item)
     repair_payload = {
@@ -3371,7 +3433,11 @@ def _attempt_manager_loop_repair(
             ),
         }
     )
-    repaired = _advance_work_item_one_step(repair_request, synthesize_user_response=False)
+    repaired = _advance_work_item_one_step(
+        repair_request,
+        synthesize_user_response=False,
+        runtime=runtime,
+    )
     repaired = _review_manager_loop_step(
         repaired,
         original_request=original_request,
@@ -9533,6 +9599,7 @@ def _apply_slack_selected_context(
     *,
     context_file_path: str,
 ) -> WorkItem:
+    _assert_slack_context_matches_work_item_binding(work_item, context)
     selected = (
         context.get("selected_message") if isinstance(context.get("selected_message"), dict) else {}
     )
@@ -9740,6 +9807,7 @@ def _apply_slack_history_context(
     *,
     context_file_path: str,
 ) -> WorkItem:
+    _assert_slack_context_matches_work_item_binding(work_item, context)
     read_context = _compact_context_text(context.get("read_context"), max_chars=4000)
     channel_id = _compact_context_text(context.get("channel_id"), max_chars=80)
     thread_ts = _compact_context_text(context.get("thread_ts"), max_chars=80)
@@ -9784,7 +9852,7 @@ def _apply_slack_history_context(
         "thread_ts": thread_ts,
         "request_ts": request_ts,
         "thread_fetch_status": _compact_context_text(
-            context.get("thread_fetch_status") or ("ok" if read_context else "missing"),
+            context.get("thread_fetch_status") or ("ok" if read_context else "not_requested"),
             max_chars=40,
         ),
         "read_context": read_context,
@@ -9846,6 +9914,52 @@ def _apply_slack_history_context(
             "audit_notes": audit_notes,
         }
     ).touch()
+
+
+def _assert_slack_context_matches_work_item_binding(
+    work_item: WorkItem,
+    context: dict[str, Any],
+) -> None:
+    metadata = work_item.target.metadata
+    stored = metadata.get("slack_context")
+    if not isinstance(stored, dict):
+        return
+    stored_channel_id = _compact_context_text(stored.get("channel_id"), max_chars=80)
+    stored_thread_ts = _compact_context_text(
+        stored.get("thread_ts") or stored.get("selected_message_ts"),
+        max_chars=80,
+    )
+    incoming_channel_id = _compact_context_text(context.get("channel_id"), max_chars=80)
+    incoming_thread_ts = _compact_context_text(
+        context.get("thread_ts")
+        or context.get("selected_message_ts")
+        or context.get("request_ts"),
+        max_chars=80,
+    )
+    stored_binding_present = bool(stored_channel_id or stored_thread_ts)
+    if stored_binding_present and (
+        not stored_channel_id
+        or not stored_thread_ts
+        or not incoming_channel_id
+        or not incoming_thread_ts
+    ):
+        raise ValueError(
+            "Slack context does not match the stored WorkItem thread binding."
+        )
+    channel_conflict = (
+        stored_channel_id
+        and incoming_channel_id
+        and stored_channel_id != incoming_channel_id
+    )
+    thread_conflict = (
+        stored_thread_ts
+        and incoming_thread_ts
+        and stored_thread_ts != incoming_thread_ts
+    )
+    if channel_conflict or thread_conflict:
+        raise ValueError(
+            "Slack context does not match the stored WorkItem thread binding."
+        )
 
 
 def _external_context_event_payload(
@@ -19641,7 +19755,11 @@ def _advance_outreach(
 
     company_ref = selected_artifacts(work_item, "company_profile")[0]
     try:
-        company_profile = store.load_company_profile(int(company_ref.artifact_id))
+        company_profile = _resolve_company_profile_artifact(company_ref, store=store)
+        if company_profile is None:
+            raise ValueError(
+                f"unsupported company profile artifact: {company_ref.artifact_id}"
+            )
     except (KeyError, TypeError, ValueError) as exc:
         blocker = WorkItemBlocker(
             code="selected_company_profile_unavailable",
@@ -19685,11 +19803,14 @@ def _advance_outreach(
     draft_audit_notes = [draft_audit_note]
     if request.live_sdk and "live SDK draft created" in draft_audit_note:
         draft_audit_notes.append("Live user-facing response synthesis executed.")
-    recommendation_mismatches = _gmail_thread_recommendation_mismatches(
-        draft,
-        recommendation=recommendation,
-        gmail_thread_context=gmail_thread_context,
-    )
+    recommendation_mismatches = [
+        *_gmail_thread_recommendation_mismatches(
+            draft,
+            recommendation=recommendation,
+            gmail_thread_context=gmail_thread_context,
+        ),
+        *_outreach_draft_contract_mismatches(draft, request=request),
+    ]
     should_repair_with_model = _should_repair_outreach_with_model(
         request,
         recommendation=recommendation,
@@ -19725,11 +19846,14 @@ def _advance_outreach(
                 repair_audit_note,
             ]
         )
-        recommendation_mismatches = _gmail_thread_recommendation_mismatches(
-            draft,
-            recommendation=recommendation,
-            gmail_thread_context=gmail_thread_context,
-        )
+        recommendation_mismatches = [
+            *_gmail_thread_recommendation_mismatches(
+                draft,
+                recommendation=recommendation,
+                gmail_thread_context=gmail_thread_context,
+            ),
+            *_outreach_draft_contract_mismatches(draft, request=request),
+        ]
         if recommendation_mismatches:
             recommendation = {
                 **recommendation,
@@ -19769,7 +19893,11 @@ def _advance_outreach(
             "Deterministic review withheld optional reply copy without a second model call; "
             "the recommendation and evidence-bounded next step were retained."
         )
-    reply_recommended = recommendation.get("reply_recommended") is not False
+    reply_recommended = _outreach_draft_should_be_retained(
+        request,
+        recommendation=recommendation,
+        mismatches=recommendation_mismatches,
+    )
     if not reply_recommended:
         draft = draft.model_copy(
             update={
@@ -22078,6 +22206,112 @@ def _gmail_thread_recommendation_mismatches(
     return mismatches
 
 
+def _outreach_draft_contract_mismatches(
+    draft: OutreachDraft,
+    *,
+    request: WorkflowRunRequest,
+) -> list[str]:
+    """Validate explicit supplied-fact draft requirements before rendering."""
+
+    if not request.live_sdk:
+        return []
+    request_text = " ".join(str(request.request_text or "").split())
+    if not re.search(
+        r"\b(?:supplied|provided)\s+"
+        r"(?:facts?|context|evidence|background|grounding)\b",
+        request_text,
+        flags=re.I,
+    ):
+        return []
+
+    fallback_plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="outreach_composer",
+    ).model_dump(mode="json")
+    planned_constraints = output_constraints_from_plan(request.manual_request_plan)
+    raw_request_constraints = output_constraints_from_plan(fallback_plan)
+    constraints = (
+        raw_request_constraints
+        if raw_request_constraints.has_deterministic_requirements()
+        else planned_constraints
+    )
+    validation = validate_output_constraints(
+        draft.email_body,
+        constraints,
+    )
+    mismatches = list(validation.violations)
+
+    body = " ".join(str(draft.email_body or "").split())
+    body_tokens = set(re.findall(r"[a-z0-9]+", body.lower()))
+    fact_stopwords = {
+        "about",
+        "after",
+        "also",
+        "anything",
+        "before",
+        "could",
+        "discuss",
+        "does",
+        "from",
+        "have",
+        "into",
+        "only",
+        "that",
+        "their",
+        "these",
+        "they",
+        "this",
+        "using",
+        "wants",
+        "with",
+        "would",
+    }
+    for fact in _extract_inline_outreach_facts(request_text):
+        fact_tokens = [
+            token
+            for token in re.findall(r"[a-z0-9]+", fact.lower())
+            if len(token) >= 4 and token not in fact_stopwords
+        ]
+        if len(fact_tokens) < 2:
+            continue
+        required_overlap = min(3, max(2, (len(set(fact_tokens)) + 2) // 3))
+        if len(set(fact_tokens) & body_tokens) < required_overlap:
+            mismatches.append(
+                "The draft does not retain enough detail from supplied fact: "
+                + fact[:180]
+            )
+
+    call_match = re.search(
+        r"\b(?P<minutes>\d{1,3})[-\s]+minute\s+"
+        r"(?P<meeting>call|conversation|meeting)\b",
+        request_text,
+        flags=re.I,
+    )
+    if call_match:
+        minutes = call_match.group("minutes")
+        meeting = call_match.group("meeting").lower()
+        has_duration = bool(
+            re.search(rf"\b{re.escape(minutes)}[-\s]+minute\b", body, flags=re.I)
+        )
+        has_meeting = bool(
+            re.search(r"\b(?:call|conversation|meeting)\b", body, flags=re.I)
+        )
+        if not (has_duration and has_meeting):
+            mismatches.append(
+                f"The draft does not include the requested {minutes}-minute {meeting} CTA."
+            )
+
+    unmet_dimensions = list(
+        getattr(getattr(draft, "request_coverage", None), "unmet_dimensions", []) or []
+    )
+    if unmet_dimensions:
+        mismatches.append(
+            "The draft reports unmet request dimensions: "
+            + "; ".join(str(item) for item in unmet_dimensions[:4])
+        )
+    return list(dict.fromkeys(item for item in mismatches if item))
+
+
 def _should_repair_outreach_with_model(
     request: WorkflowRunRequest,
     *,
@@ -22089,7 +22323,53 @@ def _should_repair_outreach_with_model(
     return bool(
         mismatches
         and request.allow_manager_loop_repair
-        and recommendation.get("reply_recommended") is not False
+        and (
+            recommendation.get("reply_recommended") is not False
+            or _operator_requested_bounded_outreach_draft(request)
+        )
+    )
+
+
+def _operator_requested_bounded_outreach_draft(
+    request: WorkflowRunRequest,
+) -> bool:
+    """Keep a safe direct draft ask from being reclassified as no-reply advice."""
+
+    text = " ".join(str(request.request_text or "").split())
+    return bool(
+        re.search(r"\b(?:draft|write|compose|prepare)\b", text, flags=re.I)
+        and re.search(
+            r"\b(?:supplied|provided)\s+(?:facts?|context|evidence|background|grounding)\b",
+            text,
+            flags=re.I,
+        )
+        and (
+            re.search(r"\b(?:no send|draft-only|draft only)\b", text, flags=re.I)
+            or re.search(
+                r"\b(?:do\s+not|don't|dont|never|without)\b"
+                r"[^.;\n]{0,200}\b(?:send|post|publish|share)\b",
+                text,
+                flags=re.I,
+            )
+        )
+        and not looks_like_send_side_effect(positive_capability_text(text))
+    )
+
+
+def _outreach_draft_should_be_retained(
+    request: WorkflowRunRequest,
+    *,
+    recommendation: dict[str, Any],
+    mismatches: list[str],
+) -> bool:
+    """Honor the operator's direct draft contract after deterministic review passes."""
+
+    return bool(
+        recommendation.get("reply_recommended") is not False
+        or (
+            _operator_requested_bounded_outreach_draft(request)
+            and not mismatches
+        )
     )
 
 
@@ -22334,10 +22614,40 @@ def _inline_outreach_context_from_request(request_text: str) -> dict[str, Any] |
     if not re.search(r"\b(?:outreach|email|linkedin|message|note)\b", text, flags=re.I):
         return None
     if not re.search(
-        r"\b(?:approved|source-backed|source backed|sources?|facts?|context)\b",
+        r"\b(?:approved|source-backed|source backed|sources?|facts?|context|"
+        r"evidence|background|grounding)\b",
         text,
         flags=re.I,
     ):
+        return None
+
+    source_url = _extract_inline_source_url(text)
+    source_label = _extract_inline_outreach_value(text, _INLINE_OUTREACH_SOURCE_LABELS)
+    facts = _extract_inline_outreach_facts(text)
+    if not facts:
+        return None
+    explicitly_supplied_for_drafting = bool(
+        re.search(
+            r"\b(?:use|using)\s+only\s+(?:these\s+|the\s+following\s+)?"
+            r"(?:operator[-\s]+)?(?:supplied|provided)\s+"
+            r"(?:facts|context|evidence|background|grounding)\b",
+            text,
+            flags=re.I,
+        )
+        and (
+            re.search(r"\b(?:no send|draft-only|draft only)\b", text, flags=re.I)
+            or re.search(
+                r"\b(?:do\s+not|don't|dont|never|without)\b"
+                r"[^.;\n]{0,200}\b(?:send|post|publish|share)\b",
+                text,
+                flags=re.I,
+            )
+        )
+    )
+    has_source_basis = bool(source_url or source_label) or bool(
+        re.search(r"\b(?:approved|source-backed|source backed)\b", text, flags=re.I)
+    ) or explicitly_supplied_for_drafting
+    if not has_source_basis:
         return None
 
     company = _extract_inline_outreach_value(
@@ -22352,27 +22662,19 @@ def _inline_outreach_context_from_request(request_text: str) -> dict[str, Any] |
         company = _company_from_inline_recipient_label(recipient_name)
     if not company:
         company = _extract_outreach_company_from_request(text)
+    if not company:
+        company = _company_from_inline_outreach_facts(facts)
     company = _clean_inline_outreach_company(company)
     if not company:
         return None
 
-    source_url = _extract_inline_source_url(text)
-    source_label = _extract_inline_outreach_value(text, _INLINE_OUTREACH_SOURCE_LABELS)
-    facts = _extract_inline_outreach_facts(text)
-    if not facts:
-        return None
-    has_source_basis = bool(source_url or source_label) or bool(
-        re.search(r"\b(?:approved|source-backed|source backed)\b", text, flags=re.I)
-    )
-    if not has_source_basis:
-        return None
     recipient_email = ""
     if recipient_name and "@" in recipient_name:
         _, recipient_email = parseaddr(recipient_name)
     return {
         "company": company,
         "source_url": source_url or "user-provided://outreach-context",
-        "source_label": source_label or "User-provided approved outreach context",
+        "source_label": source_label or "Operator-supplied outreach facts",
         "facts": facts,
         "recipient_name": recipient_name,
         "recipient_email": recipient_email,
@@ -22429,6 +22731,26 @@ def _company_from_inline_recipient_label(value: str) -> str:
     return ""
 
 
+def _company_from_inline_outreach_facts(facts: list[str]) -> str:
+    candidates: list[str] = []
+    for fact in facts:
+        match = re.match(
+            r"(?P<company>[A-Za-z][A-Za-z0-9&.' -]{1,120}?)"
+            r"(?:,\s+[^,]{1,80},)?\s+"
+            r"(?:operates?|runs?|provides?|offers?|serves?|has|wants?|plans?|"
+            r"seeks?|asked|requested|is|are)\b",
+            str(fact or "").strip(),
+        )
+        if not match:
+            continue
+        candidate = match.group("company").strip(" .;,:")
+        if candidate.lower() in {"he", "her", "it", "she", "they", "we"}:
+            continue
+        candidates.append(candidate)
+    unique = list(dict.fromkeys(candidate for candidate in candidates if candidate))
+    return unique[0] if len(unique) == 1 else ""
+
+
 def _extract_inline_source_url(text: str) -> str:
     match = re.search(r"\bhttps?://[^\s,;)]+", text)
     if match:
@@ -22465,7 +22787,8 @@ def _strip_inline_outreach_instruction_tail(text: str) -> str:
         flags=re.I,
     )
     cleaned = re.sub(
-        r"\b(?:Return|Keep|Caveats?|Constraints?|Instructions?|Do not|Don't|Dont|Never)\b"
+        r"\b(?:Return|Invite|Keep|Caveats?|Constraints?|Instructions?|"
+        r"Do not|Don't|Dont|Never)\b"
         r"[\s\S]*$",
         "",
         cleaned,
@@ -22521,6 +22844,70 @@ def _company_profile_from_inline_outreach_context(context: dict[str, Any]) -> Co
             "No live contact channel was selected.",
             "No external-use approval has been granted.",
         ],
+    )
+
+
+def _resolve_company_profile_artifact(
+    artifact: WorkItemArtifactRef,
+    *,
+    store: SQLiteStore,
+) -> CompanyProfile | None:
+    """Load a persisted profile or rebuild a bounded source-provided profile."""
+
+    try:
+        return store.load_company_profile(int(artifact.artifact_id))
+    except (KeyError, TypeError, ValueError):
+        pass
+
+    metadata = artifact.metadata if isinstance(artifact.metadata, dict) else {}
+    if (
+        not artifact.selected
+        or artifact.approval_state
+        not in {
+            ApprovalState.APPROVED_FOR_DRAFTING.value,
+            ApprovalState.APPROVED_FOR_EXTERNAL_USE.value,
+        }
+        or metadata.get("schema") != "keystone.source_provided_business_research.v1"
+        or metadata.get("source_provided") is not True
+    ):
+        return None
+
+    raw_refs = metadata.get("source_refs")
+    if not isinstance(raw_refs, list):
+        return None
+    source_refs: list[WorkItemSourceRef] = []
+    for raw_ref in raw_refs[:8]:
+        if not isinstance(raw_ref, dict):
+            continue
+        try:
+            source_refs.append(WorkItemSourceRef.model_validate(raw_ref))
+        except ValueError:
+            continue
+    if not source_refs:
+        return None
+
+    facts = list(
+        dict.fromkeys(
+            _compact_outreach_summary_text(fact)
+            for source in source_refs
+            for fact in [
+                *source.key_facts,
+                source.supported_claim,
+                source.evidence_excerpt,
+            ]
+            if _compact_outreach_summary_text(fact)
+        )
+    )[:12]
+    if not facts:
+        return None
+    source = next((item for item in source_refs if str(item.url or "").strip()), source_refs[0])
+    return _company_profile_from_inline_outreach_context(
+        {
+            "company": artifact.title,
+            "facts": facts,
+            "source_url": source.url,
+            "source_label": source.title,
+        }
     )
 
 
@@ -22708,6 +23095,18 @@ def _compose_outreach_draft_for_work_item(
                 ),
             )
             if part
+        )[:4000]
+    elif review_feedback:
+        objective = " ".join(
+            (
+                objective,
+                "Manager review feedback from the prior attempt:",
+                "; ".join(review_feedback),
+                (
+                    "Revise the structured draft so every item is resolved while using "
+                    "only the same approved facts and preserving the no-send boundary."
+                ),
+            )
         )[:4000]
     if not request.live_sdk:
         return (

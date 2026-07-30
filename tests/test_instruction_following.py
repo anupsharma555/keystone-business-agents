@@ -1,7 +1,10 @@
 from types import SimpleNamespace
 
+import pytest
+
 from keystone_agents.instruction_following import (
     InstructionFollowingRepairOutput,
+    InstructionFollowingResolution,
     interpreted_output_constraints_text,
     resolve_instruction_following_response,
     validate_output_constraints,
@@ -54,6 +57,91 @@ def test_objective_validator_covers_counts_sections_urls_and_style() -> None:
 
     assert validation.passed is True
     assert validation.item_count == 2
+
+
+def test_objective_validator_enforces_exact_unique_source_url_count() -> None:
+    constraints = InterpretedOutputConstraints(
+        scope="entire_response",
+        source_url_count_mode="exact",
+        source_url_count=2,
+        include_source_urls=True,
+    )
+
+    passing = validate_output_constraints(
+        "Sources: https://example.test/one | https://example.test/two "
+        "| duplicate https://example.test/one",
+        constraints,
+    )
+    failing = validate_output_constraints(
+        "Source: https://example.test/one",
+        constraints,
+    )
+
+    assert passing.passed is True
+    assert passing.source_url_count == 2
+    assert failing.passed is False
+    assert failing.violations == ["source URL count 1 does not satisfy exact 2"]
+
+
+@pytest.mark.parametrize(
+    "duplicate_variant",
+    [
+        "https://example.test/a.",
+        "https://example.test/a#section",
+        "https://example.test/a/?utm_source=slack",
+        "http://EXAMPLE.test:80/a/",
+    ],
+)
+def test_source_url_count_canonicalizes_duplicate_presentation_variants(
+    duplicate_variant: str,
+) -> None:
+    constraints = InterpretedOutputConstraints(
+        source_url_count_mode="exact",
+        source_url_count=2,
+    )
+
+    validation = validate_output_constraints(
+        f"https://example.test/a {duplicate_variant}",
+        constraints,
+    )
+
+    assert validation.passed is False
+    assert validation.source_url_count == 1
+
+
+@pytest.mark.parametrize(
+    "malformed_url",
+    [
+        "https://example.test:abc/path",
+        "https://example.test:99999/path",
+        "https://[example.test/path",
+    ],
+)
+def test_source_url_count_ignores_malformed_urls(malformed_url: str) -> None:
+    constraints = InterpretedOutputConstraints(
+        source_url_count_mode="exact",
+        source_url_count=1,
+    )
+
+    validation = validate_output_constraints(malformed_url, constraints)
+
+    assert validation.passed is False
+    assert validation.source_url_count == 0
+
+
+def test_instruction_following_v1_omits_unused_source_url_count() -> None:
+    resolution = InstructionFollowingResolution(
+        response_text="Abridge turns conversations into notes.",
+        validation=validate_output_constraints(
+            "Abridge turns conversations into notes.",
+            InterpretedOutputConstraints(
+                word_count_mode="exact",
+                word_count=5,
+            ),
+        ),
+    )
+
+    assert "source_url_count" not in resolution.metadata()["validation"]
 
 
 def test_required_heading_accepts_markdown_or_inline_content() -> None:

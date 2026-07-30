@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from typing import Any, Literal
 
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.calendar_actions import (
     MONTHS,
     CalendarActionPlan,
@@ -32,7 +33,6 @@ from keystone_agents.schemas.calendar_action import (
 from keystone_agents.schemas.execution_request import ContinuationObjectReference
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.sdk import Agent, build_model_settings, build_sdk_agent, compose_instructions
-from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.tools.google_calendar_tool import (
     DEFAULT_CALENDAR_ID,
     DEFAULT_CALENDAR_TIMEZONE,

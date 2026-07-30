@@ -43,7 +43,8 @@ Relevant settings:
 
 Provider reads can share a bounded request-local context containing typed read
 plans, provider clients, and safe snapshots. The kernel enforces call, item,
-page, byte, deadline, and concurrency limits and records privacy-safe
+page, byte, deadline, and concurrency limits and records privacy-safe,
+content-free
 fingerprints rather than raw queries, identities, provider payloads, or tokens.
 
 Initial adoption covers:
@@ -137,12 +138,20 @@ using an opaque run identifier.
 
 ## Verification
 
+The implementation is integrated on the reorganized `origin/main` ownership
+surfaces. CLI timing lives in `entrypoints/cli_impl.py`, leaving the lazy public
+CLI facade unchanged. Planner caching lives under `planning`, receipt
+normalization under `receipts`, audit rendering under `presentation`, and
+WorkItem/LangGraph lifecycle tests use the public `orchestration.stages`
+boundary. WorkItem entry telemetry reuses the request's existing SQLite store;
+direct runs use a bounded fallback only when no request runtime owns one.
+
 The 2026-07-27 offline implementation checkpoint passed:
 
 - focused contract and integration tests;
 - a 1,116-test cross-system integration gate;
-- the ordinary repository suite with `KEYSTONE_TEST_MODE=1`:
-  4,676 passed and one intentionally skipped;
+- the reconciled ordinary repository suite with `KEYSTONE_TEST_MODE=1`:
+  4,995 passed and one intentionally skipped;
 - repository-wide Ruff checks; and
 - `git diff --check`.
 
@@ -199,9 +208,16 @@ repos have loaded their environment:
 - every canonical `ask` receives
   `KEYSTONE_CANARY_MAX_OPENAI_REQUESTS`, and a higher bridge-supplied ceiling is
   reduced to that value;
-- only `google_workspace_context_agent` and `business_research_analyst` are
-  admitted, through the exact `-m keystone_agents.cli ask` entrypoint; arbitrary
-  scripts, modules, Python expressions, and other agents are rejected;
+- only the read-only acceptance set is admitted through the exact
+  `-m keystone_agents.cli ask` entrypoint: Google Workspace Context, Business
+  Research, Opportunity Scout, Gmail Triage, and Outreach Composer. Arbitrary
+  scripts, modules, Python expressions, mutation-oriented context agents, and
+  other agents are rejected;
+- a canonical Slack continuation may omit `--agent` only when its single
+  context file is inside the isolated canary Slack directory, has verified
+  thread-history provenance, and names one prior allowed owner. The wrapper
+  does not pin that owner: the newest request still controls whether
+  Orchestrator retains or changes agents;
 - the Workspace OAuth token is copied once into the canary directory with mode
   `0600`; token refreshes update only that staged copy and never the operator's
   original token;
@@ -251,7 +267,7 @@ The local gate passed 14 focused wrapper tests, a secret-free preview, a cold
 import proof for `keystone_agents`, telemetry, and provider-read modules, and a
 zero-call canonical Workspace ask. The synthetic bridge database argument was
 rewritten successfully: only the isolated canary database was created. The full
-repository gate then passed 4,676 tests with one intentional skip.
+reconciled repository gate then passed 4,995 tests with one intentional skip.
 
 ### Post-fix acceptance canaries
 

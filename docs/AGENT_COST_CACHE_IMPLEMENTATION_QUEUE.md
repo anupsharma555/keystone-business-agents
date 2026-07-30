@@ -35,9 +35,9 @@ outputs, source attribution, and agent quality.
   multi-target research characterizes an explicit anchor company before
   discovering comparison targets. Direct research wrappers use the same plan,
   and query planning cannot expand FAST or BALANCED result ceilings to DEEP.
-- Offline proof passes 4,676 tests with one intentional skip, repository-wide
-  Ruff, and `git diff --check`. Live Slack/provider latency and paid-model cache
-  behavior remain the next acceptance boundary.
+- The reconciled checkpoint passes 4,995 tests with one intentional skip,
+  repository-wide Ruff, and `git diff --check`. Live Slack/provider latency and
+  paid-model cache behavior remain the next acceptance boundary.
 - The first paid-model probes confirmed stable-key cacheability and exact
   planner-decision reuse, but did not pass user-answer acceptance. One repeated
   Google Workspace plan reported about 95% cached input before a provider-scope
