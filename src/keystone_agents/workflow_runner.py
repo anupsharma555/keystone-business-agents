@@ -14,6 +14,8 @@ from time import perf_counter
 from typing import Any
 from urllib.parse import urlparse
 
+from pydantic import ValidationError
+
 from keystone_agents.agents.business_research_analyst import (
     build_company_research_queries,
     compare_company_profiles_for_decision,
@@ -217,6 +219,7 @@ from keystone_agents.work_items import (
     opportunity_ready,
     record_event,
     research_ready,
+    resolve_blocker,
     selected_artifacts,
     set_next_action,
 )
@@ -1066,6 +1069,148 @@ def prepare_work_item_step(request: WorkflowRunRequest) -> PreparedWorkItemStep:
 
 
 def run_prepared_work_item_specialist(prepared: PreparedWorkItemStep) -> WorkflowRunResult:
+    """Run one specialist and convert schema failures into durable WorkItem state."""
+
+    try:
+        result = _run_prepared_work_item_specialist_unchecked(prepared)
+        return _reconcile_satisfied_manager_stage_blockers(
+            result,
+            prepared=prepared,
+        )
+    except ValidationError as exc:
+        request = prepared.request
+        store = (
+            SQLiteStore(request.database_url or database_url_from_env())
+            if request.save
+            else None
+        )
+        blocker = WorkItemBlocker(
+            code="specialist_output_validation_failed",
+            message=(
+                "The specialist produced an internally invalid structured result. "
+                "No new artifact or external side effect was accepted."
+            ),
+        )
+        return _blocked_result(
+            prepared.work_item,
+            (blocker,),
+            WorkItemNextAction(
+                action="retry_specialist_after_validation_fix",
+                agent=prepared.route,
+                description=(
+                    "Correct the shared specialist producer or schema mapping, then retry "
+                    "this same WorkItem."
+                ),
+            ),
+            store=store,
+            route=prepared.route,
+            audit_notes=[
+                (
+                    "Specialist execution stopped at the shared structured-output "
+                    f"validation boundary ({type(exc).__name__})."
+                )
+            ],
+        )
+
+
+_MANAGER_STAGE_COMPLETION_CONTRACTS: dict[
+    WorkItemRoute,
+    tuple[set[str], tuple[str, ...]],
+] = {
+    WorkItemRoute.GMAIL_TRIAGE: (
+        {"gmail_triage_report"},
+        (
+            "manager_loop_gmail_context_not_checked",
+            "manager_loop_gmail_triage_not_completed",
+        ),
+    ),
+    WorkItemRoute.BUSINESS_RESEARCH_ANALYST: (
+        {"company_profile", "research_brief", "source_summary"},
+        ("manager_loop_research_not_completed",),
+    ),
+    WorkItemRoute.OPPORTUNITY_SCOUT: (
+        {"opportunity", "opportunity_record"},
+        ("manager_loop_opportunity_not_created",),
+    ),
+    WorkItemRoute.OUTREACH_COMPOSER: (
+        {"outreach_draft", "outreach_recommendation"},
+        ("manager_loop_outreach_not_drafted",),
+    ),
+}
+
+
+def _reconcile_satisfied_manager_stage_blockers(
+    result: WorkflowRunResult,
+    *,
+    prepared: PreparedWorkItemStep,
+) -> WorkflowRunResult:
+    """Resolve prior missing-stage blockers only after this step produces its evidence."""
+
+    contract = _MANAGER_STAGE_COMPLETION_CONTRACTS.get(result.route)
+    if not result.advanced or contract is None:
+        return result
+    expected_artifact_types, blocker_codes = contract
+    produced_artifact_types = {
+        artifact.artifact_type for artifact in result.artifact_refs
+    }
+    if not expected_artifact_types.intersection(produced_artifact_types):
+        return result
+
+    unresolved_codes = {
+        blocker.code
+        for blocker in result.work_item.blockers
+        if not blocker.resolved
+    }
+    resolved_codes = [
+        code for code in blocker_codes if code in unresolved_codes
+    ]
+    if not resolved_codes:
+        return result
+
+    work_item = result.work_item
+    for code in resolved_codes:
+        work_item = resolve_blocker(work_item, code)
+    work_item = work_item.model_copy(
+        update={"status": derive_case_status(work_item)}
+    ).touch()
+    store = (
+        SQLiteStore(
+            prepared.request.database_url or database_url_from_env()
+        )
+        if prepared.request.save
+        else None
+    )
+    if store is not None:
+        store.save_work_item(work_item)
+        record_event(
+            work_item,
+            event_type="manager_stage_blockers_resolved",
+            actor=result.route.value,
+            summary=(
+                "Resolved prior missing-stage blocker(s) after the specialist "
+                "produced the required typed artifact."
+            ),
+            metadata={
+                "route": result.route.value,
+                "artifact_types": sorted(produced_artifact_types),
+                "resolved_blocker_codes": resolved_codes,
+            },
+            store=store,
+        )
+    return result.model_copy(
+        update={
+            "work_item": work_item,
+            "status": work_item.status,
+            "blockers": [
+                blocker for blocker in work_item.blockers if not blocker.resolved
+            ],
+        }
+    )
+
+
+def _run_prepared_work_item_specialist_unchecked(
+    prepared: PreparedWorkItemStep,
+) -> WorkflowRunResult:
     """Run the specialist node selected during WorkItem preparation."""
 
     request = prepared.request

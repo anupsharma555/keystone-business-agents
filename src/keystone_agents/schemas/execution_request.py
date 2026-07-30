@@ -19,6 +19,7 @@ ExecutionResultStatus = Literal[
     "completed",
     "recovered",
     "partial",
+    "needs_approval",
     "needs_input",
     "blocked",
     "failed",

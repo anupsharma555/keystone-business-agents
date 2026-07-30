@@ -50,6 +50,7 @@ from keystone_agents.schemas.opportunity import (
     OpportunityScoutResult,
     OpportunitySource,
 )
+from keystone_agents.schemas.outreach import OutreachDraft
 from keystone_agents.schemas.research import (
     ResearchArticleSummary,
     ResearchBrief,
@@ -15974,6 +15975,143 @@ def test_manager_loop_outreach_draft_remains_needs_approval(
     assert result.next_action.action == "review_outreach_draft"
     assert result.next_action.requires_approval is True
     assert any(gate.required and gate.state == "pending" for gate in result.work_item.approval_gates)
+
+
+def test_prepared_specialist_converts_schema_failure_to_durable_blocker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    work_item = WorkItem(
+        kind=WorkItemKind.OUTREACH,
+        title="Validate outreach output",
+        request_text="Draft a bounded email.",
+        current_route=WorkItemRoute.OUTREACH_COMPOSER,
+    )
+    store = SQLiteStore(database_url)
+    store.save_work_item(work_item)
+    prepared = workflow_runner.PreparedWorkItemStep(
+        request=WorkflowRunRequest(
+            request_text=work_item.request_text,
+            work_item_id=work_item.id,
+            database_url=database_url,
+            save=True,
+        ),
+        work_item=work_item,
+        route=WorkItemRoute.OUTREACH_COMPOSER,
+        input_text=work_item.request_text,
+        context_pack={},
+    )
+
+    def invalid_specialist(_prepared: object) -> WorkflowRunResult:
+        return OutreachDraft(email_body="word " * 181)  # type: ignore[return-value]
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "_run_prepared_work_item_specialist_unchecked",
+        invalid_specialist,
+    )
+
+    result = workflow_runner.run_prepared_work_item_specialist(prepared)
+
+    assert result.status == WorkItemStatus.BLOCKED
+    assert result.blockers[0].code == "specialist_output_validation_failed"
+    assert result.next_action is not None
+    assert result.next_action.action == "retry_specialist_after_validation_fix"
+    events = store.list_work_item_events(work_item.id)
+    assert events[-1].event_type == "advance_blocked"
+
+
+def test_prepared_specialist_resolves_prior_missing_stage_blocker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    work_item = WorkItem(
+        kind=WorkItemKind.OUTREACH,
+        title="Resume outreach stage",
+        request_text="Prepare the already-approved draft-only reply.",
+        current_route=WorkItemRoute.OUTREACH_COMPOSER,
+        status=WorkItemStatus.BLOCKED,
+        blockers=[
+            WorkItemBlocker(
+                code="manager_loop_outreach_not_drafted",
+                message="The earlier bounded graph stopped before Outreach Composer.",
+            )
+        ],
+    )
+    store = SQLiteStore(database_url)
+    store.save_work_item(work_item)
+    prepared = workflow_runner.PreparedWorkItemStep(
+        request=WorkflowRunRequest(
+            request_text=work_item.request_text,
+            work_item_id=work_item.id,
+            database_url=database_url,
+            save=True,
+        ),
+        work_item=work_item,
+        route=WorkItemRoute.OUTREACH_COMPOSER,
+        input_text=work_item.request_text,
+        context_pack={},
+    )
+    artifact = WorkItemArtifactRef(
+        artifact_type="outreach_draft",
+        artifact_id="draft-1",
+        source_agent=WorkItemRoute.OUTREACH_COMPOSER.value,
+        approval_state=ApprovalState.PENDING.value,
+        title="Review-only reply",
+        selected=True,
+        metadata={"approval_queue_id": "approval-1", "send_enabled": False},
+    )
+    completed_work_item = work_item.model_copy(
+        update={
+            "artifact_refs": [artifact],
+            "approval_gates": [
+                WorkItemApprovalGate(
+                    scope="external_use",
+                    state=ApprovalState.PENDING.value,
+                    required=True,
+                    approval_id="approval-1",
+                )
+            ],
+            "next_action": WorkItemNextAction(
+                action="review_outreach_draft",
+                agent=WorkItemRoute.OUTREACH_COMPOSER,
+                description="Review before external use.",
+                requires_approval=True,
+            ),
+        }
+    )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "_run_prepared_work_item_specialist_unchecked",
+        lambda _prepared: WorkflowRunResult(
+            work_item=completed_work_item,
+            route=WorkItemRoute.OUTREACH_COMPOSER,
+            status=WorkItemStatus.BLOCKED,
+            advanced=True,
+            artifact_refs=[artifact],
+            blockers=[],
+            next_action=completed_work_item.next_action,
+            human_summary="Draft created for review.",
+        ),
+    )
+
+    result = workflow_runner.run_prepared_work_item_specialist(prepared)
+    loaded = store.get_work_item(work_item.id)
+
+    assert result.status == WorkItemStatus.NEEDS_APPROVAL
+    assert result.blockers == []
+    assert loaded is not None
+    assert loaded.status == WorkItemStatus.NEEDS_APPROVAL
+    assert next(
+        blocker
+        for blocker in loaded.blockers
+        if blocker.code == "manager_loop_outreach_not_drafted"
+    ).resolved is True
+    events = store.list_work_item_events(work_item.id)
+    assert events[-1].event_type == "manager_stage_blockers_resolved"
 
 
 def test_outreach_blocks_from_research_until_context_approved(tmp_path: Path) -> None:

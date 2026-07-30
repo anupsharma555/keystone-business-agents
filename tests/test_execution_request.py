@@ -434,7 +434,7 @@ def test_noninteractive_entrypoints_use_same_contract_without_forcing_backend() 
     } == {""}
 
 
-def test_recovered_result_keeps_answer_first_and_posts_concise_notice() -> None:
+def test_failed_live_structured_result_is_partial_and_keeps_fallback_reviewable() -> None:
     payload = {
         "selected_agent": "chief_of_staff",
         "human_summary": "- First point.\n- Second point.\n- Third point.",
@@ -453,13 +453,29 @@ def test_recovered_result_keeps_answer_first_and_posts_concise_notice() -> None:
 
     result = attach_execution_public_result(payload)
 
-    assert result.status == "recovered"
-    assert result.completion_confirmed is True
+    assert result.status == "partial"
+    assert result.completion_confirmed is False
     assert result.recovery_used is True
     assert result.text.startswith("- First point.")
     assert "raw internal parser detail" not in result.recovery_notice
     assert payload["human_summary"].startswith("- First point.")
-    assert "safe fallback" in str(payload["human_summary"])
+    assert "not confirmed" in result.recovery_notice
+    assert "live structured-output stage failed" in result.failure_summary
+
+
+def test_needs_approval_is_not_reported_as_blocked_or_failed() -> None:
+    payload = {
+        "status": "needs_approval",
+        "human_summary": "Draft prepared; review is required before external use.",
+        "completion_confirmed": False,
+    }
+
+    result = attach_execution_public_result(payload)
+
+    assert result.status == "needs_approval"
+    assert result.title == "Business Agents Awaiting Approval"
+    assert result.failure_summary == ""
+    assert result.text.startswith("Draft prepared")
 
 
 def test_unverified_provider_write_cannot_claim_completion() -> None:
