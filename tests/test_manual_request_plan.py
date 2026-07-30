@@ -44,6 +44,7 @@ from keystone_agents.schemas.manual_request_plan import (
     ManualRequestPlan,
 )
 from keystone_agents.schemas.output_constraints import InterpretedOutputConstraints
+from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.test_pack_specs import get_test_pack_spec
 
 
@@ -271,6 +272,77 @@ def test_gmail_executor_refuses_contradictory_read_only_create_authority() -> No
     assert plan.draft_replies_in_output is True
     assert plan.artifact_policy == "draft_text_in_output"
     assert "gmail_verified_reply_draft_create" not in plan.candidate_helpers
+
+
+def test_complete_typed_provider_write_reconciles_contradictory_read_only_label() -> None:
+    request = (
+        'Move "Architecture review" to 2:10 PM, rename it to '
+        '"Architecture review updated", and append the supplied note.'
+    )
+    fallback = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="business_system_write",
+        task_objective="business_system_write",
+        expected_artifact_type="business_system_write_plan",
+        provider_system="google_calendar",
+        provider_operations=["read", "update", "verify"],
+        provider_action_steps=[
+            ManualProviderActionStep(operation="read", resource_type="calendar_event"),
+            ManualProviderActionStep(operation="update", resource_type="calendar_event"),
+            ManualProviderActionStep(operation="verify", resource_type="calendar_event"),
+        ],
+        side_effect_policy="internal_write_approval_required",
+        ask_shape=AskShapePolicy(permission_state="read_only"),
+    )
+
+    merged = merge_manual_request_plan(fallback, candidate)
+    authority = ExecutionIntentAuthority.from_value(merged)
+
+    assert merged.ask_shape.permission_state == "approval_required"
+    assert authority.effective_provider_operations("google_calendar") == (
+        "read",
+        "update",
+        "verify",
+    )
+    assert any(
+        "complete typed provider-write contract" in warning
+        for warning in merged.planner_warnings
+    )
+
+
+def test_incomplete_provider_write_contract_keeps_read_only_ceiling() -> None:
+    fallback = infer_manual_request_plan(
+        "Review the calendar event without changing it.",
+        requested_agent="chief_of_staff",
+    )
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="business_system_write",
+        task_objective="business_system_write",
+        expected_artifact_type="business_system_write_plan",
+        provider_system="google_calendar",
+        provider_operations=["read", "update", "verify"],
+        provider_action_steps=[
+            ManualProviderActionStep(operation="read", resource_type="calendar_event"),
+            ManualProviderActionStep(operation="verify", resource_type="calendar_event"),
+        ],
+        side_effect_policy="internal_write_approval_required",
+        ask_shape=AskShapePolicy(permission_state="read_only"),
+    )
+
+    merged = merge_manual_request_plan(fallback, candidate)
+    authority = ExecutionIntentAuthority.from_value(merged)
+
+    assert merged.ask_shape.permission_state == "read_only"
+    assert authority.effective_provider_operations("google_calendar") == (
+        "read",
+        "verify",
+    )
 
 
 def test_gmail_executor_refuses_create_when_no_draft_is_requested() -> None:
@@ -1511,6 +1583,46 @@ def test_manual_planner_context_keeps_typed_prior_owner_as_advice() -> None:
         "prior_agent": "business_research_analyst",
         "prior_request": "Assess the supplied company note.",
     }
+
+
+def test_manual_planner_context_retains_bounded_verified_provider_objects() -> None:
+    context = _compact_manual_planner_context(
+        {
+            "execution_continuation": {
+                "provider_affinity": "google_workspace",
+                "verified_objects": [
+                    {
+                        "provider_system": "google_drive",
+                        "object_type": "google_document",
+                        "object_id": "doc_123",
+                        "display_name": "Operating Model",
+                        "lifecycle_state": "active",
+                        "verification_status": "verified",
+                        "provider_scope": {"folder_path": "KNIOps"},
+                    },
+                    {
+                        "provider_system": "gmail",
+                        "object_type": "gmail_message",
+                        "object_id": "msg_unverified",
+                        "lifecycle_state": "active",
+                        "verification_status": "unverified",
+                    },
+                ],
+            }
+        }
+    )
+
+    continuation = context["execution_continuation"]
+    assert continuation["provider_affinity"] == "google_workspace"
+    assert len(continuation["verified_objects"]) == 1
+    assert continuation["verified_objects"][0]["object_id"] == "doc_123"
+    assert continuation["verified_objects"][0]["provider_scope"] == {
+        "folder_path": "KNIOps"
+    }
+    assert (
+        context["context_compaction"]["verified_provider_objects_retained"]
+        == 1
+    )
 
 
 def test_manual_planner_context_preserves_exact_current_workitem_identity() -> None:
@@ -4130,6 +4242,31 @@ def test_manual_plan_routes_unnamed_multi_company_business_research_to_scout() -
     assert plan.requires_live_search is True
 
 
+@pytest.mark.parametrize(
+    "requested_agent",
+    ["orchestrator", "chief_of_staff", "opportunity_scout"],
+)
+def test_anchor_plus_competitor_research_keeps_business_research_owner(
+    requested_agent: str,
+) -> None:
+    plan = infer_manual_request_plan(
+        (
+            "CoS, deeply research Northstar Health as the anchor. First characterize "
+            "its voice-based assessment product, then identify up to 2 closest "
+            "evidence-backed competitors. Do not count Northstar Health as a competitor."
+        ),
+        requested_agent=requested_agent,
+    )
+
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.intent == "company_research"
+    assert plan.primary_target == "Northstar Health"
+    assert plan.target_type == "company"
+    assert plan.desired_count == 2
+    assert plan.desired_count_explicit is True
+    assert plan.requires_live_search is True
+
+
 def test_manual_plan_routes_source_backed_vendor_table_to_business_research() -> None:
     plan = infer_manual_request_plan(
         (
@@ -4656,6 +4793,23 @@ def test_manual_plan_routes_direct_outreach_send_to_outreach_gate() -> None:
     assert plan.task_objective == "blocked_side_effect"
     assert plan.requires_approved_context is True
     assert plan.side_effect_policy == "draft_or_read_only"
+
+
+def test_manual_plan_preserves_google_workspace_read_with_negated_change_scope() -> None:
+    plan = infer_manual_request_plan(
+        (
+            "In KNIOps, find README.doc, report its character count, and count the "
+            "direct child folders. Read only. Do not search outside Google Drive or "
+            "change anything. Answer with only the two requested values."
+        ),
+        requested_agent="google_workspace_context_agent",
+    )
+
+    assert plan.target_agent == "google_workspace_context_agent"
+    assert plan.intent == "context_lookup"
+    assert plan.task_objective == "context_lookup"
+    assert plan.requires_approved_context is False
+    assert plan.ask_shape.permission_state == "read_only"
 
 
 @pytest.mark.parametrize(
@@ -5322,6 +5476,40 @@ def test_forbidden_provider_owner_is_pruned_across_named_entry_surfaces() -> Non
     assert merged.provider_action_steps == []
     assert merged.workflow == []
     assert merged.requires_durable_state is False
+
+
+def test_provider_scope_confinement_does_not_remove_google_workspace_owner() -> None:
+    request = (
+        "In KNIOps, find README.doc and count its characters. Read only. "
+        "Do not search outside Google Drive or change anything."
+    )
+    fallback = infer_manual_request_plan(
+        request,
+        requested_agent="google_workspace_context_agent",
+    )
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="google_workspace_context_agent",
+        target_agent="google_workspace_context_agent",
+        intent="context_lookup",
+        primary_target="README.doc",
+        target_type="business_system_context",
+        provider_system="google_workspace",
+        provider_operations=["read", "search"],
+        provider_action_steps=[
+            {"operation": "search", "resource_type": "google_drive_file"},
+            {"operation": "read", "resource_type": "google_drive_file"},
+        ],
+        side_effect_policy="draft_or_read_only",
+    )
+
+    merged = merge_manual_request_plan(fallback, candidate)
+
+    assert merged.target_agent == "google_workspace_context_agent"
+    assert merged.intent == "context_lookup"
+    assert merged.provider_system == "google_workspace"
+    assert merged.provider_operations == ["read", "search"]
+    assert not any("Removed a provider owner" in item for item in merged.planner_warnings)
 
 
 def test_llm_external_outreach_still_requires_approved_context() -> None:

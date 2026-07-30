@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import keystone_agents.cli as cli
+import keystone_agents.slack_actions as slack_actions_module
 from keystone_agents.calendar_actions import CalendarActionPlan
 from keystone_agents.cli import main
 from keystone_agents.instruction_following import InstructionFollowingRepairOutput
@@ -21,6 +22,7 @@ from keystone_agents.orchestrator.preflight_context import (
     ORCHESTRATOR_PREFLIGHT_ENV,
     ORCHESTRATOR_ROUTE_RESULT_ENV,
 )
+from keystone_agents.schemas.calendar_action import CalendarActionInterpretation
 from keystone_agents.schemas.manual_request_plan import (
     AskShapePolicy,
     ManualProviderActionStep,
@@ -122,6 +124,65 @@ def test_calendar_continuation_keeps_latest_human_task_anchor() -> None:
     assert "User follow-up: The course start is 08/15/2026" in calendar_input
     assert "Orientation Session" in calendar_input
     assert "stale" not in calendar_input.lower()
+
+
+def test_calendar_continuation_ignores_same_turn_with_slack_mention_decoration() -> None:
+    current_request = "Delete the calendar event you just updated in this thread."
+
+    calendar_input = cli._calendar_continuation_input_text(
+        (
+            "business agents continue this prior Slack thread. "
+            f"User follow-up: {current_request} "
+            "Continue the same agent task."
+        ),
+        {
+            "slack_thread_root": (
+                "Add KBA_TEST_CALENDAR Typed Continuity Validation on "
+                "August 21, 2026."
+            ),
+            "recent_slack_thread": [
+                {
+                    "role": "operator",
+                    "text": (
+                        "@KNI Rename that event to "
+                        '"KBA_TEST_CALENDAR Typed Continuity Validation Updated".'
+                    ),
+                },
+                {
+                    "role": "operator",
+                    "text": f"@ {current_request}",
+                },
+            ],
+        },
+    )
+
+    assert (
+        "Most recent operator turn: @KNI Rename that event to "
+        '"KBA_TEST_CALENDAR Typed Continuity Validation Updated".'
+    ) in calendar_input
+    assert calendar_input.count(current_request) == 1
+
+
+def test_calendar_continuation_does_not_duplicate_root_with_mention_decoration() -> None:
+    root_request = "Create Architecture review on August 18, 2026 at 2 PM."
+
+    calendar_input = cli._calendar_continuation_input_text(
+        (
+            "business agents continue this prior Slack thread. "
+            "User follow-up: Move it to 3 PM. "
+            "Continue the same agent task."
+        ),
+        {
+            "slack_thread_root": f"<@U0ASBG2R823> {root_request}",
+            "recent_slack_thread": [
+                {"role": "operator", "text": f"@KNI {root_request}"},
+                {"role": "operator", "text": "@KNI Move it to 3 PM."},
+            ],
+        },
+    )
+
+    assert calendar_input.count(root_request) == 1
+    assert "Most recent operator turn:" not in calendar_input
 
 
 def _fake_orchestrator_preflight(
@@ -824,8 +885,9 @@ def test_explicit_provider_draft_action_remains_unconfirmed_pending_approval(
     assert exit_code == 0
     assert payload["status"] == "needs_approval"
     assert payload["completion_confirmed"] is False
-    assert payload["public_result"]["status"] == "blocked"
-    assert payload["slack_display_title"] == "Business Agents Completion Not Confirmed"
+    assert payload["public_result"]["status"] == "needs_approval"
+    assert payload["public_result"]["failure_summary"] == ""
+    assert payload["slack_display_title"] == "Business Agents Awaiting Approval"
 
 
 def test_cli_init_db_uses_explicit_database_url(tmp_path: Path, capsys) -> None:
@@ -1223,6 +1285,7 @@ def test_cli_ask_json_reports_actual_execution_and_graph_metadata(
         "live_sdk": False,
         "live_search": False,
         "openai_requests": 0,
+        "work_item_openai_requests_total": 0,
     }
     assert payload["_langgraph"]["runtime"] in {
         "langgraph",
@@ -2930,6 +2993,111 @@ def test_named_cos_calendar_mention_uses_direct_path_without_model_or_graph(
     assert "manual_request_plan" not in payload
 
 
+def test_live_complete_meeting_invite_calendar_create_uses_one_planner_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = (
+        "CoS, add this event to the Google Calendar: "
+        "Topic: KBA_TEST_CALENDAR Meeting Invite Format Check "
+        "Time: Aug 4, 2026 3:20 PM Eastern Time (US and Canada) "
+        "Also, add this to the notes "
+        "Synthetic KBA validation event. No external attendees."
+    )
+    captured: dict[str, object] = {}
+
+    def fake_preflight(request_text: str, **kwargs: object) -> object:
+        captured["live_manual_plan"] = kwargs.get("live_manual_plan")
+        semantic_plan = ManualRequestPlan(
+            source="llm",
+            requested_agent="chief_of_staff",
+            target_agent="chief_of_staff",
+            intent="business_system_write",
+            task_objective="business_system_write",
+            provider_system="google_calendar",
+            provider_operations=["create"],
+            primary_target="KBA_TEST_CALENDAR Meeting Invite Format Check",
+            ask_shape={"permission_state": "approval_required"},
+            objective=request_text,
+        )
+        return cli.OrchestratorPreflight(
+            request_text=request_text,
+            requested_agent="chief_of_staff",
+            advisory_only=True,
+            selected_agent="chief_of_staff",
+            execution_allowed=True,
+            manual_request_plan=semantic_plan,
+            route_result=cli.route_request(request_text, manual_plan=semantic_plan),
+            sdk_usage_events=[{"usage": {"requests": 1}}],
+        )
+
+    def fake_direct(
+        input_text: str,
+        plan: CalendarActionPlan,
+        **kwargs: object,
+    ) -> int:
+        captured["input_text"] = input_text
+        captured["plan"] = plan
+        captured["kwargs"] = kwargs
+        return 0
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(cli, "run_direct_calendar_action", fake_direct)
+    monkeypatch.setattr(
+        "keystone_agents.agents.calendar_action_interpreter.run_typed_sdk_agent",
+        lambda **_kwargs: SimpleNamespace(
+            output=CalendarActionInterpretation(
+                operation="create",
+                operation_source_text="add this event to the Google Calendar",
+                title="KBA_TEST_CALENDAR Meeting Invite Format Check",
+                title_source_text=(
+                    "Topic: KBA_TEST_CALENDAR Meeting Invite Format Check"
+                ),
+                start_date="2026-08-04",
+                date_source_text="Aug 4, 2026",
+                start_time="15:20",
+                time_source_text="3:20 PM",
+                timezone="America/New_York",
+                timezone_source_text="Eastern Time",
+                description_from_payload=True,
+            )
+        ),
+    )
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "chief_of_staff",
+            "--live-sdk",
+            "--max-openai-requests",
+            "2",
+            "--json",
+            request,
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["live_manual_plan"] is True
+    assert captured["input_text"] == request
+    plan = captured["plan"]
+    assert isinstance(plan, CalendarActionPlan)
+    assert plan.complete is True
+    assert plan.operation == "create"
+    assert plan.title == "KBA_TEST_CALENDAR Meeting Invite Format Check"
+    assert plan.start_date == "2026-08-04"
+    assert plan.start_time == "15:20"
+    assert plan.end_time == "16:20"
+    assert plan.description == (
+        "Synthetic KBA validation event. No external attendees."
+    )
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["live"] is True
+    assert kwargs["openai_requests"] == 2
+
+
 def test_named_cos_dated_deadline_uses_calendar_path_without_calendar_keyword(
     capsys,
 ) -> None:
@@ -3107,10 +3275,16 @@ def test_typed_calendar_executor_executes_complete_live_write_immediately(
             "status": "success",
             "operation": "create_calendar_event",
             "event_id": "kba-calendar-event",
+            "title_match_kind": "exact",
+            "access_role": "owner",
             "title": title,
             "start_date": start_date,
             "html_link": "https://calendar.test/event",
-            "verification": {"status": "verified", "passed": True},
+            "verification": {
+                "status": "verified",
+                "passed": True,
+                "description_match": True,
+            },
             "send_enabled": False,
         }
 
@@ -3160,6 +3334,7 @@ def test_direct_calendar_runner_persists_rendered_result_and_semantic_context(
         provider_read_scope="bounded_collection",
         primary_target="events tomorrow",
         objective="List all my events tomorrow.",
+        ask_shape=AskShapePolicy(ask_breadth="broad"),
     )
     preflight = cli.OrchestratorPreflight(
         request_text="List all my events tomorrow.",
@@ -3204,6 +3379,14 @@ def test_direct_calendar_runner_persists_rendered_result_and_semantic_context(
         manual_plan=manual_plan,
         orchestrator_preflight=preflight,
         database_url=database_url,
+        execution_context={
+            "slack_context": {
+                "team_id": "T123",
+                "channel_id": "C123",
+                "thread_ts": "1770000000.000100",
+                "request_ts": "1770000000.000200",
+            }
+        },
     )
 
     assert exit_code == 0
@@ -3222,6 +3405,150 @@ def test_direct_calendar_runner_persists_rendered_result_and_semantic_context(
     stored_output = json.loads(stored["output_json"])
     assert stored_output["tool_receipt"]["events"][0]["title"] == "Morning review"
     assert stored_output["orchestrator_preflight"]["selected_agent"] == ("chief_of_staff")
+    assert stored_output["slack_run_provenance"] == {
+        "schema": "keystone.slack.run_provenance.v1",
+        "context_validated": True,
+        "team_id": "T123",
+        "channel_id": "C123",
+        "thread_ts": "1770000000.000100",
+        "request_ts": "1770000000.000200",
+    }
+
+
+def test_direct_calendar_runner_focuses_narrow_lookup_before_persisting(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'calendar-focused.db'}"
+    request = (
+        "find and list my medical appointment that is tomorrow. "
+        "What is the time and location? Provide what u know about it."
+    )
+    plan = CalendarActionPlan(
+        operation="read",
+        read_scope="filtered_window",
+        read_selection="all",
+        date_scope="tomorrow",
+        query="medical appointment",
+        start_date="2026-07-28",
+        calendar_scope="all_readable",
+        complete=True,
+    )
+    manual_plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        provider_system="google_calendar",
+        provider_operations=["read"],
+        provider_read_scope="bounded_collection",
+        primary_target="medical appointment tomorrow",
+        desired_count=1,
+        ask_shape=AskShapePolicy(ask_breadth="narrow"),
+    )
+    events = [
+        {
+            "event_id": "event-window",
+            "title": "Window Washing",
+            "start_date": "2026-07-28",
+            "start_time": "08:30",
+            "end_time": "09:30",
+            "start": "2026-07-28T08:30:00-04:00",
+        },
+        {
+            "event_id": "event-medical",
+            "title": "Example Family Medicine",
+            "start_date": "2026-07-28",
+            "start_time": "10:40",
+            "end_time": "11:40",
+            "start": "2026-07-28T10:40:00-04:00",
+            "source_calendar_name": "Care Appointments",
+            "source_calendar_primary": False,
+        },
+    ]
+    expected = (
+        'I found one matching event: "Example Family Medicine" on the Care Appointments '
+        "calendar on 2026-07-28, from 10:40 AM to 11:40 AM. "
+        "No location is listed in the Calendar event."
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        cli,
+        "read_google_calendar_window_impl",
+        lambda *_args, **_kwargs: {
+            "status": "success",
+            "operation": "read_calendar_window",
+            "events": events,
+            "verification": {"status": "verified_present", "passed": True},
+            "send_enabled": False,
+        },
+    )
+
+    def fake_answer(
+        request_text: str,
+        candidate_events: list[dict[str, object]],
+        **kwargs: object,
+    ) -> SimpleNamespace:
+        captured["request_text"] = request_text
+        captured["events"] = candidate_events
+        captured.update(kwargs)
+        return SimpleNamespace(
+            text=expected,
+            response_scope="focused",
+            status="matched",
+            selected_event_indexes=(1,),
+            openai_requests=1,
+            warnings=(),
+        )
+
+    monkeypatch.setattr(cli, "resolve_calendar_lookup_answer", fake_answer)
+
+    exit_code = cli.run_direct_calendar_action(
+        request,
+        plan,
+        live=True,
+        json_output=True,
+        openai_requests=2,
+        manual_plan=manual_plan,
+        database_url=database_url,
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert captured["request_text"] == request
+    assert captured["lookup_target"] == "medical appointment tomorrow"
+    assert captured["response_scope"] == "focused"
+    assert captured["events"] == events
+    assert payload["slack_display_text"] == expected
+    assert payload["public_result"]["text"] == expected
+    assert "Window Washing" not in payload["slack_display_text"]
+    assert payload["openai_requests"] == 3
+    assert payload["calendar_lookup_synthesis"] == {
+        "status": "matched",
+        "response_scope": "focused",
+        "selected_event_indexes": [1],
+        "related_event_groups": [],
+    }
+    assert payload["performance"]["provider_action_ms"] >= 0
+    assert payload["performance"]["lookup_synthesis_ms"] >= 0
+    assert payload["performance"]["direct_calendar_total_ms"] >= 0
+    assert payload["performance"]["orchestrator_preflight_ms"] == 0
+    assert payload["performance"]["pre_calendar_overhead_ms"] >= 0
+    assert (
+        payload["performance"]["ask_total_ms"]
+        >= payload["performance"]["direct_calendar_total_ms"]
+    )
+    with SQLiteStore(database_url).managed_connection() as connection:
+        stored = connection.execute(
+            "SELECT output_json FROM agent_runs WHERE id = ?",
+            (payload["agent_run_id"],),
+        ).fetchone()
+    assert stored is not None
+    stored_output = json.loads(stored["output_json"])
+    assert stored_output["slack_display_text"] == expected
+    assert stored_output["calendar_lookup_synthesis"]["selected_event_indexes"] == [1]
 
 
 def test_typed_calendar_executor_forwards_timed_event_fields_to_writer(
@@ -3262,6 +3589,77 @@ def test_typed_calendar_executor_forwards_timed_event_fields_to_writer(
     assert captured["timezone"] == "America/New_York"
 
 
+def test_verified_calendar_create_persists_exact_object_for_slack_thread(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'calendar-continuity.db'}"
+
+    def fake_create(title: str, start_date: str, **kwargs: object) -> dict[str, object]:
+        return {
+            "status": "success",
+            "operation": "create_calendar_event",
+            "event_id": "event_exact_123",
+            "calendar_id": "primary",
+            "title": title,
+            "start_date": start_date,
+            "start_time": kwargs.get("start_time"),
+            "end_time": kwargs.get("end_time"),
+            "verification": {"status": "verified", "passed": True},
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(cli, "create_google_calendar_event_impl", fake_create)
+    plan = CalendarActionPlan(
+        operation="create",
+        title="Architecture review",
+        start_date="2026-08-18",
+        start_time="14:00",
+        end_time="14:30",
+        timezone="America/New_York",
+        calendar_id="primary",
+        complete=True,
+    )
+
+    exit_code = cli.run_direct_calendar_action(
+        "Create Architecture review on August 18, 2026 at 2 PM.",
+        plan,
+        live=True,
+        json_output=True,
+        database_url=database_url,
+        execution_context={
+            "slack_context": {
+                "team_id": "T123",
+                "channel_id": "C123",
+                "thread_ts": "1770000000.000100",
+                "request_ts": "1770000000.000200",
+            }
+        },
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["continuation_objects"][0]["object_id"] == "event_exact_123"
+    references = (
+        slack_actions_module.latest_verified_provider_objects_for_slack_thread(
+            team_id="T123",
+            channel_id="C123",
+            thread_ts="1770000000.000100",
+            before_request_ts="1770000000.000300",
+            database_url=database_url,
+        )
+    )
+    assert len(references) == 1
+    assert references[0].provider_system == "google_calendar"
+    assert references[0].object_id == "event_exact_123"
+    assert references[0].provider_scope == {
+        "calendar_id": "primary",
+        "start_time": "14:00",
+        "end_time": "14:30",
+    }
+
+
 def test_typed_calendar_executor_resolves_natural_update_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3274,8 +3672,12 @@ def test_typed_calendar_executor_resolves_natural_update_reference(
             "operation": "resolve_calendar_event",
             "event_reference": event_reference,
             "event_id": "kba-calendar-event",
+            "title_match_kind": "exact",
+            "access_role": "owner",
             "title": "Frontiers in Human Dynamics paper Due Date",
             "start_date": "2026-11-04",
+            "start": "2026-11-04T14:00:00-05:00",
+            "end": "2026-11-04T14:30:00-05:00",
             "match_count": 1,
         }
 
@@ -3288,7 +3690,11 @@ def test_typed_calendar_executor_resolves_natural_update_reference(
             "title": "Frontiers in Human Dynamics paper Due Date",
             "start_date": "2026-11-04",
             "description_present": True,
-            "verification": {"status": "verified", "passed": True},
+            "verification": {
+                "status": "verified",
+                "passed": True,
+                "description_match": True,
+            },
             "send_enabled": False,
         }
 
@@ -3314,6 +3720,7 @@ def test_typed_calendar_executor_resolves_natural_update_reference(
     assert payload["calendar_lookup"]["match_count"] == 1
     assert captured["event_id"] == "kba-calendar-event"
     assert captured["update"]["description"] == "submit the final paper"
+    assert captured["update"]["duration_minutes"] == 30
     assert captured["update"]["live"] is True
 
 
@@ -3329,6 +3736,8 @@ def test_typed_calendar_executor_delete_resolves_exact_event_and_verifies_absenc
             "operation": "resolve_calendar_event",
             "event_reference": event_reference,
             "event_id": "kba-calendar-delete-event",
+            "title_match_kind": "exact",
+            "access_role": "owner",
             "title": "KBA_TEST_CALENDAR_DIRECT",
             "start_date": "2026-07-21",
             "match_count": 1,
@@ -3371,6 +3780,121 @@ def test_typed_calendar_executor_delete_resolves_exact_event_and_verifies_absenc
     assert captured["delete"]["live"] is True
 
 
+def test_typed_calendar_executor_deletes_exactly_two_explicit_duplicates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deleted: list[tuple[str, str]] = []
+
+    def fake_resolve(event_reference: str, **kwargs: object) -> dict[str, object]:
+        assert event_reference == "Expert Initial Interview: Anup Sharma"
+        assert kwargs["start_date"] == "2026-08-03"
+        assert kwargs["start_time"] == "10:15"
+        assert kwargs["calendar_scope"] == "all_readable"
+        return {
+            "status": "ambiguous",
+            "operation": "resolve_calendar_event",
+            "event_reference": event_reference,
+            "match_count": 2,
+            "title_match_kind": "exact",
+            "matches": [
+                {
+                    "calendar_id": "primary",
+                    "event_id": "expert-primary",
+                    "access_role": "owner",
+                },
+                {
+                    "calendar_id": "meetings@example.test",
+                    "event_id": "expert-meetings",
+                    "access_role": "writer",
+                },
+            ],
+        }
+
+    def fake_delete(event_id: str, **kwargs: object) -> dict[str, object]:
+        deleted.append((str(kwargs["calendar_id"]), event_id))
+        return {
+            "status": "success",
+            "operation": "delete_calendar_event",
+            "event_id": event_id,
+            "title": "Expert Initial Interview: Anup Sharma",
+            "start_date": "2026-08-03",
+            "verification": {"status": "verified", "passed": True},
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(cli, "resolve_google_calendar_event_impl", fake_resolve)
+    monkeypatch.setattr(cli, "delete_google_calendar_event_impl", fake_delete)
+    plan = CalendarActionPlan(
+        operation="delete",
+        event_reference="Expert Initial Interview: Anup Sharma",
+        event_reference_date="2026-08-03",
+        event_reference_time="10:15",
+        target_count=2,
+        calendar_scope="all_readable",
+        all_day=False,
+        complete=True,
+    )
+
+    payload = cli.execute_direct_calendar_action(
+        "Delete both matching Calendar events.",
+        plan,
+        live=True,
+    )
+
+    assert payload["status"] == "done"
+    assert payload["tool_receipt"]["deleted_count"] == 2
+    assert payload["tool_receipt"]["verification"]["passed"] is True
+    assert deleted == [
+        ("primary", "expert-primary"),
+        ("meetings@example.test", "expert-meetings"),
+    ]
+    assert payload["slack_display_text"] == (
+        'Deleted and verified 2 Google Calendar events titled '
+        '"Expert Initial Interview: Anup Sharma" on 2026-08-03.'
+    )
+
+
+def test_typed_calendar_executor_blocks_multi_delete_when_exact_count_disagrees(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "resolve_google_calendar_event_impl",
+        lambda *_args, **_kwargs: {
+            "status": "ambiguous",
+            "match_count": 3,
+            "matches": [
+                {"calendar_id": "primary", "event_id": f"event-{index}"}
+                for index in range(3)
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "delete_google_calendar_event_impl",
+        lambda event_id, **_kwargs: deleted.append(event_id),
+    )
+    plan = CalendarActionPlan(
+        operation="delete",
+        event_reference="Duplicate meeting",
+        event_reference_date="2026-08-03",
+        start_time="10:15",
+        target_count=2,
+        complete=True,
+    )
+
+    payload = cli.execute_direct_calendar_action(
+        "Delete both duplicate meetings.",
+        plan,
+        live=True,
+    )
+
+    assert payload["status"] == "blocked"
+    assert "Expected exactly 2" in payload["message"]
+    assert deleted == []
+
+
 def test_typed_calendar_executor_thread_time_update_uses_prior_event_date(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3383,6 +3907,8 @@ def test_typed_calendar_executor_thread_time_update_uses_prior_event_date(
             "operation": "resolve_calendar_event",
             "event_reference": event_reference,
             "event_id": "kba-calendar-thread-event",
+            "title_match_kind": "exact",
+            "access_role": "owner",
             "title": "Livestream with Corey Ching and Peter Steinberger",
             "start_date": "2026-07-14",
             "match_count": 1,
@@ -3451,6 +3977,8 @@ def test_typed_calendar_executor_thread_note_appends(
             "status": "success",
             "event_reference": event_reference,
             "event_id": "kba-calendar-note-event",
+            "title_match_kind": "exact",
+            "access_role": "owner",
             "title": "Partner livestream",
             "start_date": "2026-07-14",
             "match_count": 1,
@@ -3466,7 +3994,11 @@ def test_typed_calendar_executor_thread_note_appends(
             "start_date": "2026-07-14",
             "description_present": True,
             "description_mode": "append",
-            "verification": {"status": "verified", "passed": True},
+            "verification": {
+                "status": "verified",
+                "passed": True,
+                "description_match": True,
+            },
             "send_enabled": False,
         }
 
@@ -3485,6 +4017,117 @@ def test_typed_calendar_executor_thread_note_appends(
     assert payload["status"] == "done"
     assert captured["update"]["description"] == url
     assert captured["update"]["append_description"] is True
+
+
+def test_typed_calendar_executor_blocks_fuzzy_only_mutation_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    updated: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "resolve_google_calendar_event_impl",
+        lambda *_args, **_kwargs: {
+            "status": "success",
+            "event_id": "fuzzy-event",
+            "title": "Quarterly Review Extended",
+            "title_match_kind": "fuzzy",
+            "access_role": "owner",
+            "match_count": 1,
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "update_google_calendar_event_impl",
+        lambda event_id, **_kwargs: updated.append(event_id),
+    )
+    plan = CalendarActionPlan(
+        operation="update",
+        event_reference="Quarterly Review",
+        description="New note",
+        complete=True,
+    )
+
+    payload = cli.execute_direct_calendar_action("Update Quarterly Review.", plan, live=True)
+
+    assert payload["status"] == "blocked"
+    assert "exact event-title match" in payload["message"]
+    assert updated == []
+
+
+def test_typed_calendar_executor_blocks_single_read_only_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "resolve_google_calendar_event_impl",
+        lambda *_args, **_kwargs: {
+            "status": "success",
+            "event_id": "read-only-event",
+            "title": "Shared Review",
+            "title_match_kind": "exact",
+            "access_role": "reader",
+            "match_count": 1,
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "delete_google_calendar_event_impl",
+        lambda event_id, **_kwargs: deleted.append(event_id),
+    )
+    plan = CalendarActionPlan(
+        operation="delete",
+        event_reference="Shared Review",
+        complete=True,
+    )
+
+    payload = cli.execute_direct_calendar_action("Delete Shared Review.", plan, live=True)
+
+    assert payload["status"] == "blocked"
+    assert "read-only" in payload["message"]
+    assert deleted == []
+
+
+def test_typed_calendar_executor_rejects_receipt_missing_requested_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "update_google_calendar_event_impl",
+        lambda *_args, **_kwargs: {
+            "status": "success",
+            "operation": "update_calendar_event",
+            "event_id": "exact-event",
+            "title": "Review",
+            "start_date": "2026-08-04",
+            "start_time": "10:15",
+            "verification": {"status": "verified", "passed": True},
+            "send_enabled": False,
+        },
+    )
+    plan = CalendarActionPlan(
+        operation="update",
+        event_id="exact-event",
+        event_reference="Review",
+        start_date="2026-08-04",
+        start_time="11:30",
+        end_time="12:30",
+        all_day=False,
+        complete=True,
+    )
+
+    payload = cli.execute_direct_calendar_action(
+        "Move Review to 11:30 AM.",
+        plan,
+        live=True,
+    )
+
+    assert payload["status"] == "verification_failed"
+    assert payload["tool_receipt"]["verification"]["passed"] is False
+    assert (
+        payload["tool_receipt"]["verification"]["requested_changes_match"]
+        is False
+    )
 
 
 def test_typed_calendar_executor_verifies_event_read(
@@ -3537,6 +4180,74 @@ def test_typed_calendar_executor_verifies_event_read(
     assert payload["public_result"]["text"] == (
         'Yes - "UT Austin Course Starts" is on your Google Calendar on 2026-08-15 '
         "from 12:00 PM to 1:00 PM."
+    )
+
+
+def test_typed_calendar_executor_reads_verified_thread_event_by_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_read_event(event_id: str, **kwargs: object) -> dict[str, object]:
+        captured["event_id"] = event_id
+        captured["read"] = kwargs
+        return {
+            "status": "success",
+            "operation": "read_calendar_event",
+            "event_id": event_id,
+            "calendar_id": "primary",
+            "title": "KBA_TEST_CALENDAR Advisory Authority Final 20261007",
+            "display_start_date": "2026-10-07",
+            "display_start_time": "13:15",
+            "display_end_time": "13:45",
+            "description": "Source-grounded update passed.",
+            "found": True,
+            "verification": {
+                "status": "verified_present",
+                "passed": True,
+            },
+            "send_enabled": False,
+        }
+
+    monkeypatch.setattr(cli, "read_google_calendar_event_impl", fake_read_event)
+    monkeypatch.setattr(
+        cli,
+        "resolve_google_calendar_event_impl",
+        lambda *_args, **_kwargs: pytest.fail(
+            "A verified exact event ID must not fall back to title resolution."
+        ),
+    )
+    plan = CalendarActionPlan(
+        operation="read",
+        event_reference="that same event",
+        event_reference_date="2026-10-07",
+        event_id="event-exact-123",
+        calendar_id="primary",
+        timezone="America/New_York",
+        complete=True,
+    )
+    request = (
+        "Read that same event and report its exact title, date, start time, "
+        "end time, and description. Do not change anything."
+    )
+
+    payload = cli.execute_direct_calendar_action(request, plan, live=True)
+
+    assert captured == {
+        "event_id": "event-exact-123",
+        "read": {
+            "calendar_id": "primary",
+            "display_timezone": "America/New_York",
+            "include_description": True,
+            "live": True,
+        },
+    }
+    assert payload["status"] == "done"
+    assert payload["side_effects"]["calendar_write_performed"] is False
+    assert payload["slack_display_text"] == (
+        'Yes - "KBA_TEST_CALENDAR Advisory Authority Final 20261007" is on '
+        "your Google Calendar on 2026-10-07 from 1:15 PM to 1:45 PM. "
+        "Description: Source-grounded update passed."
     )
 
 
@@ -3601,6 +4312,28 @@ def test_typed_calendar_executor_reads_next_event_in_remaining_today_window(
     assert payload["side_effects"]["calendar_write_performed"] is False
 
 
+def test_calendar_window_bounds_preserve_explicit_time_range() -> None:
+    plan = CalendarActionPlan(
+        operation="read",
+        read_scope="time_window",
+        read_selection="all",
+        date_scope="specific_date",
+        start_date="2026-08-20",
+        start_time="14:00",
+        end_time="16:30",
+        timezone="America/New_York",
+        complete=True,
+    )
+
+    assert cli._calendar_window_bounds(
+        plan,
+        now=datetime.fromisoformat("2026-07-29T12:00:00-04:00"),
+    ) == (
+        "2026-08-20T14:00:00-04:00",
+        "2026-08-20T16:30:00-04:00",
+    )
+
+
 def test_direct_filtered_calendar_read_lists_shared_calendar_matches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3625,6 +4358,8 @@ def test_direct_filtered_calendar_read_lists_shared_calendar_matches(
                 {
                     "event_id": "flight-2",
                     "title": "Flight: Atlanta (ATL) to Philadelphia (PHL)",
+                    "source_calendar_name": "Travel",
+                    "source_calendar_primary": False,
                     "start_date": "2026-07-22",
                     "start": "2026-07-22T13:00:00-04:00",
                     "end": "2026-07-22T15:00:00-04:00",
@@ -3656,7 +4391,7 @@ def test_direct_filtered_calendar_read_lists_shared_calendar_matches(
     )
 
     assert captured["calendar_scope"] == "selected_readable"
-    assert captured["query"] == "flight"
+    assert captured["query"] == ""
     assert payload["status"] == "done"
     assert payload["tool_receipt"]["found"] is True
     assert payload["tool_receipt"]["selected_event"] is None
@@ -3664,7 +4399,7 @@ def test_direct_filtered_calendar_read_lists_shared_calendar_matches(
         'Google Calendar events matching "flight":\n'
         '- "Flight to Philadelphia (DL 2131)" on 2026-07-22 '
         "from 1:00 PM to 3:00 PM\n"
-        '- "Flight: Atlanta (ATL) to Philadelphia (PHL)" on 2026-07-22 '
+        '- "Flight: Atlanta (ATL) to Philadelphia (PHL)" (Travel) on 2026-07-22 '
         "from 1:00 PM to 3:00 PM"
     )
 
@@ -3686,16 +4421,11 @@ def test_direct_filtered_calendar_read_lists_shared_calendar_matches(
         ),
     ],
 )
-def test_live_calendar_variants_use_shared_chief_provider_path_with_five_call_ceiling(
+def test_live_calendar_variants_use_planner_then_typed_calendar_path(
     request_text: str,
-    capsys,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[list[str]] = []
-    child_envs: list[dict[str, str]] = []
-
-    def fail_direct_calendar_path(*_args: object, **_kwargs: object) -> object:
-        pytest.fail("Live natural-language Calendar asks must use the shared Chief path.")
+    captured: dict[str, object] = {}
 
     def fake_semantic_preflight(
         preflight_request: str,
@@ -3726,72 +4456,77 @@ def test_live_calendar_variants_use_shared_chief_provider_path_with_five_call_ce
             execution_allowed=True,
             manual_request_plan=plan,
             route_result=result,
+            sdk_usage_events=[{"usage": {"requests": 1}}],
         )
 
-    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
-        calls.append(command)
-        child_envs.append(dict(kwargs.get("env") or {}))
+    def fake_resolve(
+        request: str,
+        fallback: CalendarActionPlan | None,
+        **kwargs: object,
+    ) -> SimpleNamespace:
+        captured["resolve_request"] = request
+        captured["fallback"] = fallback
+        captured["resolve_kwargs"] = kwargs
         return SimpleNamespace(
-            returncode=0,
-            stdout=json.dumps(
-                {
-                    "status": "done",
-                    "output_type": "ChiefOfStaffResult",
-                    "send_enabled": False,
-                    "human_summary": (
-                        "Google Calendar event created and verified: "
-                        '"UT Austin Course Starts" on 2026-08-15.'
-                    ),
-                    "output": {
-                        "summary": (
-                            "Google Calendar event created and verified: "
-                            '"UT Austin Course Starts" on 2026-08-15.'
-                        )
-                    },
-                    "tool_receipts": [
-                        {
-                            "status": "success",
-                            "operation": "create_calendar_event",
-                            "title": "UT Austin Course Starts",
-                            "start_date": "2026-08-15",
-                            "verification": {"passed": True},
-                        }
-                    ],
-                }
+            plan=CalendarActionPlan(
+                operation="create",
+                title="UT Austin Course Starts",
+                start_date="2026-08-15",
+                start_time="08:00",
+                end_time="09:00",
+                all_day=False,
+                complete=True,
             ),
-            stderr="",
+            interpreter_used=True,
+            openai_requests=1,
+            warnings=(),
         )
+
+    def fake_direct(
+        input_text: str,
+        plan: CalendarActionPlan,
+        **kwargs: object,
+    ) -> int:
+        captured["direct_input"] = input_text
+        captured["plan"] = plan
+        captured["direct_kwargs"] = kwargs
+        return 0
 
     monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
     monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
     monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_semantic_preflight)
-    monkeypatch.setattr(cli, "resolve_calendar_action_plan", fail_direct_calendar_path)
-    monkeypatch.setattr(cli, "run_isolated_child_process", fake_run)
+    monkeypatch.setattr(cli, "resolve_calendar_action_plan", fake_resolve)
+    monkeypatch.setattr(cli, "run_direct_calendar_action", fake_direct)
+    monkeypatch.setattr(
+        cli,
+        "run_isolated_child_process",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Planner-authorized Calendar asks must stay on the typed Calendar path."
+        ),
+    )
 
     exit_code = main(
         [
             "ask",
             "--live-sdk",
             "--max-openai-requests",
-            "5",
+            "2",
             "--json",
             request_text,
         ]
     )
 
     assert exit_code == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["selected_agent"] == "chief_of_staff"
-    assert payload.get("status") != "blocked"
-    assert payload["script_payload"]["status"] == "done"
-    assert payload["manual_request_plan"]["provider_system"] == "google_calendar"
-    assert calls and "scripts/run_chief_of_staff.py" in calls[0]
-    assert "--live-search" not in calls[0]
-    assert "--live-search-plan" not in calls[0]
-    assert calls[0][calls[0].index("--quality") + 1] == "fast"
-    child_plan = json.loads(child_envs[0][MANUAL_REQUEST_PLAN_ENV])
-    assert child_plan["provider_system"] == "google_calendar"
-    assert child_plan["intent"] == "business_system_write"
+    assert captured["fallback"] is None
+    assert captured["resolve_kwargs"]["live"] is True
+    assert captured["resolve_kwargs"]["semantic_candidate"] is True
+    plan = captured["plan"]
+    assert isinstance(plan, CalendarActionPlan)
+    assert plan.operation == "create"
+    assert plan.title == "UT Austin Course Starts"
+    assert plan.start_date == "2026-08-15"
+    assert plan.start_time == "08:00"
+    assert captured["direct_kwargs"]["openai_requests"] == 2
 
 
 def test_live_calendar_followup_reuses_human_root_without_failed_bot_output_or_search(
@@ -4053,6 +4788,135 @@ def test_live_unowned_calendar_followup_executes_typed_action_before_work_item(
     assert captured["direct_kwargs"]["openai_requests"] == 2
 
 
+def test_live_complete_calendar_delete_uses_one_planner_request(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    current_request = (
+        'Delete both calendar events titled "Expert Initial Interview: Anup Sharma" '
+        "on August 3, 2026 at 10:15 AM."
+    )
+    envelope = "\n".join(
+        [
+            "business agents continue this prior Slack thread.",
+            f"Current user request (authoritative): {current_request}",
+            "Provider affinity: calendar",
+            (
+                "Previous request: Create KBA_TEST_CALENDAR Meeting Invite Format "
+                "Check on August 4, 2026."
+            ),
+            (
+                "Previous result: Google Calendar event created and verified: "
+                '"KBA_TEST_CALENDAR Meeting Invite Format Check" on 2026-08-04.'
+            ),
+            f"User follow-up: {current_request}",
+            "Continue the same agent task.",
+        ]
+    )
+    context_file = tmp_path / "slack-calendar-delete.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.message_context.v1",
+                "thread_ts": "1785373682.046209",
+                "thread_root_request": (
+                    "Create KBA_TEST_CALENDAR Meeting Invite Format Check "
+                    "on August 4, 2026."
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_preflight(request_text: str, **_kwargs: object) -> object:
+        semantic_plan = ManualRequestPlan(
+            source="llm",
+            target_agent="chief_of_staff",
+            intent="business_system_write",
+            task_objective="business_system_write",
+            provider_system="google_calendar",
+            provider_operations=["delete"],
+            primary_target="Expert Initial Interview: Anup Sharma",
+            required_entities=["Expert Initial Interview: Anup Sharma"],
+            desired_count=2,
+            desired_count_explicit=True,
+            ask_shape={"permission_state": "approval_required"},
+            objective=request_text,
+        )
+        return cli.OrchestratorPreflight(
+            request_text=request_text,
+            advisory_only=True,
+            selected_agent="chief_of_staff",
+            execution_allowed=True,
+            manual_request_plan=semantic_plan,
+            route_result=cli.route_request(request_text, manual_plan=semantic_plan),
+            sdk_usage_events=[{"usage": {"requests": 1}}],
+        )
+
+    def fake_direct(
+        input_text: str,
+        plan: CalendarActionPlan,
+        **kwargs: object,
+    ) -> int:
+        captured["input_text"] = input_text
+        captured["plan"] = plan
+        captured["kwargs"] = kwargs
+        return 0
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(cli, "run_direct_calendar_action", fake_direct)
+    monkeypatch.setattr(
+        "keystone_agents.agents.calendar_action_interpreter.run_typed_sdk_agent",
+        lambda **_kwargs: SimpleNamespace(
+            output=CalendarActionInterpretation(
+                operation="delete",
+                operation_source_text="Delete both calendar events",
+                event_reference="Expert Initial Interview: Anup Sharma",
+                event_reference_source_text=(
+                    'calendar events titled "Expert Initial Interview: Anup Sharma"'
+                ),
+                event_reference_date="2026-08-03",
+                event_reference_date_source_text="August 3, 2026",
+                event_reference_time="10:15",
+                event_reference_time_source_text="10:15 AM",
+            )
+        ),
+    )
+
+    exit_code = main(
+        [
+            "ask",
+            "--live-sdk",
+            "--context-file",
+            str(context_file),
+            "--max-openai-requests",
+            "2",
+            "--json",
+            envelope,
+        ]
+    )
+
+    assert exit_code == 0
+    plan = captured["plan"]
+    assert isinstance(plan, CalendarActionPlan)
+    assert plan.operation == "delete"
+    assert plan.event_reference == "Expert Initial Interview: Anup Sharma"
+    assert plan.event_reference_date == "2026-08-03"
+    assert plan.start_time == ""
+    assert plan.event_reference_time == "10:15"
+    assert plan.target_count == 2
+    assert plan.calendar_scope == "all_readable"
+    assert "KBA_TEST_CALENDAR Meeting Invite Format Check" in str(
+        captured["input_text"]
+    )
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["openai_requests"] == 2
+
+
 def test_live_named_chief_calendar_read_uses_same_typed_path_as_followup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4158,6 +5022,79 @@ def test_live_named_chief_calendar_read_uses_same_typed_path_as_followup(
     assert captured["direct_kwargs"]["openai_requests"] == 2
 
 
+def test_complete_calendar_read_budget_skips_redundant_interpreter_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Find my medical appointment tomorrow."
+    captured: dict[str, object] = {}
+
+    def fake_preflight(request_text: str, **_kwargs: object) -> object:
+        semantic_plan = ManualRequestPlan(
+            source="llm",
+            requested_agent="chief_of_staff",
+            target_agent="chief_of_staff",
+            intent="context_lookup",
+            task_objective="context_lookup",
+            provider_system="google_calendar",
+            provider_operations=["read"],
+            provider_read_scope="bounded_collection",
+            provider_result_mode="items",
+            primary_target="medical appointment",
+            ask_shape=AskShapePolicy(
+                ask_breadth="narrow",
+                permission_state="read_only",
+            ),
+        )
+        return cli.OrchestratorPreflight(
+            request_text=request_text,
+            requested_agent="chief_of_staff",
+            advisory_only=True,
+            selected_agent="chief_of_staff",
+            execution_allowed=True,
+            manual_request_plan=semantic_plan,
+            route_result=cli.route_request(request_text, manual_plan=semantic_plan),
+            sdk_usage_events=[{"usage": {"requests": 1}}],
+        )
+
+    def fake_direct(
+        input_text: str,
+        plan: CalendarActionPlan,
+        **kwargs: object,
+    ) -> int:
+        captured["input_text"] = input_text
+        captured["plan"] = plan
+        captured["kwargs"] = kwargs
+        return 0
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setattr(
+        "keystone_agents.agents.calendar_action_interpreter.current_calendar_date",
+        lambda: datetime(2026, 7, 27).date(),
+    )
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(cli, "run_direct_calendar_action", fake_direct)
+
+    exit_code = main(
+        [
+            "ask",
+            "--agent",
+            "chief_of_staff",
+            "--live-sdk",
+            "--max-openai-requests",
+            "2",
+            "--json",
+            request,
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["input_text"] == request
+    assert captured["plan"].query == "medical appointment"
+    assert captured["plan"].start_date == "2026-07-28"
+    assert captured["kwargs"]["openai_requests"] == 1
+
+
 def test_continuation_provider_affinity_fills_only_unspecified_provider() -> None:
     plan = infer_manual_request_plan(
         "What date is the UT Course Orientation Session?",
@@ -4260,6 +5197,39 @@ def test_live_provider_plan_cannot_be_downgraded_to_tool_free_response() -> None
         cli._should_run_direct_supplied_response(
             request,
             requested_route="gmail_triage",
+            manual_plan=plan,
+        )
+        is False
+    )
+
+
+def test_workspace_document_plan_cannot_be_downgraded_to_tool_free_response() -> None:
+    request = (
+        "Google Workspace Context Agent, find README.doc in KNIOps, read it, and "
+        "summarize its purpose and operating model without changing anything."
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="google_workspace_context_agent",
+        target_agent="google_workspace_context_agent",
+        intent="context_lookup",
+        task_objective="context_lookup",
+        expected_artifact_type="context_summary",
+        provider_system="google_workspace",
+        provider_operations=["read"],
+        primary_target="README.doc in KNIOps",
+        target_type="business_system_context",
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(
+            source_type_preference=["google_document"],
+            permission_state="read_only",
+        ),
+    )
+
+    assert (
+        cli._should_run_direct_supplied_response(
+            request,
+            requested_route="google_workspace_context_agent",
             manual_plan=plan,
         )
         is False
@@ -5906,6 +6876,8 @@ def test_slack_history_context_recovers_verified_provider_scope_by_thread(
     database_url = f"sqlite:///{tmp_path / 'thread-provider-scope.db'}"
     provenance = {
         "schema": "keystone.slack.run_provenance.v1",
+        "context_validated": True,
+        "team_id": "T123",
         "channel_id": "C123",
         "thread_ts": "1770000000.000100",
         "request_ts": "1770000000.000200",
@@ -5949,10 +6921,11 @@ def test_slack_history_context_recovers_verified_provider_scope_by_thread(
     context_path = tmp_path / "slack-history-context.json"
     context_path.write_text(
         json.dumps(
-            {
-                "schema": "keystone.slack.history_context.v1",
-                "channel_id": "C123",
-                "thread_ts": "1770000000.000100",
+                {
+                    "schema": "keystone.slack.history_context.v1",
+                    "team_id": "T123",
+                    "channel_id": "C123",
+                    "thread_ts": "1770000000.000100",
                 "request_ts": "1770000000.000400",
                 "thread_root_request": "What is the Personal Expenses total?",
                 "thread_messages": [
@@ -5978,6 +6951,86 @@ def test_slack_history_context_recovers_verified_provider_scope_by_thread(
     assert scope["airtable_table"] == "Personal Expenses"
     assert scope["item_refs"] == ["recOne", "recTwo"]
     assert scope["verified"] is True
+
+
+def test_slack_history_context_recovers_verified_exact_objects_by_thread(
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'thread-provider-object.db'}"
+    provenance = {
+        "schema": "keystone.slack.run_provenance.v1",
+        "context_validated": True,
+        "team_id": "T123",
+        "channel_id": "C123",
+        "thread_ts": "1770000000.000100",
+        "request_ts": "1770000000.000200",
+    }
+    SQLiteStore(database_url).save_agent_run(
+        agent_name="google_workspace_context_agent",
+        input_summary="Create the operating model document.",
+        dry_run=False,
+        status="success",
+        output={
+            "status": "done",
+            "public_result": {
+                "status": "completed",
+                "text": "The document was created and verified.",
+                "completion_confirmed": True,
+            },
+            "continuation_objects": [
+                {
+                    "provider_system": "google_drive",
+                    "object_type": "google_document",
+                    "object_id": "doc_123",
+                    "display_name": "Operating Model",
+                    "lifecycle_state": "active",
+                    "verification_status": "verified",
+                    "provider_scope": {"folder_path": "KNIOps"},
+                }
+            ],
+            "slack_run_provenance": provenance,
+        },
+    )
+    context_path = tmp_path / "slack-history-context.json"
+    context_path.write_text(
+        json.dumps(
+                {
+                    "schema": "keystone.slack.history_context.v1",
+                    "team_id": "T123",
+                    "channel_id": "C123",
+                    "thread_ts": "1770000000.000100",
+                "request_ts": "1770000000.000400",
+                "thread_root_request": "Create the operating model document.",
+                "thread_messages": [
+                    {
+                        "ts": "1770000000.000400",
+                        "role": "operator",
+                        "text": "GWC summarize the document you just created.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = cli._orchestrator_workflow_state_from_cli_context(
+        context_file_path=str(context_path),
+        request_text="GWC summarize the document you just created.",
+        database_url=database_url,
+    )
+
+    assert state["verified_provider_objects"] == [
+        {
+            "provider_system": "google_drive",
+            "object_type": "google_document",
+            "object_id": "doc_123",
+            "display_name": "Operating Model",
+            "effective_date": "",
+            "lifecycle_state": "active",
+            "verification_status": "verified",
+            "provider_scope": {"folder_path": "KNIOps"},
+        }
+    ]
 
 
 def test_blocked_workitem_and_failed_slack_attempts_are_historical_for_new_ask(
@@ -6214,6 +7267,43 @@ def test_resumable_supplied_context_requires_work_item_even_if_planner_selects_o
     )
 
     assert cli._preflight_requires_work_item(one_owner_preflight) is True
+
+
+def test_multi_target_competitor_research_requires_work_item() -> None:
+    request = (
+        "Deeply research Ellipsis Health as the anchor, then identify up to 2 "
+        "evidence-backed competitors. Do not count Ellipsis Health as a competitor."
+    )
+    preflight = cli.run_orchestrator_preflight(
+        request,
+        requested_agent="chief_of_staff",
+    )
+    plan = preflight.manual_request_plan.model_copy(
+        update={
+            "target_agent": "business_research_analyst",
+            "intent": "company_research",
+            "primary_target": "Ellipsis Health",
+            "target_type": "company",
+            "desired_count": 2,
+            "desired_count_explicit": True,
+            "requires_durable_state": False,
+        }
+    )
+    multi_target_preflight = preflight.model_copy(
+        update={
+            "request_text": request,
+            "manual_request_plan": plan,
+            "route_result": preflight.route_result.model_copy(
+                update={"route": "business_research_analyst"}
+            ),
+        }
+    )
+
+    assert cli._preflight_requires_work_item(multi_target_preflight) is True
+    assert (
+        cli._preflight_work_item_entry_route(multi_target_preflight)
+        == "business_research_analyst"
+    )
 
 
 def test_chief_context_advisors_do_not_replace_workitem_entry_owner() -> None:
@@ -8046,6 +9136,7 @@ def test_airtable_followup_run_uses_verified_projection_before_model(
         manual_plan=plan,
         execution_context={
             "slack_scope": {
+                "team_id": "T123",
                 "channel_id": "C123",
                 "thread_ts": "1770000000.000100",
                 "request_ts": "1770000000.000400",
@@ -8068,6 +9159,8 @@ def test_airtable_followup_run_uses_verified_projection_before_model(
     ]
     assert stored_output["slack_run_provenance"] == {
         "schema": "keystone.slack.run_provenance.v1",
+        "context_validated": True,
+        "team_id": "T123",
         "channel_id": "C123",
         "thread_ts": "1770000000.000100",
         "request_ts": "1770000000.000400",
@@ -8224,6 +9317,56 @@ def test_context_agent_tool_receipts_are_bounded_and_report_verified_writes() ->
             },
         }
     ]
+
+
+def test_gmail_internal_receipt_preserves_exact_identity_before_public_redaction() -> None:
+    raw_result = SimpleNamespace(
+        new_items=[
+            SimpleNamespace(
+                type="tool_call_output_item",
+                output=json.dumps(
+                    {
+                        "status": "success",
+                        "operation": "send_test_draft",
+                        "provider": "gmail",
+                        "gmail_account": "operator@example.test",
+                        "draft_id": "draft_internal_123",
+                        "message_id": "message_internal_456",
+                        "thread_id": "thread_internal_789",
+                        "subject": "KBA_TEST_EMAIL provider continuity",
+                        "sent": True,
+                        "verification": {
+                            "status": "verified",
+                            "passed": True,
+                        },
+                    }
+                ),
+            )
+        ]
+    )
+
+    receipts = cli._context_agent_tool_receipts(raw_result)
+    payload: dict[str, object] = {}
+    references = cli.attach_verified_continuation_objects(payload, receipts)
+    _, public_receipts = cli._context_agent_public_payload(
+        "gmail_context_agent",
+        {},
+        receipts,
+    )
+
+    assert references[0].object_type == "gmail_message"
+    assert references[0].object_id == "message_internal_456"
+    assert references[0].provider_scope == {
+        "gmail_account": "operator@example.test",
+        "thread_id": "thread_internal_789",
+        "draft_id": "draft_internal_123",
+    }
+    assert payload["continuation_objects"][0]["object_id"] == "message_internal_456"
+    rendered_public_receipts = json.dumps(public_receipts)
+    assert "message_internal_456" not in rendered_public_receipts
+    assert "draft_internal_123" not in rendered_public_receipts
+    assert "thread_internal_789" not in rendered_public_receipts
+    assert "operator@example.test" not in rendered_public_receipts
 
 
 def test_context_agent_tool_receipts_report_verified_receipt_create_and_attachment() -> None:
@@ -8914,6 +10057,42 @@ def test_zotero_lifecycle_public_payload_removes_provider_identity() -> None:
     assert "item_key" not in public_receipts[0]
 
 
+def test_zotero_ordered_read_keeps_selected_identity_internal_only() -> None:
+    raw_result = SimpleNamespace(
+        new_items=[
+            SimpleNamespace(
+                type="tool_call_output_item",
+                output=json.dumps(
+                    {
+                        "status": "success",
+                        "operation": "read_items",
+                        "provider_read": True,
+                        "library_id": "12345",
+                        "library_type": "user",
+                        "selected_item_key": "ARTICLEINTERNAL",
+                        "selected_item_title": "Selected article",
+                        "selected_item_has_abstract": True,
+                    }
+                ),
+            )
+        ]
+    )
+
+    receipts = cli._context_agent_tool_receipts(raw_result)
+    public_output, public_receipts = cli._context_agent_public_payload(
+        "zotero_context_agent",
+        {"zotero_item_keys": ["ARTICLEINTERNAL"]},
+        receipts,
+    )
+
+    assert receipts[0]["selected_item_key"] == "ARTICLEINTERNAL"
+    assert receipts[0]["library_id"] == "12345"
+    assert public_output["zotero_item_keys"] == []
+    assert "selected_item_key" not in public_receipts[0]
+    assert "library_id" not in public_receipts[0]
+    assert "ARTICLEINTERNAL" not in json.dumps(public_receipts)
+
+
 def test_context_agent_tool_receipts_report_zotero_delete_and_absence() -> None:
     raw_result = SimpleNamespace(
         new_items=[
@@ -9438,6 +10617,7 @@ def test_cli_google_workspace_context_live_sdk_enables_live_read_default(
     def fake_run_typed_sdk_sync(agent, prompt, output_type, **kwargs):
         captured["agent_name"] = agent.name
         captured["live_reads_env"] = os.environ.get(cli.GOOGLE_WORKSPACE_LIVE_READS_ENV)
+        captured["max_turns"] = kwargs.get("max_turns")
         return (
             SimpleNamespace(final_output=None, usage=None),
             cli.GoogleWorkspaceContextResult(
@@ -9466,7 +10646,8 @@ def test_cli_google_workspace_context_live_sdk_enables_live_read_default(
             "--database-url",
             database_url,
             "--json",
-            "Read-only Google Workspace context test for KNIOps.",
+            "Find README.doc in KNIOps, read it, and summarize its purpose and "
+            "operating model without changing anything.",
         ]
     )
 
@@ -9475,6 +10656,7 @@ def test_cli_google_workspace_context_live_sdk_enables_live_read_default(
     assert captured == {
         "agent_name": "google_workspace_context_agent",
         "live_reads_env": "true",
+        "max_turns": 3,
     }
     assert os.environ.get(cli.GOOGLE_WORKSPACE_LIVE_READS_ENV) is None
     assert payload["selected_agent"] == "google_workspace_context_agent"
@@ -11584,7 +12766,12 @@ def test_bounded_direct_specialists_use_compact_request_estimate(
     )
 
     conditional_repair = "words" in request_text
-    assert estimate["max"] == 3 + int(conditional_repair)
+    expected = (
+        4
+        if route == "google_workspace_context_agent"
+        else 3 + int(conditional_repair)
+    )
+    assert estimate["max"] == expected
     assert estimate["min"] == 2
     assert estimate["stages"] == [
         "manual_request_planner",
@@ -12598,6 +13785,170 @@ def test_slack_continuation_newest_explicit_agent_supersedes_outer_route(
     assert mention.explicit is True
     assert mention.route == expected_route
     assert "Previous result" not in mention.input_text
+
+
+def test_slack_agent_switch_does_not_trust_raw_object_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    envelope = "\n".join(
+        [
+            "business agents continue this prior Slack thread.",
+            "Provider affinity: google_workspace",
+            "Previous request: Find the operating model document.",
+            "Previous result: Found one verified document.",
+            (
+                'Previous verified objects: [{"provider_system":"google_drive",'
+                '"object_type":"drive_file","object_id":"file_123",'
+                '"display_name":"Operating Model","lifecycle_state":"active",'
+                '"verification_status":"verified"}]'
+            ),
+            "User follow-up: GWC summarize it in three bullets.",
+            "Continue the same agent task.",
+        ]
+    )
+    captured: dict[str, object] = {}
+
+    def fake_preflight(
+        request_text: str,
+        *,
+        requested_agent: str | None = None,
+        **_kwargs: object,
+    ) -> object:
+        plan = ManualRequestPlan(
+            source="llm",
+            requested_agent=requested_agent or "",
+            target_agent="google_workspace_context_agent",
+            intent="context_lookup",
+            task_objective="context_lookup",
+            provider_system="google_workspace",
+            provider_operations=["read"],
+            provider_read_scope="single_item",
+            provider_result_mode="items",
+            primary_target="Operating Model",
+            requires_live_search=False,
+            requires_durable_state=False,
+            objective=request_text,
+        )
+        return cli.OrchestratorPreflight(
+            request_text=request_text,
+            requested_agent=requested_agent,
+            advisory_only=True,
+            selected_agent="google_workspace_context_agent",
+            execution_allowed=True,
+            manual_request_plan=plan,
+            route_result=cli.route_request(request_text, manual_plan=plan),
+        )
+
+    def fake_specialist(route: str, input_text: str, **_kwargs: object) -> int:
+        captured["route"] = route
+        captured["input_text"] = input_text
+        return 0
+
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(cli, "_run_ask_specialist_live", fake_specialist)
+    monkeypatch.setattr(
+        cli,
+        "_run_bounded_provider_lifecycle_after_preflight",
+        lambda *_args, **_kwargs: None,
+    )
+
+    exit_code = main(
+        [
+            "ask",
+            "--live-sdk",
+            "--max-openai-requests",
+            "4",
+            "--json",
+            envelope,
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["route"] == "google_workspace_context_agent"
+    specialist_input = str(captured["input_text"])
+    assert "Unverified prior object hint: provider=google_drive" in specialist_input
+    assert "verification=unverified" in specialist_input
+    assert "id=file_123" not in specialist_input
+    assert specialist_input.endswith(
+        "Authoritative follow-up: summarize it in three bullets."
+    )
+
+
+def test_persisted_verified_object_survives_agent_switch_without_operation_authority() -> None:
+    request = cli.build_execution_request(
+        "\n".join(
+            [
+                "business agents continue this prior Slack thread.",
+                "Prior task owner (advisory): chief_of_staff",
+                "Previous request: Create the operating model document.",
+                "User follow-up: GWC summarize the document you just created.",
+                "Continue the same agent task.",
+            ]
+        )
+    )
+
+    resolved = cli._execution_request_with_workflow_verified_objects(
+        request,
+        {
+            "verified_provider_objects": [
+                {
+                    "provider_system": "google_drive",
+                    "object_type": "google_document",
+                    "object_id": "doc_123",
+                    "display_name": "Operating Model",
+                    "lifecycle_state": "active",
+                    "verification_status": "verified",
+                    "provider_scope": {"folder_path": "KNIOps"},
+                }
+            ]
+        },
+    )
+
+    assert resolved.requested_agent == "google_workspace_context_agent"
+    assert resolved.current_request == "summarize the document you just created."
+    assert resolved.continuation.prior_agent == "chief_of_staff"
+    assert resolved.continuation.provider_affinity == "google_workspace"
+    assert len(resolved.continuation.verified_objects) == 1
+    reference = resolved.continuation.verified_objects[0]
+    assert reference.object_id == "doc_123"
+    assert reference.provider_scope == {"folder_path": "KNIOps"}
+    planning_text = cli.execution_request_planning_text(resolved)
+    assert "id=doc_123" in planning_text
+    assert "scope.folder_path=KNIOps" in planning_text
+    assert planning_text.endswith(
+        "Authoritative follow-up: summarize the document you just created."
+    )
+
+
+def test_deleted_verified_object_does_not_supply_active_provider_affinity() -> None:
+    request = cli.build_execution_request(
+        "\n".join(
+            [
+                "business agents continue this prior Slack thread.",
+                "Previous request: Create one temporary document.",
+                "User follow-up: Summarize it.",
+                "Continue the same agent task.",
+            ]
+        )
+    )
+
+    resolved = cli._execution_request_with_workflow_verified_objects(
+        request,
+        {
+            "verified_provider_objects": [
+                {
+                    "provider_system": "google_drive",
+                    "object_type": "google_document",
+                    "object_id": "doc_deleted",
+                    "lifecycle_state": "deleted",
+                    "verification_status": "verified",
+                }
+            ]
+        },
+    )
+
+    assert resolved.continuation.provider_affinity == ""
+    assert resolved.continuation.verified_objects[0].lifecycle_state == "deleted"
 
 
 def test_slack_continuation_newest_bare_cos_runs_current_route_not_stale_graph(

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -226,6 +228,7 @@ def business_research_quality_budget(
     request_text: str = "",
     live_search: bool = False,
     cost_profile: str = "standard",
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
 ) -> AgentQualityBudget:
     """Resolve retrieval/model controls for Business Research Analyst runs."""
 
@@ -235,6 +238,7 @@ def business_research_quality_budget(
         live_search=live_search,
         cost_profile=cost_profile,
         agent_label="Business Research Analyst",
+        manual_request_plan=manual_request_plan,
     )
     budget = _research_budget_for_mode(
         "business_research_analyst",
@@ -264,6 +268,7 @@ def opportunity_scout_quality_budget(
     cost_profile: str = "standard",
     formal_opportunity: bool = False,
     source_context_required: bool = False,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
 ) -> AgentQualityBudget:
     """Resolve retrieval/model controls for Opportunity Scout runs."""
 
@@ -273,6 +278,7 @@ def opportunity_scout_quality_budget(
         live_search=live_search,
         cost_profile=cost_profile,
         agent_label="Opportunity Scout",
+        manual_request_plan=manual_request_plan,
     )
     if formal_opportunity or source_context_required:
         resolved = QualityMode.DEEP
@@ -424,21 +430,37 @@ def _resolve_research_quality_mode(
     live_search: bool,
     cost_profile: str,
     agent_label: str,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None,
 ) -> tuple[QualityMode, list[str]]:
     explicit = mode is not None and str(mode).strip() != ""
     if explicit:
         resolved = normalize_quality_mode(mode, QualityMode.BALANCED)
         return resolved, [f"Quality mode explicitly requested: {resolved.value}."]
 
-    profile_mode = _quality_mode_from_cost_profile(cost_profile)
-    if profile_mode is not None:
-        return profile_mode, [
-            f"Quality mode inferred as {profile_mode.value} from cost profile {cost_profile!r}."
+    authority = ExecutionIntentAuthority.from_value(manual_request_plan)
+    if (
+        authority.canonical
+        and authority.plan is not None
+        and _canonical_research_plan_has_quality_signal(authority)
+    ):
+        resolved = _research_quality_mode_from_plan(
+            authority.plan,
+            live_search=live_search,
+        )
+        return resolved, [
+            "Quality mode derived from the canonical request plan's evidence "
+            "depth, breadth, cost preference, and live-research requirement."
         ]
 
     if _looks_like_deep_research_request(request_text):
         return QualityMode.DEEP, [
             f"Quality mode inferred as deep for {agent_label} source-backed/deeper research."
+        ]
+
+    profile_mode = _quality_mode_from_cost_profile(cost_profile)
+    if profile_mode is not None:
+        return profile_mode, [
+            f"Quality mode inferred as {profile_mode.value} from cost profile {cost_profile!r}."
         ]
 
     if live_search:
@@ -449,6 +471,44 @@ def _resolve_research_quality_mode(
     return QualityMode.FAST, [
         f"Quality mode inferred as fast for fixture/dry-run {agent_label} research."
     ]
+
+
+def _research_quality_mode_from_plan(
+    plan: ManualRequestPlan,
+    *,
+    live_search: bool,
+) -> QualityMode:
+    ask_shape = plan.ask_shape
+    if (
+        ask_shape.evidence_depth == "deep"
+        or ask_shape.ask_breadth == "broad"
+        or ask_shape.cost_mode == "quality"
+    ):
+        return QualityMode.DEEP
+    if (
+        ask_shape.evidence_depth == "quick"
+        and ask_shape.ask_breadth in {"narrow", "bounded"}
+        and ask_shape.cost_mode == "minimize"
+    ):
+        return QualityMode.FAST
+    if live_search or plan.requires_live_search:
+        return QualityMode.BALANCED
+    return QualityMode.FAST
+
+
+def _canonical_research_plan_has_quality_signal(
+    authority: ExecutionIntentAuthority,
+) -> bool:
+    plan = authority.plan
+    if plan is None:
+        return False
+    ask_shape = plan.ask_shape
+    return bool(
+        "requires_live_search" in authority.supplied_fields
+        or ask_shape.ask_breadth != "unspecified"
+        or ask_shape.evidence_depth != "unspecified"
+        or ask_shape.cost_mode != "unspecified"
+    )
 
 
 def _quality_mode_from_cost_profile(cost_profile: str) -> QualityMode | None:
@@ -484,6 +544,12 @@ def _looks_like_deep_research_request(text: str) -> bool:
     if any(
         marker in normalized
         for marker in (
+            "deep research",
+            "deeply research",
+            "deeper research",
+            "research deeply",
+            "research in depth",
+            "thorough research",
             "deep search",
             "deeper search",
             "deepened search",

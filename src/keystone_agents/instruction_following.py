@@ -8,6 +8,7 @@ from typing import Any
 
 from pydantic import BaseModel, field_validator
 
+from keystone_agents.execution_telemetry import compact_execution_telemetry
 from keystone_agents.run import run_typed_sdk_agent
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.output_constraints import (
@@ -73,6 +74,7 @@ class InstructionFollowingResolution:
     repair_usage: dict[str, Any] | None = None
     repair_cost: dict[str, Any] | None = None
     repair_request_cache: dict[str, Any] | None = None
+    repair_execution_telemetry: dict[str, Any] | None = None
     error: str = ""
 
     def metadata(self) -> dict[str, Any]:
@@ -90,6 +92,9 @@ class InstructionFollowingResolution:
             payload["repair_cost"] = self.repair_cost
         if self.repair_request_cache:
             payload["repair_request_cache"] = self.repair_request_cache
+        repair_timing = compact_execution_telemetry(self.repair_execution_telemetry)
+        if repair_timing:
+            payload["repair_execution_telemetry"] = repair_timing
         return payload
 
 
@@ -291,6 +296,7 @@ def resolve_instruction_following_response(
         repair_usage=getattr(result, "usage", None),
         repair_cost=getattr(result, "cost", None),
         repair_request_cache=getattr(result, "request_cache", None),
+        repair_execution_telemetry=getattr(result, "execution_telemetry", None),
     )
 
 

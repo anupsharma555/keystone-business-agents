@@ -9,6 +9,7 @@ from keystone_agents.quality_budget import (
     business_research_quality_budget,
     opportunity_scout_quality_budget,
 )
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,7 @@ def resolve_sdk_turn_policy(
     request_text: str = "",
     live_search: bool = False,
     cost_profile: str = "standard",
+    manual_request_plan: ManualRequestPlan | dict[str, object] | None = None,
     explicit_max_turns: int | None = None,
     formal_opportunity: bool = False,
     source_context_required: bool = False,
@@ -65,6 +67,7 @@ def resolve_sdk_turn_policy(
             request_text=request_text,
             live_search=live_search,
             cost_profile=cost_profile,
+            manual_request_plan=manual_request_plan,
         )
         return SDKTurnPolicy(
             agent_name=normalized,
@@ -78,6 +81,7 @@ def resolve_sdk_turn_policy(
             cost_profile=cost_profile,
             formal_opportunity=formal_opportunity,
             source_context_required=source_context_required,
+            manual_request_plan=manual_request_plan,
         )
         return SDKTurnPolicy(
             agent_name=normalized,

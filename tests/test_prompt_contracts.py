@@ -558,6 +558,15 @@ def test_context_agent_prompts_require_live_read_tools_for_live_read_only_invoca
     assert "Do not import or mutate Zotero" in zotero
 
 
+def test_manual_planner_owns_exact_provider_object_cardinality() -> None:
+    text = " ".join(_read_prompt("manual_request_planner.md").split())
+
+    assert '"delete both matching events"' in text
+    assert "Treat `both` as an exact count of 2" in text
+    assert "unbounded plural words such as \"these events,\"" in text
+    assert "mutation executors use this field" in text
+
+
 def test_workspace_prompt_uses_direct_scoped_write_authority() -> None:
     text = _read_prompt("google_workspace_context.md")
 

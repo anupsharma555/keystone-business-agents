@@ -2528,6 +2528,23 @@ def _explicit_audience_scope(lower: str) -> str:
 def _normalize_llm_plan_contract(candidate: ManualRequestPlan) -> ManualRequestPlan:
     """Resolve schema contradictions from typed intent/provider relationships."""
 
+    mutation_operations = {"create", "update", "delete", "attach"}
+    planned_mutations = mutation_operations.intersection(candidate.provider_operations)
+    mutation_steps = {
+        step.operation
+        for step in candidate.provider_action_steps
+        if step.operation in mutation_operations
+    }
+    complete_provider_write_contract = bool(
+        candidate.intent == "business_system_write"
+        and candidate.task_objective == "business_system_write"
+        and candidate.expected_artifact_type == "business_system_write_plan"
+        and candidate.provider_system != "unspecified"
+        and candidate.side_effect_policy == "internal_write_approval_required"
+        and planned_mutations
+        and mutation_steps
+        and mutation_steps <= planned_mutations
+    )
     internal_gmail_collection_draft = bool(
         candidate.provider_system == "gmail"
         and candidate.target_type == "gmail_message_collection"
@@ -2574,6 +2591,18 @@ def _normalize_llm_plan_contract(candidate: ManualRequestPlan) -> ManualRequestP
     }
     updates: dict[str, Any] = {}
     warnings = list(candidate.planner_warnings)
+    if (
+        complete_provider_write_contract
+        and candidate.ask_shape.permission_state == "read_only"
+    ):
+        updates["ask_shape"] = candidate.ask_shape.model_copy(
+            update={"permission_state": "approval_required"}
+        )
+        warnings.append(
+            "Reconciled a contradictory read-only permission label with the "
+            "planner's complete typed provider-write contract; provider identity, "
+            "approval, live-gate, and receipt checks still apply."
+        )
     if internal_gmail_collection_draft:
         updates.update(
             {
@@ -3052,12 +3081,24 @@ def _semantic_target_agent(
         and requested_agent in {None, "orchestrator"}
         and explicit_text_agent not in {None, "orchestrator"}
     ):
+        if (
+            explicit_text_agent
+            in {"chief_of_staff", "opportunity_scout", "business_research_analyst"}
+            and _looks_like_anchor_competitor_research_request(route_text)
+        ):
+            return "business_research_analyst"
         return explicit_text_agent
     if (
         honor_text_agent_mentions
         and requested_agent in {None, "orchestrator"}
         and conversational_agent not in {None, "orchestrator"}
     ):
+        if (
+            conversational_agent
+            in {"chief_of_staff", "opportunity_scout", "business_research_analyst"}
+            and _looks_like_anchor_competitor_research_request(route_text)
+        ):
+            return "business_research_analyst"
         return conversational_agent
     if _looks_like_browser_diagnostics_only_request(text):
         return (
@@ -3073,6 +3114,8 @@ def _semantic_target_agent(
         # generic company/research and side-effect fallbacks inspect its title.
         return "chief_of_staff"
     if _looks_like_research_table_synthesis(route_text):
+        return "business_research_analyst"
+    if _looks_like_anchor_competitor_research_request(route_text):
         return "business_research_analyst"
     if _looks_like_unnamed_company_set_discovery(route_text):
         return "opportunity_scout"
@@ -3556,6 +3599,8 @@ def _has_clear_task_ownership(
             )
         )
     if agent == "opportunity_scout":
+        if _looks_like_anchor_competitor_research_request(route_text):
+            return False
         return bool(
             _looks_like_unnamed_company_set_discovery(route_text)
             or looks_like_opportunity_to_outreach_loop(route_text)
@@ -3571,7 +3616,8 @@ def _has_clear_task_ownership(
         )
     if agent == "business_research_analyst":
         return bool(
-            _company_profile_target(route_text)
+            _looks_like_anchor_competitor_research_request(route_text)
+            or _company_profile_target(route_text)
             or _company_comparison_target(route_text)
             or _workflow_company_target(route_text)
             or _looks_like_research_table_synthesis(route_text)
@@ -4283,8 +4329,9 @@ def _looks_like_external_write_side_effect(text: str) -> bool:
     lower = re.sub(r"\bprior\s+post\b", "prior message", lower)
     if re.search(
         r"\b(?:do\s+not|don't|dont|never|no)\b[\s\S]{0,180}"
-        r"\b(?:add|create|insert|update|delete|remove|modify|write|save|attach|export|"
-        r"move|share|schedule|publish|post|send|deliver)\b",
+        r"\b(?:add|attach|change|create|delete|deliver|edit|export|insert|modify|"
+        r"move|publish|remove|rename|reschedule|save|schedule|send|share|shift|"
+        r"update|write)\b",
         lower,
     ):
         return False
@@ -5037,6 +5084,34 @@ def _looks_like_unnamed_company_set_discovery(text: str) -> bool:
     )
 
 
+def _looks_like_anchor_competitor_research_request(text: str) -> bool:
+    """Recognize one named research anchor plus a separate competitor set."""
+
+    lower = " ".join(str(text or "").lower().split())
+    anchor_scope = bool(
+        re.search(
+            r"\b(?:as|is)\s+(?:the|an?)\s+anchor\b"
+            r"|\banchor\s+(?:company|target|product|platform)\b",
+            lower,
+        )
+    )
+    competitor_scope = bool(
+        re.search(
+            r"\b(?:competitors?|competing\s+(?:companies|products?|platforms?|tools?)|"
+            r"alternatives?|comparables?)\b",
+            lower,
+        )
+    )
+    research_scope = bool(
+        re.search(
+            r"\b(?:research|characterize|profile|analy[sz]e|investigate|assess|"
+            r"evaluate|compare|identify|find)\b",
+            lower,
+        )
+    )
+    return bool(anchor_scope and competitor_scope and research_scope)
+
+
 def _clean_company_candidate(value: str) -> str:
     cleaned = " ".join(str(value or "").split()).strip(" .,:;-[]")
     cleaned = re.split(
@@ -5240,9 +5315,22 @@ def _negative_constraint_forbids_provider_access(
         "zotero": ("zotero",),
         "slack": ("slack",),
     }
+    provider_terms = access_provider_terms.get(provider, ())
+    provider_pattern = "|".join(re.escape(term) for term in provider_terms)
+    if provider_pattern and re.search(
+        r"\b(?:do\s+not|don't|dont|never|avoid|skip|no|without)\b"
+        r"[^.;\n]{0,120}\b(?:use|access|read|check|query|search|browse|fetch|"
+        r"retrieve|open|connect\s+to)\b"
+        r"[^.;\n]{0,80}\b(?:outside|beyond)\b"
+        rf"[^.;\n]{{0,40}}\b(?:{provider_pattern})\b",
+        normalized,
+    ):
+        # "Do not search outside Google Drive" confines the allowed read to
+        # that provider; it does not prohibit the provider itself.
+        return False
     return any(
         re.search(rf"\b{re.escape(term)}\b", normalized)
-        for term in access_provider_terms.get(provider, ())
+        for term in provider_terms
     )
 
 

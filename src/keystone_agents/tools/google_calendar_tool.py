@@ -15,6 +15,11 @@ import requests
 
 from keystone_agents.config import parse_bool
 from keystone_agents.guardrails import keystone_tool_guardrail_kwargs
+from keystone_agents.provider_read import (
+    ProviderReadContextError,
+    current_provider_read_context,
+    record_provider_read_result,
+)
 from keystone_agents.sdk import function_tool
 from keystone_agents.tools.gmail_tool import GmailTool
 
@@ -130,10 +135,24 @@ class GoogleCalendarTool:
     def list_selected_readable_calendars(self) -> list[dict[str, Any]]:
         """Return calendars selected in the connected account's Calendar UI."""
 
+        return [
+            item
+            for item in self._list_readable_calendars(show_hidden=False)
+            if bool(item.get("selected") or item.get("primary"))
+        ]
+
+    def list_all_readable_calendars(self) -> list[dict[str, Any]]:
+        """Return every CalendarList entry readable by the connected account."""
+
+        return self._list_readable_calendars(show_hidden=True)
+
+    def _list_readable_calendars(self, *, show_hidden: bool) -> list[dict[str, Any]]:
+        """Read the account CalendarList without exposing provider identifiers."""
+
         params = urlencode(
             {
                 "minAccessRole": "reader",
-                "showHidden": "false",
+                "showHidden": "true" if show_hidden else "false",
                 "maxResults": 250,
             }
         )
@@ -152,7 +171,6 @@ class GoogleCalendarTool:
             item
             for item in items
             if isinstance(item, dict)
-            and bool(item.get("selected") or item.get("primary"))
             and str(item.get("id") or "").strip()
         ]
 
@@ -217,6 +235,26 @@ class GoogleCalendarTool:
         )
 
 
+def _google_calendar_read_tool(
+    supplied_tool: GoogleCalendarTool | None,
+) -> GoogleCalendarTool:
+    """Reuse one Calendar client inside a canonical bounded read request."""
+
+    if supplied_tool is not None:
+        return supplied_tool
+    read_context = current_provider_read_context()
+    if read_context is None or read_context.plan.provider != "google_calendar":
+        return GoogleCalendarTool(live=True)
+    if not read_context.try_start_attempt():
+        raise ProviderReadContextError(
+            "Google Calendar read exceeded its bounded call or deadline budget."
+        )
+    return read_context.service(
+        "google_calendar.live_read_tool",
+        lambda: GoogleCalendarTool(live=True),
+    )
+
+
 def _google_api_error_detail(response: Any) -> str:
     """Return bounded provider reason/message without echoing request credentials."""
 
@@ -243,7 +281,10 @@ def resolve_google_calendar_event_impl(
     event_reference: str,
     *,
     start_date: str = "",
+    start_time: str = "",
     calendar_id: str = "",
+    calendar_scope: str = "configured",
+    display_timezone: str = "",
     live: bool = False,
     tool: GoogleCalendarTool | None = None,
 ) -> dict[str, Any]:
@@ -251,7 +292,14 @@ def resolve_google_calendar_event_impl(
 
     reference = _required(event_reference, "Calendar event name")
     requested_date = _iso_date(start_date) if start_date.strip() else ""
+    requested_time = str(start_time or "").strip()[:5]
     clean_calendar = _calendar_id(calendar_id)
+    clean_scope = str(calendar_scope or "configured").strip().lower()
+    if clean_scope not in {"configured", "selected_readable", "all_readable"}:
+        raise ValueError(
+            "Calendar resolution scope must be configured, selected_readable, "
+            "or all_readable."
+        )
     if not live:
         return {
             "status": "dry-run",
@@ -259,10 +307,21 @@ def resolve_google_calendar_event_impl(
             "calendar_id": clean_calendar,
             "event_reference": reference,
             "start_date": requested_date,
+            "start_time": requested_time,
+            "calendar_scope": clean_scope,
             "match_count": 0,
             "send_enabled": False,
         }
-    calendar = tool or GoogleCalendarTool(live=True)
+    calendar = _google_calendar_read_tool(tool)
+    if clean_scope == "all_readable":
+        calendar_entries = calendar.list_all_readable_calendars()
+    elif clean_scope == "selected_readable":
+        calendar_entries = calendar.list_selected_readable_calendars()
+    else:
+        calendar_entries = [{"id": clean_calendar, "primary": True}]
+    if not calendar_entries:
+        calendar_entries = [{"id": clean_calendar, "primary": True}]
+    candidates: list[dict[str, Any]] = []
     if requested_date:
         zone = ZoneInfo(
             os.getenv(GOOGLE_CALENDAR_TIMEZONE_ENV, DEFAULT_CALENDAR_TIMEZONE).strip()
@@ -273,14 +332,58 @@ def resolve_google_calendar_event_impl(
             datetime.min.time(),
             tzinfo=zone,
         )
-        candidates = calendar.list_events_window(
-            clean_calendar,
-            time_min=window_start.isoformat(),
-            time_max=(window_start + timedelta(days=1)).isoformat(),
-            max_results=100,
-        )
+        for entry in calendar_entries:
+            source_calendar_id = str(entry.get("id") or "").strip()
+            if not source_calendar_id:
+                continue
+            for item in calendar.list_events_window(
+                source_calendar_id,
+                time_min=window_start.isoformat(),
+                time_max=(window_start + timedelta(days=1)).isoformat(),
+                max_results=100,
+            ):
+                candidates.append(
+                    {
+                        **item,
+                        "_source_calendar_id": source_calendar_id,
+                        "_source_calendar_name": " ".join(
+                            str(
+                                entry.get("summaryOverride")
+                                or entry.get("summary")
+                                or ""
+                            ).split()
+                        )[:240],
+                        "_source_calendar_access_role": str(
+                            entry.get("accessRole") or ""
+                        ),
+                    }
+                )
     else:
-        candidates = calendar.find_events(clean_calendar, reference, max_results=10)
+        for entry in calendar_entries:
+            source_calendar_id = str(entry.get("id") or "").strip()
+            if not source_calendar_id:
+                continue
+            for item in calendar.find_events(
+                source_calendar_id,
+                reference,
+                max_results=10,
+            ):
+                candidates.append(
+                    {
+                        **item,
+                        "_source_calendar_id": source_calendar_id,
+                        "_source_calendar_name": " ".join(
+                            str(
+                                entry.get("summaryOverride")
+                                or entry.get("summary")
+                                or ""
+                            ).split()
+                        )[:240],
+                        "_source_calendar_access_role": str(
+                            entry.get("accessRole") or ""
+                        ),
+                    }
+                )
     candidates = [
         item
         for item in candidates
@@ -292,6 +395,7 @@ def resolve_google_calendar_event_impl(
         for item in candidates
         if _normalize_event_title(item.get("summary")) == normalized_reference
     ]
+    title_match_kind = "exact" if exact else "fuzzy"
     matches = exact or [
         item
         for item in candidates
@@ -306,46 +410,200 @@ def resolve_google_calendar_event_impl(
         matches = [
             item
             for item in matches
-            if _provider_event_start_date(item) == requested_date
+            if (
+                _provider_event_start_date(
+                    item,
+                    display_timezone=display_timezone,
+                )
+                == requested_date
+            )
         ]
+    if requested_time:
+        matches = [
+            item
+            for item in matches
+            if str(
+                _bounded_calendar_event(
+                    item,
+                    display_timezone=display_timezone,
+                ).get("display_start_time")
+                or _bounded_calendar_event(
+                    item,
+                    display_timezone=display_timezone,
+                ).get("start_time")
+                or ""
+            )[:5]
+            == requested_time
+        ]
+    bounded_matches = [
+        {
+            "event_id": str(item.get("id") or ""),
+            "calendar_id": str(item.get("_source_calendar_id") or clean_calendar),
+            "source_calendar_name": str(item.get("_source_calendar_name") or ""),
+            "access_role": str(
+                item.get("_source_calendar_access_role") or ""
+            ),
+            "title": str(item.get("summary") or ""),
+            **{
+                key: value
+                for key, value in _bounded_calendar_event(
+                    item,
+                    display_timezone=display_timezone,
+                ).items()
+                if key
+                in {
+                    "start_date",
+                    "start_time",
+                    "display_start_date",
+                    "display_start_time",
+                    "timezone",
+                    "display_timezone",
+                }
+            },
+        }
+        for item in matches
+    ]
     if len(matches) != 1:
-        return {
+        result = {
             "status": "not_found" if not matches else "ambiguous",
             "operation": "resolve_calendar_event",
             "calendar_id": clean_calendar,
             "event_reference": reference,
             "start_date": requested_date,
+            "start_time": requested_time,
+            "calendar_scope": clean_scope,
+            "title_match_kind": title_match_kind,
             "match_count": len(matches),
+            "matches": bounded_matches,
             "send_enabled": False,
         }
+        record_provider_read_result("resolve_google_calendar_event", result)
+        return result
     event = matches[0]
-    bounded_event = _bounded_calendar_event(event)
+    bounded_event = _bounded_calendar_event(
+        event,
+        display_timezone=display_timezone,
+    )
     start = str(bounded_event.get("start") or "")
     end = str(bounded_event.get("end") or "")
-    all_day = bool(start and "T" not in start)
-    return {
+    result = {
         "status": "success",
         "operation": "resolve_calendar_event",
-        "calendar_id": clean_calendar,
+        "calendar_id": str(event.get("_source_calendar_id") or clean_calendar),
+        "calendar_scope": clean_scope,
+        "source_calendar_name": str(event.get("_source_calendar_name") or ""),
+        "access_role": str(event.get("_source_calendar_access_role") or ""),
         "event_reference": reference,
+        "title_match_kind": title_match_kind,
         "match_count": 1,
         "event_id": str(event.get("id") or ""),
         "provider_link": str(event.get("htmlLink") or ""),
         "title": str(event.get("summary") or ""),
-        "start_date": _provider_event_start_date(event),
+        "start_date": str(bounded_event.get("start_date") or ""),
         "start": start,
         "end": end,
-        "start_time": "" if all_day else start[11:16],
-        "end_time": "" if all_day else end[11:16],
-        "all_day": all_day,
-        "timezone": str((event.get("start") or {}).get("timeZone") or ""),
+        "end_date": str(bounded_event.get("end_date") or ""),
+        "start_time": str(bounded_event.get("start_time") or ""),
+        "end_time": str(bounded_event.get("end_time") or ""),
+        "display_start_date": str(bounded_event.get("display_start_date") or ""),
+        "display_end_date": str(bounded_event.get("display_end_date") or ""),
+        "display_start_time": str(bounded_event.get("display_start_time") or ""),
+        "display_end_time": str(bounded_event.get("display_end_time") or ""),
+        "all_day": bool(bounded_event.get("all_day")),
+        "timezone": str(bounded_event.get("timezone") or ""),
+        "display_timezone": str(bounded_event.get("display_timezone") or ""),
+        "location": str(bounded_event.get("location") or ""),
         "send_enabled": False,
     }
+    record_provider_read_result("resolve_google_calendar_event", result)
+    return result
 
 
-def _provider_event_start_date(event: dict[str, Any]) -> str:
-    start = event.get("start") if isinstance(event.get("start"), dict) else {}
-    return str(start.get("date") or start.get("dateTime") or "")[:10]
+def _provider_event_start_date(
+    event: dict[str, Any],
+    *,
+    display_timezone: str = "",
+) -> str:
+    bounded = _bounded_calendar_event(
+        event,
+        display_timezone=display_timezone,
+    )
+    return str(
+        bounded.get("display_start_date")
+        or bounded.get("start_date")
+        or ""
+    )
+
+
+def read_google_calendar_event_impl(
+    event_id: str,
+    *,
+    calendar_id: str = "",
+    display_timezone: str = "",
+    include_description: bool = False,
+    live: bool = False,
+    tool: GoogleCalendarTool | None = None,
+) -> dict[str, Any]:
+    """Read one exact Calendar event by its already-verified provider identity."""
+
+    clean_event_id = _required(event_id, "Calendar event id")
+    clean_calendar = _calendar_id(calendar_id)
+    if not live:
+        return {
+            "status": "dry-run",
+            "operation": "read_calendar_event",
+            "calendar_id": clean_calendar,
+            "event_id": clean_event_id,
+            "include_description": bool(include_description),
+            "found": False,
+            "verification": {"status": "preview", "passed": False},
+            "external_writes_enabled": False,
+            "send_enabled": False,
+        }
+
+    calendar = _google_calendar_read_tool(tool)
+    event = calendar.get_event(clean_calendar, clean_event_id)
+    found = not event.get("_not_found") and str(
+        event.get("status") or "confirmed"
+    ).lower() != "cancelled"
+    if not found:
+        result = {
+            "status": "not_found",
+            "operation": "read_calendar_event",
+            "calendar_id": clean_calendar,
+            "event_id": clean_event_id,
+            "found": False,
+            "verification": {
+                "status": "verified_absent",
+                "passed": True,
+            },
+            "external_writes_enabled": False,
+            "send_enabled": False,
+        }
+        record_provider_read_result("read_google_calendar_event", result)
+        return result
+
+    bounded_event = _bounded_calendar_event(
+        event,
+        display_timezone=display_timezone,
+    )
+    result = {
+        **bounded_event,
+        "status": "success",
+        "operation": "read_calendar_event",
+        "calendar_id": clean_calendar,
+        "found": True,
+        "verification": {
+            "status": "verified_present",
+            "passed": True,
+        },
+        "external_writes_enabled": False,
+        "send_enabled": False,
+    }
+    if include_description:
+        result["description"] = str(event.get("description") or "").strip()[:4000]
+    record_provider_read_result("read_google_calendar_event", result)
+    return result
 
 
 def read_google_calendar_window_impl(
@@ -356,6 +614,7 @@ def read_google_calendar_window_impl(
     calendar_scope: str = "configured",
     query: str = "",
     max_results: int = 100,
+    display_timezone: str = "",
     live: bool = False,
     tool: GoogleCalendarTool | None = None,
 ) -> dict[str, Any]:
@@ -369,8 +628,10 @@ def read_google_calendar_window_impl(
         raise ValueError("Calendar window end must be after its start.")
     clean_calendar = _calendar_id(calendar_id)
     clean_scope = str(calendar_scope or "configured").strip().lower()
-    if clean_scope not in {"configured", "selected_readable"}:
-        raise ValueError("Calendar read scope must be configured or selected_readable.")
+    if clean_scope not in {"configured", "selected_readable", "all_readable"}:
+        raise ValueError(
+            "Calendar read scope must be configured, selected_readable, or all_readable."
+        )
     clean_query = " ".join(str(query or "").split()).strip()[:200]
     bounded_max = min(max(int(max_results), 1), 100)
     if not live:
@@ -389,12 +650,13 @@ def read_google_calendar_window_impl(
             "external_writes_enabled": False,
             "send_enabled": False,
         }
-    calendar = tool or GoogleCalendarTool(live=True)
-    calendar_entries = (
-        calendar.list_selected_readable_calendars()
-        if clean_scope == "selected_readable"
-        else [{"id": clean_calendar, "primary": clean_calendar == "primary"}]
-    )
+    calendar = _google_calendar_read_tool(tool)
+    if clean_scope == "all_readable":
+        calendar_entries = calendar.list_all_readable_calendars()
+    elif clean_scope == "selected_readable":
+        calendar_entries = calendar.list_selected_readable_calendars()
+    else:
+        calendar_entries = [{"id": clean_calendar, "primary": clean_calendar == "primary"}]
     if not calendar_entries:
         calendar_entries = [{"id": clean_calendar, "primary": True}]
     events: list[dict[str, Any]] = []
@@ -410,12 +672,26 @@ def read_google_calendar_window_impl(
             query=clean_query,
         )
         for raw_event in raw_events:
-            event = _bounded_calendar_event(raw_event)
+            event = _bounded_calendar_event(
+                raw_event,
+                display_timezone=display_timezone,
+            )
             event["source_calendar_id"] = source_calendar_id
+            event["source_calendar_name"] = " ".join(
+                str(entry.get("summaryOverride") or entry.get("summary") or "").split()
+            )[:240]
+            event["source_calendar_primary"] = bool(entry.get("primary"))
             events.append(event)
     events = [event for event in events if event["status"] != "cancelled"]
-    events = sorted(events, key=lambda event: str(event.get("start") or ""))[:bounded_max]
-    return {
+    events = sorted(
+        events,
+        key=lambda event: (
+            str(event.get("display_start_date") or event.get("start_date") or ""),
+            str(event.get("display_start_time") or event.get("start_time") or ""),
+            str(event.get("title") or ""),
+        ),
+    )[:bounded_max]
+    result = {
         "status": "success",
         "operation": "read_calendar_window",
         "calendar_id": clean_calendar,
@@ -431,6 +707,8 @@ def read_google_calendar_window_impl(
         "external_writes_enabled": False,
         "send_enabled": False,
     }
+    record_provider_read_result("read_google_calendar_window", result)
+    return result
 
 
 def create_google_calendar_event_impl(
@@ -543,6 +821,19 @@ def update_google_calendar_event_impl(
         changes["summary"] = title.strip()
     if start_time.strip() and not start_date.strip():
         raise ValueError("Calendar timed update requires start_date with start_time.")
+    calendar = tool or GoogleCalendarTool(live=live)
+    before: dict[str, Any] = {}
+    if live:
+        _require_live_write_gate()
+        before = calendar.get_event(clean_calendar, clean_event_id)
+        if before.get("_not_found"):
+            raise GoogleCalendarError("Exact Calendar event was not found for update.")
+    effective_duration = duration_minutes
+    if live and start_time.strip() and not end_time.strip():
+        effective_duration = _provider_event_duration_minutes(
+            before,
+            fallback=duration_minutes,
+        )
     if start_date.strip():
         clean_date = _iso_date(start_date)
         changes.update(
@@ -550,7 +841,7 @@ def update_google_calendar_event_impl(
                 clean_date,
                 start_time=start_time,
                 end_time=end_time,
-                duration_minutes=duration_minutes,
+                duration_minutes=effective_duration,
                 timezone=clean_timezone,
             )
         )
@@ -558,15 +849,10 @@ def update_google_calendar_event_impl(
         changes["description"] = description.strip()
     if not changes:
         raise ValueError("Calendar event update requires title, start_date, or description.")
-    calendar = tool or GoogleCalendarTool(live=live)
     if not live:
         preview = _preview("update", clean_calendar, clean_event_id, changes, approval)
         preview["description_mode"] = "append" if append_description else "replace"
         return preview
-    _require_live_write_gate()
-    before = calendar.get_event(clean_calendar, clean_event_id)
-    if before.get("_not_found"):
-        raise GoogleCalendarError("Exact Calendar event was not found for update.")
     if append_description and description.strip():
         changes["description"] = _append_calendar_description(
             str(before.get("description") or ""),
@@ -576,8 +862,12 @@ def update_google_calendar_event_impl(
     verified = calendar.get_event(clean_calendar, clean_event_id)
     expected_title = str(changes.get("summary") or before.get("summary") or "")
     expected_start_payload = changes.get("start") or before.get("start") or {}
+    expected_end_payload = changes.get("end") or before.get("end") or {}
     expected_start = str(
         expected_start_payload.get("dateTime") or expected_start_payload.get("date") or ""
+    )
+    expected_end = str(
+        expected_end_payload.get("dateTime") or expected_end_payload.get("date") or ""
     )
     expected_all_day = bool(expected_start_payload.get("date"))
     expected_description = str(
@@ -602,6 +892,7 @@ def update_google_calendar_event_impl(
         "title": expected_title,
         "start_date": expected_start[:10],
         "start_time": "" if expected_all_day else expected_start[11:16],
+        "end_time": "" if expected_all_day else expected_end[11:16],
         "all_day": expected_all_day,
         "timezone": clean_timezone,
         "description_present": bool(expected_description),
@@ -660,7 +951,10 @@ def read_google_calendar_window(
     time_min: str,
     time_max: str,
     calendar_id: str = "",
+    calendar_scope: str = "configured",
+    query: str = "",
     max_results: int = 100,
+    display_timezone: str = "",
     live: bool = False,
 ) -> str:
     """Read a bounded Calendar window and label recurring event instances."""
@@ -670,7 +964,10 @@ def read_google_calendar_window(
             time_min,
             time_max,
             calendar_id=calendar_id,
+            calendar_scope=calendar_scope,
+            query=query,
             max_results=max_results,
+            display_timezone=display_timezone,
             live=live,
         ),
         sort_keys=True,
@@ -822,28 +1119,99 @@ def _rfc3339(value: str, label: str) -> str:
     return cleaned
 
 
-def _bounded_calendar_event(event: dict[str, Any]) -> dict[str, Any]:
+def _calendar_display_datetime(
+    value: str,
+    *,
+    display_timezone: str,
+) -> datetime | None:
+    """Convert one provider RFC3339 timestamp into the configured display zone."""
+
+    if not value or "T" not in value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    try:
+        display_zone = ZoneInfo(display_timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise GoogleCalendarError(
+            f"Unknown Google Calendar display timezone: {display_timezone}."
+        ) from exc
+    return parsed.astimezone(display_zone)
+
+
+def _bounded_calendar_event(
+    event: dict[str, Any],
+    *,
+    display_timezone: str = "",
+) -> dict[str, Any]:
     start = event.get("start") if isinstance(event.get("start"), dict) else {}
     end = event.get("end") if isinstance(event.get("end"), dict) else {}
     start_value = str(start.get("dateTime") or start.get("date") or "")
     end_value = str(end.get("dateTime") or end.get("date") or "")
     all_day = bool(start.get("date") and not start.get("dateTime"))
+    clean_display_timezone = _timezone(display_timezone)
+    display_start = _calendar_display_datetime(
+        start_value,
+        display_timezone=clean_display_timezone,
+    )
+    display_end = _calendar_display_datetime(
+        end_value,
+        display_timezone=clean_display_timezone,
+    )
+    display_start_date = (
+        display_start.date().isoformat() if display_start is not None else start_value[:10]
+    )
+    display_end_date = (
+        display_end.date().isoformat() if display_end is not None else end_value[:10]
+    )
+    display_start_time = (
+        ""
+        if all_day
+        else (
+            display_start.strftime("%H:%M")
+            if display_start is not None
+            else start_value[11:16]
+        )
+    )
+    display_end_time = (
+        ""
+        if all_day
+        else (
+            display_end.strftime("%H:%M")
+            if display_end is not None
+            else end_value[11:16]
+        )
+    )
     recurring_event_id = str(event.get("recurringEventId") or "")
-    return {
+    bounded_event = {
         "event_id": str(event.get("id") or ""),
         "title": " ".join(str(event.get("summary") or "(untitled event)").split())[:240],
         "status": str(event.get("status") or "confirmed").lower(),
         "start_date": start_value[:10],
         "start": start_value,
         "end": end_value,
+        "end_date": end_value[:10],
         "start_time": "" if all_day else start_value[11:16],
         "end_time": "" if all_day else end_value[11:16],
+        "display_start_date": display_start_date,
+        "display_end_date": display_end_date,
+        "display_start_time": display_start_time,
+        "display_end_time": display_end_time,
         "all_day": all_day,
         "timezone": str(start.get("timeZone") or ""),
+        "display_timezone": "" if all_day else clean_display_timezone,
         "html_link": str(event.get("htmlLink") or ""),
         "is_recurring": bool(recurring_event_id),
         "recurring_event_id": recurring_event_id,
     }
+    location = " ".join(str(event.get("location") or "").split())[:500]
+    if location:
+        bounded_event["location"] = location
+    return bounded_event
 
 
 def _calendar_id(value: str) -> str:
@@ -956,6 +1324,24 @@ def _calendar_update_dates(
         dates[boundary]["dateTime"] = None
         dates[boundary]["timeZone"] = None
     return dates
+
+
+def _provider_event_duration_minutes(
+    event: dict[str, Any],
+    *,
+    fallback: int,
+) -> int:
+    """Read one exact event's current duration before shifting its start."""
+
+    start = str((event.get("start") or {}).get("dateTime") or "")
+    end = str((event.get("end") or {}).get("dateTime") or "")
+    try:
+        parsed_start = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        parsed_end = datetime.fromisoformat(end.replace("Z", "+00:00"))
+    except ValueError:
+        return fallback
+    duration = int((parsed_end - parsed_start).total_seconds() // 60)
+    return duration if 1 <= duration <= 1440 else fallback
 
 
 def _append_calendar_description(existing: str, addition: str) -> str:

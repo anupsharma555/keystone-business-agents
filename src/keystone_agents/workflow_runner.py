@@ -43,6 +43,7 @@ from keystone_agents.company_research import research_company_fixture
 from keystone_agents.config import cli_default_live_gmail, load_settings
 from keystone_agents.contact_enrichment import build_contact_enrichment_artifact
 from keystone_agents.cost_tracking import parse_cost_tracking_directive
+from keystone_agents.execution_telemetry import compact_execution_telemetry
 from keystone_agents.finance_expense_receipts import (
     extract_finance_receipt_evidence,
     infer_finance_expense_receipt_target,
@@ -102,6 +103,7 @@ from keystone_agents.provider_side_effect_policy import (
 )
 from keystone_agents.quality_budget import (
     AgentQualityBudget,
+    QualityMode,
     business_research_quality_budget,
     opportunity_scout_quality_budget,
     quality_mode_from_cost_profile,
@@ -114,7 +116,7 @@ from keystone_agents.response_synthesis import (
     response_synthesis_sources,
     synthesize_user_facing_work_item_response_sdk_result,
 )
-from keystone_agents.run import run_retrieved_sdk_synthesis
+from keystone_agents.run import run_retrieved_sdk_synthesis, sdk_run_failure_metadata
 from keystone_agents.schemas.approval import ApprovalScope, ApprovalState
 from keystone_agents.schemas.chief_context import ChiefContextEvidenceBundle
 from keystone_agents.schemas.chief_of_staff import ChiefOfStaffSourceRef
@@ -1445,6 +1447,11 @@ def _workflow_execution_steps(events: list[WorkItemEvent]) -> list[WorkflowExecu
             if isinstance(metadata.get("aggregate_usage"), dict)
             else {}
         )
+        execution_telemetry = (
+            metadata.get("execution_telemetry")
+            if isinstance(metadata.get("execution_telemetry"), dict)
+            else {}
+        )
         category = _workflow_event_category(event.event_type)
         status = _workflow_event_status(event.event_type, metadata)
         provider = _safe_execution_label(
@@ -1459,7 +1466,9 @@ def _workflow_execution_steps(events: list[WorkItemEvent]) -> list[WorkflowExecu
                 name=_safe_execution_label(event.event_type) or "work_item_event",
                 status=status,
                 duration_ms=_nonnegative_float(
-                    metadata.get("duration_ms") or metadata.get("time_to_response_ms")
+                    metadata.get("duration_ms")
+                    or metadata.get("time_to_response_ms")
+                    or execution_telemetry.get("total_duration_ms")
                 ),
                 error_kind=_safe_execution_label(
                     metadata.get("error_type")
@@ -5986,6 +5995,9 @@ def _maybe_synthesize_user_facing_response(
                     cost=instruction_resolution.repair_cost or {},
                     request_cache=instruction_resolution.repair_request_cache or {},
                     store=store,
+                    execution_telemetry=(
+                        instruction_resolution.repair_execution_telemetry or {}
+                    ),
                 )
             text = (
                 instruction_resolution.response_text
@@ -6119,6 +6131,7 @@ def _maybe_synthesize_user_facing_response(
             cost=sdk_result.cost,
             request_cache=sdk_result.request_cache,
             store=store,
+            execution_telemetry=getattr(sdk_result, "execution_telemetry", None),
         )
     text = format_user_response_synthesis(
         synthesis,
@@ -6188,6 +6201,9 @@ def _maybe_synthesize_user_facing_response(
             cost=instruction_resolution.repair_cost or {},
             request_cache=instruction_resolution.repair_request_cache or {},
             store=store,
+            execution_telemetry=(
+                instruction_resolution.repair_execution_telemetry or {}
+            ),
         )
     text = (
         instruction_resolution.response_text
@@ -8260,10 +8276,12 @@ def _record_workflow_sdk_cost_event(
     request_cache: dict[str, Any] | None,
     store: SQLiteStore,
     run_stage: str = "",
+    execution_telemetry: dict[str, Any] | None = None,
 ) -> None:
     usage_payload = dict(usage or {})
     cost_payload = dict(cost or {})
     cache_payload = dict(request_cache or {})
+    telemetry_payload = compact_execution_telemetry(execution_telemetry)
     record_event(
         work_item,
         event_type=event_type,
@@ -8352,6 +8370,11 @@ def _record_workflow_sdk_cost_event(
                 )
                 if cache_payload.get(key) is not None
             },
+            **(
+                {"execution_telemetry": telemetry_payload}
+                if telemetry_payload
+                else {}
+            ),
         },
         store=store,
     )
@@ -8379,6 +8402,11 @@ def _record_preflight_sdk_cost_events(
         request_cache = (
             event.get("request_cache") if isinstance(event.get("request_cache"), dict) else {}
         )
+        execution_telemetry = (
+            event.get("execution_telemetry")
+            if isinstance(event.get("execution_telemetry"), dict)
+            else {}
+        )
         event_key = _workflow_sdk_usage_event_key(
             agent_name=agent_name,
             run_stage=run_stage,
@@ -8397,6 +8425,7 @@ def _record_preflight_sdk_cost_events(
             request_cache=request_cache,
             store=store,
             run_stage=run_stage,
+            execution_telemetry=execution_telemetry,
         )
         existing_keys.add(event_key)
 
@@ -10210,6 +10239,7 @@ def _quality_budgeted_hosted_web_search_max_calls(
 def _quality_budget_audit_note(budget: AgentQualityBudget) -> str:
     controls = [
         f"mode={budget.mode.value}",
+        f"max_seconds={budget.max_seconds}",
         f"retrieval_max_results={budget.retrieval_max_results}",
         f"hosted_web_search_max_calls={budget.hosted_web_search_max_calls}",
         f"tool_tier={budget.tool_tier}",
@@ -10965,6 +10995,11 @@ def _try_live_gmail_thread_retrieval(
             request_cache=semantic_ranking.outcome.request_cache,
             store=store,
             run_stage="gmail_semantic_candidate_ranking",
+            execution_telemetry=getattr(
+                semantic_ranking.outcome,
+                "execution_telemetry",
+                None,
+            ),
         )
     return WorkflowRunResult(
         work_item=updated,
@@ -11113,6 +11148,11 @@ def _no_suitable_gmail_outreach_candidate_result(
             request_cache=semantic_ranking.outcome.request_cache,
             store=store,
             run_stage="gmail_semantic_candidate_ranking",
+            execution_telemetry=getattr(
+                semantic_ranking.outcome,
+                "execution_telemetry",
+                None,
+            ),
         )
     no_candidate_reason = (
         "The Gmail specialist did not identify a relevant urgent or important "
@@ -13329,10 +13369,31 @@ def _advance_chief_of_staff(
                     request_cache=typed_result.request_cache,
                     store=store,
                     run_stage="chief_of_staff.live_sdk",
+                    execution_telemetry=getattr(
+                        typed_result,
+                        "execution_telemetry",
+                        None,
+                    ),
                 )
         except Exception as exc:
             if not _recoverable_live_chief_of_staff_output_error(exc):
                 raise
+            failure_metadata = sdk_run_failure_metadata(exc)
+            if store is not None and failure_metadata:
+                _record_workflow_sdk_cost_event(
+                    work_item,
+                    event_type="workflow_sdk_usage",
+                    summary="Recorded failed Chief of Staff live SDK attempt.",
+                    agent_name=WorkItemRoute.CHIEF_OF_STAFF.value,
+                    usage=failure_metadata.get("usage"),
+                    cost=failure_metadata.get("cost"),
+                    request_cache=failure_metadata.get("request_cache"),
+                    store=store,
+                    run_stage="chief_of_staff.live_sdk_failed",
+                    execution_telemetry=failure_metadata.get(
+                        "execution_telemetry"
+                    ),
+                )
             output = plan_chief_of_staff_request(request_text, database_url=request.database_url)
             mode_note = (
                 "Chief of Staff live SDK output failed validation; deterministic fallback "
@@ -15130,6 +15191,7 @@ def _advance_research(
             request_text=f"{request.request_text} {work_item.request_text}",
             live_search=live_research_allowed,
             cost_profile=request.cost_profile,
+            manual_request_plan=manual_plan,
         )
         max_results = _quality_budgeted_max_results(request, quality_budget)
         hosted_web_search_max_calls = _quality_budgeted_hosted_web_search_max_calls(
@@ -15142,11 +15204,16 @@ def _advance_research(
         profile, metadata = retrieve_company_profile_live(
             company=target,
             request_text=request.request_text or work_item.request_text,
-            max_results=(max(max_results, 8) if query_builder is not None else max_results),
+            max_results=(
+                max(max_results, 8)
+                if query_builder is not None and quality_budget.mode == QualityMode.DEEP
+                else max_results
+            ),
             query_builder=query_builder,
             agents_web_search_max_calls=hosted_web_search_max_calls,
             agents_web_search_parallel=not _is_slack_conservative_cost_profile(request),
             retrieval_hint=_retrieval_hint_for_request(request),
+            retrieval_deadline_seconds=quality_budget.max_seconds,
         )
         audit_notes = [
             "Live company retrieval executed.",
@@ -16217,6 +16284,7 @@ def _advance_multi_target_research(
         request_text=f"{request_text} {work_item.request_text}",
         live_search=request.live_search,
         cost_profile=request.cost_profile,
+        manual_request_plan=manual_plan,
     )
     plan = build_multi_target_research_plan(
         request_text=request_text,
@@ -16357,7 +16425,11 @@ def _multi_target_work_item_sources(
 ) -> list[WorkItemSourceRef]:
     refs: list[WorkItemSourceRef] = []
     seen_urls: set[str] = set()
-    for packet in result.packets:
+    packets = [
+        *([result.anchor_packet] if result.anchor_packet is not None else []),
+        *result.packets,
+    ]
+    for packet in packets:
         for raw_source in packet.source_refs[:6]:
             if not isinstance(raw_source, dict):
                 continue
@@ -17073,6 +17145,7 @@ def _advance_zotero_article_research(
                 ),
                 live=True,
                 session=sdk_session,
+                manual_request_plan=request.manual_request_plan,
                 tool_tier="deep_retrieval" if source_context else "web_search",
                 attach_tools=not bool(source_context),
                 compact_instructions=bool(source_context),
@@ -17305,6 +17378,7 @@ def _advance_opportunity(
             cost_profile=request.cost_profile,
             formal_opportunity=formal_opportunity_request,
             source_context_required=source_context_required,
+            manual_request_plan=request.manual_request_plan,
         )
         max_results = _quality_budgeted_max_results(
             request,
@@ -17333,6 +17407,7 @@ def _advance_opportunity(
                 cost=getattr(sdk_result, "cost", None),
                 request_cache=getattr(sdk_result, "request_cache", None),
                 store=store,
+                execution_telemetry=getattr(sdk_result, "execution_telemetry", None),
             )
 
         search_plan = (
@@ -17354,6 +17429,7 @@ def _advance_opportunity(
             agents_web_search_parallel=not _is_slack_conservative_cost_profile(request),
             retrieval_hint=_retrieval_hint_for_request(request),
             verify_source_pages=verify_source_pages,
+            retrieval_deadline_seconds=quality_budget.max_seconds,
         )
         audit_notes = [
             "Live opportunity retrieval executed.",
@@ -19631,6 +19707,7 @@ def _advance_outreach(
                 request_cache=sdk_usage_event.get("request_cache"),
                 store=store,
                 run_stage="work_item_outreach_composer",
+                execution_telemetry=sdk_usage_event.get("execution_telemetry"),
             )
         draft, repair_audit_note, sdk_usage_event, recommendation = (
             _compose_outreach_draft_for_work_item(
@@ -19817,6 +19894,7 @@ def _advance_outreach(
             request_cache=sdk_usage_event.get("request_cache"),
             store=store,
             run_stage="work_item_outreach_composer",
+            execution_telemetry=sdk_usage_event.get("execution_telemetry"),
         )
     return WorkflowRunResult(
         work_item=work_item,
@@ -20293,6 +20371,7 @@ def _advance_thread_local_outreach_draft(
             request_cache=sdk_usage_event.get("request_cache"),
             store=store,
             run_stage="thread_local_outreach_composer",
+            execution_telemetry=sdk_usage_event.get("execution_telemetry"),
         )
     summary = _format_outreach_draft_work_item_summary(
         draft,
@@ -20639,6 +20718,9 @@ def _compose_thread_local_outreach_draft_for_work_item(
                 "usage": dict(getattr(outcome, "usage", None) or {}),
                 "cost": dict(getattr(outcome, "cost", None) or {}),
                 "request_cache": dict(getattr(outcome, "request_cache", None) or {}),
+                "execution_telemetry": dict(
+                    getattr(outcome, "execution_telemetry", None) or {}
+                ),
             },
             recommendation,
         )
@@ -22721,10 +22803,16 @@ def _compose_outreach_draft_for_work_item(
                 "usage": dict(getattr(outcome, "usage", None) or {}),
                 "cost": dict(getattr(outcome, "cost", None) or {}),
                 "request_cache": dict(getattr(outcome, "request_cache", None) or {}),
+                "execution_telemetry": dict(
+                    getattr(outcome, "execution_telemetry", None) or {}
+                ),
             },
             recommendation,
         )
     except Exception as exc:
+        failure_metadata = sdk_run_failure_metadata(exc)
+        failure_detail = _sdk_failure_detail_from_metadata(failure_metadata)
+        detail_suffix = f" ({failure_detail})" if failure_detail else ""
         return (
             compose_outreach_draft_fixture(
                 company_profile=company_profile,
@@ -22733,11 +22821,45 @@ def _compose_outreach_draft_for_work_item(
             ),
             (
                 "Outreach Composer live SDK drafting failed with "
-                f"{type(exc).__name__}; deterministic draft-only fallback created."
+                f"{type(exc).__name__}{detail_suffix}; deterministic draft-only fallback created."
             ),
-            None,
+            (
+                {
+                    "usage": failure_metadata.get("usage") or {},
+                    "cost": failure_metadata.get("cost") or {},
+                    "request_cache": failure_metadata.get("request_cache") or {},
+                    "execution_telemetry": failure_metadata.get("execution_telemetry") or {},
+                    "failure": failure_metadata,
+                }
+                if failure_metadata
+                else None
+            ),
             {},
         )
+
+
+def _sdk_failure_detail_from_metadata(metadata: dict[str, Any]) -> str:
+    """Render a compact failure reason from shared audit-safe SDK metadata."""
+
+    guardrail = metadata.get("guardrail")
+    if not isinstance(guardrail, dict):
+        return ""
+    risk_flags = [
+        str(item).strip()
+        for item in guardrail.get("risk_flags") or []
+        if str(item).strip()
+    ]
+    reasons = [
+        str(item).strip()
+        for item in guardrail.get("reasons") or []
+        if str(item).strip()
+    ]
+    parts: list[str] = []
+    if risk_flags:
+        parts.append("risk_flags=" + ",".join(risk_flags[:4]))
+    if reasons:
+        parts.append("reasons=" + "; ".join(reasons[:3]))
+    return _compact_outreach_summary_text(" | ".join(parts))[:240]
 
 
 def _block_unsupported_route(

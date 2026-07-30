@@ -851,6 +851,8 @@ def chief_slack_command_resolution_is_applicable(request_text: str) -> bool:
     if infer_calendar_action_plan(text) is not None:
         return False
     plan = infer_manual_request_plan(text, requested_agent="chief_of_staff")
+    if plan.provider_system == "google_calendar":
+        return False
     if plan.intent == "business_system_write":
         return False
     if plan.target_agent in {

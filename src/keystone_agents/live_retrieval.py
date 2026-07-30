@@ -85,6 +85,64 @@ class SharedSearchProviderConfig:
     parallel_provider_fanout: bool
 
 
+@dataclass
+class _ResearchRetrievalDeadline:
+    """Stage-aware deadline that preserves already retrieved partial evidence."""
+
+    deadline_seconds: float | None
+    clock: Callable[[], float]
+    started_at: float
+    stopped_before_stage: str = ""
+
+    @classmethod
+    def start(
+        cls,
+        deadline_seconds: float | None,
+        *,
+        clock: Callable[[], float],
+    ) -> _ResearchRetrievalDeadline:
+        normalized = (
+            None if deadline_seconds is None else max(0.0, float(deadline_seconds))
+        )
+        return cls(
+            deadline_seconds=normalized,
+            clock=clock,
+            started_at=clock(),
+        )
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return max(0.0, self.clock() - self.started_at)
+
+    @property
+    def remaining_seconds(self) -> float | None:
+        if self.deadline_seconds is None:
+            return None
+        return max(0.0, self.deadline_seconds - self.elapsed_seconds)
+
+    def allows(self, stage: str) -> bool:
+        remaining = self.remaining_seconds
+        if remaining is None or remaining > 0.0:
+            return True
+        if not self.stopped_before_stage:
+            self.stopped_before_stage = stage
+        return False
+
+    def bounded_timeout(self, configured_seconds: float) -> float:
+        remaining = self.remaining_seconds
+        if remaining is None:
+            return configured_seconds
+        return max(0.01, min(configured_seconds, remaining))
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "status": "partial" if self.stopped_before_stage else "complete",
+            "deadline_seconds": self.deadline_seconds,
+            "elapsed_seconds": round(self.elapsed_seconds, 3),
+            "stopped_before_stage": self.stopped_before_stage or None,
+        }
+
+
 def search_provider_label(metadata: dict[str, Any]) -> str:
     """Return a compact label for the providers actually used."""
 
@@ -968,10 +1026,16 @@ def retrieve_company_profile_live(
     query_builder: Callable[[str, str | None], list[str]] | None = None,
     search_provider_builder: Callable[..., Any] | None = None,
     profile_builder: Callable[..., CompanyProfile] | None = None,
+    retrieval_deadline_seconds: float | None = None,
+    clock: Callable[[], float] = perf_counter,
 ) -> tuple[CompanyProfile, dict[str, Any]]:
     """Run the hybrid live-search ladder for company research."""
 
-    total_started_at = perf_counter()
+    deadline = _ResearchRetrievalDeadline.start(
+        retrieval_deadline_seconds,
+        clock=clock,
+    )
+    total_started_at = clock()
     settings_loader = settings_loader or load_settings
     default_query_builder = query_builder is None
     query_builder = query_builder or build_company_research_queries
@@ -1039,16 +1103,18 @@ def retrieve_company_profile_live(
         settings=settings,
         enabled=search_provider_builder is build_search_provider,
     ) as searxng_runtime:
-        search_started_at = perf_counter()
+        search_started_at = clock()
         search_concurrency = min(_company_search_concurrency(), max(1, len(queries)))
         if search_concurrency <= 1 or len(queries) <= 1:
-            for query in queries:
-                query_started_at = perf_counter()
+            for index, query in enumerate(queries):
+                if index > 0 and not deadline.allows(f"search_query_{index + 1}"):
+                    break
+                query_started_at = clock()
                 results = client.search_web(query, num_results=max_results)
                 query_timings.append(
                     {
                         "query": query,
-                        "seconds": round(perf_counter() - query_started_at, 3),
+                        "seconds": round(clock() - query_started_at, 3),
                         "result_count": len(results),
                     }
                 )
@@ -1062,13 +1128,13 @@ def retrieve_company_profile_live(
                 query: str,
             ) -> tuple[int, str, list[Any], float, dict[str, Any]]:
                 query_client = build_client()
-                query_started_at = perf_counter()
+                query_started_at = clock()
                 results = query_client.search_web(query, num_results=max_results)
                 return (
                     index,
                     query,
                     results,
-                    perf_counter() - query_started_at,
+                    clock() - query_started_at,
                     query_client.telemetry(),
                 )
 
@@ -1082,7 +1148,9 @@ def retrieve_company_profile_live(
             try:
                 for future in as_completed(
                     futures,
-                    timeout=_company_search_total_timeout_seconds(),
+                    timeout=deadline.bounded_timeout(
+                        _company_search_total_timeout_seconds()
+                    ),
                 ):
                     completed_futures.add(future)
                     index, query, results, seconds, telemetry = future.result()
@@ -1104,7 +1172,9 @@ def retrieve_company_profile_live(
                     query_timings.append(
                         {
                             "query": query,
-                            "seconds": _company_search_total_timeout_seconds(),
+                            "seconds": deadline.bounded_timeout(
+                                _company_search_total_timeout_seconds()
+                            ),
                             "result_count": 0,
                             "error": "company_search_total_timeout",
                         }
@@ -1114,8 +1184,8 @@ def retrieve_company_profile_live(
             for results in ordered_results:
                 search_results.extend(results)
 
-        search_seconds = perf_counter() - search_started_at
-    quality_started_at = perf_counter()
+        search_seconds = clock() - search_started_at
+    quality_started_at = clock()
     search_quality = assess_company_search_quality(
         results=search_results,
         company_name=company,
@@ -1123,13 +1193,13 @@ def retrieve_company_profile_live(
         request_text=request_text,
         autonomy_hint=autonomy_hint,
     )
-    quality_seconds = perf_counter() - quality_started_at
+    quality_seconds = clock() - quality_started_at
     metadata = _merge_company_search_telemetry(
         provider_sequence=search_config.provider_sequence,
         telemetry_packets=telemetry_packets or [client.telemetry()],
     )
-    website_started_at = perf_counter()
-    if extract_selected_pages:
+    website_started_at = clock()
+    if extract_selected_pages and deadline.allows("website_extraction"):
         website_inputs, website_errors, website_stats = _extract_company_website_inputs(
             company=company,
             company_url=company_url,
@@ -1138,7 +1208,21 @@ def retrieve_company_profile_live(
             provider=str(
                 getattr(settings, "website_extractor", "trafilatura") or "trafilatura"
             ),
+            total_timeout_seconds=deadline.remaining_seconds,
+            clock=clock,
         )
+    elif extract_selected_pages:
+        website_inputs, website_errors, website_stats = [], [
+            "Website extraction skipped because the research deadline was reached."
+        ], {
+            "mode": "skipped_research_deadline",
+            "providers_used": [],
+            "pages_considered": 0,
+            "page_count": 0,
+            "claim_count": 0,
+            "timed_out": True,
+            "total_timeout_seconds": 0.0,
+        }
     else:
         website_inputs, website_errors, website_stats = [], [], {
             "mode": "skipped_quick_retrieval",
@@ -1147,8 +1231,8 @@ def retrieve_company_profile_live(
             "page_count": 0,
             "claim_count": 0,
         }
-    website_seconds = perf_counter() - website_started_at
-    profile_started_at = perf_counter()
+    website_seconds = clock() - website_started_at
+    profile_started_at = clock()
     profile_kwargs: dict[str, Any] = {
         "company_name": company,
         "company_url": company_url,
@@ -1158,7 +1242,7 @@ def retrieve_company_profile_live(
     if _profile_builder_accepts_request_focus(profile_builder):
         profile_kwargs["request_focus_terms"] = request_focus_terms
     profile = profile_builder(**profile_kwargs)
-    profile_seconds = perf_counter() - profile_started_at
+    profile_seconds = clock() - profile_started_at
     source_focus = _profile_source_focus_diagnostics(
         profile,
         request_focus_terms=request_focus_terms,
@@ -1190,7 +1274,7 @@ def retrieve_company_profile_live(
             "search_quality": search_quality.to_dict(),
             "source_coverage": search_quality.source_coverage,
             "timing": {
-                "total_seconds": round(perf_counter() - total_started_at, 3),
+                "total_seconds": round(clock() - total_started_at, 3),
                 "search_seconds": round(search_seconds, 3),
                 "quality_assessment_seconds": round(quality_seconds, 3),
                 "website_extraction_seconds": round(website_seconds, 3),
@@ -1208,6 +1292,7 @@ def retrieve_company_profile_live(
                 **website_stats,
                 "errors": website_errors[:5],
             },
+            "research_deadline": deadline.metadata(),
             "retrieval_ladder": [
                 {
                     "rung": "search_discovery",
@@ -1249,6 +1334,8 @@ def _extract_company_website_inputs(
     search_results: list[Any],
     queries: list[str] | None = None,
     provider: str,
+    total_timeout_seconds: float | None = None,
+    clock: Callable[[], float] = perf_counter,
 ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
     provider_sequence = website_extraction_provider_sequence(primary_provider=provider)
     fallback_provider = ",".join(provider_sequence[1:])
@@ -1288,15 +1375,21 @@ def _extract_company_website_inputs(
     errors: list[str] = []
     html_review_attempts = 0
     html_review_claim_count = 0
-    extraction_started_at = perf_counter()
+    configured_timeout = _website_extraction_total_timeout_seconds()
+    effective_timeout = (
+        configured_timeout
+        if total_timeout_seconds is None
+        else max(0.0, min(configured_timeout, total_timeout_seconds))
+    )
+    extraction_started_at = clock()
     extraction_timed_out = False
     extraction_budget = website_extraction_budget()
     for index, url in enumerate(urls, start=1):
-        if perf_counter() - extraction_started_at >= _website_extraction_total_timeout_seconds():
+        if clock() - extraction_started_at >= effective_timeout:
             extraction_timed_out = True
             errors.append(
                 "Website extraction stopped after "
-                f"{_website_extraction_total_timeout_seconds():.1f}s total budget; "
+                f"{effective_timeout:.1f}s total budget; "
                 f"{max(0, len(urls) - index + 1)} page(s) were not extracted."
             )
             break
@@ -1375,7 +1468,7 @@ def _extract_company_website_inputs(
         "agent_html_review_page_count": html_review_attempts,
         "agent_html_review_claim_count": html_review_claim_count,
         "timed_out": extraction_timed_out,
-        "total_timeout_seconds": _website_extraction_total_timeout_seconds(),
+        "total_timeout_seconds": effective_timeout,
         "firecrawl_call_cap": extraction_budget.firecrawl_max_calls,
         "firecrawl_calls_attempted": extraction_budget.firecrawl_calls_attempted,
     }
@@ -2280,6 +2373,8 @@ def run_opportunity_scout_live(
     sandbox_search_review_hosted_web_search_external_web_access: bool = True,
     sandbox_search_review_hosted_web_search_context_size: str | None = None,
     verify_source_pages: bool | None = None,
+    retrieval_deadline_seconds: float | None = None,
+    clock: Callable[[], float] = perf_counter,
 ) -> tuple[OpportunityScoutResult, dict[str, Any]]:
     """Run Opportunity Scout live search with orchestrator-aware retrieval hints."""
 
@@ -2311,6 +2406,8 @@ def run_opportunity_scout_live(
             save=save,
             existing_state=existing_state,
             verify_source_pages=verify_source_pages,
+            retrieval_deadline_seconds=retrieval_deadline_seconds,
+            clock=clock,
         )
         collected_results = provider.collected_results()
         metadata = provider.telemetry()

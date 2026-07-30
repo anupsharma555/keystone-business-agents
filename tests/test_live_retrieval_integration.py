@@ -134,6 +134,71 @@ def test_company_live_retrieval_prioritizes_request_focused_sources(
     ]
 
 
+def test_company_research_deadline_returns_partial_evidence_before_enrichment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    now = [0.0]
+    calls: list[str] = []
+
+    class FakeProvider:
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            calls.append(query)
+            now[0] = 50.0
+            return [
+                SearchResult(
+                    title="Acme official product",
+                    link="https://acme.example/product",
+                    snippet="Acme describes its product.",
+                    source="searxng",
+                )
+            ]
+
+    monkeypatch.setenv("KEYSTONE_COMPANY_SEARCH_CONCURRENCY", "1")
+    monkeypatch.setattr(
+        live_retrieval,
+        "load_settings",
+        lambda: SimpleNamespace(
+            search_provider="searxng",
+            website_extractor="trafilatura",
+        ),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_company_research_queries",
+        lambda *_args: ["Acme official product", "Acme current customers"],
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "build_search_provider",
+        lambda provider=None, *, live=False: FakeProvider(),
+    )
+    monkeypatch.setattr(
+        live_retrieval,
+        "_extract_company_website_inputs",
+        lambda **_kwargs: pytest.fail("deadline should skip website extraction"),
+    )
+
+    profile, metadata = live_retrieval.retrieve_company_profile_live(
+        company="Acme",
+        retrieval_deadline_seconds=45,
+        clock=lambda: now[0],
+    )
+
+    assert profile.name == "Acme"
+    assert calls
+    assert set(calls) == {"Acme official product"}
+    assert metadata["research_deadline"] == {
+        "status": "partial",
+        "deadline_seconds": 45.0,
+        "elapsed_seconds": 50.0,
+        "stopped_before_stage": "search_query_2",
+    }
+    assert metadata["website_extraction"]["mode"] == "skipped_research_deadline"
+    assert metadata["website_extraction"]["timed_out"] is True
+
+
 def test_company_live_retrieval_defaults_to_searxng_with_hosted_parallel_lane(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

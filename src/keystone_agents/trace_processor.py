@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from keystone_agents.execution_telemetry import compact_execution_telemetry
 from keystone_agents.model_provider import sanitize_trace_metadata
 
 _REGISTERED_PROCESSOR: KeystoneEvalTraceProcessor | None = None
@@ -130,6 +131,7 @@ def record_sdk_run_summary_trace_event(
     retry_count: int = 0,
     repair_loop_count: int = 0,
     duration_ms: float | None = None,
+    execution_telemetry: dict[str, Any] | None = None,
     database_path: str | Path | None = None,
 ) -> int | None:
     """Persist one sanitized SDK run-level trace summary when trace summaries are enabled."""
@@ -173,6 +175,7 @@ def record_sdk_run_summary_trace_event(
         retry_count=retry_count,
         repair_loop_count=repair_loop_count,
         duration_ms=duration_ms,
+        execution_telemetry=execution_telemetry or {},
     )
     try:
         from promptfoo.eval_database import record_eval_trace_event
@@ -222,6 +225,7 @@ def _sdk_run_summary_metadata(
     retry_count: int,
     repair_loop_count: int,
     duration_ms: float | None,
+    execution_telemetry: dict[str, Any],
 ) -> dict[str, Any]:
     observed = _observed_sdk_activity(raw_result)
     turns_used, turns_source = _turns_used(raw_result, usage)
@@ -345,6 +349,9 @@ def _sdk_run_summary_metadata(
             "raw_tool_io_included": False,
         },
     }
+    execution_timing = compact_execution_telemetry(execution_telemetry)
+    if execution_timing:
+        metadata["execution_timing"] = execution_timing
     metadata.update(
         {
             "diagnostic_contract": {

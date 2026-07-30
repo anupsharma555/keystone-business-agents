@@ -9,6 +9,7 @@ import pytest
 import keystone_agents.cli as cli_module
 import keystone_agents.slack_actions as slack_actions_module
 import scripts.handle_slack_agent_action as slack_agent_action_cli
+from keystone_agents.agents import manual_request_planner as planner_module
 from keystone_agents.cli import main
 from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.schemas.approval import ApprovalQueueItem
@@ -375,7 +376,63 @@ def test_orchestrator_workflow_state_keeps_newest_eight_thread_messages() -> Non
         f"thread message {index}" for index in range(2, 10)
     ]
     assert state["recent_slack_thread"][-1]["summary"] == "thread message 9"
+    assert all(
+        item["role"] == "operator"
+        for item in state["recent_slack_thread"]
+    )
+    assert all(
+        item["text"] == item["summary"]
+        for item in state["recent_slack_thread"]
+    )
     assert state["slack_thread_transcript"].endswith("Use the latest correction.")
+
+
+def test_typed_slack_context_keeps_bot_prose_out_of_operator_authority() -> None:
+    context = build_selected_message_context(
+        _message_action_payload(),
+        thread_messages=[
+            {
+                "ts": "1715366400.000100",
+                "user": "U-HUMAN",
+                "text": "Create a calendar event called Architecture review.",
+            },
+            {
+                "ts": "1715366401.000100",
+                "bot_id": "B-KNI",
+                "subtype": "bot_message",
+                "text": "Gmail triage completed for the stale request.",
+            },
+            {
+                "ts": "1715366402.000100",
+                "user": "U-HUMAN",
+                "text": "Rename that event to Architecture review updated.",
+            },
+            {
+                "ts": "1715366403.000100",
+                "user": "U-HUMAN",
+                "text": "Delete the event you just updated.",
+            },
+        ],
+    )
+
+    state = slack_actions_module.orchestrator_workflow_state_from_slack_context(
+        context,
+        request_text="Delete the event you just updated.",
+    )
+
+    assert [item["role"] for item in state["recent_slack_thread"]] == [
+        "operator",
+        "agent",
+        "operator",
+        "operator",
+    ]
+    assert cli_module._latest_distinct_slack_operator_turn(
+        state,
+        current_request="Delete the event you just updated.",
+    ) == "Rename that event to Architecture review updated."
+    assert "gmail_triage" not in (
+        planner_module._context_owner_candidates_from_workflow_context(state)
+    )
 
 
 def test_orchestrator_workflow_state_retains_verified_gmail_result_scope(
@@ -488,6 +545,295 @@ def test_orchestrator_workflow_state_retains_verified_airtable_aggregate_scope(
     assert scope["item_count"] == 4
     assert scope["complete"] is True
     assert scope["verified"] is True
+
+
+@pytest.mark.parametrize(
+    ("provider_system", "object_type", "object_id", "provider_scope"),
+    [
+        (
+            "gmail",
+            "gmail_message",
+            "msg_123",
+            {"gmail_account": "operator@example.com", "thread_id": "thread_123"},
+        ),
+        (
+            "google_drive",
+            "google_document",
+            "doc_123",
+            {"folder_path": "KNIOps"},
+        ),
+        (
+            "airtable",
+            "airtable_record",
+            "rec_123",
+            {"base_alias": "finance_tax_tracker", "table": "Business Expenses"},
+        ),
+        (
+            "zotero",
+            "zotero_note",
+            "note_123",
+            {
+                "library_id": "12345",
+                "library_type": "user",
+                "parent_item_key": "parent_123",
+            },
+        ),
+    ],
+)
+def test_slack_thread_restores_latest_verified_exact_provider_object(
+    tmp_path: Path,
+    provider_system: str,
+    object_type: str,
+    object_id: str,
+    provider_scope: dict[str, str],
+) -> None:
+    database_url = _database_url(tmp_path)
+    SQLiteStore(database_url).save_agent_run(
+        agent_name="chief_of_staff",
+        input_summary="Create or update the exact provider object.",
+        dry_run=False,
+        status="success",
+        output={
+            "status": "done",
+            "public_result": {
+                "status": "completed",
+                "text": "The exact provider object was verified.",
+                "completion_confirmed": True,
+            },
+            "continuation_objects": [
+                {
+                    "provider_system": provider_system,
+                    "object_type": object_type,
+                    "object_id": object_id,
+                    "lifecycle_state": "active",
+                    "verification_status": "verified",
+                    "provider_scope": provider_scope,
+                }
+            ],
+            "slack_run_provenance": {
+                "schema": "keystone.slack.run_provenance.v1",
+                "context_validated": True,
+                "team_id": "T123",
+                "channel_id": "C123",
+                "thread_ts": "1715366400.000100",
+                "request_ts": "1715366401.000100",
+            },
+        },
+    )
+
+    references = (
+        slack_actions_module.latest_verified_provider_objects_for_slack_thread(
+            channel_id="C123",
+            thread_ts="1715366400.000100",
+            database_url=database_url,
+            team_id="T123",
+            before_request_ts="1715366402.000100",
+        )
+    )
+
+    assert len(references) == 1
+    assert references[0].provider_system == provider_system
+    assert references[0].object_type == object_type
+    assert references[0].object_id == object_id
+    assert references[0].provider_scope == provider_scope
+
+
+def test_slack_thread_does_not_restore_unconfirmed_exact_provider_object(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    SQLiteStore(database_url).save_agent_run(
+        agent_name="google_workspace_context_agent",
+        input_summary="Attempt a provider write.",
+        dry_run=False,
+        status="blocked",
+        output={
+            "status": "blocked",
+            "public_result": {
+                "status": "blocked",
+                "text": "Provider verification failed.",
+                "completion_confirmed": False,
+            },
+            "continuation_objects": [
+                {
+                    "provider_system": "google_drive",
+                    "object_type": "google_document",
+                    "object_id": "doc_unverified",
+                    "lifecycle_state": "active",
+                    "verification_status": "verified",
+                }
+            ],
+            "slack_run_provenance": {
+                "schema": "keystone.slack.run_provenance.v1",
+                "context_validated": True,
+                "team_id": "T123",
+                "channel_id": "C123",
+                "thread_ts": "1715366400.000100",
+                "request_ts": "1715366401.000100",
+            },
+        },
+    )
+
+    assert (
+        slack_actions_module.latest_verified_provider_objects_for_slack_thread(
+            channel_id="C123",
+            thread_ts="1715366400.000100",
+            database_url=database_url,
+            team_id="T123",
+            before_request_ts="1715366402.000100",
+        )
+        == ()
+    )
+
+
+def test_slack_thread_rehydrates_causal_object_history_and_lifecycle(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+
+    def save(
+        *,
+        request_ts: str,
+        object_id: str,
+        lifecycle_state: str,
+        team_id: str = "T123",
+        dry_run: bool = False,
+    ) -> None:
+        SQLiteStore(database_url).save_agent_run(
+            agent_name="chief_of_staff",
+            input_summary="Operate on one exact provider object.",
+            dry_run=dry_run,
+            status="success",
+            output={
+                "status": "done",
+                "public_result": {
+                    "status": "completed",
+                    "text": "The exact provider object was verified.",
+                    "completion_confirmed": True,
+                },
+                "continuation_objects": [
+                    {
+                        "provider_system": "google_calendar",
+                        "object_type": "calendar_event",
+                        "object_id": object_id,
+                        "lifecycle_state": lifecycle_state,
+                        "verification_status": "verified",
+                    }
+                ],
+                "slack_run_provenance": {
+                    "schema": "keystone.slack.run_provenance.v1",
+                    "context_validated": True,
+                    "team_id": team_id,
+                    "channel_id": "C123",
+                    "thread_ts": "1715366400.000100",
+                    "request_ts": request_ts,
+                },
+            },
+        )
+
+    # Save the newer deletion first and the older create afterward to prove
+    # Slack request order, not database completion order, owns lifecycle state.
+    save(
+        request_ts="1715366402.000100",
+        object_id="event_one",
+        lifecycle_state="deleted",
+    )
+    save(
+        request_ts="1715366401.000100",
+        object_id="event_one",
+        lifecycle_state="active",
+    )
+    save(
+        request_ts="1715366401.500100",
+        object_id="event_two",
+        lifecycle_state="active",
+    )
+    save(
+        request_ts="1715366402.500100",
+        object_id="wrong_workspace",
+        lifecycle_state="active",
+        team_id="T999",
+    )
+    save(
+        request_ts="1715366402.600100",
+        object_id="dry_run_object",
+        lifecycle_state="active",
+        dry_run=True,
+    )
+
+    references = (
+        slack_actions_module.latest_verified_provider_objects_for_slack_thread(
+            team_id="T123",
+            channel_id="C123",
+            thread_ts="1715366400.000100",
+            before_request_ts="1715366403.000100",
+            database_url=database_url,
+        )
+    )
+
+    assert {
+        reference.object_id: reference.lifecycle_state
+        for reference in references
+    } == {
+        "event_one": "deleted",
+        "event_two": "active",
+    }
+
+
+def test_slack_thread_rehydration_requires_validated_workspace_and_request_time(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    SQLiteStore(database_url).save_agent_run(
+        agent_name="chief_of_staff",
+        input_summary="Create one exact event.",
+        dry_run=False,
+        status="success",
+        output={
+            "public_result": {
+                "status": "completed",
+                "text": "Verified.",
+                "completion_confirmed": True,
+            },
+            "continuation_objects": [
+                {
+                    "provider_system": "google_calendar",
+                    "object_type": "calendar_event",
+                    "object_id": "event_untrusted_provenance",
+                    "verification_status": "verified",
+                }
+            ],
+            "slack_run_provenance": {
+                "schema": "keystone.slack.run_provenance.v1",
+                "context_validated": False,
+                "team_id": "T123",
+                "channel_id": "C123",
+                "thread_ts": "1715366400.000100",
+                "request_ts": "1715366401.000100",
+            },
+        },
+    )
+
+    assert (
+        slack_actions_module.latest_verified_provider_objects_for_slack_thread(
+            team_id="T123",
+            channel_id="C123",
+            thread_ts="1715366400.000100",
+            before_request_ts="1715366402.000100",
+            database_url=database_url,
+        )
+        == ()
+    )
+    assert (
+        slack_actions_module.latest_verified_provider_objects_for_slack_thread(
+            team_id="",
+            channel_id="C123",
+            thread_ts="1715366400.000100",
+            before_request_ts="1715366402.000100",
+            database_url=database_url,
+        )
+        == ()
+    )
 
 
 def test_message_action_creates_context_file_and_modal(tmp_path: Path) -> None:

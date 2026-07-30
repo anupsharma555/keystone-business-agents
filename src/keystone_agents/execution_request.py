@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 from collections.abc import Mapping
 from typing import Any, cast
 
 from keystone_agents.agent_mentions import parse_agent_mention
 from keystone_agents.schemas.execution_request import (
+    ContinuationObjectReference,
     ExecutionContinuation,
     ExecutionEntrypoint,
     ExecutionPublicResult,
@@ -120,20 +122,45 @@ def execution_request_planning_text(request: ExecutionRequest) -> str:
     # prose may describe a failed route and must not become task authority.
     if request.continuation.provider_affinity:
         prior_result = ""
-    if not prior_request and not prior_result:
+    verified_objects = request.continuation.verified_objects
+    if not prior_request and not prior_result and not verified_objects:
         return current
     parts: list[str] = []
     if prior_request:
         parts.append(prior_request)
     if prior_result:
         parts.append(f"Prior result for context: {prior_result}")
+    parts.extend(
+        _verified_object_planning_line(reference)
+        for reference in verified_objects
+    )
     if current:
         parts.append(f"Authoritative follow-up: {current}")
     return "\n".join(parts)
 
 
 def _normalized_request_identity(value: str) -> str:
-    return " ".join(str(value or "").casefold().split())
+    return normalize_slack_operator_turn_identity(value)
+
+
+def normalize_slack_operator_turn_identity(value: object) -> str:
+    """Normalize transport-only Slack mention decoration for turn equality.
+
+    Slack root asks and thread replies can preserve the app mention as ``<@…>``,
+    ``@KNI``, or a bare ``@ `` prefix while the child request contains only the
+    operator's words.  Those forms are the same human turn.  Removing only that
+    leading transport decoration prevents an identical prior ask from being
+    replayed as context without changing meaningful mentions inside the request.
+    """
+
+    clean = html.unescape(str(value or "").strip())
+    clean = re.sub(
+        r"^\s*(?:<@[^>]+>|@KNI\b|@(?=\s))\s*",
+        "",
+        clean,
+        flags=re.IGNORECASE,
+    )
+    return " ".join(clean.casefold().split())
 
 
 def continuation_owner_advice(
@@ -274,6 +301,7 @@ def attach_execution_public_result(payload: dict[str, Any]) -> ExecutionPublicRe
         completion_confirmed = False
 
     receipts = _payload_receipts(payload)
+    attach_verified_continuation_objects(payload, receipts)
     write_receipts = [receipt for receipt in receipts if _receipt_is_write(receipt)]
     side_effects = payload.get("side_effects")
     side_effect_mapping = side_effects if isinstance(side_effects, Mapping) else {}
@@ -383,6 +411,21 @@ def attach_execution_public_result(payload: dict[str, Any]) -> ExecutionPublicRe
     payload["public_result"] = result.model_dump(mode="json")
     _mirror_public_result(payload, result)
     return result
+
+
+def attach_verified_continuation_objects(
+    payload: dict[str, Any],
+    receipts: list[Mapping[str, Any]],
+) -> tuple[ContinuationObjectReference, ...]:
+    """Attach exact identities only from provider-verified internal receipts."""
+
+    continuation_objects = _verified_object_references_from_receipts(receipts)
+    if continuation_objects:
+        payload["continuation_objects"] = [
+            reference.model_dump(mode="json")
+            for reference in continuation_objects
+        ]
+    return continuation_objects
 
 
 def _public_result_operation_boundary(
@@ -576,6 +619,239 @@ def _payload_receipts(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return receipts
 
 
+def _verified_object_references_from_receipts(
+    receipts: list[Mapping[str, Any]],
+) -> tuple[ContinuationObjectReference, ...]:
+    """Project verified provider receipts into the shared continuation contract."""
+
+    references: list[ContinuationObjectReference] = []
+    for receipt in receipts:
+        if not _receipt_verification_passed(receipt):
+            continue
+        reference = _verified_object_reference_from_receipt(receipt)
+        if reference is None:
+            continue
+        if reference not in references:
+            references.append(reference)
+    return tuple(references[:8])
+
+
+def _receipt_verification_passed(receipt: Mapping[str, Any]) -> bool:
+    verification = receipt.get("verification")
+    if isinstance(verification, Mapping):
+        return verification.get("passed") is True
+    if (
+        receipt.get("provider_read") is True
+        and str(receipt.get("status") or "").strip().lower() == "success"
+        and any(
+            str(receipt.get(key) or "").strip()
+            for key in (
+                "selected_item_key",
+                "item_key",
+                "event_id",
+                "document_id",
+                "record_id",
+                "draft_id",
+                "message_id",
+                "thread_id",
+            )
+        )
+    ):
+        return True
+    return bool(
+        receipt.get("provider_verification") == "passed"
+        and receipt.get("content_verified") is True
+    )
+
+
+def _verified_object_reference_from_receipt(
+    receipt: Mapping[str, Any],
+) -> ContinuationObjectReference | None:
+    """Map verified provider receipt fields to one provider-neutral identity."""
+
+    operation = str(
+        receipt.get("operation")
+        or receipt.get("action")
+        or receipt.get("operation_type")
+        or receipt.get("status")
+        or ""
+    ).strip().lower()
+    verification = receipt.get("verification")
+    verification_mapping = (
+        verification if isinstance(verification, Mapping) else {}
+    )
+    deleted = bool(
+        re.search(r"(?:^|_)(?:delete|deleted|trash|trashed|remove)(?:_|$)", operation)
+        or receipt.get("trashed") is True
+        or any(
+            verification_mapping.get(key) is True
+            for key in (
+                "draft_absent_after_cleanup",
+                "record_absent_after_cleanup",
+                "note_absent_after_cleanup",
+                "item_absent_after_cleanup",
+                "document_trashed_after_cleanup",
+                "record_absent_after",
+                "item_absent_after",
+            )
+        )
+    )
+
+    event_id = str(receipt.get("event_id") or "").strip()
+    if event_id:
+        title = str(receipt.get("title") or receipt.get("summary") or "").strip()
+        return ContinuationObjectReference(
+            provider_system="google_calendar",
+            object_type="calendar_event",
+            object_id=event_id,
+            display_name=title,
+            effective_date=str(
+                receipt.get("display_start_date")
+                or receipt.get("start_date")
+                or ""
+            ).strip(),
+            lifecycle_state="deleted" if deleted else "active",
+            verification_status="verified",
+            provider_scope=_bounded_provider_scope(
+                {
+                    **receipt,
+                    "start_time": (
+                        receipt.get("display_start_time")
+                        or receipt.get("start_time")
+                    ),
+                    "end_time": (
+                        receipt.get("display_end_time")
+                        or receipt.get("end_time")
+                    ),
+                },
+                ("calendar_id", "start_time", "end_time"),
+            ),
+        )
+
+    document_id = str(receipt.get("document_id") or "").strip()
+    if document_id:
+        return ContinuationObjectReference(
+            provider_system="google_drive",
+            object_type="google_document",
+            object_id=document_id,
+            display_name=str(receipt.get("title") or "").strip(),
+            lifecycle_state="deleted" if deleted else "active",
+            verification_status="verified",
+            provider_scope=_bounded_provider_scope(
+                receipt,
+                ("folder_path", "google_account"),
+            ),
+        )
+
+    record_id = str(receipt.get("record_id") or "").strip()
+    table = str(receipt.get("table") or "").strip()
+    if record_id and table:
+        return ContinuationObjectReference(
+            provider_system="airtable",
+            object_type="airtable_record",
+            object_id=record_id,
+            display_name=str(
+                receipt.get("display_name")
+                or receipt.get("title")
+                or receipt.get("name")
+                or ""
+            ).strip(),
+            lifecycle_state="deleted" if deleted else "active",
+            verification_status="verified",
+            provider_scope=_bounded_provider_scope(
+                receipt,
+                ("base_alias", "table"),
+            ),
+        )
+
+    item_key = str(
+        receipt.get("item_key") or receipt.get("selected_item_key") or ""
+    ).strip()
+    if item_key:
+        is_note = bool(
+            str(receipt.get("parent_item_key") or "").strip()
+            or str(receipt.get("required_marker") or "").strip()
+            or re.search(r"(?:^|_)(?:note|test_note)(?:_|$)", operation)
+        )
+        return ContinuationObjectReference(
+            provider_system="zotero",
+            object_type="zotero_note" if is_note else "zotero_item",
+            object_id=item_key,
+            display_name=str(
+                receipt.get("selected_item_title")
+                or receipt.get("title")
+                or receipt.get("required_marker")
+                or ""
+            ).strip(),
+            lifecycle_state="deleted" if deleted else "active",
+            verification_status="verified",
+            provider_scope=_bounded_provider_scope(
+                receipt,
+                ("library_id", "library_type", "parent_item_key"),
+            ),
+        )
+
+    draft_id = str(receipt.get("draft_id") or "").strip()
+    message_id = str(receipt.get("message_id") or "").strip()
+    thread_id = str(receipt.get("thread_id") or "").strip()
+    if draft_id or message_id or thread_id:
+        sent = bool(
+            receipt.get("sent") is True
+            or re.search(r"(?:^|_)(?:send|sent)(?:_|$)", operation)
+        )
+        object_type = (
+            "gmail_message"
+            if sent and message_id
+            else "gmail_thread"
+            if sent and thread_id
+            else "gmail_draft"
+            if draft_id
+            else "gmail_message"
+            if message_id
+            else "gmail_thread"
+        )
+        object_id = (
+            message_id or thread_id
+            if sent
+            else draft_id or message_id or thread_id
+        )
+        provider_scope = _bounded_provider_scope(
+            receipt,
+            ("gmail_account",),
+        )
+        if thread_id and object_type != "gmail_thread":
+            provider_scope["thread_id"] = thread_id
+        if message_id and object_type == "gmail_draft":
+            provider_scope["message_id"] = message_id
+        if draft_id and sent:
+            provider_scope["draft_id"] = draft_id
+        return ContinuationObjectReference(
+            provider_system="gmail",
+            object_type=object_type,
+            object_id=object_id,
+            display_name=str(
+                receipt.get("subject")
+                or receipt.get("title")
+                or ""
+            ).strip(),
+            lifecycle_state="deleted" if deleted else "active",
+            verification_status="verified",
+            provider_scope=provider_scope,
+        )
+    return None
+
+
+def _bounded_provider_scope(
+    receipt: Mapping[str, Any],
+    keys: tuple[str, ...],
+) -> dict[str, str]:
+    return {
+        key: str(receipt.get(key) or "").strip()
+        for key in keys
+        if str(receipt.get(key) or "").strip()
+    }
+
+
 def _receipt_is_write(receipt: Mapping[str, Any]) -> bool:
     operation = str(
         receipt.get("operation")
@@ -642,7 +918,97 @@ def _slack_continuation(
         prior_request=prior_requests[-1] if prior_requests else "",
         prior_result_title=prior_titles[-1] if prior_titles else "",
         prior_result_summary=prior_results[-1] if prior_results else "",
+        verified_objects=verified_continuation_objects(raw_request),
     )
+
+
+def verified_continuation_objects(
+    raw_request: str,
+) -> tuple[ContinuationObjectReference, ...]:
+    """Return non-authoritative object hints from a continuation envelope.
+
+    Raw Slack text cannot self-assert provider verification. Exact verified
+    identities are rehydrated separately from locally persisted provider
+    receipts. This parser keeps only bounded display/date hints for compatibility.
+    """
+
+    references: list[ContinuationObjectReference] = []
+    for raw_value in _all_envelope_values(raw_request, "Previous verified objects"):
+        try:
+            parsed = json.loads(raw_value)
+        except json.JSONDecodeError:
+            continue
+        values = parsed if isinstance(parsed, list) else [parsed]
+        for value in values:
+            if not isinstance(value, Mapping):
+                continue
+            try:
+                reference = ContinuationObjectReference.model_validate(value)
+            except ValueError:
+                continue
+            reference = reference.model_copy(
+                update={
+                    "object_id": "",
+                    "provider_scope": {},
+                    "verification_status": "unverified",
+                }
+            )
+            if reference not in references:
+                references.append(reference)
+    if references:
+        return tuple(references[:8])
+
+    prior_results = _all_envelope_values(raw_request, "Previous result")
+    calendar_pattern = re.compile(
+        r"\bGoogle Calendar event\s+"
+        r"(?P<operation>created|updated|deleted)\s+and\s+verified\s*:\s*"
+        r"[\"“](?P<title>.+?)[\"”]"
+        r"(?:\s+on\s+(?P<date>20\d{2}-\d{2}-\d{2}))?",
+        re.IGNORECASE,
+    )
+    for result in reversed(prior_results):
+        match = calendar_pattern.search(result)
+        if not match:
+            continue
+        operation = match.group("operation").lower()
+        return (
+            ContinuationObjectReference(
+                provider_system="google_calendar",
+                object_type="calendar_event",
+                display_name=match.group("title").strip(),
+                effective_date=str(match.group("date") or ""),
+                lifecycle_state="deleted" if operation == "deleted" else "active",
+                verification_status="unverified",
+            ),
+        )
+    return ()
+
+
+def _verified_object_planning_line(
+    reference: ContinuationObjectReference,
+) -> str:
+    fields = [
+        f"provider={reference.provider_system}",
+        f"type={reference.object_type}",
+        f"state={reference.lifecycle_state}",
+        f"verification={reference.verification_status}",
+    ]
+    if reference.object_id:
+        fields.append(f"id={reference.object_id}")
+    if reference.display_name:
+        fields.append(f"name={reference.display_name}")
+    if reference.effective_date:
+        fields.append(f"date={reference.effective_date}")
+    fields.extend(
+        f"scope.{key}={value}"
+        for key, value in sorted(reference.provider_scope.items())
+    )
+    prefix = (
+        "Prior verified object for context"
+        if reference.verification_status == "verified"
+        else "Unverified prior object hint"
+    )
+    return f"{prefix}: " + ", ".join(fields)
 
 
 def _slack_envelope_prior_agent(raw_request: str) -> str:
@@ -665,7 +1031,8 @@ def _all_envelope_values(raw_request: str, label: str) -> list[str]:
         r"(?=\s+(?:Current user request \(authoritative\):|Linked WorkItem:|"
         r"Prior task owner \(advisory\):|Provider affinity:|Previous request:|"
         r"Previous result title:|"
-        r"Previous result:|User follow-up:|Continue the same agent task\b)|$)"
+        r"Previous result:|Previous verified objects:|User follow-up:|"
+        r"Continue the same agent task\b)|$)"
     )
     return [
         _strip_slack_entrypoint_decoration(" ".join(match.group(1).split()))
@@ -695,5 +1062,7 @@ __all__ = [
     "continuation_owner_advice",
     "execution_request_planning_text",
     "latest_slack_operator_request",
+    "normalize_slack_operator_turn_identity",
     "slack_work_item_control_requested",
+    "verified_continuation_objects",
 ]

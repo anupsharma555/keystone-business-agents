@@ -17,6 +17,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from dataclasses import replace as dataclass_replace
 from functools import wraps
+from hashlib import sha256
 from importlib import resources
 from pathlib import Path
 from typing import Any, Protocol, TypeVar
@@ -112,7 +113,9 @@ LIVE_MODEL_TIMEOUT_SECONDS_ENV = "KEYSTONE_LIVE_MODEL_TIMEOUT_SECONDS"
 LIVE_MODEL_MAX_RETRIES_ENV = "KEYSTONE_LIVE_MODEL_MAX_RETRIES"
 SDK_INCLUDE_USAGE_ENV = "KEYSTONE_SDK_INCLUDE_USAGE"
 SDK_PROMPT_CACHE_RETENTION_ENV = "KEYSTONE_SDK_PROMPT_CACHE_RETENTION"
+SDK_PROMPT_CACHE_SCOPE_ENV = "KEYSTONE_SDK_PROMPT_CACHE_SCOPE"
 DEFAULT_PROMPT_CACHE_RETENTION = "24h"
+DEFAULT_PROMPT_CACHE_SCOPE = "local-single-operator"
 _FALSE_ENV_VALUES = {"", "0", "false", "no", "off", "disabled"}
 
 
@@ -164,6 +167,152 @@ def active_sdk_data_handling_profile() -> SDKDataHandlingProfile | None:
     """Return the request-local data profile, if one is active."""
 
     return _SDK_DATA_HANDLING_PROFILE.get()
+
+
+def agent_with_stable_prompt_cache_key(
+    agent: AgentLike,
+    *,
+    provider: str,
+    model_name: str,
+) -> AgentLike:
+    """Clone one OpenAI agent with a privacy-scoped static-prefix cache key.
+
+    The key groups equivalent static execution profiles across asks, Slack
+    threads, and follow-ups. It deliberately excludes request text, provider
+    records, Slack identifiers, session identifiers, and other dynamic input.
+    The provider still validates the exact prompt prefix before reusing cached
+    tokens; this key is a grouping hint, not an execution or authorization
+    cache.
+    """
+
+    if str(provider or "").strip().lower() != "openai":
+        return agent
+    scope = _sdk_prompt_cache_scope()
+    if scope is None:
+        return agent
+    settings = getattr(agent, "model_settings", None)
+    if _prompt_cache_key_from_model_settings(settings):
+        return agent
+
+    profile = active_sdk_data_handling_profile()
+    key_payload = {
+        "version": "keystone.prompt_cache_profile.v1",
+        "privacy_scope_sha256": sha256(scope.encode("utf-8")).hexdigest(),
+        "data_handling_profile": profile.name if profile is not None else "default",
+        "repo_instruction_profile": repo_instruction_profile_id(),
+        "agent_name": str(getattr(agent, "name", "") or ""),
+        "model_name": str(model_name or getattr(agent, "model", "") or ""),
+        "instructions_sha256": sha256(
+            str(getattr(agent, "instructions", "") or "").encode("utf-8")
+        ).hexdigest(),
+        "tools": _prompt_cache_tool_payload(getattr(agent, "tools", []) or []),
+        "output_schema": _prompt_cache_output_schema(
+            getattr(agent, "output_type", None)
+        ),
+    }
+    digest = sha256(
+        json.dumps(
+            key_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:32]
+    key = f"kba:prompt:v1:{digest}"
+    updated_settings = _model_settings_with_explicit_prompt_cache_key(settings, key)
+    clone = getattr(agent, "clone", None)
+    if callable(clone):
+        return clone(model_settings=updated_settings)
+    if isinstance(agent, LocalAgent):
+        return dataclass_replace(agent, model_settings=updated_settings)
+    return agent
+
+
+def prompt_cache_key_audit_metadata(agent: AgentLike) -> dict[str, Any]:
+    """Return audit-safe metadata for an explicit profile cache key."""
+
+    key = _prompt_cache_key_from_model_settings(
+        getattr(agent, "model_settings", None)
+    )
+    if not key:
+        return {
+            "prompt_cache_key_present": False,
+            "prompt_cache_key_hash": "",
+            "prompt_cache_key_source": "",
+        }
+    return {
+        "prompt_cache_key_present": True,
+        "prompt_cache_key_hash": sha256(key.encode("utf-8")).hexdigest()[:12],
+        "prompt_cache_key_source": "explicit_static_profile",
+    }
+
+
+def _sdk_prompt_cache_scope() -> str | None:
+    raw = os.getenv(SDK_PROMPT_CACHE_SCOPE_ENV)
+    value = DEFAULT_PROMPT_CACHE_SCOPE if raw is None else raw.strip()
+    if value.lower() in _FALSE_ENV_VALUES:
+        return None
+    return value
+
+
+def _prompt_cache_key_from_model_settings(settings: Any) -> str:
+    if isinstance(settings, Mapping):
+        containers = (settings.get("extra_args"), settings.get("extra_body"))
+    else:
+        containers = (
+            getattr(settings, "extra_args", None),
+            getattr(settings, "extra_body", None),
+        )
+    for container in containers:
+        if isinstance(container, Mapping) and container.get("prompt_cache_key"):
+            return str(container["prompt_cache_key"])
+    return ""
+
+
+def _model_settings_with_explicit_prompt_cache_key(
+    settings: Any,
+    key: str,
+) -> Any:
+    if isinstance(settings, Mapping):
+        updated = dict(settings)
+        extra_args = dict(updated.get("extra_args") or {})
+        extra_args["prompt_cache_key"] = key
+        updated["extra_args"] = extra_args
+        return updated
+    resolved = settings or ModelSettings()
+    extra_args = dict(getattr(resolved, "extra_args", None) or {})
+    extra_args["prompt_cache_key"] = key
+    return dataclass_replace(resolved, extra_args=extra_args)
+
+
+def _prompt_cache_tool_payload(tools: Sequence[Any]) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for tool in tools:
+        schema = getattr(tool, "params_json_schema", None)
+        if schema is None:
+            schema = getattr(tool, "parameters", None)
+        payload.append(
+            {
+                "name": str(
+                    getattr(tool, "name", "")
+                    or getattr(tool, "__name__", type(tool).__name__)
+                ),
+                "schema": schema if isinstance(schema, Mapping) else {},
+            }
+        )
+    return payload
+
+
+def _prompt_cache_output_schema(output_type: Any) -> dict[str, Any]:
+    schema = getattr(output_type, "model_json_schema", None)
+    if callable(schema):
+        try:
+            value = schema()
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+    return {}
 
 if _SDK_IMPORT_ERROR is not None:
     _SANDBOX_IMPORT_ERROR: ImportError | None = _SDK_IMPORT_ERROR

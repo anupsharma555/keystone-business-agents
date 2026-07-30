@@ -125,6 +125,35 @@ def test_failed_constraint_gets_one_llm_repair(monkeypatch) -> None:
             usage={"available": True, "total_tokens": 50},
             cost={"available": True, "total_cost_usd": 0.001},
             request_cache={},
+            execution_telemetry={
+                "schema": "keystone.execution_telemetry.v1",
+                "telemetry_id": "private-telemetry-id",
+                "run_id": "private-run-id",
+                "started_at_utc": "2026-07-27T12:00:00Z",
+                "status": "completed",
+                "total_duration_ms": 125.0,
+                "first_feedback_ms": 120.0,
+                "final_response_ms": 120.0,
+                "spans": [
+                    {
+                        "schema": "keystone.execution_stage_span.v1",
+                        "span_id": "private-span-id",
+                        "telemetry_id": "private-telemetry-id",
+                        "run_id": "private-run-id",
+                        "parent_span_id": "",
+                        "sequence": 1,
+                        "turn_index": 1,
+                        "attempt_index": 1,
+                        "stage": "sdk.model_attempt",
+                        "status": "ok",
+                        "started_offset_ms": 0.0,
+                        "finished_offset_ms": 120.0,
+                        "duration_ms": 120.0,
+                        "error_kind": "",
+                        "attributes": [],
+                    }
+                ],
+            },
         )
 
     monkeypatch.setattr(
@@ -144,6 +173,10 @@ def test_failed_constraint_gets_one_llm_repair(monkeypatch) -> None:
     assert resolution.repair_succeeded is True
     assert resolution.validation.passed is True
     assert resolution.response_text.endswith("Abridge turns conversations into notes.")
+    repair_timing = resolution.metadata()["repair_execution_telemetry"]
+    assert repair_timing["total_duration_ms"] == 125.0
+    assert "spans" not in repair_timing
+    assert "private" not in str(repair_timing)
 
 
 def test_compliant_response_skips_repair(monkeypatch) -> None:

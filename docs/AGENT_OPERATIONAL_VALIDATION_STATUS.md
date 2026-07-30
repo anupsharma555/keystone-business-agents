@@ -14,6 +14,172 @@ Status vocabulary:
 - **Blocked:** the required context/provider state is currently absent.
 - **N/A:** the dimension does not apply to that control-plane or read-only agent.
 
+## 2026-07-29 Five-Call Calendar Semantic Contract Slice
+
+The latest bounded Slack slice is **Partial and not merge-ready**. Exactly five
+serial CoS asks covered an all-readable Calendar read, one exact create, a
+same-thread move, a combined move/rename/note update, and a same-thread delete.
+The read completed in about one second and the create completed in 22.084
+seconds with provider read-back. The three continuation mutations failed safely
+without changing the event:
+
+- the move was blocked after 22.913 seconds because timezone evidence inherited
+  from the create was incorrectly treated as a newly requested timezone;
+- the combined update was blocked after 25.124 seconds because the general
+  planner correctly selected `update` but emitted the contradictory typed
+  permission `read_only`; the shared execution authority therefore reduced the
+  canonical plan to `read` and safely rejected the Calendar specialist's
+  source-grounded `update`; and
+- the delete was blocked after 24.842 seconds because the relational reference
+  `created earlier in this thread` reached provider lookup as a literal title.
+
+The offline repair keeps an unstated timezone unchanged, requires the model's
+operation evidence to be source-compatible, and reconciles a complete typed
+provider-write contract that accidentally carries `read_only` to
+`approval_required`. That schema-level reconciliation requires matching write
+intent, task objective, provider, side-effect policy, mutation operation, and
+provider-object step; genuine or incomplete read-only plans remain capped at
+read/search/verify. The repair also adds the model-owned
+`event_reference_from_thread_context` field. That field binds a relational
+follow-up to one active provider-verified thread object. Python still owns exact
+identity, writable access, approval, live-write, and read-back gates. None of
+these changes adds a natural-phrase parser as the semantic owner.
+
+The five-call budget was not exceeded. The exact synthetic event was cleaned up
+through a zero-model deterministic provider lookup/delete after the Slack
+delete failure; absence verification returned zero remaining matches. Current
+offline verification passes 4,737 tests with one skip, repository-wide Ruff,
+and `git diff --check`. Live proof of the final combined update and contextual
+delete contracts remains pending. Before merge, run one newly budgeted
+five-call Slack sequence: all-readable Calendar read, exact synthetic create,
+same-thread move, same-thread rename plus note append, and contextual delete.
+Run the calls serially with no automatic retries, cap each ask at two model
+requests, require at least four of five correct outcomes, and stop immediately
+for any unintended mutation or wrong-object match. Record provider read-back
+and Slack-visible latency for every call; if deletion fails, use only the
+zero-model exact provider cleanup path and record the failure rather than
+spending an unbudgeted Slack retry.
+
+## 2026-07-29 Planner-Owned Calendar Action Follow-Ups
+
+The compact Calendar lane is **Proven live for create and contextual delete,
+partial for contextual update**. The parser no longer skips live semantic
+planning or owns the Calendar operation. The planner now emits one primary
+mutation for a single provider-object action; initial title, date, notes, and
+attendee fields remain part of `create` rather than becoming competing
+`update` or `attach` operations. Deterministic code reduces the typed sequence
+once, validates required fields and scope, and leaves exact identity, access,
+write gates, and read-back receipts authoritative.
+
+Three same-thread Slack asks exercised the revised boundary. Run 6671 created
+and verified `KBA_TEST_CALENDAR Compact Delete Latency Check` on 2026-08-11
+even though the event title contains the word `Delete`. It used one OpenAI
+request and completed in 10.529 seconds: 7.744 seconds in Orchestrator
+preflight, 2.127 seconds in Calendar preparation, and 0.658 seconds in the
+provider action.
+
+Run 6672 correctly resolved the provider-verified object through the natural
+follow-up `the event you just created`, but exposed a remaining field-contract
+defect. It appended/replaced the requested note while silently dropping the
+requested move from 2:35 PM to 3:05 PM, then labeled the partial change
+verified. The provider receipt proved that the event remained at 2:35 PM, so
+this run is recorded as a functional failure despite its stored success status.
+The offline repair now carries source-anchored model update fields that the
+diagnostic parser missed, preserves append mode, validates date/time formats,
+and makes read-back verification cover the requested time when present.
+
+Run 6673 used the natural follow-up `the calendar event you just updated in
+this thread`, resolved the same provider object, deleted it, and verified
+absence. It used two OpenAI requests and completed in 14.271 seconds. The
+synthetic event was therefore cleaned up. The post-failure repair passed 489
+focused Calendar, CLI, provider-tool, and joined-lifecycle tests plus Ruff and
+`git diff --check`; its live update reproof remains pending because this
+acceptance slice was intentionally limited to three Slack asks.
+
+## 2026-07-29 Exact Duplicate Calendar Deletion
+
+The exact duplicate-delete lifecycle is **Proven live** for one natural Slack
+thread request. The operator asked to delete both events titled `Expert Initial
+Interview: Anup Sharma` on August 3, 2026 at 10:15 AM. The first post-repair
+attempt exposed a remaining general merge defect: the current model plan
+correctly carried the requested title, date, time, and count, but the
+existing-event identity field was repopulated from an unrelated verified prior
+event in the same thread. No Calendar write occurred in that failed run.
+
+The shared Calendar contract now recognizes plural event/meeting/appointment
+objects and treats a source-verified current title as the lookup identity for
+read, update, and delete operations before consulting prior thread state.
+Deictic requests such as `delete it` may still use the prior verified object.
+Focused Calendar and CLI verification passed 430 tests; the broader Calendar,
+execution-request, direct-response, planner, Chief, and workflow gate passed
+1,094 tests. Ruff and `git diff --check` passed.
+
+After the Slack worker restart, run 6668 preserved the current title,
+`2026-08-03`, `10:15`, exact target count 2, and `all_readable` Calendar scope.
+The provider resolver returned exactly two independently addressable active
+matches. Both exact provider objects were deleted, and the aggregate receipt
+verified `events_absent_after=2`. Slack returned one concise completion message,
+and the operator's Google Calendar view independently showed both events absent.
+No unrelated Calendar event was changed.
+
+The run used two OpenAI requests and completed in 15.663 seconds:
+Orchestrator preflight took 6.931 seconds, pre-Calendar overhead took 5.097
+seconds, and provider resolution plus both verified deletions took 3.635
+seconds. This lifecycle is proven; broader Calendar phrasing and continuation
+coverage remains part of the pre-merge diverse Slack acceptance gate.
+
+## 2026-07-27 Calendar Timezone And Related-Record Repair
+
+The Calendar/Chief repair is **Proven live**. Provider RFC3339 timestamps are
+now preserved as raw receipt fields
+and separately normalized into configured display-date, display-time, and
+display-timezone fields before semantic selection or reader-facing rendering.
+The focused selector can also identify multiple Calendar records as evidence
+for one real-world event. The renderer keeps both records visible, includes
+available location details, and calls out conflicting times or locations
+instead of choosing one silently or returning the complete agenda.
+
+The development checkout passed 900 tests across Calendar, Chief, CLI, SDK,
+acceptance, and Gmail boundaries. The Slack runtime checkout passed 140
+Calendar-focused tests. Its broader selected gate passed 904 of 905 tests; the
+single failure reproduces independently in the unrelated eval-score-template
+dashboard URL assertion. Gmail Triage required no behavior change: it shares
+the Google OAuth credential/scope boundary, while Calendar retrieval,
+relationship interpretation, and answer synthesis remain Chief/Calendar
+owned. The Slack Socket Mode worker was restarted after runtime synchronization.
+
+The operator's live Slack retest asked for the next day's appointment(s), time,
+location, and known details. The result correctly focused on one
+provider-verified visit, rendered its local time in America/New_York, included
+the available Calendar location, and omitted unrelated agenda items. The Slack
+bridge completed the run in 24 seconds. The persisted KBA receipt records two
+model requests and no Calendar write.
+
+### Calendar Read Latency Follow-Up
+
+Recent Slack receipts showed focused Calendar reads taking roughly 22 to 35
+seconds. The newest focused path used three model requests: Orchestrator
+planning, Calendar action interpretation, and post-read event selection. The
+middle interpretation was redundant when the canonical Orchestrator plan
+already specified one read-only bounded Calendar collection with an item
+result and an explicit day window.
+
+Complete canonical Calendar reads now reuse that typed plan directly. Ambiguous
+or incomplete plans still enter the Calendar interpreter, and writes retain the
+interpreter and all existing deterministic gates. Focused lookups keep the
+post-read selector so the model still identifies relevant events and related
+records from provider-verified metadata. Broad full-window agenda asks continue
+to skip post-read selection.
+
+The direct Calendar payload records provider-action, lookup-synthesis,
+Orchestrator-preflight, pre-Calendar overhead, direct-total, and ask-total
+timing separately. The proven live focused run used two model requests:
+Calendar provider retrieval took 2.207 seconds and lookup synthesis took 2.809
+seconds, for 5.016 seconds in the direct Calendar path. The remaining Slack
+elapsed time is now attributable on the next authorized run through the added
+Orchestrator and pre-Calendar timing fields rather than being conflated with
+provider latency.
+
 ## 2026-07-25 Zotero Latest-Abstract Natural Ask
 
 The final serialized row in the authorized live window is **Proven**. A normal
@@ -2985,6 +3151,173 @@ The current 25-call window has used 12 model requests and has 13 remaining:
 four before this acceptance slice, two for the initial Gmail row, two for its
 successful unchanged retry, two for the stopped Chief multi-source row, and two
 for the unchanged retry that isolated the Slack bridge defect.
+
+### 2026-07-29 Calendar continuity and bounded-read live checkpoint
+
+Five serial natural Slack asks exercised Chief of Staff Calendar read, create,
+move, rename-plus-note, and contextual delete behavior. The live budget allowed
+at most two model requests per ask, prohibited automatic retries, and required a
+stop on any wrong-object or unintended mutation. The persisted run evidence
+records two model requests per ask, or ten total. No wrong-object mutation
+occurred. End-to-end Slack latency was approximately 22-32 seconds per ask.
+
+Three asks passed:
+
+- a marked synthetic event was created and provider-verified;
+- the same event was moved while preserving its duration and other fields;
+- that same event was renamed and received an appended note.
+
+Two asks did not meet acceptance:
+
+- the read found the only event inside the requested 2:00-4:30 PM window but
+  appended unrelated events from the rest of the day;
+- the contextual delete blocked safely because the exact renamed event identity
+  was not rehydrated into the follow-up execution.
+
+The strict live score is therefore 3 of 5, or 60%, below the 80% pre-merge gate.
+No retry or merge followed. The synthetic event remains on August 21, 2026 for
+later verified cleanup.
+
+The failures have separate causes. The Calendar read interpreter retained the
+date but the executor expanded the provider query to the entire day. The
+follow-up failure crossed a repository boundary: the Slack history context
+carried channel, thread, and request timestamps but omitted the Slack workspace
+identifier needed by KBA's trusted provenance contract. KBA correctly refused
+to load a provider object without the complete scope; the exact-ID safety gate
+then blocked the delete.
+
+KBA now preserves explicit clock bounds through the Calendar plan and provider
+window, and contextual mutations prefer the latest verified provider event ID,
+including after a rename. Explicit current-turn titles still override thread
+identity. Regression coverage replays the failed natural wording and verifies
+the exact 2:00-4:30 PM bounds plus rename-then-delete identity. Calendar and CLI
+coverage passes 465 tests; the complete repository gate passes 4,766 tests with
+one intentional skip; Ruff and `git diff --check` pass.
+
+Fresh live proof remains pending the sibling Slack context-producer change:
+carry `team_id` through `SlackBusinessAgentContext`, write it into the bounded
+history-context file, restart the Socket Mode worker, and then rerun only the
+failed read and contextual-delete rows under a new explicit live allowance.
+
+### 2026-07-30 mixed-version Calendar follow-up checkpoint
+
+The sibling Slack bridge now carries `team_id` through root mentions, thread
+follow-ups, and slash-command context, and writes it into the bounded KBA
+history file. Focused bridge tests passed and the Socket Mode worker restarted
+healthy. A broader sibling contract run had 299 passes and one unrelated
+pre-existing failure around nested WorkItem selection.
+
+Two serial Slack asks were authorized to rerun only the failed Calendar rows,
+with at most two model requests per ask, no automatic retries, and an immediate
+stop after a failure. The first contextual delete still blocked safely. Its new
+run had valid workspace/channel/thread/request provenance, but the verified
+create/move/rename receipts predated the bridge change and therefore had no
+trustworthy thread provenance to rehydrate. KBA correctly refused to infer an
+exact provider ID from database adjacency or bot prose.
+
+The compatibility repair allows a legacy contextual delete to recover only
+through an exact planner target that appears verbatim in authenticated operator
+history. The provider must still resolve one exact active writable event across
+all readable calendars before using its ID; zero or multiple matches remain
+blocked. A second Slack retry also blocked safely because repeated operator
+turns differed only by retained `@KNI` mention decoration, causing the adapter
+to choose the previous delete rather than the earlier rename as its human
+context anchor. Turn comparison now strips only leading Slack mention
+decoration before equality checks.
+
+The two-call rerun slice scored 0 of 2, with no unintended mutation and about
+28 seconds of visible Slack latency per ask. The broader seven-call Calendar
+ledger is 3 of 7, or 43%, and remains below the 80% pre-merge gate. Both reruns
+used two model requests. Local planner cost telemetry captured one request per
+run at approximately $0.0112 and $0.0048; the second run reused 9,984 of 11,564
+input tokens. The OpenAI Admin Usage endpoint showed zero requests in the
+visible complete 26-minute window, so platform-side attribution was unavailable
+or delayed and local estimates are not invoice evidence.
+
+The final compatibility and mention-normalization changes have not received
+another live call because the explicit budget is exhausted. Offline Calendar,
+CLI, provider-object, and Slack-continuation coverage passes 203 focused tests;
+the complete repository gate passes 4,769 tests with one intentional skip, and
+Ruff passes. The marked synthetic event still remains on August 21, 2026 and
+needs a separately authorized verified cleanup. Merge remains blocked pending a
+fresh post-change create -> move -> rename/note -> contextual delete lifecycle
+and the bounded-read rerun.
+
+### 2026-07-30 offline continuity architecture gate
+
+A follow-up architecture review found two shared continuity defects beyond the
+Calendar-specific compatibility path. Verified provider objects were already
+stored newest-first, but Calendar context resolution reversed that order and
+could select an older object when a thread contained multiple distinct events.
+Typed Slack context also dropped human-versus-bot role identity when converted
+to Orchestrator workflow state, allowing completed bot prose to compete with
+authenticated operator turns. Calendar now consumes verified objects
+newest-first, and typed Slack context preserves explicit `operator` and `agent`
+roles.
+
+Leading Slack app-mention decoration is now normalized through one shared turn
+identity helper for all providers. This prevents an otherwise identical
+operator turn from being replayed as distinct context while preserving mentions
+inside the request. The natural-language planner, not a phrase-specific Python
+parser, owns explicit provider-object cardinality: requests such as "delete
+both matching events" can authorize an exact count of two, while unbounded
+plurals remain non-explicit. Python remains authoritative only for exact object
+identity, mutation breadth, approval/live gates, writable scope, and provider
+read-back.
+
+The final focused architecture gate passes 1,035 tests, Ruff, and the diff
+check. An added composed scenario now replays the five-ask Calendar slice
+offline: exact bounded read, verified create, same-thread move,
+Orchestrator-to-Chief rename plus note append, and contextual delete. It proves
+the same provider event ID survives every mutation, Slack human/bot roles remain
+distinct, the newest deleted receipt wins over older active state, and a
+different thread cannot inherit the object. The affected gate passes 585 tests,
+and a fresh complete repository run with the scenario included passes 4,779
+tests with one intentional skip.
+
+No live API or Slack call was made for this checkpoint because the prior live
+allowance was exhausted, so the live Calendar score remains 3 of 7 (43%), the
+marked August 21 synthetic event remains, and merge remains blocked. The exact
+next live prompts, evidence fields, `$0.15` cost ceiling, ten-request hard stop,
+failure cleanup, and 4-of-5 acceptance gate are recorded in
+`artifacts/test-pack/next-live-calendar-thread-continuity-plan.json`.
+The sibling Slack Socket Mode worker is running from the configured
+`keystone-slack` checkout; its local health record reports `healthy`, connected,
+zero consecutive socket or delivery failures, and no restart recommendation.
+
+The provider-neutral continuity audit also found that Google Drive, Gmail, and
+Airtable verified receipts could already become exact Slack-thread objects, but
+Zotero receipts could not. Verified Zotero item and note receipts now project
+their exact item key, bounded library/parent scope, and active/deleted lifecycle
+into the same continuation contract. One composed offline matrix covers Drive,
+Gmail, Airtable, and Zotero from provider receipt through persisted Slack
+provenance, same-thread rehydration, explicit agent change, and current-human
+authority; it also proves a different thread cannot inherit the object. The
+focused provider-continuity gate passes 121 tests. The complete no-API
+repository gate now passes 4,786 tests with one intentional skip; Ruff and
+`git diff --check` pass.
+
+### 2026-07-30 Calendar fast-read and research deadline checkpoint
+
+The request-local fast-read kernel now covers canonical read-only Chief of
+Staff Calendar plans. Multiple Calendar reads within one model attempt reuse
+one client, consume bounded attempts, and emit content-free receipts. Calendar
+writes remain on their existing exact-ID, approval, read-back, and verification
+path.
+
+Research FAST, BALANCED, and DEEP `max_seconds` values are now consumed by the
+shared Business Research and Opportunity retrieval paths instead of existing
+only as metadata. The active stage-aware limits are 45, 120, and 300 seconds.
+When a limit is reached, the run keeps already retrieved evidence, stops
+starting later queries or enrichment stages, and records a partial result with
+the stage where it stopped. In-flight provider calls are not force-cancelled.
+Multi-target depth reads receive the same per-retrieval budget.
+
+Focused Calendar/read and research deadline tests pass without live API calls.
+Live Slack latency and paid-model cache behavior remain unproven; the five-ask
+Calendar acceptance batch still requires a fresh explicit cost allowance.
+The complete no-API repository gate passes 4,791 tests with one intentional
+skip; Ruff and `git diff --check` pass.
 
 ## Priority Order
 

@@ -27,6 +27,70 @@ ExecutionResultStatus = Literal[
 ]
 
 
+class ContinuationObjectReference(BaseModel):
+    """Provider-verified object identity carried across one conversation turn."""
+
+    provider_system: str
+    object_type: str
+    object_id: str = ""
+    display_name: str = ""
+    effective_date: str = ""
+    lifecycle_state: Literal["active", "deleted", "unknown"] = "unknown"
+    verification_status: Literal["verified", "unverified"] = "verified"
+    provider_scope: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator(
+        "provider_system",
+        "object_type",
+        "object_id",
+        "display_name",
+        "effective_date",
+        mode="before",
+    )
+    @classmethod
+    def _clean_reference_text(cls, value: object) -> str:
+        return str(value or "").replace("\u2014", "-").strip()
+
+    @field_validator("provider_scope", mode="before")
+    @classmethod
+    def _clean_provider_scope(cls, value: object) -> dict[str, str]:
+        if not isinstance(value, dict):
+            return {}
+        cleaned: dict[str, str] = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key or "").replace("\u2014", "-").strip()[:64]
+            item = str(raw_value or "").replace("\u2014", "-").strip()[:500]
+            if key and item:
+                cleaned[key] = item
+            if len(cleaned) >= 8:
+                break
+        return cleaned
+
+    @model_validator(mode="after")
+    def _require_identity(self) -> ContinuationObjectReference:
+        if self.verification_status == "verified" and not self.object_id:
+            raise ValueError(
+                "Verified continuation object references require an exact object_id."
+            )
+        if not self.object_id and not self.display_name:
+            raise ValueError(
+                "Continuation object references require object_id or display_name."
+            )
+        allowed_scope_keys = {
+            "google_calendar": {"calendar_id", "start_time", "end_time"},
+            "google_drive": {"folder_path", "google_account"},
+            "airtable": {"base_alias", "table"},
+            "gmail": {"gmail_account", "thread_id", "message_id", "draft_id"},
+            "zotero": {"library_id", "library_type", "parent_item_key"},
+        }.get(self.provider_system, set())
+        self.provider_scope = {
+            key: value
+            for key, value in self.provider_scope.items()
+            if key in allowed_scope_keys
+        }
+        return self
+
+
 class DirectAgentResponseInput(BaseModel):
     """Complete operator request plus its interpreted response constraints."""
 
@@ -81,6 +145,7 @@ class ExecutionContinuation(BaseModel):
     prior_request: str = ""
     prior_result_title: str = ""
     prior_result_summary: str = ""
+    verified_objects: tuple[ContinuationObjectReference, ...] = ()
 
     @field_validator(
         "work_item_id",
@@ -195,6 +260,7 @@ class ExecutionPublicResult(BaseModel):
 
 
 __all__ = [
+    "ContinuationObjectReference",
     "DirectAgentResponse",
     "DirectAgentResponseInput",
     "ExecutionContinuation",

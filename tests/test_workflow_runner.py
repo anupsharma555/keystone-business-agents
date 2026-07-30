@@ -8870,10 +8870,12 @@ def test_deep_source_backed_opportunity_request_verifies_source_pages(
     assert captured_kwargs["verify_source_pages"] is True
     assert captured_kwargs["max_results"] == 8
     assert captured_kwargs["agents_web_search_max_calls"] == 2
+    assert captured_kwargs["retrieval_deadline_seconds"] == 300
     assert result.artifact_refs
     assert any(
         "quality budget applied for opportunity_scout" in note.lower()
         and "mode=deep" in note.lower()
+        and "max_seconds=300" in note.lower()
         and "tool_tier=deep_retrieval" in note.lower()
         for note in result.audit_notes
     )
@@ -11717,7 +11719,7 @@ def test_current_year_business_research_deepens_initial_query_plan(
     query_text = "\n".join(captured["queries"]).lower()
     assert result.advanced is True
     assert captured["company"] == "OpenEvidence"
-    assert captured["max_results"] >= 8
+    assert captured["max_results"] == 5
     assert "openevidence 2026 company update" in query_text
     assert "funding valuation revenue growth" in query_text
     assert "partnership customers product roadmap" in query_text
@@ -11819,6 +11821,9 @@ def test_deeper_business_research_uses_deep_quality_budget(
         captured["company"] = company
         captured["max_results"] = kwargs.get("max_results")
         captured["agents_web_search_max_calls"] = kwargs.get("agents_web_search_max_calls")
+        captured["retrieval_deadline_seconds"] = kwargs.get(
+            "retrieval_deadline_seconds"
+        )
         return research_company_fixture(company_name=company), {
             "debug_notes": ["fake deep retrieval"]
         }
@@ -11853,10 +11858,69 @@ def test_deeper_business_research_uses_deep_quality_budget(
     assert captured["company"] == "OpenAI"
     assert captured["max_results"] == 8
     assert captured["agents_web_search_max_calls"] == 2
+    assert captured["retrieval_deadline_seconds"] == 300
     audit_text = " ".join(result.audit_notes).lower()
     assert "quality budget applied for business_research_analyst" in audit_text
     assert "mode=deep" in audit_text
+    assert "max_seconds=300" in audit_text
     assert "tool_tier=deep_retrieval" in audit_text
+
+
+def test_fast_business_research_keeps_query_builder_within_fast_retrieval_budget(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_retrieve_company_profile_live(*, company: str, **kwargs: object):
+        captured["company"] = company
+        captured["max_results"] = kwargs.get("max_results")
+        captured["agents_web_search_max_calls"] = kwargs.get(
+            "agents_web_search_max_calls"
+        )
+        captured["query_builder"] = kwargs.get("query_builder")
+        captured["retrieval_deadline_seconds"] = kwargs.get(
+            "retrieval_deadline_seconds"
+        )
+        return research_company_fixture(company_name=company), {
+            "debug_notes": ["fake fast retrieval"]
+        }
+
+    monkeypatch.setattr(
+        "keystone_agents.workflow_runner.retrieve_company_profile_live",
+        fake_retrieve_company_profile_live,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text="Quickly scan OpenEvidence's current work in 2026.",
+            database_url=_database_url(tmp_path),
+            save=True,
+            live_search=True,
+            live_sdk=True,
+            requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            manual_request_plan={
+                "source": "llm",
+                "requested_agent": "business_research_analyst",
+                "target_agent": "business_research_analyst",
+                "intent": "company_research",
+                "primary_target": "OpenEvidence",
+                "requires_live_search": True,
+                "ask_shape": {
+                    "ask_breadth": "narrow",
+                    "evidence_depth": "quick",
+                    "cost_mode": "minimize",
+                },
+            },
+        )
+    )
+
+    assert result.advanced is True
+    assert captured["company"] == "OpenEvidence"
+    assert callable(captured["query_builder"])
+    assert captured["max_results"] == 3
+    assert captured["agents_web_search_max_calls"] == 0
+    assert captured["retrieval_deadline_seconds"] == 45
 
 
 def test_current_year_business_research_focuses_latest_followup_query_terms(

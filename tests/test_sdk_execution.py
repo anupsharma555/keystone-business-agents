@@ -121,6 +121,7 @@ from keystone_agents.schemas.email_triage import (
     GmailCandidateRankingResult,
     GmailPriorityGroupingResult,
 )
+from keystone_agents.schemas.manual_request_plan import AskShapePolicy, ManualRequestPlan
 from keystone_agents.schemas.operational_context import (
     AirtableContextResult,
     GoogleWorkspaceContextResult,
@@ -1224,6 +1225,7 @@ def test_run_typed_sdk_agent_attaches_failed_attempt_count_when_usage_is_unavail
     assert failure["usage"]["provider_request_count_confirmed"] is True
     assert failure["usage"]["available"] is False
     assert failure["cost"]["available"] is False
+    assert failure["execution_telemetry"]["status"] == "failed"
 
 
 def test_run_typed_sdk_agent_attaches_bounded_guardrail_failure_reason(
@@ -1780,6 +1782,61 @@ def test_direct_specialist_sdk_turn_policy_supports_quality_and_explicit_overrid
         max_turns=2,
     )
     assert captured["max_turns"] == 2
+
+
+def test_direct_research_wrappers_use_canonical_plan_for_turns_and_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_research: dict[str, Any] = {}
+    captured_scout: dict[str, Any] = {}
+    quick_plan = ManualRequestPlan(
+        source="llm",
+        target_agent="business_research_analyst",
+        intent="research_brief",
+        objective="Run a bounded source scan.",
+        task_objective="source_research",
+        expected_artifact_type="source_summary",
+        requires_live_search=True,
+        ask_shape=AskShapePolicy(
+            ask_breadth="narrow",
+            evidence_depth="quick",
+            cost_mode="minimize",
+        ),
+    )
+
+    monkeypatch.setattr(
+        business_research_module,
+        "run_typed_sdk_agent",
+        lambda **kwargs: captured_research.update(kwargs) or kwargs,
+    )
+    monkeypatch.setattr(
+        opportunity_scout_module,
+        "run_typed_sdk_agent",
+        lambda **kwargs: captured_scout.update(kwargs) or kwargs,
+    )
+
+    run_business_research_analyst_sdk(
+        BusinessResearchSDKInput(
+            company_name="OpenAI",
+            context="The operator used generic research wording.",
+        ),
+        live=True,
+        manual_request_plan=quick_plan,
+    )
+    run_opportunity_scout_sdk(
+        OpportunityScoutSDKInput(topic="behavioral health opportunities"),
+        live=True,
+        manual_request_plan=quick_plan,
+    )
+
+    assert captured_research["max_turns"] == 4
+    assert captured_scout["max_turns"] == 4
+    assert "search_web" not in {
+        str(getattr(tool, "name", "")) for tool in captured_research["agent"].tools
+    }
+    assert "search_web" not in {
+        str(getattr(tool, "name", "")) for tool in captured_scout["agent"].tools
+    }
 
 
 def test_business_research_analyst_focused_brief_runtime_uses_llm_output_contract(
@@ -3789,6 +3846,11 @@ def test_high_confidence_manifest_match_resolves_preprints_without_model() -> No
         "update that same Airtable expense record",
         "create a Google Doc in Drive and verify it",
         "create a Gmail draft to myself and do not send it",
+        (
+            "list all events tomorrow from every Google Calendar I can read, "
+            "including selected shared calendars"
+        ),
+        "what is on my Google Calendar tomorrow?",
     ],
 )
 def test_chief_native_command_resolver_does_not_intercept_provider_actions(

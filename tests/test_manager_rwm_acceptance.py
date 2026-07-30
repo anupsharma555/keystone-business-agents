@@ -6,13 +6,16 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+from keystone_agents.agents import calendar_action_interpreter as calendar_interpreter
 from keystone_agents.agents.chief_of_staff import plan_chief_of_staff_request
 from keystone_agents.agents.orchestrator import route_request
 from keystone_agents.manual_request import infer_manual_request_plan
+from keystone_agents.schemas.calendar_action import CalendarLookupSynthesis
 from keystone_agents.schemas.chief_of_staff import (
     ChiefOfStaffResult,
     ChiefSpecialistToolInput,
 )
+from keystone_agents.schemas.manual_request_plan import AskShapePolicy, ManualRequestPlan
 from keystone_agents.schemas.orchestrator import OrchestratorResult
 from scripts import run_chief_of_staff as chief_script
 
@@ -255,3 +258,259 @@ def test_chief_calendar_completion_preserves_slack_renderer_contract(
     assert payload["tool_receipt"]["event_id"] == "event-test-id"
     assert payload["tool_receipt"]["html_link"] == "https://calendar.example.test/event"
     assert payload["usage"]["requests"] == 1
+
+
+def test_chief_calendar_read_returns_answer_without_route_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan = SimpleNamespace(
+        operation="read",
+        read_scope="time_window",
+        description="",
+        event_reference="",
+        title="",
+        start_date="2026-07-28",
+        start_time="",
+        end_time="",
+    )
+    answer = (
+        "Google Calendar events:\n"
+        '- "Example Medical Clinic" (Care Appointments) on 2026-07-28 '
+        "from 10:40 AM to 11:40 AM"
+    )
+    monkeypatch.setattr(
+        chief_script,
+        "execute_direct_calendar_action",
+        lambda *_args, **_kwargs: {
+            "status": "done",
+            "human_summary": answer,
+            "calendar_action": vars(plan),
+            "calendar_lookup": {"calendar_scope": "all_readable"},
+            "tool_receipt": {
+                "operation": "read_calendar_window",
+                "events": [{"title": "Example Medical Clinic"}],
+                "verification": {"passed": True},
+            },
+            "public_result": {
+                "status": "completed",
+                "title": "Business Agents Result Ready",
+                "text": answer,
+            },
+            "side_effects": {"calendar_write_performed": False},
+        },
+    )
+    exit_code = chief_script._run_interpreted_calendar_action(
+        input_text="list tomorrow from every readable Google Calendar",
+        plan=plan,
+        json_output=True,
+        openai_requests=2,
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["slack_display_text"] == answer
+    assert payload["display_text"] == answer
+    assert payload["output"]["summary"] == answer
+    assert payload["output"]["recommended_actions"] == []
+    assert payload["output"]["approval_required"] is False
+    assert payload["output"]["recommended_route"]["workflow_type"] == (
+        "calendar-read-complete"
+    )
+    assert "workflow" not in payload["slack_display_text"].lower()
+    assert "route" not in payload["slack_display_text"].lower()
+
+
+def test_chief_targeted_calendar_read_returns_model_selected_provider_answer(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan = SimpleNamespace(
+        operation="read",
+        read_scope="time_window",
+        query="",
+        description="",
+        event_reference="",
+        title="",
+        start_date="2026-07-28",
+        start_time="",
+        end_time="",
+    )
+    events = [
+        {
+            "title": "Window Washing",
+            "start_date": "2026-07-28",
+            "start_time": "08:30",
+            "end_time": "09:30",
+            "source_calendar_name": "",
+            "source_calendar_primary": True,
+        },
+        {
+            "title": "Example Medical Clinic",
+            "start_date": "2026-07-28",
+            "start_time": "10:40",
+            "end_time": "11:40",
+            "location": "100 Example Avenue, Exampleville, PA 19000",
+            "source_calendar_name": "Care Appointments",
+            "source_calendar_primary": False,
+        },
+    ]
+    monkeypatch.setattr(
+        chief_script,
+        "execute_direct_calendar_action",
+        lambda *_args, **_kwargs: {
+            "status": "done",
+            "human_summary": "Google Calendar events: raw list",
+            "calendar_action": vars(plan),
+            "calendar_lookup": {"calendar_scope": "all_readable"},
+            "tool_receipt": {
+                "operation": "read_calendar_window",
+                "events": events,
+                "verification": {"passed": True},
+            },
+            "public_result": {
+                "status": "completed",
+                "title": "Business Agents Result Ready",
+                "text": "Google Calendar events: raw list",
+            },
+            "side_effects": {"calendar_write_performed": False},
+        },
+    )
+    expected = (
+        'I found one matching event: "Example Medical Clinic" on the '
+        "Care Appointments calendar on 2026-07-28, from 10:40 AM to 11:40 AM. "
+        "Location: 100 Example Avenue, Exampleville, PA 19000."
+    )
+    monkeypatch.setattr(
+        chief_script,
+        "resolve_calendar_lookup_answer",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            text=expected,
+            openai_requests=1,
+            warnings=(),
+        ),
+    )
+
+    exit_code = chief_script._run_interpreted_calendar_action(
+        input_text="CoS, find and list my medical appointment that is tomorrow.",
+        plan=plan,
+        json_output=True,
+        openai_requests=2,
+        manual_plan=ManualRequestPlan(
+            source="llm",
+            target_agent="chief_of_staff",
+            intent="context_lookup",
+            provider_system="google_calendar",
+            provider_operations=["read"],
+            provider_read_scope="bounded_collection",
+            primary_target="medical appointment tomorrow",
+            ask_shape=AskShapePolicy(ask_breadth="narrow"),
+        ),
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["slack_display_text"] == expected
+    assert payload["public_result"]["text"] == expected
+    assert "Window Washing" not in payload["slack_display_text"]
+    assert payload["usage"]["requests"] == 3
+
+
+def test_chief_groups_duplicate_calendar_records_and_uses_local_time(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan = SimpleNamespace(
+        operation="read",
+        read_scope="time_window",
+        query="",
+        start_date="2026-07-28",
+    )
+    events = [
+        {
+            "title": "Example Medical Clinic",
+            "start": "2026-07-28T10:40:00-04:00",
+            "end": "2026-07-28T11:40:00-04:00",
+            "display_start_date": "2026-07-28",
+            "display_start_time": "10:40",
+            "display_end_date": "2026-07-28",
+            "display_end_time": "11:40",
+            "display_timezone": "America/New_York",
+            "source_calendar_name": "Care Appointments",
+            "source_calendar_primary": False,
+        },
+        {
+            "title": "Established Client Visit",
+            "start": "2026-07-28T14:25:00Z",
+            "end": "2026-07-28T15:00:00Z",
+            "start_time": "14:25",
+            "end_time": "15:00",
+            "display_start_date": "2026-07-28",
+            "display_start_time": "10:25",
+            "display_end_date": "2026-07-28",
+            "display_end_time": "11:00",
+            "display_timezone": "America/New_York",
+            "location": "100 Example Avenue, Exampleville, PA 19000",
+            "source_calendar_name": "Appointments",
+            "source_calendar_primary": False,
+        },
+    ]
+    monkeypatch.setattr(
+        chief_script,
+        "execute_direct_calendar_action",
+        lambda *_args, **_kwargs: {
+            "status": "done",
+            "human_summary": "Raw full-day agenda",
+            "tool_receipt": {
+                "operation": "read_calendar_window",
+                "events": events,
+                "verification": {"passed": True},
+            },
+            "side_effects": {"calendar_write_performed": False},
+        },
+    )
+    monkeypatch.setattr(
+        calendar_interpreter,
+        "run_typed_sdk_agent",
+        lambda **_kwargs: SimpleNamespace(
+            output=CalendarLookupSynthesis(
+                status="matched",
+                selected_event_indexes=[0, 1],
+                related_event_groups=[[0, 1]],
+                selection_reason=(
+                    "The overlapping records appear to describe the same visit."
+                ),
+            )
+        ),
+    )
+
+    exit_code = chief_script._run_interpreted_calendar_action(
+        input_text=(
+            "CoS, find my medical appointment tomorrow. What is its time and location?"
+        ),
+        plan=plan,
+        json_output=True,
+        openai_requests=2,
+        manual_plan=ManualRequestPlan(
+            source="llm",
+            target_agent="chief_of_staff",
+            intent="context_lookup",
+            provider_system="google_calendar",
+            provider_operations=["read"],
+            provider_read_scope="bounded_collection",
+            primary_target="medical appointment tomorrow",
+            ask_shape=AskShapePolicy(ask_breadth="narrow"),
+        ),
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert "one likely event represented by 2 Calendar entries" in payload[
+        "slack_display_text"
+    ]
+    assert "10:25 AM to 11:00 AM" in payload["slack_display_text"]
+    assert "10:40 AM to 11:40 AM" in payload["slack_display_text"]
+    assert "100 Example Avenue" in payload["slack_display_text"]
+    assert "different times" in payload["slack_display_text"]
+    assert "2:25 PM" not in payload["slack_display_text"]
+    assert "Raw full-day agenda" not in payload["slack_display_text"]

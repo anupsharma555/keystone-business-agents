@@ -31,6 +31,11 @@ from keystone_agents.guardrails import (
     enforce_tool_output_guardrails,
     keystone_tool_guardrail_kwargs,
 )
+from keystone_agents.provider_read import (
+    ProviderReadContextError,
+    current_provider_read_context,
+    record_provider_read_result,
+)
 from keystone_agents.schemas.email_triage import (
     GMAIL_MANAGED_LABELS,
     GMAIL_PRIMARY_LABEL_SET,
@@ -1972,6 +1977,7 @@ class GmailTool:
             "status": "message_state_modified" if passed else "verification_failed",
             "message_id": clean_id,
             "thread_id": str(after.get("threadId") or before.get("threadId") or ""),
+            "gmail_account": expected,
             "operation": operation,
             "label": clean_label,
             "before_label_ids": before_labels,
@@ -2597,16 +2603,34 @@ class GmailTool:
         raise NotImplementedError("Free-form external email sending is not implemented.")
 
 
+def _gmail_read_tool() -> GmailTool:
+    """Reuse one authenticated read client within a bounded agent request."""
+
+    read_context = current_provider_read_context()
+    if read_context is None or read_context.plan.provider != "gmail":
+        return GmailTool(live=True)
+    if not read_context.try_start_attempt():
+        raise ProviderReadContextError(
+            "Gmail read request exceeded its bounded call or deadline budget."
+        )
+    return read_context.service(
+        "gmail.live_read_tool",
+        lambda: GmailTool(live=True),
+    )
+
+
 def list_recent_messages(
     label: str | None = None,
     max_results: int = 1,
     query: str | None = None,
 ) -> list[dict[str, Any]]:
-    return GmailTool(live=True).list_recent_messages(
+    result = _gmail_read_tool().list_recent_messages(
         label=label,
         max_results=max_results,
         query=query,
     )
+    record_provider_read_result("gmail_list_recent_messages", result)
+    return result
 
 
 def count_messages(
@@ -2616,12 +2640,14 @@ def count_messages(
     page_size: int = 500,
     max_pages: int = 50,
 ) -> dict[str, Any]:
-    return GmailTool(live=True).count_messages(
+    result = _gmail_read_tool().count_messages(
         label=label,
         query=query,
         page_size=page_size,
         max_pages=max_pages,
     )
+    record_provider_read_result("gmail_count_messages", result)
+    return result
 
 
 def project_message_summaries(
@@ -2633,7 +2659,7 @@ def project_message_summaries(
     page_size: int = 100,
     max_pages: int = 50,
 ) -> dict[str, Any]:
-    return GmailTool(live=True).project_message_summaries(
+    result = _gmail_read_tool().project_message_summaries(
         requested_fields=requested_fields,
         label=label,
         query=query,
@@ -2641,6 +2667,8 @@ def project_message_summaries(
         page_size=page_size,
         max_pages=max_pages,
     )
+    record_provider_read_result("gmail_project_message_summaries", result)
+    return result
 
 
 def search_message_summaries(
@@ -2648,11 +2676,13 @@ def search_message_summaries(
     max_results: int = 10,
     query: str | None = None,
 ) -> list[dict[str, Any]]:
-    return GmailTool(live=True).search_message_summaries(
+    result = _gmail_read_tool().search_message_summaries(
         label=label,
         max_results=max_results,
         query=query,
     )
+    record_provider_read_result("gmail_search_message_summaries", result)
+    return result
 
 
 def batch_get_messages(
@@ -2660,25 +2690,33 @@ def batch_get_messages(
     *,
     skip_blocked: bool = False,
 ) -> list[dict[str, Any]]:
-    return GmailTool(live=True).batch_get_messages(
+    result = _gmail_read_tool().batch_get_messages(
         message_ids=message_ids,
         skip_blocked=skip_blocked,
     )
+    record_provider_read_result("gmail_batch_get_messages", result)
+    return result
 
 
 def list_threads_by_label_filter(label_filter: str, max_results: int = 5) -> list[dict[str, Any]]:
-    return GmailTool(live=True).list_threads_by_label_filter(
+    result = _gmail_read_tool().list_threads_by_label_filter(
         label_filter=label_filter,
         max_results=max_results,
     )
+    record_provider_read_result("gmail_list_threads_by_label_filter", result)
+    return result
 
 
 def get_message(message_id: str) -> dict[str, Any]:
-    return GmailTool(live=True).get_message(message_id=message_id)
+    result = _gmail_read_tool().get_message(message_id=message_id)
+    record_provider_read_result("gmail_get_message", result)
+    return result
 
 
 def get_thread(thread_id: str) -> dict[str, Any]:
-    return GmailTool(live=True).get_thread(thread_id=thread_id)
+    result = _gmail_read_tool().get_thread(thread_id=thread_id)
+    record_provider_read_result("gmail_get_thread", result)
+    return result
 
 
 def apply_labels(

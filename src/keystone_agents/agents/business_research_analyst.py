@@ -51,6 +51,7 @@ from keystone_agents.schemas.company_profile import (
     research_data_point_label,
 )
 from keystone_agents.schemas.contact_context import ContactRecord, CRMAccountContext
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.research import ResearchBrief
 from keystone_agents.sdk import (
     Agent,
@@ -985,6 +986,7 @@ def run_business_research_analyst_sdk(
     context_flags: Mapping[str, bool] | None = None,
     tool_tier: str | int | None = None,
     max_turns: int | None = None,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
     attach_tools: bool = True,
     compact_instructions: bool = False,
 ) -> TypedAgentRunResult[CompanyProfile]:
@@ -993,12 +995,14 @@ def run_business_research_analyst_sdk(
     resolved_tool_tier = tool_tier or _default_business_research_sdk_tool_tier(
         typed_input,
         live=live,
+        manual_request_plan=manual_request_plan,
     )
     typed_input_for_run = _with_runtime_source_layer_policy(typed_input)
     turn_policy = resolve_sdk_turn_policy(
         "business_research_analyst",
         request_text=skill_request_text(typed_input),
         live_search=live,
+        manual_request_plan=manual_request_plan,
         explicit_max_turns=max_turns,
     )
     return run_typed_sdk_agent(
@@ -1028,6 +1032,7 @@ def run_business_research_analyst_focused_brief_sdk(
     session: Any | None = None,
     tool_tier: str | int | None = None,
     max_turns: int | None = None,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
     attach_tools: bool = True,
     compact_instructions: bool = False,
 ) -> TypedAgentRunResult[CompanyResearchFocusedBrief]:
@@ -1036,12 +1041,14 @@ def run_business_research_analyst_focused_brief_sdk(
     resolved_tool_tier = tool_tier or _default_business_research_sdk_tool_tier(
         typed_input,
         live=live,
+        manual_request_plan=manual_request_plan,
     )
     typed_input_for_run = _with_runtime_source_layer_policy(typed_input)
     turn_policy = resolve_sdk_turn_policy(
         "business_research_analyst",
         request_text=skill_request_text(typed_input),
         live_search=live,
+        manual_request_plan=manual_request_plan,
         explicit_max_turns=max_turns,
     )
     return run_typed_sdk_agent(
@@ -1070,6 +1077,7 @@ def run_business_research_analyst_research_brief_sdk(
     session: Any | None = None,
     tool_tier: str | int | None = None,
     max_turns: int | None = None,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
     attach_tools: bool = True,
     compact_instructions: bool = False,
 ) -> TypedAgentRunResult[ResearchBrief]:
@@ -1078,12 +1086,14 @@ def run_business_research_analyst_research_brief_sdk(
     resolved_tool_tier = tool_tier or _default_business_research_sdk_tool_tier(
         typed_input,
         live=live,
+        manual_request_plan=manual_request_plan,
     )
     typed_input_for_run = _with_runtime_source_layer_policy(typed_input)
     turn_policy = resolve_sdk_turn_policy(
         "business_research_analyst",
         request_text=skill_request_text(typed_input),
         live_search=live,
+        manual_request_plan=manual_request_plan,
         explicit_max_turns=max_turns,
     )
     return run_typed_sdk_agent(
@@ -1152,11 +1162,13 @@ def _default_business_research_sdk_tool_tier(
     | str,
     *,
     live: bool,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
 ) -> str:
     """Infer a read-only tool tier for default Business Research SDK runs."""
 
     budget = business_research_quality_budget(
         request_text=skill_request_text(typed_input),
         live_search=live,
+        manual_request_plan=manual_request_plan,
     )
     return budget.tool_tier or "core_read"

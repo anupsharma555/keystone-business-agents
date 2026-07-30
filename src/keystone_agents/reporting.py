@@ -5170,6 +5170,7 @@ def _audit_rows(store: SQLiteStore, limit: int) -> tuple[list[str], list[list[An
             _agent_run_cache_hit_rate(row),
             _agent_run_estimated_cost(row),
             _agent_run_request_cache_label(row),
+            _agent_run_latency_label(row),
             row.get("input_summary"),
             row.get("created_at_et") or row.get("created_at"),
         ]
@@ -5184,6 +5185,7 @@ def _audit_rows(store: SQLiteStore, limit: int) -> tuple[list[str], list[list[An
         "Cache Hit",
         "Est. Cost",
         "Request Cache",
+        "SDK Time",
         "Input Summary",
         "Created ET",
     ], rows
@@ -5226,6 +5228,16 @@ def _agent_run_request_cache_label(row: dict[str, Any]) -> str:
     return f"{static_prefix}; {session}; chars={dynamic_chars}"
 
 
+def _agent_run_latency_label(row: dict[str, Any]) -> str:
+    telemetry = _agent_run_sdk_metrics(row)["execution_telemetry"]
+    duration_ms = _float_or_none(telemetry.get("total_duration_ms"))
+    if duration_ms is None:
+        duration_ms = _float_or_none(telemetry.get("final_response_ms"))
+    if duration_ms is None:
+        return "n/a"
+    return f"{duration_ms / 1000:.2f}s"
+
+
 def _agent_run_sdk_metrics(row: dict[str, Any]) -> dict[str, Any]:
     output = _safe_json_load(row.get("output_json"))
     usage = _as_report_dict(output.get("_sdk_usage")) or _as_report_dict(output.get("usage"))
@@ -5233,6 +5245,7 @@ def _agent_run_sdk_metrics(row: dict[str, Any]) -> dict[str, Any]:
     request_cache = _as_report_dict(output.get("_sdk_request_cache")) or _as_report_dict(
         output.get("request_cache")
     )
+    execution_telemetry = _as_report_dict(output.get("_execution_telemetry"))
     return {
         "usage_available": bool(usage),
         "cost_available": bool(cost.get("estimated_usd", cost.get("amount_usd")) is not None),
@@ -5243,6 +5256,7 @@ def _agent_run_sdk_metrics(row: dict[str, Any]) -> dict[str, Any]:
         "cache_hit_rate": _float_or_none(usage.get("cache_hit_rate")),
         "estimated_usd": _float_or_none(cost.get("estimated_usd", cost.get("amount_usd"))) or 0.0,
         "session_attached": bool(request_cache.get("session_attached")),
+        "execution_telemetry": execution_telemetry,
     }
 
 

@@ -7,6 +7,7 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
+from keystone_agents.execution_telemetry import compact_execution_telemetry
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.temporal_policy import temporal_depth_policy
 
@@ -126,6 +127,9 @@ def _compact_sdk_usage_events(events: Any | None) -> list[dict[str, Any]]:
             value = event.get(key)
             if isinstance(value, Mapping):
                 compact[key] = dict(value)
+        telemetry = compact_execution_telemetry(event.get("execution_telemetry"))
+        if telemetry:
+            compact["execution_telemetry"] = telemetry
         if compact:
             compact_events.append(compact)
     return compact_events

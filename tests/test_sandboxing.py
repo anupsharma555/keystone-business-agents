@@ -95,10 +95,10 @@ def test_sandbox_docs_cover_keystone_use_cases_and_security() -> None:
         assert phrase in text
 
 
-def test_openai_agents_dependency_floor_is_0_14_5() -> None:
+def test_openai_agents_dependency_range_is_0_19() -> None:
     config = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert "openai-agents>=0.14.5" in config["project"]["dependencies"]
+    assert "openai-agents>=0.19.1,<0.20" in config["project"]["dependencies"]
 
 
 def test_sandbox_scaffold_is_import_guarded_when_classes_are_missing(

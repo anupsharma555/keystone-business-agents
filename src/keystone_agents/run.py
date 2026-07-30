@@ -19,6 +19,10 @@ from keystone_agents.costing import (
     estimate_usage_cost,
     gemini_free_tier_usage_context,
 )
+from keystone_agents.execution_telemetry import (
+    ExecutionTelemetryRecorder,
+    compact_execution_telemetry,
+)
 from keystone_agents.local_file_inputs import local_file_input_bundle_from_text
 from keystone_agents.model_provider import (
     GEMINI_PROVIDER,
@@ -33,12 +37,23 @@ from keystone_agents.model_provider import (
 )
 from keystone_agents.models import AgentRunRequest, AgentRunResult, RunMode, TypedAgentRunResult
 from keystone_agents.operator_failures import known_exception_to_operator_failure
+from keystone_agents.provider_read import (
+    ProviderReadPlan,
+    ProviderReadPolicy,
+    activate_provider_read_context,
+)
 from keystone_agents.provider_recovery import (
     ProviderPartialSuccessError,
     ProviderRecoveryStore,
     failure_stage_from_exception,
 )
-from keystone_agents.sdk import AgentLike, repo_instruction_profile_id, run_typed_sdk_sync
+from keystone_agents.sdk import (
+    AgentLike,
+    agent_with_stable_prompt_cache_key,
+    prompt_cache_key_audit_metadata,
+    repo_instruction_profile_id,
+    run_typed_sdk_sync,
+)
 from keystone_agents.sdk_sessions import build_sdk_session_from_env, session_audit_metadata
 from keystone_agents.tool_receipt_journal import (
     instrument_agent_tools,
@@ -75,6 +90,7 @@ class SDKSynthesisOutcome:
     cost: dict[str, Any] = field(default_factory=dict)
     budget_guard: dict[str, Any] = field(default_factory=dict)
     request_cache: dict[str, Any] = field(default_factory=dict)
+    execution_telemetry: dict[str, Any] = field(default_factory=dict)
     provider_usage_context: dict[str, Any] = field(default_factory=dict)
     started_at_unix: float | None = None
     ended_at_unix: float | None = None
@@ -185,6 +201,7 @@ def run_typed_sdk_agent(
 ) -> TypedAgentRunResult[TOutput]:
     """Run an SDK agent through a typed, credential-safe execution path."""
 
+    execution_telemetry = ExecutionTelemetryRecorder()
     if run_config is not None:
         if config is not None:
             model_provider = config.provider
@@ -199,6 +216,11 @@ def run_typed_sdk_agent(
         )
         model_provider = model_config.provider
         model_name = model_config.model
+    agent = agent_with_stable_prompt_cache_key(
+        agent,
+        provider=model_provider,
+        model_name=model_name,
+    )
     resolved_session = session or build_sdk_session_from_env()
     prompt = sdk_input_from_typed_input(typed_input, live=live, provider=model_provider)
     base_prompt = prompt
@@ -239,23 +261,41 @@ def run_typed_sdk_agent(
     while True:
         reset_sdk_search_telemetry()
         set_sdk_search_request_context(audit_prompt)
+        attempt_index = rate_limit_retry_count + structured_output_retry_count + 1
         try:
-            raw_result, output = run_typed_sdk_sync(
-                agent,
-                prompt,
-                output_type,
-                run_config=run_config,
-                live=live,
-                config=config,
-                session=active_session,
-                workflow_name=workflow_name,
-                group_id=group_id,
-                trace_metadata=trace_metadata,
-                tracing_disabled=tracing_disabled,
-                trace_include_sensitive_data=trace_include_sensitive_data,
-                trace_config=trace_config,
-                max_turns=max_turns,
-            )
+            with execution_telemetry.span(
+                "sdk.model_attempt",
+                attempt_index=attempt_index,
+                attributes={
+                    "agent_name": agent.name,
+                    "provider": model_provider,
+                    "model_name": model_name,
+                    "run_mode": model_run_mode,
+                    "live": live,
+                },
+            ):
+                with activate_provider_read_context(
+                    _provider_read_plan_for_agent(
+                        agent.name,
+                        typed_input=typed_input,
+                    )
+                ):
+                    raw_result, output = run_typed_sdk_sync(
+                        agent,
+                        prompt,
+                        output_type,
+                        run_config=run_config,
+                        live=live,
+                        config=config,
+                        session=active_session,
+                        workflow_name=workflow_name,
+                        group_id=group_id,
+                        trace_metadata=trace_metadata,
+                        tracing_disabled=tracing_disabled,
+                        trace_include_sensitive_data=trace_include_sensitive_data,
+                        trace_config=trace_config,
+                        max_turns=max_turns,
+                    )
             search_telemetry = consume_sdk_search_telemetry()
             break
         except Exception as exc:
@@ -296,11 +336,11 @@ def run_typed_sdk_agent(
             else:
                 for tool, prior_is_enabled in temporarily_disabled_tools.values():
                     tool.is_enabled = prior_is_enabled
-                attempt_count = (
-                    rate_limit_retry_count + structured_output_retry_count + 1
-                )
+                failure_telemetry = execution_telemetry.snapshot(
+                    status="failed"
+                ).model_dump(mode="json", by_alias=True)
                 confirmed_provider_requests = (
-                    attempt_count if _provider_response_was_observed(exc) else 0
+                    attempt_index if _provider_response_was_observed(exc) else 0
                 )
                 failure_metadata = {
                     "schema": "keystone.sdk_run_failure.v1",
@@ -309,11 +349,11 @@ def run_typed_sdk_agent(
                     "model": model_name,
                     "run_mode": model_run_mode,
                     "failure_kind": _failure_kind(exc),
-                    "attempt_count": attempt_count,
+                    "attempt_count": attempt_index,
                     "usage": {
                         "available": False,
                         "requests": confirmed_provider_requests,
-                        "model_attempts_started": attempt_count,
+                        "model_attempts_started": attempt_index,
                         "provider_request_count_confirmed": bool(
                             confirmed_provider_requests
                         ),
@@ -338,8 +378,9 @@ def run_typed_sdk_agent(
                     },
                     "request_cache": {
                         **request_cache,
-                        "failed_model_attempts": attempt_count,
+                        "failed_model_attempts": attempt_index,
                     },
+                    "execution_telemetry": failure_telemetry,
                 }
                 guardrail_diagnostics = _sdk_guardrail_failure_diagnostics(exc)
                 if guardrail_diagnostics:
@@ -372,6 +413,7 @@ def run_typed_sdk_agent(
                         rate_limit_retry_count + structured_output_retry_count
                     ),
                     duration_ms=round((time.time() - started_at) * 1000, 3),
+                    execution_telemetry=failure_telemetry,
                 )
                 if recovery_store is not None and recovery_store.receipts:
                     partial_success = recovery_store.mark_failed(
@@ -394,17 +436,32 @@ def run_typed_sdk_agent(
     captured_tool_receipts = tool_receipt_journal()
     output = _attach_retrieval_diagnostics(output, search_telemetry)
     search_diagnostics = sdk_search_diagnostics_from_telemetry(search_telemetry)
-    usage = _extract_sdk_usage(raw_result)
+    usage = _usage_with_explicit_prompt_cache_metadata(
+        _extract_sdk_usage(raw_result),
+        request_cache=request_cache,
+    )
     cost = estimate_usage_cost(provider=model_provider, model=model_name, usage=usage)
     try:
-        budget_guard = enforce_agent_run_budget(
-            agent_name=agent.name,
-            provider=model_provider,
-            model=model_name,
-            cost=cost,
-            strict_unknown_cost=live and run_config is None,
-        )
+        with execution_telemetry.span(
+            "sdk.budget_check",
+            attributes={
+                "agent_name": agent.name,
+                "provider": model_provider,
+                "model_name": model_name,
+                "live": live,
+            },
+        ):
+            budget_guard = enforce_agent_run_budget(
+                agent_name=agent.name,
+                provider=model_provider,
+                model=model_name,
+                cost=cost,
+                strict_unknown_cost=live and run_config is None,
+            )
     except Exception as exc:
+        failure_telemetry = execution_telemetry.snapshot(
+            status="failed"
+        ).model_dump(mode="json", by_alias=True)
         _attach_sdk_run_failure_metadata(
             exc,
             {
@@ -420,6 +477,7 @@ def run_typed_sdk_agent(
                 "usage": usage,
                 "cost": cost,
                 "request_cache": request_cache,
+                "execution_telemetry": failure_telemetry,
             },
         )
         _record_sdk_run_summary_safely(
@@ -439,8 +497,13 @@ def run_typed_sdk_agent(
             failure_kind=_failure_kind(exc),
             retry_count=rate_limit_retry_count + structured_output_retry_count,
             duration_ms=round((time.time() - started_at) * 1000, 3),
+            execution_telemetry=failure_telemetry,
         )
         raise
+    execution_telemetry.mark_final_response()
+    execution_telemetry_payload = execution_telemetry.snapshot(
+        status="completed"
+    ).model_dump(mode="json", by_alias=True)
     _record_sdk_run_summary_safely(
         agent_name=agent.name,
         model_provider=model_provider,
@@ -458,6 +521,7 @@ def run_typed_sdk_agent(
         status="ok",
         retry_count=rate_limit_retry_count + structured_output_retry_count,
         duration_ms=round((time.time() - started_at) * 1000, 3),
+        execution_telemetry=execution_telemetry_payload,
     )
     return TypedAgentRunResult(
         agent_name=agent.name,
@@ -483,8 +547,86 @@ def run_typed_sdk_agent(
                 else {}
             ),
         },
+        execution_telemetry=execution_telemetry_payload,
         tool_receipts=captured_tool_receipts,
     )
+
+
+def _provider_read_plan_for_agent(
+    agent_name: str,
+    *,
+    typed_input: Any = None,
+) -> ProviderReadPlan | None:
+    """Return a bounded request-local read context for direct provider owners."""
+
+    provider_by_agent = {
+        "airtable_context_agent": "airtable",
+        "gmail_triage": "gmail",
+        "google_workspace_context_agent": "google_workspace",
+        "zotero_context_agent": "zotero",
+    }
+    normalized_agent = str(agent_name or "").strip().lower()
+    provider = provider_by_agent.get(normalized_agent)
+    if provider is None and normalized_agent == "chief_of_staff":
+        provider = _chief_single_provider_read(typed_input)
+    if provider is None:
+        return None
+    return ProviderReadPlan(
+        provider=provider,
+        operation="read",
+        resource="agent_request",
+        policy=ProviderReadPolicy(
+            max_items=500,
+            max_pages=50,
+            max_bytes=20 * 1024 * 1024,
+            max_provider_calls=100,
+            timeout_seconds=120.0,
+            max_retries=1,
+            max_concurrency=4,
+        ),
+    )
+
+
+def _chief_single_provider_read(typed_input: Any) -> str | None:
+    """Return one canonical read-only provider owned by a Chief request."""
+
+    if not isinstance(typed_input, Mapping):
+        return None
+    raw_plan = typed_input.get("manual_request_plan")
+    if hasattr(raw_plan, "model_dump"):
+        raw_plan = raw_plan.model_dump(mode="python")
+    if not isinstance(raw_plan, Mapping):
+        return None
+    provider = str(raw_plan.get("provider_system") or "").strip().lower()
+    if provider not in {
+        "airtable",
+        "gmail",
+        "google_calendar",
+        "google_workspace",
+        "zotero",
+    }:
+        return None
+    operations = {
+        str(value or "").strip().lower()
+        for value in (raw_plan.get("provider_operations") or ())
+        if str(value or "").strip()
+    }
+    if not operations or operations.intersection(
+        {
+            "create",
+            "delete",
+            "label",
+            "modify",
+            "post",
+            "remove",
+            "send",
+            "trash",
+            "update",
+            "write",
+        }
+    ):
+        return None
+    return provider
 
 
 def _disable_completed_mutation_tools(
@@ -768,6 +910,30 @@ def _prompt_cache_metadata(raw_result: Any) -> dict[str, Any]:
     return {
         "prompt_cache_key_present": True,
         "prompt_cache_key_hash": digest,
+        "prompt_cache_key_source": "agents_sdk_generated",
+    }
+
+
+def _usage_with_explicit_prompt_cache_metadata(
+    usage: dict[str, Any],
+    *,
+    request_cache: Mapping[str, Any],
+) -> dict[str, Any]:
+    if (
+        not request_cache.get("prompt_cache_key_present")
+        or usage.get("prompt_cache_key_present")
+    ):
+        return usage
+    return {
+        **usage,
+        "prompt_cache_key_present": True,
+        "prompt_cache_key_hash": str(
+            request_cache.get("prompt_cache_key_hash") or ""
+        ),
+        "prompt_cache_key_source": str(
+            request_cache.get("prompt_cache_key_source")
+            or "explicit_static_profile"
+        ),
     }
 
 
@@ -802,6 +968,7 @@ def _sdk_request_cache_metadata(
         "max_turns": max_turns,
         "max_turns_source": "caller" if max_turns is not None else "sdk_default",
         "session_attached": session is not None,
+        **prompt_cache_key_audit_metadata(agent),
         **session_metadata,
         "note": (
             "Fingerprints are audit-safe diagnostics for prompt-cache behavior; raw "
@@ -829,6 +996,7 @@ def _record_sdk_run_summary_safely(
     retry_count: int = 0,
     duration_ms: float | None = None,
     search_diagnostics: dict[str, Any] | None = None,
+    execution_telemetry: Mapping[str, Any] | None = None,
 ) -> None:
     try:
         from keystone_agents.trace_processor import record_sdk_run_summary_trace_event
@@ -855,6 +1023,7 @@ def _record_sdk_run_summary_safely(
             failure_kind=failure_kind,
             retry_count=retry_count,
             duration_ms=duration_ms,
+            execution_telemetry=dict(execution_telemetry or {}),
         )
     except Exception:
         return None
@@ -1034,8 +1203,9 @@ def _sdk_audit_output(
     cost: dict[str, Any],
     budget_guard: dict[str, Any],
     request_cache: dict[str, Any],
+    execution_telemetry: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "result": output,
         "_sdk_model": {
             "provider": model_provider,
@@ -1047,6 +1217,10 @@ def _sdk_audit_output(
         "_sdk_budget_guard": budget_guard,
         "_sdk_request_cache": request_cache,
     }
+    telemetry = compact_execution_telemetry(execution_telemetry)
+    if telemetry:
+        payload["_execution_telemetry"] = telemetry
+    return payload
 
 
 def _today_et() -> str:
@@ -1261,6 +1435,7 @@ def run_retrieved_sdk_synthesis(
             cost=typed_result.cost,
             budget_guard=typed_result.budget_guard,
             request_cache=typed_result.request_cache,
+            execution_telemetry=typed_result.execution_telemetry,
             tool_receipts=typed_result.tool_receipts,
         )
         usage = typed_result.usage or _extract_sdk_usage(typed_result.raw_result)
@@ -1289,6 +1464,7 @@ def run_retrieved_sdk_synthesis(
                 cost=cost,
                 budget_guard=typed_result.budget_guard,
                 request_cache=typed_result.request_cache,
+                execution_telemetry=typed_result.execution_telemetry,
             )
             storage_results["agent_run"] = storage.save_agent_run(
                 agent_name=agent.name,
@@ -1349,6 +1525,7 @@ def run_retrieved_sdk_synthesis(
         cost=cost,
         budget_guard=typed_result.budget_guard,
         request_cache=typed_result.request_cache,
+        execution_telemetry=typed_result.execution_telemetry,
         provider_usage_context=provider_usage_context,
         started_at_unix=started_at,
         ended_at_unix=time.time(),

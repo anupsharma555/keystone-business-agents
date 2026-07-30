@@ -326,6 +326,64 @@ def test_specialist_live_dispatch_preserves_bounded_thread_context(
     assert captured["kwargs"]["execution_context"] == execution_context
 
 
+def test_workspace_read_dispatches_to_context_agent_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = (
+        "Google Workspace Context Agent, find README.doc in KNIOps, read it, and "
+        "summarize its purpose and operating model without changing anything."
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="google_workspace_context_agent",
+        target_agent="google_workspace_context_agent",
+        intent="context_lookup",
+        task_objective="context_lookup",
+        expected_artifact_type="context_summary",
+        provider_system="google_workspace",
+        provider_operations=["read"],
+        primary_target="README.doc in KNIOps",
+        target_type="business_system_context",
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(
+            source_type_preference=["google_document"],
+            permission_state="read_only",
+        ),
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        cli,
+        "_run_direct_supplied_context_response_live",
+        lambda *_args, **_kwargs: pytest.fail(
+            "provider-backed Workspace reads must not use the tool-free response lane"
+        ),
+    )
+
+    def fake_context_agent(
+        selected_route: str,
+        input_text: str,
+        **kwargs: object,
+    ) -> int:
+        captured.update(route=selected_route, input_text=input_text, kwargs=kwargs)
+        return 23
+
+    monkeypatch.setattr(cli, "_run_ask_context_agent_live", fake_context_agent)
+
+    assert (
+        cli._run_ask_specialist_live(
+            "google_workspace_context_agent",
+            request,
+            json_output=True,
+            manual_plan=plan,
+        )
+        == 23
+    )
+    assert captured["route"] == "google_workspace_context_agent"
+    assert captured["input_text"] == request
+    assert captured["kwargs"]["manual_plan"] == plan
+
+
 def test_direct_response_prompt_keeps_current_request_authoritative() -> None:
     typed_input = DirectAgentResponseInput(
         requested_agent="business_research_analyst",
