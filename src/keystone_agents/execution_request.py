@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import html
+import json
 import re
+from collections.abc import Mapping
 from typing import cast
 
 from keystone_agents.agent_mentions import parse_agent_mention
 from keystone_agents.presentation.public_result import attach_execution_public_result
+from keystone_agents.runtime.continuation import (
+    attach_verified_continuation_objects,
+)
 from keystone_agents.schemas.execution_request import (
+    ContinuationObjectReference,
     ExecutionContinuation,
     ExecutionEntrypoint,
     ExecutionRequest,
@@ -111,20 +117,38 @@ def execution_request_planning_text(request: ExecutionRequest) -> str:
     # prose may describe a failed route and must not become task authority.
     if request.continuation.provider_affinity:
         prior_result = ""
-    if not prior_request and not prior_result:
+    verified_objects = request.continuation.verified_objects
+    if not prior_request and not prior_result and not verified_objects:
         return current
     parts: list[str] = []
     if prior_request:
         parts.append(prior_request)
     if prior_result:
         parts.append(f"Prior result for context: {prior_result}")
+    parts.extend(
+        _verified_object_planning_line(reference)
+        for reference in verified_objects
+    )
     if current:
         parts.append(f"Authoritative follow-up: {current}")
     return "\n".join(parts)
 
 
 def _normalized_request_identity(value: str) -> str:
-    return " ".join(str(value or "").casefold().split())
+    return normalize_slack_operator_turn_identity(value)
+
+
+def normalize_slack_operator_turn_identity(value: object) -> str:
+    """Normalize transport-only Slack mention decoration for turn equality."""
+
+    clean = html.unescape(str(value or "").strip())
+    clean = re.sub(
+        r"^\s*(?:<@[^>]+>|@KNI\b|@(?=\s))\s*",
+        "",
+        clean,
+        flags=re.IGNORECASE,
+    )
+    return " ".join(clean.casefold().split())
 
 
 def continuation_owner_advice(
@@ -216,7 +240,92 @@ def _slack_continuation(
         prior_request=prior_requests[-1] if prior_requests else "",
         prior_result_title=prior_titles[-1] if prior_titles else "",
         prior_result_summary=prior_results[-1] if prior_results else "",
+        verified_objects=verified_continuation_objects(raw_request),
     )
+
+
+def verified_continuation_objects(
+    raw_request: str,
+) -> tuple[ContinuationObjectReference, ...]:
+    """Return non-authoritative object hints from a continuation envelope."""
+
+    references: list[ContinuationObjectReference] = []
+    for raw_value in _all_envelope_values(raw_request, "Previous verified objects"):
+        try:
+            parsed = json.loads(raw_value)
+        except json.JSONDecodeError:
+            continue
+        values = parsed if isinstance(parsed, list) else [parsed]
+        for value in values:
+            if not isinstance(value, Mapping):
+                continue
+            try:
+                reference = ContinuationObjectReference.model_validate(value)
+            except ValueError:
+                continue
+            reference = reference.model_copy(
+                update={
+                    "object_id": "",
+                    "provider_scope": {},
+                    "verification_status": "unverified",
+                }
+            )
+            if reference not in references:
+                references.append(reference)
+    if references:
+        return tuple(references[:8])
+
+    prior_results = _all_envelope_values(raw_request, "Previous result")
+    calendar_pattern = re.compile(
+        r"\bGoogle Calendar event\s+"
+        r"(?P<operation>created|updated|deleted)\s+and\s+verified\s*:\s*"
+        r"[\"“](?P<title>.+?)[\"”]"
+        r"(?:\s+on\s+(?P<date>20\d{2}-\d{2}-\d{2}))?",
+        re.IGNORECASE,
+    )
+    for result in reversed(prior_results):
+        match = calendar_pattern.search(result)
+        if not match:
+            continue
+        operation = match.group("operation").lower()
+        return (
+            ContinuationObjectReference(
+                provider_system="google_calendar",
+                object_type="calendar_event",
+                display_name=match.group("title").strip(),
+                effective_date=str(match.group("date") or ""),
+                lifecycle_state="deleted" if operation == "deleted" else "active",
+                verification_status="unverified",
+            ),
+        )
+    return ()
+
+
+def _verified_object_planning_line(
+    reference: ContinuationObjectReference,
+) -> str:
+    fields = [
+        f"provider={reference.provider_system}",
+        f"type={reference.object_type}",
+        f"state={reference.lifecycle_state}",
+        f"verification={reference.verification_status}",
+    ]
+    if reference.object_id:
+        fields.append(f"id={reference.object_id}")
+    if reference.display_name:
+        fields.append(f"name={reference.display_name}")
+    if reference.effective_date:
+        fields.append(f"date={reference.effective_date}")
+    fields.extend(
+        f"scope.{key}={value}"
+        for key, value in sorted(reference.provider_scope.items())
+    )
+    prefix = (
+        "Prior verified object for context"
+        if reference.verification_status == "verified"
+        else "Unverified prior object hint"
+    )
+    return f"{prefix}: " + ", ".join(fields)
 
 
 def _slack_envelope_prior_agent(raw_request: str) -> str:
@@ -239,7 +348,8 @@ def _all_envelope_values(raw_request: str, label: str) -> list[str]:
         r"(?=\s+(?:Current user request \(authoritative\):|Linked WorkItem:|"
         r"Prior task owner \(advisory\):|Provider affinity:|Previous request:|"
         r"Previous result title:|"
-        r"Previous result:|User follow-up:|Continue the same agent task\b)|$)"
+        r"Previous result:|Previous verified objects:|User follow-up:|"
+        r"Continue the same agent task\b)|$)"
     )
     return [
         _strip_slack_entrypoint_decoration(" ".join(match.group(1).split()))
@@ -264,10 +374,13 @@ def _strip_slack_entrypoint_decoration(value: str) -> str:
 
 
 __all__ = [
+    "attach_verified_continuation_objects",
     "attach_execution_public_result",
     "build_execution_request",
     "continuation_owner_advice",
     "execution_request_planning_text",
     "latest_slack_operator_request",
+    "normalize_slack_operator_turn_identity",
     "slack_work_item_control_requested",
+    "verified_continuation_objects",
 ]

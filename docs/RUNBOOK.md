@@ -74,17 +74,29 @@ dry-run previews, secret handling, and approval/audit coverage.
 
 ## Agents SDK Baseline
 
-Install `openai-agents>=0.14.5`. The 0.14.5 line is the current Keystone baseline because it
-contains the Python SDK tracing/runtime fields used here plus the beta sandbox agent and
-human-in-the-loop fixes documented in `docs/SANDBOX_AGENTS.md`.
+Install the repository dependency set with `.venv/bin/python -m pip install -e ".[dev]"`;
+do not install an unbounded Agents SDK version separately. `pyproject.toml` is authoritative:
+Keystone currently requires `openai-agents>=0.19.1,<0.20`. Version `0.19.1` is the validated
+minimum and is installed in the active `.venv` as of 2026-07-30. The upper bound prevents an
+untested `0.20` upgrade while allowing reviewed `0.19.x` patch releases.
+
+Confirm the exact runtime version after installation or dependency changes:
+
+```bash
+.venv/bin/python -c 'from importlib.metadata import version; print(version("openai-agents"))'
+```
+
+The 0.19 baseline has been exercised through deterministic SDK-contract tests and bounded live
+direct-agent and LangGraph runs. Re-run those gates before widening the compatibility range.
+Optional sandbox behavior remains import-guarded as documented in `docs/SANDBOX_AGENTS.md`.
 
 Gemini compatibility uses Google's direct OpenAI-compatible endpoint by default through the
 existing OpenAI Agents SDK provider path. LiteLLM remains optional as an external gateway, not
 the in-process Python `litellm` package. Run the LiteLLM proxy in a separate environment or
 container only when needed, then set `LITELLM_BASE_URL` or the relevant `KEYSTONE_*_BASE_URL`.
 Do not install `litellm` into the Keystone `.venv` unless its OpenAI Python dependency range is
-compatible with `openai-agents>=0.14.5`; the health check reports an in-process LiteLLM package
-that pins `openai` exactly.
+compatible with the authoritative `openai-agents` range in `pyproject.toml`; the health check
+reports an in-process LiteLLM package that pins `openai` exactly.
 
 Keystone builds `RunConfig` through `src/keystone_agents/sdk.py` instead of constructing it
 inline in agents. Keep live traces named with `KEYSTONE_TRACE_WORKFLOW_NAME`, group related runs

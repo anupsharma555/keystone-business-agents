@@ -310,14 +310,21 @@ def _budget_for_mode(mode: QualityMode, *, notes: list[str]) -> AgentQualityBudg
             max_turns=4,
             reasoning_effort="low",
             verbosity="low",
-            max_tokens=2500,
+            max_tokens=4000,
             max_review_passes=0,
             max_tool_calls=6,
             max_seconds=45,
             tool_tier="core_read",
             enable_synthesis_review=False,
             enable_context_deepening=False,
-            notes=notes,
+            notes=[
+                *notes,
+                (
+                    "Fast mode retains a structured-output ceiling sized for the "
+                    "Chief of Staff canonical schema; speed comes from fewer turns "
+                    "and tools, not truncating the required result contract."
+                ),
+            ],
         )
     if mode == QualityMode.DEEP:
         return AgentQualityBudget(

@@ -1977,6 +1977,7 @@ class GmailTool:
             "status": "message_state_modified" if passed else "verification_failed",
             "message_id": clean_id,
             "thread_id": str(after.get("threadId") or before.get("threadId") or ""),
+            "gmail_account": expected,
             "operation": operation,
             "label": clean_label,
             "before_label_ids": before_labels,

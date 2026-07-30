@@ -1149,6 +1149,23 @@ def test_call_prep_uses_only_source_backed_internal_context() -> None:
     )
 
 
+def test_fixture_bounds_long_workflow_objective_before_building_email() -> None:
+    long_objective = " ".join(
+        ["Draft a careful follow-up that preserves every workflow constraint"] * 60
+    )
+
+    draft = compose_outreach_draft_fixture(
+        company_profile=load_company_profile("sample_company_curebase"),
+        opportunity_record=load_opportunity_record("sample_lead_curebase"),
+        outreach_goal=long_objective,
+    )
+
+    assert len(draft.outreach_goal.split()) <= 32
+    assert len(draft.email_body.split()) <= 180
+    assert draft.approval_required is True
+    assert draft.send_enabled is False
+
+
 def test_call_prep_excludes_unbacked_personalization() -> None:
     draft = compose_outreach_draft_fixture(
         company_profile=load_company_profile("sample_company_curebase"),
@@ -1290,6 +1307,48 @@ def test_cli_sdk_missing_approved_context_returns_blocked_result(
     assert payload.send_enabled is False
 
 
+def test_cli_sdk_failure_returns_structured_no_side_effect_payload(
+    monkeypatch,
+    capsys,
+) -> None:
+    import scripts.run_outreach_draft as cli
+
+    class FakeSDKFailure(RuntimeError):
+        pass
+
+    failure = FakeSDKFailure("guardrail rejected output")
+    failure.keystone_sdk_run_failure = {
+        "schema": "keystone.sdk_run_failure.v1",
+        "run_mode": "live_sdk",
+        "failure_kind": "output_guardrail_tripwire_triggered",
+        "usage": {"available": False, "requests": 1},
+        "cost": {"available": False},
+        "request_cache": {"failed_model_attempts": 1},
+        "guardrail": {
+            "risk_flags": ["unsupported_claim"],
+            "reasons": ["unsupported outreach claim: proven results"],
+        },
+    }
+
+    def fake_run_sdk_synthesis(args):
+        raise failure
+
+    monkeypatch.setattr(cli, "_run_sdk_synthesis", fake_run_sdk_synthesis)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_outreach_draft.py", "--live-sdk", "--json"],
+    )
+
+    assert cli.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "failed"
+    assert payload["usage"]["requests"] == 1
+    assert payload["sdk_failure"]["guardrail"]["risk_flags"] == ["unsupported_claim"]
+    assert payload["draft_created"] is False
+    assert payload["send_enabled"] is False
+
+
 def test_cli_run_sdk_can_return_multiple_validated_variants(monkeypatch, capsys) -> None:
     import scripts.run_outreach_draft as cli
 
@@ -1408,6 +1467,7 @@ def test_cli_run_sdk_can_return_multiple_validated_variants(monkeypatch, capsys)
 def test_cli_live_sdk_uses_single_pass_variant_synthesis(monkeypatch, capsys) -> None:
     import scripts.run_outreach_draft as cli
 
+    monkeypatch.setenv("KEYSTONE_OPENAI_API_KEY", "test-only-openai-key")
     calls: list[tuple[bool, list[str]]] = []
     company_profile = load_research_brief_profile("sample_company_curebase_research_brief")
     approved_context = build_approved_outreach_drafting_context(

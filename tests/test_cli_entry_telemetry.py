@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 from types import SimpleNamespace
 
 import keystone_agents.cli as cli
+import keystone_agents.config as config_module
 from keystone_agents.execution_telemetry import ExecutionTelemetryRecorder
 from keystone_agents.schemas.work_item import (
     WorkflowRunResult,
@@ -118,6 +120,47 @@ def test_explicit_work_item_entry_owns_the_same_output_observer(
     assert capsys.readouterr().out == "work item complete\n"
     assert persisted[0]["status"] == "completed"
     assert cli._ASK_ENTRY_TELEMETRY.get() is None
+
+
+def test_live_work_item_entry_loads_and_restores_repo_environment(
+    monkeypatch,
+    capsys,
+) -> None:
+    loads: list[tuple[str, bool]] = []
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+
+    def fake_load_settings(
+        env_file: str = ".env",
+        *,
+        force_dotenv: bool = False,
+    ) -> SimpleNamespace:
+        loads.append((env_file, force_dotenv))
+        os.environ["KEYSTONE_OPENAI_API_KEY"] = "test-only-kba-key"
+        return SimpleNamespace()
+
+    def fake_advance(_args) -> int:
+        assert os.environ["KEYSTONE_OPENAI_API_KEY"] == "test-only-kba-key"
+        print("live work item complete")
+        return 0
+
+    monkeypatch.setattr(config_module, "load_settings", fake_load_settings)
+    monkeypatch.setattr(
+        cli,
+        "_run_work_items_advance_with_current_environment",
+        fake_advance,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_persist_entry_execution_telemetry",
+        lambda _scope, _telemetry: None,
+    )
+    args = _args()
+    args.live_sdk = True
+
+    assert cli._run_work_items_advance(args) == 0
+    assert capsys.readouterr().out == "live work item complete\n"
+    assert loads == [(".env", True)]
+    assert "KEYSTONE_OPENAI_API_KEY" not in os.environ
 
 
 def test_work_item_entry_timing_is_persisted_as_content_free_event(

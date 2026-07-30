@@ -867,6 +867,9 @@ def _research_selected_targets(
             agents_web_search_max_calls=agents_web_search_max_calls,
             agents_web_search_parallel=False,
             retrieval_hint=retrieval_hint,
+            retrieval_deadline_seconds=(
+                quality_budget.max_seconds if quality_budget is not None else None
+            ),
         )
         return _packet_from_profile(plan, candidate, profile, metadata)
 

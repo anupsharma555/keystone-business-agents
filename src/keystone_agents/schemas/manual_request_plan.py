@@ -354,7 +354,8 @@ class ManualRequestPlan(BaseModel):
         default=False,
         description=(
             "True only when the operator explicitly bounded the number of domain "
-            "results; false when desired_count is merely the schema default."
+            "results or provider objects to read or change; false when desired_count "
+            "is merely the schema default or a response-format count."
         ),
     )
     constraints: list[str] = Field(default_factory=list)

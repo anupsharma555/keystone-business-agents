@@ -14,6 +14,9 @@ from keystone_agents.authority.semantic import (
 )
 from keystone_agents.presentation.consistency import reconcile_failed_review
 from keystone_agents.receipts.mutations import receipt_reports_possible_write
+from keystone_agents.runtime.continuation import (
+    attach_verified_continuation_objects,
+)
 from keystone_agents.schemas.execution_request import (
     ExecutionPublicResult,
     ExecutionResultStatus,
@@ -101,16 +104,27 @@ def attach_execution_public_result(
         )
     )
     failed = raw_status in {"failed", "timeout", "error"}
-    blocked = raw_status in {"blocked", "needs_context", "needs_approval"}
+    approval_pending = raw_status == "needs_approval"
+    blocked = raw_status in {"blocked", "needs_context"}
+    recovery_completion_confirmed = bool(
+        payload.get("recovery_completion_confirmed")
+    )
     completion_confirmed = bool(
         payload.get("completion_confirmed")
         if "completion_confirmed" in payload
         else text and not failed and not blocked and not clarification
     )
-    if failed or blocked or clarification:
+    if (
+        failed
+        or blocked
+        or approval_pending
+        or clarification
+        or (recovery_used and not recovery_completion_confirmed)
+    ):
         completion_confirmed = False
 
     receipts = _payload_receipts(payload)
+    attach_verified_continuation_objects(payload, receipts)
     write_receipts = [receipt for receipt in receipts if _receipt_is_write(receipt)]
     side_effects = payload.get("side_effects")
     side_effect_mapping = side_effects if isinstance(side_effects, Mapping) else {}
@@ -153,18 +167,22 @@ def attach_execution_public_result(
         status = "failed"
     elif clarification:
         status = "needs_input"
+    elif approval_pending:
+        status = "needs_approval"
     elif blocked:
         status = "blocked"
     elif recovery_used and completion_confirmed:
         status = "recovered"
+    elif recovery_used:
+        status = "partial"
     elif completion_confirmed:
         status = "completed"
     else:
         status = "blocked"
 
     recovery_notice = (
-        "Chief's structured result could not be validated. This answer was recovered "
-        "through the safe fallback; no additional provider action was taken."
+        "Chief's structured result could not be validated. A safe deterministic "
+        "fallback is shown for review, but the requested live result is not confirmed."
         if recovery_used
         else ""
     )
@@ -178,16 +196,26 @@ def attach_execution_public_result(
         or output_failure_mapping.get("code")
         or ""
     ).strip()
-    failure_summary = (
-        text if status in {"failed", "blocked", "needs_input"} else ""
-    )
-    title = str(payload.get("slack_display_title") or "").strip() or {
+    failure_summary = text if status in {"failed", "blocked", "needs_input"} else ""
+    if status == "partial":
+        failure_summary = (
+            "The live structured-output stage failed; the displayed fallback is "
+            "reviewable but does not confirm live completion."
+        )
+    default_title = {
         "completed": "Business Agents Result Ready",
         "recovered": "Business Agents Result Recovered",
+        "partial": "Business Agents Partial Result",
+        "needs_approval": "Business Agents Awaiting Approval",
         "needs_input": "Business Agents Need Input",
         "blocked": "Business Agents Blocked",
         "failed": "Business Agents Run Failed",
     }[status]
+    title = (
+        default_title
+        if status in {"partial", "needs_approval"}
+        else str(payload.get("slack_display_title") or "").strip() or default_title
+    )
     result = ExecutionPublicResult(
         status=status,
         title=title,

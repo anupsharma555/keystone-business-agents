@@ -30,6 +30,7 @@ from keystone_agents.planning.decision_cache import (
     planner_profile_fingerprint,
 )
 from keystone_agents.run import run_typed_sdk_agent
+from keystone_agents.schemas.execution_request import ContinuationObjectReference
 from keystone_agents.schemas.manual_request_plan import (
     ManualProviderResultSetScope,
     ManualRequestPlan,
@@ -419,6 +420,24 @@ def _compact_manual_planner_context(
             )
             if str(execution_continuation.get(key) or "").strip()
         }
+        raw_verified_objects = execution_continuation.get("verified_objects")
+        if isinstance(raw_verified_objects, list | tuple):
+            verified_objects: list[dict[str, Any]] = []
+            for value in raw_verified_objects:
+                if not isinstance(value, Mapping):
+                    continue
+                try:
+                    reference = ContinuationObjectReference.model_validate(value)
+                except (TypeError, ValueError):
+                    continue
+                if reference.verification_status != "verified":
+                    continue
+                verified_objects.append(reference.model_dump(mode="json"))
+                if len(verified_objects) >= 8:
+                    break
+            if verified_objects:
+                compact_continuation["verified_objects"] = verified_objects
+                receipt["verified_provider_objects_retained"] = len(verified_objects)
         if compact_continuation:
             compact["execution_continuation"] = compact_continuation
     if len(receipt) > 1:

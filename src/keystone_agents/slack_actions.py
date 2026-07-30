@@ -30,6 +30,7 @@ from keystone_agents.planning.compatibility import (
     infer_manual_request_plan,
     live_search_allowed_for_execution,
 )
+from keystone_agents.schemas.execution_request import ContinuationObjectReference
 from keystone_agents.schemas.manual_request_plan import ManualProviderResultSetScope
 from keystone_agents.schemas.work_item import WorkflowRunRequest
 from keystone_agents.sdk_sessions import build_sdk_session, resolve_sdk_session_spec
@@ -1958,10 +1959,12 @@ def orchestrator_workflow_state_from_slack_context(
         return {}
     state = {
         "slack_context": {
+            "team_id": context.team_id,
             "channel_id": context.channel_id,
             "channel_name": context.channel_name,
             "selected_message_ts": context.selected_message_ts,
             "thread_ts": context.thread_ts,
+            "request_ts": context.selected_message_ts,
             "thread_fetch_status": context.thread_fetch_status,
             "permalink": context.permalink,
             "warnings": context.warnings,
@@ -1971,6 +1974,15 @@ def orchestrator_workflow_state_from_slack_context(
             {
                 "id": message.ts,
                 "source_agent": message.user_id or message.username,
+                "role": (
+                    "agent"
+                    if bool(message.metadata.get("is_bot"))
+                    else "operator"
+                ),
+                "text": _clean_text(
+                    _prompt_safe_slack_message_text(message),
+                    max_chars=320,
+                ),
                 "summary": _clean_text(
                     _prompt_safe_slack_message_text(message),
                     max_chars=320,
@@ -2212,6 +2224,8 @@ def latest_verified_provider_result_scope_for_slack_thread(
     channel_id: str,
     thread_ts: str,
     database_url: str | None,
+    team_id: str = "",
+    before_request_ts: str = "",
 ) -> ManualProviderResultSetScope | None:
     """Resolve the newest verified provider scope persisted for one Slack thread.
 
@@ -2221,30 +2235,119 @@ def latest_verified_provider_result_scope_for_slack_thread(
     on an adapter-specific run id being forwarded on every follow-up.
     """
 
-    wanted_channel = str(channel_id or "").strip()
-    wanted_thread = str(thread_ts or "").strip()
-    if not wanted_channel or not wanted_thread:
-        return None
-    try:
-        rows = SQLiteStore(database_url).fetch_all("agent_runs")
-    except (OSError, ValueError, sqlite3.Error):
-        return None
-    for row in reversed(rows):
-        payload = _agent_run_output_payload(row)
-        provenance = payload.get("slack_run_provenance")
-        if not isinstance(provenance, dict):
-            provenance = payload.get("run_provenance")
-        if not isinstance(provenance, dict):
-            continue
-        if (
-            str(provenance.get("channel_id") or "").strip() != wanted_channel
-            or str(provenance.get("thread_ts") or "").strip() != wanted_thread
-        ):
-            continue
+    rows = _trusted_slack_thread_agent_runs(
+        team_id=team_id,
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+        before_request_ts=before_request_ts,
+        database_url=database_url,
+    )
+    for row in rows:
         scope = _verified_provider_result_scope_from_agent_run(row)
         if scope is not None:
             return scope
     return None
+
+
+def latest_verified_provider_objects_for_slack_thread(
+    *,
+    channel_id: str,
+    thread_ts: str,
+    database_url: str | None,
+    team_id: str = "",
+    before_request_ts: str = "",
+) -> tuple[ContinuationObjectReference, ...]:
+    """Resolve causally prior exact provider-object state for one Slack thread."""
+
+    rows = _trusted_slack_thread_agent_runs(
+        team_id=team_id,
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+        before_request_ts=before_request_ts,
+        database_url=database_url,
+    )
+    references: list[ContinuationObjectReference] = []
+    seen_objects: set[tuple[str, str, str]] = set()
+    for row in rows:
+        row_references = _verified_provider_objects_from_agent_run(row)
+        for reference in row_references:
+            identity = (
+                reference.provider_system,
+                reference.object_type,
+                reference.object_id,
+            )
+            if identity in seen_objects:
+                continue
+            seen_objects.add(identity)
+            references.append(reference)
+            if len(references) >= 8:
+                return tuple(references)
+    return tuple(references)
+
+
+def _trusted_slack_thread_agent_runs(
+    *,
+    team_id: str,
+    channel_id: str,
+    thread_ts: str,
+    before_request_ts: str,
+    database_url: str | None,
+) -> list[dict[str, Any]]:
+    """Return verified live rows ordered by Slack request time, not completion."""
+
+    wanted_team = str(team_id or "").strip()
+    wanted_channel = str(channel_id or "").strip()
+    wanted_thread = str(thread_ts or "").strip()
+    before_key = _slack_timestamp_key(before_request_ts)
+    if (
+        not wanted_team
+        or not wanted_channel
+        or not wanted_thread
+        or before_key is None
+    ):
+        return []
+    try:
+        rows = SQLiteStore(database_url).fetch_all("agent_runs")
+    except (OSError, ValueError, sqlite3.Error):
+        return []
+    matched: list[tuple[tuple[int, int], int, dict[str, Any]]] = []
+    for row in rows:
+        if bool(row.get("dry_run")):
+            continue
+        if str(row.get("status") or "").strip().lower() != "success":
+            continue
+        payload = _agent_run_output_payload(row)
+        provenance = payload.get("slack_run_provenance")
+        if not isinstance(provenance, dict):
+            continue
+        if (
+            provenance.get("schema") != "keystone.slack.run_provenance.v1"
+            or provenance.get("context_validated") is not True
+            or str(provenance.get("team_id") or "").strip() != wanted_team
+            or str(provenance.get("channel_id") or "").strip() != wanted_channel
+            or str(provenance.get("thread_ts") or "").strip() != wanted_thread
+        ):
+            continue
+        request_key = _slack_timestamp_key(provenance.get("request_ts"))
+        if request_key is None or request_key >= before_key:
+            continue
+        try:
+            row_id = int(row.get("id") or 0)
+        except (TypeError, ValueError):
+            row_id = 0
+        matched.append((request_key, row_id, row))
+    matched.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [row for _request_key, _row_id, row in matched]
+
+
+def _slack_timestamp_key(value: object) -> tuple[int, int] | None:
+    """Parse Slack's decimal timestamp without lossy float conversion."""
+
+    raw = str(value or "").strip()
+    if not re.fullmatch(r"\d+(?:\.\d+)?", raw):
+        return None
+    seconds, _, fraction = raw.partition(".")
+    return int(seconds), int((fraction + "000000")[:6])
 
 
 def _agent_run_output_payload(row: dict[str, Any]) -> dict[str, Any]:
@@ -2258,6 +2361,45 @@ def _agent_run_output_payload(row: dict[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _verified_provider_objects_from_agent_run(
+    row: dict[str, Any],
+) -> tuple[ContinuationObjectReference, ...]:
+    """Accept exact object identity only from a completed verified public result."""
+
+    if bool(row.get("dry_run")):
+        return ()
+    if str(row.get("status") or "").strip().lower() != "success":
+        return ()
+    payload = _agent_run_output_payload(row)
+    public_result = payload.get("public_result")
+    if not isinstance(public_result, dict):
+        return ()
+    if public_result.get("completion_confirmed") is not True:
+        return ()
+    if str(public_result.get("status") or "").strip().lower() not in {
+        "verified",
+        "completed",
+        "recovered",
+    }:
+        return ()
+    raw_references = payload.get("continuation_objects")
+    if not isinstance(raw_references, list | tuple):
+        return ()
+    references: list[ContinuationObjectReference] = []
+    for value in raw_references:
+        if not isinstance(value, dict):
+            continue
+        try:
+            reference = ContinuationObjectReference.model_validate(value)
+        except (TypeError, ValueError):
+            continue
+        if reference.verification_status != "verified":
+            continue
+        if reference not in references:
+            references.append(reference)
+    return tuple(references[:8])
 
 
 def _verified_provider_result_scope_from_agent_run(

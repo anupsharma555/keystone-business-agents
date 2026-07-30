@@ -1235,6 +1235,7 @@ def airtable_write_record_impl(
     return {
         "status": "success",
         "operation": "update" if clean_record_id else "create",
+        "base_alias": str(config.get("base_alias") or base_alias or "").strip(),
         "table": table_name,
         "record_id": written_record_id,
         "provider_link": (
@@ -3340,6 +3341,12 @@ def google_doc_write_impl(
         "content_mode": normalized_mode,
         "provider_verification": "passed",
         "content_verified": True,
+        "verification": {
+            "status": "verified",
+            "passed": True,
+            "document_id_match": bool(target_id),
+            "content_match": True,
+        },
         "url": f"https://docs.google.com/document/d/{target_id}/edit",
         "provider_link": f"https://docs.google.com/document/d/{target_id}/edit",
         "folder_path": target_folder_path,

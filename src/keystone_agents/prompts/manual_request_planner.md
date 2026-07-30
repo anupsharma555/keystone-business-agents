@@ -65,6 +65,12 @@ Slack operations, or research). Do not require the operator to repeat the
 source name or provider ID when the context identifies one object. If context
 identifies zero or multiple plausible objects, use clarification. Context never
 waives approval, live-write, exact-match, or provider read-back gates.
+When `execution_continuation.verified_objects` is present, use only entries with
+`verification_status=verified` as provider identity evidence. Preserve the exact
+object ID and provider scope for the selected object, including through an agent
+change. Its prior lifecycle state does not authorize a new operation: the latest
+operator request alone supplies the requested read or mutation, and a deleted
+object must not be treated as active.
 
 When `execution_continuation.prior_agent` is present, treat it as advisory task
 continuity, not as an explicit agent command. Retain that owner for a revision,
@@ -129,6 +135,25 @@ contract, not permission to execute. Use the most specific stable object:
 Use `unspecified` only when the object genuinely cannot be resolved from the
 current turn and bounded context. Do not infer an object from quoted,
 historical, negated, or example text.
+
+For a single provider-object action, emit one primary mutation. Creating an
+object with its requested title, date, notes, attendees, fields, or other
+initial values is one `create`; those initial fields are not separate `update`
+or `attach` operations. Use `update` only when the operator asks to change an
+already-existing provider object. Emit multiple mutation steps only when the
+operator explicitly requests a multi-call lifecycle such as create-then-revise
+or create-then-delete. In that explicit lifecycle, order the mutation steps as
+they must execute; the first mutation is the primary action.
+
+Keep the typed write contract internally consistent. When
+`intent=business_system_write`, `task_objective=business_system_write`,
+`side_effect_policy=internal_write_approval_required`, and
+`provider_operations` plus `provider_action_steps` include a mutation, set
+`ask_shape.permission_state=approval_required`, not `read_only`. This does not
+approve the action: Python still enforces exact provider identity, authenticated
+operator scope, live-write flags, safety gates, and provider read-back. Reserve
+`permission_state=read_only` for plans whose admitted provider operations are
+only `read`, `search`, and `verify`.
 
 Copy explicit negative clauses such as "do not send", "without modifying
 Zotero", "never post", or "no outreach or CRM write" into `constraints` as
@@ -316,14 +341,20 @@ Populate:
   opportunities; it should become `source_summary` when the request asks for
   summaries, highlights, recaps, takeaways, analysis, or a research brief about
   the meeting.
-- `desired_count` from domain-result requests like "find 5 companies"; otherwise
-  use 1. Response cardinality such as "three bullets" or "one sentence" belongs
-  only in `ask_shape.output_constraints` and must not change retrieval breadth.
+- `desired_count` from explicitly bounded domain-result requests like "find 5
+  companies" and explicitly bounded provider-object actions like "delete both
+  matching events" or "update these two records"; otherwise use 1. Treat
+  `both` as an exact count of 2 only when it quantifies the provider objects
+  being read or changed. Response cardinality such as "three bullets" or "one
+  sentence" belongs only in `ask_shape.output_constraints` and must not change
+  retrieval or mutation breadth.
 - Set `desired_count_explicit=true` only when the operator explicitly bounded
-  the number of domain results, such as "show 3 emails" or "find 5 companies."
-  Keep it false for the schema default and for response-only counts such as
-  "three bullets." Collection executors use this field to distinguish a real
-  provider limit from the default value 1.
+  the number of domain results or provider objects, such as "show 3 emails,"
+  "find 5 companies," or "delete both matching events." Keep it false for the
+  schema default, unbounded plural words such as "these events," and
+  response-only counts such as "three bullets." Provider collection and
+  mutation executors use this field to distinguish an exact operator-approved
+  cardinality from the default value 1.
 - `constraints` with relevant terms such as current, U.S.-relevant, behavioral
   health, psychiatry, clinical AI, conference, implementation, advisory.
 - `required_entities` for named entities that retrieved sources must match, such

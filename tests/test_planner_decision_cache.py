@@ -8,6 +8,7 @@ from keystone_agents.agents.manual_request_planner import resolve_manual_request
 from keystone_agents.planning.decision_cache import (
     PlannerDecisionCache,
     build_planner_decision_cache_identity,
+    planner_context_revision_payload,
     planner_decision_cache_eligibility,
     planner_profile_fingerprint,
 )
@@ -96,6 +97,137 @@ def test_identity_invalidates_on_context_profile_and_scope_changes() -> None:
         )
         == 4
     )
+
+
+def test_identity_invalidates_when_verified_provider_result_count_changes() -> None:
+    common = dict(
+        request_text="Summarize that without changing anything.",
+        requested_agent="google_workspace_context_agent",
+        profile_fingerprint=_profile(),
+        scope="operator-fixture",
+    )
+    provider_scope = {
+        "source_run_id": "run-workspace-read",
+        "provider_system": "google_workspace",
+        "provider_read_scope": "bounded_collection",
+        "item_count": 1,
+        "item_refs": ["file-one"],
+        "complete": True,
+        "verified": True,
+    }
+
+    first = build_planner_decision_cache_identity(
+        workflow_context={"prior_provider_result_scope": provider_scope},
+        **common,
+    )
+    changed_count = build_planner_decision_cache_identity(
+        workflow_context={
+            "prior_provider_result_scope": {
+                **provider_scope,
+                "item_count": 2,
+            }
+        },
+        **common,
+    )
+
+    assert first.context_hash
+    assert changed_count.context_hash
+    assert first.cache_key != changed_count.cache_key
+
+
+def test_identity_invalidates_when_exact_verified_object_changes() -> None:
+    common = dict(
+        request_text="Summarize that without changing anything.",
+        requested_agent="google_workspace_context_agent",
+        profile_fingerprint=_profile(),
+        scope="operator-fixture",
+    )
+
+    def workflow_context(
+        *,
+        object_id: str = "doc-provider-id-one",
+        google_account: str = "workspace-account-one",
+    ) -> dict[str, object]:
+        return {
+            "execution_continuation": {
+                "verified_objects": [
+                    {
+                        "provider_system": "google_drive",
+                        "object_type": "google_document",
+                        "object_id": object_id,
+                        "display_name": "README.doc",
+                        "verification_status": "verified",
+                        "lifecycle_state": "active",
+                        "provider_scope": {
+                            "folder_path": "KNIOps",
+                            "google_account": google_account,
+                        },
+                    }
+                ]
+            }
+        }
+
+    first = build_planner_decision_cache_identity(
+        workflow_context=workflow_context(),
+        **common,
+    )
+    changed_object = build_planner_decision_cache_identity(
+        workflow_context=workflow_context(object_id="doc-provider-id-two"),
+        **common,
+    )
+    changed_scope = build_planner_decision_cache_identity(
+        workflow_context=workflow_context(google_account="workspace-account-two"),
+        **common,
+    )
+
+    assert first.context_hash
+    assert len(
+        {
+            first.cache_key,
+            changed_object.cache_key,
+            changed_scope.cache_key,
+        }
+    ) == 3
+
+
+def test_context_revision_ignores_unverified_objects_and_hashes_identity() -> None:
+    verified_context = {
+        "execution_continuation": {
+            "provider_affinity": "google_workspace",
+            "verified_objects": [
+                {
+                    "provider_system": "google_drive",
+                    "object_type": "google_document",
+                    "object_id": "private-provider-document-id",
+                    "display_name": "Private Operating Notes.doc",
+                    "verification_status": "verified",
+                    "provider_scope": {
+                        "google_account": "private-workspace-account",
+                    },
+                },
+                {
+                    "provider_system": "google_drive",
+                    "object_type": "google_document",
+                    "object_id": "unverified-document-id",
+                    "display_name": "Unverified Notes.doc",
+                    "verification_status": "unverified",
+                },
+            ],
+        }
+    }
+    payload = planner_context_revision_payload(verified_context)
+    serialized = str(payload)
+
+    assert len(payload["verified_objects"]) == 1
+    assert payload["continuation"] == {
+        "provider_affinity": "google_workspace",
+    }
+    assert "private-provider-document-id" not in serialized
+    assert "Private Operating Notes.doc" not in serialized
+    assert "private-workspace-account" not in serialized
+    assert "unverified-document-id" not in serialized
+    assert payload["verified_objects"][0]["object_id_hash"]
+    assert payload["verified_objects"][0]["provider_scope_hash"]
 
 
 def test_cache_round_trip_is_advisory_and_expires(tmp_path: Path) -> None:

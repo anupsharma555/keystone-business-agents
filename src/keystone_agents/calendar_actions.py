@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from hashlib import sha256
 from zoneinfo import ZoneInfo
 
+from keystone_agents.execution_request import verified_continuation_objects
+from keystone_agents.schemas.execution_request import ContinuationObjectReference
 from keystone_agents.tools.google_calendar_tool import (
     DEFAULT_CALENDAR_ID,
     DEFAULT_CALENDAR_TIMEZONE,
@@ -18,17 +21,29 @@ from keystone_agents.tools.google_calendar_tool import (
 
 MONTHS = {
     "january": 1,
+    "jan": 1,
     "february": 2,
+    "feb": 2,
     "march": 3,
+    "mar": 3,
     "april": 4,
+    "apr": 4,
     "may": 5,
     "june": 6,
+    "jun": 6,
     "july": 7,
+    "jul": 7,
     "august": 8,
+    "aug": 8,
     "september": 9,
+    "sep": 9,
+    "sept": 9,
     "october": 10,
+    "oct": 10,
     "november": 11,
+    "nov": 11,
     "december": 12,
+    "dec": 12,
 }
 
 
@@ -52,6 +67,8 @@ class CalendarActionPlan:
     event_id: str = ""
     event_reference: str = ""
     event_reference_date: str = ""
+    event_reference_time: str = ""
+    target_count: int = 1
     calendar_id: str = DEFAULT_CALENDAR_ID
     calendar_scope: str = "configured"
     timezone: str = DEFAULT_CALENDAR_TIMEZONE
@@ -159,10 +176,17 @@ def infer_calendar_action_plan(
     )
     if not text or not is_calendar_action_candidate(text):
         return None
+    verified_title, _verified_date, verified_operation = _verified_prior_calendar_event(
+        text
+    )
+    verified_active_event = bool(
+        verified_title and verified_operation in {"created", "updated"}
+    )
     if latest_followup and not (
         _explicit_calendar_mutation_requested(latest_followup)
         or _looks_like_implicit_calendar_deadline(latest_followup)
         or _looks_like_implicit_calendar_change(latest_followup)
+        or (verified_active_event and _operation(action_text) in {"update", "delete"})
     ):
         # The prior thread establishes Calendar identity, but the deterministic
         # parser must not reinterpret a generic continuation such as “add this
@@ -174,18 +198,28 @@ def infer_calendar_action_plan(
         return None
     calendar_id = os.getenv(GOOGLE_CALENDAR_ID_ENV, DEFAULT_CALENDAR_ID).strip()
     timezone = os.getenv(GOOGLE_CALENDAR_TIMEZONE_ENV, DEFAULT_CALENDAR_TIMEZONE).strip()
-    event_id = _event_id(text)
+    event_id = _event_id(action_source)
     event_reference = _event_reference(action_source, operation=operation)
-    if operation != "create" and not event_id and not event_reference and previous_request:
-        event_reference = _title(previous_request, operation="create")
+    prior_event = calendar_thread_event_context(text, today=today)
+    contextual_reference = is_contextual_calendar_event_reference(event_reference)
+    if contextual_reference:
+        event_reference = ""
+    use_prior_identity = bool(
+        operation != "create"
+        and not event_id
+        and not event_reference
+    )
+    if use_prior_identity:
+        event_id = prior_event["event_id"]
+        event_reference = prior_event["event_reference"]
     event_reference_date = (
-        _prior_thread_event_date(previous_request, today=today)
-        if operation != "create" and previous_request
-        else ""
+        prior_event["event_reference_date"] if use_prior_identity else ""
     )
     title = _title(action_source, operation=operation)
     event_dates = _event_dates(action_source, today=today)
     start_date = event_dates[0] if event_dates else ""
+    if operation in {"delete", "read"} and event_dates and not use_prior_identity:
+        event_reference_date = event_dates[0]
     if operation == "update" and _has_calendar_date_replacement(
         action_source,
         event_dates,
@@ -272,6 +306,33 @@ def _slack_thread_action_context(text: str) -> tuple[str, str]:
     )
 
 
+def _verified_prior_calendar_event(
+    text: str,
+    *,
+    verified_objects: Sequence[ContinuationObjectReference] = (),
+) -> tuple[str, str, str]:
+    """Extract the latest provider-verified Calendar identity and operation."""
+
+    # Persisted Slack-thread objects are newest-first.  Compatibility hints
+    # parsed from the transport envelope appear first only when no persisted
+    # verified identity exists, and cannot satisfy this verified-ID branch.
+    references = (*verified_objects, *verified_continuation_objects(text))
+    for reference in references:
+        if (
+            reference.provider_system != "google_calendar"
+            or reference.object_type != "calendar_event"
+            or reference.verification_status != "verified"
+            or not reference.object_id
+        ):
+            continue
+        return (
+            _clean_event_reference(reference.display_name),
+            reference.effective_date,
+            "deleted" if reference.lifecycle_state == "deleted" else "updated",
+        )
+    return "", "", ""
+
+
 def current_calendar_date(timezone: str = DEFAULT_CALENDAR_TIMEZONE) -> date:
     """Return today's date in the configured operator timezone."""
 
@@ -280,7 +341,11 @@ def current_calendar_date(timezone: str = DEFAULT_CALENDAR_TIMEZONE) -> date:
     return datetime.now(ZoneInfo(timezone)).date()
 
 
-def compact_calendar_interpretation_request(request_text: str) -> str:
+def compact_calendar_interpretation_request(
+    request_text: str,
+    *,
+    verified_objects: Sequence[ContinuationObjectReference] = (),
+) -> str:
     """Remove accumulated Slack result/error text before the one-turn model call."""
 
     text = " ".join(str(request_text or "").split()).strip()
@@ -288,6 +353,15 @@ def compact_calendar_interpretation_request(request_text: str) -> str:
     if not latest_followup:
         return text
     lines = [f"Current operator request: {latest_followup}"]
+    prior_event = calendar_thread_event_context(
+        request_text,
+        verified_objects=verified_objects,
+    )
+    if prior_event["source"] == "verified_prior_result":
+        identity = f'title="{prior_event["event_reference"]}"'
+        if prior_event["event_reference_date"]:
+            identity += f' date="{prior_event["event_reference_date"]}"'
+        lines.append(f"Prior verified Calendar event: {identity}")
     if previous_request:
         lines.append(f"Previous Calendar request: {previous_request}")
     event_id = _event_id(text)
@@ -296,7 +370,11 @@ def compact_calendar_interpretation_request(request_text: str) -> str:
     return "\n".join(lines)
 
 
-def calendar_interpretation_context(request_text: str) -> CalendarInterpretationContext:
+def calendar_interpretation_context(
+    request_text: str,
+    *,
+    verified_objects: Sequence[ContinuationObjectReference] = (),
+) -> CalendarInterpretationContext:
     """Return bounded directive/context text plus an immutable note payload.
 
     Calendar action words inside an event description must never influence the
@@ -304,7 +382,10 @@ def calendar_interpretation_context(request_text: str) -> CalendarInterpretation
     preserves the exact operator text for the provider write.
     """
 
-    compact = compact_calendar_interpretation_request(request_text)
+    compact = compact_calendar_interpretation_request(
+        request_text,
+        verified_objects=verified_objects,
+    )
     lines = compact.splitlines()
     current = (
         lines[0].removeprefix("Current operator request: ")
@@ -367,6 +448,17 @@ def default_calendar_end_time(start_time: str, *, duration_minutes: int = 60) ->
     return (start + timedelta(minutes=duration_minutes)).strftime("%H:%M")
 
 
+def calendar_times_from_evidence(evidence: str) -> tuple[str, str]:
+    """Resolve clock values from one model-cited operator span.
+
+    This is a narrow field validator, not an intent or operation classifier.
+    Prefixing ``at`` lets the Calendar clock parser handle evidence spans such
+    as ``1pm start`` that intentionally omit the surrounding action verb.
+    """
+
+    return _event_times(f"at {str(evidence or '').strip()}")
+
+
 def is_calendar_action_candidate(request_text: str) -> bool:
     """Admit only action-bound Calendar requests to the specialized interpreter.
 
@@ -404,7 +496,7 @@ def _explicit_calendar_mutation_requested(text: str) -> bool:
         r"reschedule|shift|update)"
     )
     calendar_object = (
-        r"(?:calendar\s+)?(?:event|meeting|appointment|reminder)"
+        r"(?:calendar\s+)?(?:events?|meetings?|appointments?|reminders?)"
         r"(?!\s+(?:agenda|minutes|notes?|recording|summary|transcript)\b)"
     )
     mutate_object = (
@@ -536,19 +628,60 @@ def calendar_thread_event_context(
     request_text: str,
     *,
     today: date | None = None,
+    verified_objects: Sequence[ContinuationObjectReference] = (),
 ) -> dict[str, str]:
     """Return bounded prior-event identity for an LLM-interpreted thread action."""
 
     text = " ".join(str(request_text or "").split()).strip()
     previous_request, _latest_followup = _slack_thread_action_context(text)
+    verified_title, verified_date, verified_operation = _verified_prior_calendar_event(
+        text,
+        verified_objects=verified_objects,
+    )
+    prior_event_deleted = verified_operation == "deleted"
+    verified_event_id = ""
+    verified_start_time = ""
+    verified_end_time = ""
+    for reference in (*verified_objects, *verified_continuation_objects(text)):
+        if (
+            reference.provider_system == "google_calendar"
+            and reference.object_type == "calendar_event"
+            and reference.verification_status == "verified"
+            and reference.object_id
+        ):
+            if reference.lifecycle_state != "deleted":
+                verified_event_id = reference.object_id
+                verified_start_time = reference.provider_scope.get("start_time", "")
+                verified_end_time = reference.provider_scope.get("end_time", "")
+            break
+    request_title = (
+        _title(previous_request, operation="create")
+        if previous_request and not prior_event_deleted
+        else ""
+    )
+    request_date = (
+        _prior_thread_event_date(previous_request, today=today)
+        if previous_request
+        else ""
+    )
     return {
-        "event_id": _event_id(text),
+        "event_id": _event_id(text) or verified_event_id,
         "event_reference": (
-            _title(previous_request, operation="create") if previous_request else ""
+            "" if prior_event_deleted else verified_title or request_title
         ),
         "event_reference_date": (
-            _prior_thread_event_date(previous_request, today=today)
-            if previous_request
+            "" if prior_event_deleted else verified_date or request_date
+        ),
+        "event_start_time": "" if prior_event_deleted else verified_start_time,
+        "event_end_time": "" if prior_event_deleted else verified_end_time,
+        "source": (
+            "verified_prior_deletion"
+            if prior_event_deleted
+            else
+            "verified_prior_result"
+            if verified_title
+            else "prior_request"
+            if request_title
             else ""
         ),
     }
@@ -684,24 +817,25 @@ def _event_times(text: str) -> tuple[str, str]:
                 end_ampm,
             ),
         )
-    replacement_range = re.search(
-        rf"\bto\s+{clock.format(name='start')}\s*[-–]\s*"
-        rf"{clock.format(name='end')}\b",
+    labeled_field_range = re.search(
+        r"\btime\s*:\s*(?:(?!\b(?:notes?|also)\b).){0,160}?"
+        rf"\b(?:between|from|at)?\s*{clock.format(name='start')}\s*"
+        rf"(?:to|until|through|and|[-–])\s*{clock.format(name='end')}\b",
         text,
         re.I,
     )
-    if replacement_range:
-        end_ampm = replacement_range.group("end_ampm") or ""
-        start_ampm = replacement_range.group("start_ampm") or end_ampm
+    if labeled_field_range:
+        end_ampm = labeled_field_range.group("end_ampm") or ""
+        start_ampm = labeled_field_range.group("start_ampm") or end_ampm
         return (
             _normalize_clock(
-                replacement_range.group("start_hour"),
-                replacement_range.group("start_minute"),
+                labeled_field_range.group("start_hour"),
+                labeled_field_range.group("start_minute"),
                 start_ampm,
             ),
             _normalize_clock(
-                replacement_range.group("end_hour"),
-                replacement_range.group("end_minute"),
+                labeled_field_range.group("end_hour"),
+                labeled_field_range.group("end_minute"),
                 end_ampm,
             ),
         )
@@ -725,6 +859,43 @@ def _event_times(text: str) -> tuple[str, str]:
                 range_match.group("end_minute"),
                 end_ampm,
             ),
+        )
+    replacement_range = re.search(
+        rf"\bto\s+{clock.format(name='start')}\s*[-–]\s*"
+        rf"{clock.format(name='end')}\b",
+        text,
+        re.I,
+    )
+    if replacement_range:
+        end_ampm = replacement_range.group("end_ampm") or ""
+        start_ampm = replacement_range.group("start_ampm") or end_ampm
+        return (
+            _normalize_clock(
+                replacement_range.group("start_hour"),
+                replacement_range.group("start_minute"),
+                start_ampm,
+            ),
+            _normalize_clock(
+                replacement_range.group("end_hour"),
+                replacement_range.group("end_minute"),
+                end_ampm,
+            ),
+        )
+    labeled_single = re.search(
+        r"\btime\s*:\s*(?:(?!\b(?:notes?|also)\b).){0,120}?"
+        r"\b(?P<start_hour>\d{1,2})(?::(?P<start_minute>\d{2}))?\s*"
+        r"(?P<start_ampm>a\.?m\.?|p\.?m\.?)(?=\s|$|\()",
+        text,
+        re.I,
+    )
+    if labeled_single:
+        return (
+            _normalize_clock(
+                labeled_single.group("start_hour"),
+                labeled_single.group("start_minute"),
+                labeled_single.group("start_ampm"),
+            ),
+            "",
         )
     single = re.search(
         rf"\b(?:at|from|around)\s+{clock.format(name='start')}\b",
@@ -758,7 +929,8 @@ def _normalize_clock(hour_text: str, minute_text: str | None, ampm_text: str) ->
 
 def _title(text: str, *, operation: str) -> str:
     labeled = re.search(
-        r"\bevent\s*:\s*(?P<title>.+?)(?=\s+(?:dates?|time|notes?)\s*:|$)",
+        r"\b(?:event|topic)\s*:\s*(?P<title>.+?)"
+        r"(?=\s+(?:dates?|time|notes?)\s*:|$)",
         text,
         re.I,
     )
@@ -825,6 +997,14 @@ def _clean_title(value: str) -> str:
 
 
 def _description(text: str) -> str:
+    supplied_for_notes = re.search(
+        r"\b(?:also\s*,?\s*)?(?:add|put|include)\s+this\s+"
+        r"(?:in|to)\s+(?:the\s+)?notes?\s*:?\s*(?P<note>.+)$",
+        text,
+        re.I,
+    )
+    if supplied_for_notes:
+        return _clean_description_payload(supplied_for_notes.group("note"))
     quoted = re.search(
         r"\b(?:with\s+(?:a\s+)?notes?\s*:?\s*|notes?\s*:\s*)"
         r"[\"“](?P<note>.+?)[\"”]",
@@ -870,7 +1050,17 @@ def _clean_description_payload(value: str) -> str:
         ("'", "'"),
         ('‘', '’'),
     }:
-        return cleaned[1:-1].strip()
+        cleaned = cleaned[1:-1].strip()
+    control_suffix = re.search(
+        r"(?<=[.!?])\s+"
+        r"(?:keep|leave)\s+(?:everything|anything|all\s+other\s+fields?)\s+"
+        r"(?:else\s+)?unchanged[.!?]?$"
+        r"|(?<=[.!?])\s+do\s+not\s+change\s+anything\s+else[.!?]?$",
+        cleaned,
+        re.I,
+    )
+    if control_suffix:
+        cleaned = cleaned[: control_suffix.start()].rstrip()
     return cleaned
 
 
@@ -887,7 +1077,7 @@ def _event_reference(text: str, *, operation: str) -> str:
     if note_change:
         return _clean_event_reference(note_change.group("reference"))
     named = re.search(
-        r"\b(?:calendar\s+)?event\s+(?:called|named|titled)\s+"
+        r"\b(?:calendar\s+)?events?\s+(?:called|named|titled)\s+"
         r"[\"“]?(?P<reference>.+?)[\"”]?(?=\s+(?:to|with|on)\b|$)",
         text,
         re.I,
@@ -924,10 +1114,34 @@ def _event_reference(text: str, *, operation: str) -> str:
     return _clean_event_reference(dated_move.group("reference")) if dated_move else ""
 
 
+def is_contextual_calendar_event_reference(value: str) -> bool:
+    """Return whether an event reference depends on prior conversation context."""
+
+    cleaned = re.sub(r"^(?:the\s+)", "", str(value or "").strip(), flags=re.I)
+    cleaned = cleaned.strip(" .,:;\"“”")[:240]
+    if re.fullmatch(
+        r"(?:(?:this|that)\s+)?same|this|that|it|"
+        r"(?:calendar\s+)?event|(?:medical\s+)?appointment",
+        cleaned,
+        re.I,
+    ):
+        return True
+    return bool(
+        re.fullmatch(
+            r"(?:(?:this|that)\s+)?(?:same\s+)?(?:one|event|appointment)?\s*"
+            r"(?:that\s+)?(?:you|we|i)\s+(?:just\s+)?"
+            r"(?:created|added|scheduled|updated|mentioned|discussed)"
+            r"(?:\s+(?:here|above|in\s+(?:this|the)\s+thread))?",
+            cleaned,
+            re.I,
+        )
+    )
+
+
 def _clean_event_reference(value: str) -> str:
     cleaned = re.sub(r"^(?:the\s+)", "", str(value or "").strip(), flags=re.I)
     cleaned = cleaned.strip(" .,:;\"“”")[:240]
-    if re.fullmatch(r"(?:(?:this|that)\s+)?same|this|that", cleaned, re.I):
+    if is_contextual_calendar_event_reference(cleaned):
         return ""
     return cleaned
 

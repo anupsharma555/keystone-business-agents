@@ -7,6 +7,7 @@ import pytest
 
 import keystone_agents.run as run_module
 import keystone_agents.tools.gmail_tool as gmail_module
+import keystone_agents.tools.google_calendar_tool as calendar_module
 import keystone_agents.tools.internal_data_tools as workspace_module
 from keystone_agents.model_provider import ModelConfig
 from keystone_agents.provider_read import (
@@ -174,6 +175,93 @@ def test_workspace_drive_read_consumes_budget_and_emits_safe_receipt(
     assert receipt["completeness"] == "complete"
     assert "private-file-id" not in str(receipt)
     assert "README.doc" not in str(receipt)
+
+
+def test_calendar_reads_reuse_one_request_local_client_and_emit_safe_receipts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instances: list[Any] = []
+
+    class _FakeCalendarTool:
+        def __init__(self, *, live: bool) -> None:
+            assert live is True
+            instances.append(self)
+
+        def list_all_readable_calendars(self) -> list[dict[str, Any]]:
+            return [{"id": "private-calendar-id", "summary": "Private Calendar"}]
+
+        def list_events_window(self, *_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
+            return [
+                {
+                    "id": "private-event-id",
+                    "summary": "Private Event",
+                    "status": "confirmed",
+                    "start": {"dateTime": "2026-09-14T14:00:00-04:00"},
+                    "end": {"dateTime": "2026-09-14T14:30:00-04:00"},
+                }
+            ]
+
+    monkeypatch.setattr(calendar_module, "GoogleCalendarTool", _FakeCalendarTool)
+    reset_tool_receipt_journal()
+
+    with activate_provider_read_context(_plan("google_calendar")) as context:
+        first = calendar_module.read_google_calendar_window_impl(
+            "2026-09-14T14:00:00-04:00",
+            "2026-09-14T16:30:00-04:00",
+            calendar_scope="all_readable",
+            live=True,
+        )
+        second = calendar_module.read_google_calendar_window_impl(
+            "2026-09-14T14:00:00-04:00",
+            "2026-09-14T16:30:00-04:00",
+            calendar_scope="all_readable",
+            live=True,
+        )
+        assert context is not None
+        assert context.attempt_count == 2
+
+    assert first == second
+    assert len(instances) == 1
+    receipts = [
+        receipt
+        for receipt in tool_receipt_journal()
+        if receipt.get("provider_read") is True
+    ]
+    assert len(receipts) == 2
+    assert {receipt["provider"] for receipt in receipts} == {"google_calendar"}
+    serialized = json.dumps(receipts)
+    assert "private-event-id" not in serialized
+    assert "Private Event" not in serialized
+    assert "private-calendar-id" not in serialized
+
+
+def test_chief_single_provider_read_activates_calendar_fast_read_context() -> None:
+    plan = run_module._provider_read_plan_for_agent(
+        "chief_of_staff",
+        typed_input={
+            "request": "Read my events in this bounded window.",
+            "manual_request_plan": {
+                "provider_system": "google_calendar",
+                "provider_operations": ["read"],
+            },
+        },
+    )
+
+    assert plan is not None
+    assert plan.provider == "google_calendar"
+    assert (
+        run_module._provider_read_plan_for_agent(
+            "chief_of_staff",
+            typed_input={
+                "request": "Create one event.",
+                "manual_request_plan": {
+                    "provider_system": "google_calendar",
+                    "provider_operations": ["create"],
+                },
+            },
+        )
+        is None
+    )
 
 
 def test_direct_provider_agent_activates_fast_read_context(

@@ -14,6 +14,8 @@ from time import perf_counter
 from typing import Any
 from urllib.parse import urlparse
 
+from pydantic import ValidationError
+
 from keystone_agents.agents.business_research_analyst import (
     build_company_research_queries,
     compare_company_profiles_for_decision,
@@ -117,7 +119,7 @@ from keystone_agents.response_synthesis import (
     response_synthesis_sources,
     synthesize_user_facing_work_item_response_sdk_result,
 )
-from keystone_agents.run import run_retrieved_sdk_synthesis
+from keystone_agents.run import run_retrieved_sdk_synthesis, sdk_run_failure_metadata
 from keystone_agents.runtime.request import RequestRuntime
 from keystone_agents.schemas.approval import ApprovalScope, ApprovalState
 from keystone_agents.schemas.chief_context import ChiefContextEvidenceBundle
@@ -222,6 +224,7 @@ from keystone_agents.work_items import (
     opportunity_ready,
     record_event,
     research_ready,
+    resolve_blocker,
     selected_artifacts,
     set_next_action,
 )
@@ -1093,6 +1096,148 @@ def prepare_work_item_step(
 
 
 def run_prepared_work_item_specialist(prepared: PreparedWorkItemStep) -> WorkflowRunResult:
+    """Run one specialist and convert schema failures into durable WorkItem state."""
+
+    try:
+        result = _run_prepared_work_item_specialist_unchecked(prepared)
+        return _reconcile_satisfied_manager_stage_blockers(
+            result,
+            prepared=prepared,
+        )
+    except ValidationError as exc:
+        request = prepared.request
+        store = (
+            SQLiteStore(request.database_url or database_url_from_env())
+            if request.save
+            else None
+        )
+        blocker = WorkItemBlocker(
+            code="specialist_output_validation_failed",
+            message=(
+                "The specialist produced an internally invalid structured result. "
+                "No new artifact or external side effect was accepted."
+            ),
+        )
+        return _blocked_result(
+            prepared.work_item,
+            (blocker,),
+            WorkItemNextAction(
+                action="retry_specialist_after_validation_fix",
+                agent=prepared.route,
+                description=(
+                    "Correct the shared specialist producer or schema mapping, then retry "
+                    "this same WorkItem."
+                ),
+            ),
+            store=store,
+            route=prepared.route,
+            audit_notes=[
+                (
+                    "Specialist execution stopped at the shared structured-output "
+                    f"validation boundary ({type(exc).__name__})."
+                )
+            ],
+        )
+
+
+_MANAGER_STAGE_COMPLETION_CONTRACTS: dict[
+    WorkItemRoute,
+    tuple[set[str], tuple[str, ...]],
+] = {
+    WorkItemRoute.GMAIL_TRIAGE: (
+        {"gmail_triage_report"},
+        (
+            "manager_loop_gmail_context_not_checked",
+            "manager_loop_gmail_triage_not_completed",
+        ),
+    ),
+    WorkItemRoute.BUSINESS_RESEARCH_ANALYST: (
+        {"company_profile", "research_brief", "source_summary"},
+        ("manager_loop_research_not_completed",),
+    ),
+    WorkItemRoute.OPPORTUNITY_SCOUT: (
+        {"opportunity", "opportunity_record"},
+        ("manager_loop_opportunity_not_created",),
+    ),
+    WorkItemRoute.OUTREACH_COMPOSER: (
+        {"outreach_draft", "outreach_recommendation"},
+        ("manager_loop_outreach_not_drafted",),
+    ),
+}
+
+
+def _reconcile_satisfied_manager_stage_blockers(
+    result: WorkflowRunResult,
+    *,
+    prepared: PreparedWorkItemStep,
+) -> WorkflowRunResult:
+    """Resolve prior missing-stage blockers only after this step produces its evidence."""
+
+    contract = _MANAGER_STAGE_COMPLETION_CONTRACTS.get(result.route)
+    if not result.advanced or contract is None:
+        return result
+    expected_artifact_types, blocker_codes = contract
+    produced_artifact_types = {
+        artifact.artifact_type for artifact in result.artifact_refs
+    }
+    if not expected_artifact_types.intersection(produced_artifact_types):
+        return result
+
+    unresolved_codes = {
+        blocker.code
+        for blocker in result.work_item.blockers
+        if not blocker.resolved
+    }
+    resolved_codes = [
+        code for code in blocker_codes if code in unresolved_codes
+    ]
+    if not resolved_codes:
+        return result
+
+    work_item = result.work_item
+    for code in resolved_codes:
+        work_item = resolve_blocker(work_item, code)
+    work_item = work_item.model_copy(
+        update={"status": derive_case_status(work_item)}
+    ).touch()
+    store = (
+        SQLiteStore(
+            prepared.request.database_url or database_url_from_env()
+        )
+        if prepared.request.save
+        else None
+    )
+    if store is not None:
+        store.save_work_item(work_item)
+        record_event(
+            work_item,
+            event_type="manager_stage_blockers_resolved",
+            actor=result.route.value,
+            summary=(
+                "Resolved prior missing-stage blocker(s) after the specialist "
+                "produced the required typed artifact."
+            ),
+            metadata={
+                "route": result.route.value,
+                "artifact_types": sorted(produced_artifact_types),
+                "resolved_blocker_codes": resolved_codes,
+            },
+            store=store,
+        )
+    return result.model_copy(
+        update={
+            "work_item": work_item,
+            "status": work_item.status,
+            "blockers": [
+                blocker for blocker in work_item.blockers if not blocker.resolved
+            ],
+        }
+    )
+
+
+def _run_prepared_work_item_specialist_unchecked(
+    prepared: PreparedWorkItemStep,
+) -> WorkflowRunResult:
     """Run the specialist node selected during WorkItem preparation."""
 
     request = prepared.request
@@ -8323,6 +8468,11 @@ def _record_preflight_sdk_cost_events(
         request_cache = (
             event.get("request_cache") if isinstance(event.get("request_cache"), dict) else {}
         )
+        execution_telemetry = (
+            event.get("execution_telemetry")
+            if isinstance(event.get("execution_telemetry"), dict)
+            else {}
+        )
         event_key = _workflow_sdk_usage_event_key(
             agent_name=agent_name,
             run_stage=run_stage,
@@ -8341,11 +8491,7 @@ def _record_preflight_sdk_cost_events(
             request_cache=request_cache,
             store=store,
             run_stage=run_stage,
-            execution_telemetry=(
-                event.get("execution_telemetry")
-                if isinstance(event.get("execution_telemetry"), dict)
-                else None
-            ),
+            execution_telemetry=execution_telemetry,
         )
         existing_keys.add(event_key)
 
@@ -10207,6 +10353,7 @@ def _quality_budgeted_hosted_web_search_max_calls(
 def _quality_budget_audit_note(budget: AgentQualityBudget) -> str:
     controls = [
         f"mode={budget.mode.value}",
+        f"max_seconds={budget.max_seconds}",
         f"retrieval_max_results={budget.retrieval_max_results}",
         f"hosted_web_search_max_calls={budget.hosted_web_search_max_calls}",
         f"tool_tier={budget.tool_tier}",
@@ -13345,6 +13492,22 @@ def _advance_chief_of_staff(
         except Exception as exc:
             if not _recoverable_live_chief_of_staff_output_error(exc):
                 raise
+            failure_metadata = sdk_run_failure_metadata(exc)
+            if store is not None and failure_metadata:
+                _record_workflow_sdk_cost_event(
+                    work_item,
+                    event_type="workflow_sdk_usage",
+                    summary="Recorded failed Chief of Staff live SDK attempt.",
+                    agent_name=WorkItemRoute.CHIEF_OF_STAFF.value,
+                    usage=failure_metadata.get("usage"),
+                    cost=failure_metadata.get("cost"),
+                    request_cache=failure_metadata.get("request_cache"),
+                    store=store,
+                    run_stage="chief_of_staff.live_sdk_failed",
+                    execution_telemetry=failure_metadata.get(
+                        "execution_telemetry"
+                    ),
+                )
             output = plan_chief_of_staff_request(request_text, database_url=request.database_url)
             mode_note = (
                 "Chief of Staff live SDK output failed validation; deterministic fallback "
@@ -15157,13 +15320,14 @@ def _advance_research(
             request_text=request.request_text or work_item.request_text,
             max_results=(
                 max(max_results, 8)
-                if query_builder is not None and quality_budget.mode != QualityMode.FAST
+                if query_builder is not None and quality_budget.mode == QualityMode.DEEP
                 else max_results
             ),
             query_builder=query_builder,
             agents_web_search_max_calls=hosted_web_search_max_calls,
             agents_web_search_parallel=not _is_slack_conservative_cost_profile(request),
             retrieval_hint=_retrieval_hint_for_request(request),
+            retrieval_deadline_seconds=quality_budget.max_seconds,
         )
         audit_notes = [
             "Live company retrieval executed.",
@@ -17095,6 +17259,7 @@ def _advance_zotero_article_research(
                 ),
                 live=True,
                 session=sdk_session,
+                manual_request_plan=request.manual_request_plan,
                 tool_tier="deep_retrieval" if source_context else "web_search",
                 attach_tools=not bool(source_context),
                 compact_instructions=bool(source_context),
@@ -17378,6 +17543,7 @@ def _advance_opportunity(
             agents_web_search_parallel=not _is_slack_conservative_cost_profile(request),
             retrieval_hint=_retrieval_hint_for_request(request),
             verify_source_pages=verify_source_pages,
+            retrieval_deadline_seconds=quality_budget.max_seconds,
         )
         audit_notes = [
             "Live opportunity retrieval executed.",
@@ -23043,6 +23209,9 @@ def _compose_outreach_draft_for_work_item(
             recommendation,
         )
     except Exception as exc:
+        failure_metadata = sdk_run_failure_metadata(exc)
+        failure_detail = _sdk_failure_detail_from_metadata(failure_metadata)
+        detail_suffix = f" ({failure_detail})" if failure_detail else ""
         return (
             compose_outreach_draft_fixture(
                 company_profile=company_profile,
@@ -23051,11 +23220,45 @@ def _compose_outreach_draft_for_work_item(
             ),
             (
                 "Outreach Composer live SDK drafting failed with "
-                f"{type(exc).__name__}; deterministic draft-only fallback created."
+                f"{type(exc).__name__}{detail_suffix}; deterministic draft-only fallback created."
             ),
-            None,
+            (
+                {
+                    "usage": failure_metadata.get("usage") or {},
+                    "cost": failure_metadata.get("cost") or {},
+                    "request_cache": failure_metadata.get("request_cache") or {},
+                    "execution_telemetry": failure_metadata.get("execution_telemetry") or {},
+                    "failure": failure_metadata,
+                }
+                if failure_metadata
+                else None
+            ),
             {},
         )
+
+
+def _sdk_failure_detail_from_metadata(metadata: dict[str, Any]) -> str:
+    """Render a compact failure reason from shared audit-safe SDK metadata."""
+
+    guardrail = metadata.get("guardrail")
+    if not isinstance(guardrail, dict):
+        return ""
+    risk_flags = [
+        str(item).strip()
+        for item in guardrail.get("risk_flags") or []
+        if str(item).strip()
+    ]
+    reasons = [
+        str(item).strip()
+        for item in guardrail.get("reasons") or []
+        if str(item).strip()
+    ]
+    parts: list[str] = []
+    if risk_flags:
+        parts.append("risk_flags=" + ",".join(risk_flags[:4]))
+    if reasons:
+        parts.append("reasons=" + "; ".join(reasons[:3]))
+    return _compact_outreach_summary_text(" | ".join(parts))[:240]
 
 
 def _block_unsupported_route(

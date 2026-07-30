@@ -10,6 +10,10 @@ The project is built around a simple boundary: agents may research, reason,
 prepare artifacts, create drafts, and stage internal plans, but they do not send
 external messages or perform unapproved business-system writes.
 
+For a first local run, use [Setup](#setup) and [Common Commands](#common-commands).
+For operator modes, runtime versions, live flags, and troubleshooting, use
+`docs/RUNBOOK.md`.
+
 ## What This Repo Aims To Do
 
 - Coordinate Keystone business workflows through typed agents instead of
@@ -124,6 +128,13 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -e ".[dev]"
 ```
 
+The authoritative Agents SDK range is `openai-agents>=0.19.1,<0.20`; version
+`0.19.1` is the currently validated minimum. Confirm the installed version with:
+
+```bash
+.venv/bin/python -c 'from importlib.metadata import version; print(version("openai-agents"))'
+```
+
 Optional LangGraph runtime:
 
 ```bash
@@ -134,6 +145,7 @@ Initialize local SQLite state:
 
 ```bash
 .venv/bin/python scripts/init_db.py
+.venv/bin/python scripts/health_check.py
 ```
 
 Optional live configuration can be copied from `.env.example`:
@@ -146,6 +158,12 @@ This repo uses `KEYSTONE_OPENAI_API_KEY` for live OpenAI SDK work. It does not
 assume that a generic `OPENAI_API_KEY` belongs to this project.
 
 ## Common Commands
+
+With the normal local defaults, these commands remain fixture-backed and
+dry-run-safe. In `live-test` or `full-live` mode, explicit named-agent mentions
+may enable live SDK execution; pass `--no-live-sdk` when a run must remain
+offline. No agent command grants permission to send, publish, or perform an
+unapproved external write.
 
 List registered agents:
 

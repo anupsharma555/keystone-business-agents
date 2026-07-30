@@ -1812,6 +1812,211 @@ def test_run_script_live_sdk_runs_orchestrator_preflight_when_parent_absent(
     assert payload["orchestrator_preflight"]["selected_agent"] == "chief_of_staff"
 
 
+def test_run_script_routes_bounded_calendar_read_through_typed_interpreter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from keystone_agents.agents.orchestrator import OrchestratorPreflight
+    from keystone_agents.schemas.orchestrator import OrchestratorResult
+
+    script = _load_run_chief_of_staff_script()
+    request = (
+        "CoS, list all events tomorrow from every Google Calendar I can read, "
+        "including selected shared calendars."
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        primary_target="tomorrow's events across readable Google Calendars",
+        target_type="business_system_context",
+        provider_system="google_calendar",
+        provider_operations=["read"],
+        provider_read_scope="bounded_collection",
+        provider_result_mode="items",
+        objective=request,
+        task_objective="context_lookup",
+        expected_artifact_type="context_summary",
+    )
+    resolved_calendar_plan = object()
+    captured: dict[str, object] = {}
+
+    class FakeModelConfig:
+        def as_log_dict(self) -> dict[str, str]:
+            return {"provider": "openai", "name": "gpt-5.4-mini"}
+
+    def fake_preflight(*args: object, **_kwargs: object) -> OrchestratorPreflight:
+        return OrchestratorPreflight(
+            request_text=str(args[0]),
+            requested_agent="chief_of_staff",
+            advisory_only=True,
+            selected_agent="chief_of_staff",
+            manual_request_plan=plan,
+            route_result=OrchestratorResult(
+                route="chief_of_staff",
+                target_agent="chief_of_staff",
+                rationale="Use the typed Google Calendar read path.",
+            ),
+        )
+
+    def fake_resolve(
+        request_text: str,
+        fallback: object,
+        **kwargs: object,
+    ) -> SimpleNamespace:
+        captured["resolve_request"] = request_text
+        captured["fallback"] = fallback
+        captured["resolve_kwargs"] = kwargs
+        return SimpleNamespace(
+            plan=resolved_calendar_plan,
+            openai_requests=1,
+            warnings=(),
+        )
+
+    def fake_run_interpreted(**kwargs: object) -> int:
+        captured["interpreted_kwargs"] = kwargs
+        return 0
+
+    monkeypatch.delenv(MANUAL_REQUEST_PLAN_ENV, raising=False)
+    monkeypatch.delenv(ORCHESTRATOR_PREFLIGHT_ENV, raising=False)
+    monkeypatch.setattr(script, "load_settings", lambda **_: None)
+    monkeypatch.setattr(
+        script,
+        "get_runtime_agent_model_config",
+        lambda *_args, **_kwargs: FakeModelConfig(),
+    )
+    monkeypatch.setattr(script, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(script, "infer_calendar_action_plan", lambda _text: None)
+    monkeypatch.setattr(script, "resolve_calendar_action_plan", fake_resolve)
+    monkeypatch.setattr(script, "_run_interpreted_calendar_action", fake_run_interpreted)
+    monkeypatch.setattr(
+        script,
+        "run_chief_of_staff_sdk",
+        lambda *_args, **_kwargs: pytest.fail(
+            "A bounded Calendar read must not fall through to generic Chief execution."
+        ),
+    )
+
+    assert script.main(["--live-sdk", "--json", "--input", request]) == 0
+
+    assert captured["resolve_request"] == request
+    assert captured["resolve_kwargs"]["manual_plan"] is plan
+    assert captured["resolve_kwargs"]["semantic_candidate"] is True
+    assert captured["resolve_kwargs"]["live"] is True
+    assert captured["interpreted_kwargs"] == {
+        "input_text": request,
+        "plan": resolved_calendar_plan,
+        "json_output": True,
+        "openai_requests": 2,
+        "model_override": None,
+        "manual_plan": plan,
+    }
+
+
+def test_run_script_routes_complete_calendar_write_through_typed_interpreter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from keystone_agents.agents.orchestrator import OrchestratorPreflight
+    from keystone_agents.schemas.orchestrator import OrchestratorResult
+
+    script = _load_run_chief_of_staff_script()
+    request = (
+        "CoS, add this event to the Google Calendar: "
+        "Topic: Expert Initial Interview: Example Person "
+        "Time: Jul 31, 2026 10:15 AM Eastern Time (US and Canada) "
+        "Also, add this to the notes "
+        "Join Zoom Meeting https://example.zoom.us/j/123456789 "
+        "Meeting ID: 123 456 789"
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="business_system_write",
+        primary_target="Expert Initial Interview: Example Person",
+        target_type="business_system_context",
+        provider_system="google_calendar",
+        provider_operations=["create"],
+        objective=request,
+        task_objective="business_system_write",
+        expected_artifact_type="business_system_write_plan",
+        side_effect_policy="internal_write_approval_required",
+    )
+    resolved_calendar_plan = object()
+    captured: dict[str, object] = {}
+
+    class FakeModelConfig:
+        def as_log_dict(self) -> dict[str, str]:
+            return {"provider": "openai", "name": "gpt-5.4-mini"}
+
+    def fake_preflight(*args: object, **_kwargs: object) -> OrchestratorPreflight:
+        return OrchestratorPreflight(
+            request_text=str(args[0]),
+            requested_agent="chief_of_staff",
+            advisory_only=True,
+            selected_agent="chief_of_staff",
+            manual_request_plan=plan,
+            route_result=OrchestratorResult(
+                route="chief_of_staff",
+                target_agent="chief_of_staff",
+                rationale="Use the typed Google Calendar write path.",
+            ),
+        )
+
+    def fake_resolve(
+        request_text: str,
+        fallback: object,
+        **kwargs: object,
+    ) -> SimpleNamespace:
+        captured["resolve_request"] = request_text
+        captured["fallback"] = fallback
+        captured["resolve_kwargs"] = kwargs
+        return SimpleNamespace(
+            plan=resolved_calendar_plan,
+            openai_requests=1,
+            warnings=(),
+        )
+
+    def fake_run_interpreted(**kwargs: object) -> int:
+        captured["interpreted_kwargs"] = kwargs
+        return 0
+
+    monkeypatch.delenv(MANUAL_REQUEST_PLAN_ENV, raising=False)
+    monkeypatch.delenv(ORCHESTRATOR_PREFLIGHT_ENV, raising=False)
+    monkeypatch.setattr(script, "load_settings", lambda **_: None)
+    monkeypatch.setattr(
+        script,
+        "get_runtime_agent_model_config",
+        lambda *_args, **_kwargs: FakeModelConfig(),
+    )
+    monkeypatch.setattr(script, "run_orchestrator_preflight", fake_preflight)
+    monkeypatch.setattr(script, "infer_calendar_action_plan", lambda _text: None)
+    monkeypatch.setattr(script, "resolve_calendar_action_plan", fake_resolve)
+    monkeypatch.setattr(script, "_run_interpreted_calendar_action", fake_run_interpreted)
+    monkeypatch.setattr(
+        script,
+        "run_chief_of_staff_sdk",
+        lambda *_args, **_kwargs: pytest.fail(
+            "An authorized Calendar write must not fall through to generic Chief execution."
+        ),
+    )
+
+    assert script.main(["--live-sdk", "--json", "--input", request]) == 0
+
+    assert captured["resolve_request"] == request
+    assert captured["resolve_kwargs"]["manual_plan"] is plan
+    assert captured["resolve_kwargs"]["semantic_candidate"] is True
+    assert captured["resolve_kwargs"]["live"] is True
+    assert captured["interpreted_kwargs"] == {
+        "input_text": request,
+        "plan": resolved_calendar_plan,
+        "json_output": True,
+        "openai_requests": 2,
+        "model_override": None,
+        "manual_plan": plan,
+    }
+
+
 def test_run_script_live_contact_lookup_uses_shared_gmail_workflow_once(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -3755,6 +3960,44 @@ def test_run_script_calendar_read_reconciles_reordered_title_tokens() -> None:
     assert payload["public_result"]["omit_title"] is True
 
 
+def test_chief_provider_summary_prefers_local_display_time_and_location() -> None:
+    script = _load_run_chief_of_staff_script()
+    plan = ManualRequestPlan(
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        provider_system="google_calendar",
+        primary_target="Established Client Visit",
+    )
+
+    summary = script._calendar_provider_human_summary(
+        manual_request_plan=plan,
+        receipts=[
+            {
+                "status": "success",
+                "operation": "resolve_calendar_event",
+                "event_reference": "Established Client Visit",
+                "title": "Established Client Visit",
+                "start": "2026-07-28T14:25:00Z",
+                "start_date": "2026-07-28",
+                "start_time": "14:25",
+                "display_start_date": "2026-07-28",
+                "display_start_time": "10:25",
+                "display_timezone": "America/New_York",
+                "location": "100 Example Avenue, Exampleville, PA 19000",
+            }
+        ],
+        fallback="Raw model prose",
+    )
+
+    assert summary == (
+        'Yes - "Established Client Visit" is on your Google Calendar '
+        "on 2026-07-28 at 10:25 AM (America/New_York). "
+        "Location: 100 Example Avenue, Exampleville, PA 19000."
+    )
+    assert "2:25 PM" not in summary
+
+
 @pytest.mark.parametrize(
     ("status", "expected"),
     [
@@ -4103,7 +4346,7 @@ def test_run_script_calendar_write_uses_verified_receipt_for_public_answer() -> 
     assert "Workflow complete" not in payload["public_result"]["text"]
 
 
-def test_run_script_uses_write_receipt_preserved_by_sdk_retry_journal(
+def test_run_script_uses_write_receipt_from_typed_calendar_executor(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -4124,20 +4367,32 @@ def test_run_script_uses_write_receipt_preserved_by_sdk_retry_journal(
         def as_log_dict(self) -> dict[str, str]:
             return {"provider": "openai", "name": "gpt-5.4-mini"}
 
-    def fake_run_chief_of_staff_sdk(
-        *_args: object,
-        **_kwargs: object,
-    ) -> TypedAgentRunResult:
-        return TypedAgentRunResult(
-            agent_name="chief_of_staff",
-            output=ChiefOfStaffResult(
-                mode="llm",
-                summary="The event was updated and verified.",
-            ),
-            raw_result=SimpleNamespace(new_items=[]),
-            live=True,
-            tool_receipts=[
-                {
+    calendar_plan = SimpleNamespace(
+        operation="update",
+        title="KBA_TEST_CALENDAR natural language canary",
+        event_reference="KBA_TEST_CALENDAR natural language canary",
+        start_date="2026-07-22",
+        start_time="16:20",
+        end_time="16:45",
+        description="",
+    )
+
+    monkeypatch.setattr(
+        script,
+        "resolve_calendar_action_plan",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            plan=calendar_plan,
+            openai_requests=1,
+            warnings=(),
+        ),
+    )
+    monkeypatch.setattr(
+        script,
+        "execute_direct_calendar_action",
+        lambda *_args, **_kwargs: {
+            "status": "done",
+            "human_summary": "The event was updated and verified.",
+            "tool_receipt": {
                     "status": "success",
                     "operation": "update_calendar_event",
                     "event_id": "event-1",
@@ -4147,9 +4402,10 @@ def test_run_script_uses_write_receipt_preserved_by_sdk_retry_journal(
                     "end_time": "16:45",
                     "verification": {"passed": True},
                     "tool_name": "update_google_calendar_event",
-                }
-            ],
-        )
+            },
+            "side_effects": {"calendar_write_performed": True},
+        },
+    )
 
     monkeypatch.setenv(MANUAL_REQUEST_PLAN_ENV, plan.model_dump_json())
     monkeypatch.delenv(ORCHESTRATOR_PREFLIGHT_ENV, raising=False)
@@ -4159,7 +4415,13 @@ def test_run_script_uses_write_receipt_preserved_by_sdk_retry_journal(
         "get_runtime_agent_model_config",
         lambda *_args, **_kwargs: FakeModelConfig(),
     )
-    monkeypatch.setattr(script, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+    monkeypatch.setattr(
+        script,
+        "run_chief_of_staff_sdk",
+        lambda *_args, **_kwargs: pytest.fail(
+            "A Calendar write must not fall through to generic Chief execution."
+        ),
+    )
 
     assert (
         script.main(
@@ -4178,8 +4440,8 @@ def test_run_script_uses_write_receipt_preserved_by_sdk_retry_journal(
     assert payload["completion_confirmed"] is True
     assert payload["side_effects"]["calendar_write_performed"] is True
     assert payload["human_summary"] == (
-        'Google Calendar event updated and verified: '
-        '"KBA_TEST_CALENDAR natural language canary" on 2026-07-22.'
+        "Updated KBA_TEST_CALENDAR natural language canary on 2026-07-22 "
+        "at 16:20-16:45; Google Calendar provider read-back passed."
     )
 
 

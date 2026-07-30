@@ -9,7 +9,7 @@ outputs, source attribution, and agent quality.
 
 - The manual request planner now uses a dedicated compact prompt profile rather
   than the full shared memory, company, renderer, and writing prompt stack.
-- OpenAI requests use a stable operator-scoped prompt-cache key derived from
+- OpenAI requests use a stable privacy-scoped prompt-cache key derived from
   static execution structure rather than request, thread, session, or provider
   content.
 - An advisory exact planner-decision cache can reuse eligible plans across
@@ -34,11 +34,10 @@ outputs, source attribution, and agent quality.
 - Canonical research plans now select `FAST`, `BALANCED`, or `DEEP`, and
   multi-target research characterizes an explicit anchor company before
   discovering comparison targets. Direct research wrappers use the same plan,
-  FAST remains strictly bounded while BALANCED preserves the established
-  deeper initial-query floor for time-sensitive company research.
-- Offline proof passes 4,714 tests with 17 intentional skips, repository-wide
-  Ruff, and `git diff --check`. Live Slack/provider latency and paid-model cache
-  behavior remain the next acceptance boundary.
+  and query planning cannot expand FAST or BALANCED result ceilings to DEEP.
+- The reconciled checkpoint passes 4,995 tests with one intentional skip,
+  repository-wide Ruff, and `git diff --check`. Live Slack/provider latency and
+  paid-model cache behavior remain the next acceptance boundary.
 - The first paid-model probes confirmed stable-key cacheability and exact
   planner-decision reuse, but did not pass user-answer acceptance. One repeated
   Google Workspace plan reported about 95% cached input before a provider-scope

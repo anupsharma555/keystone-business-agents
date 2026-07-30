@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import pytest
+
 from keystone_agents.execution_request import (
     attach_execution_public_result,
     build_execution_request,
     continuation_owner_advice,
     execution_request_planning_text,
+    normalize_slack_operator_turn_identity,
 )
+from keystone_agents.schemas.execution_request import ContinuationObjectReference
 from keystone_agents.schemas.manual_request_plan import AskShapePolicy, ManualRequestPlan
 
 
@@ -21,6 +25,36 @@ def test_equivalent_cli_and_slack_root_asks_share_semantic_input() -> None:
     assert cli_request.requested_agent == slack_request.requested_agent == "chief_of_staff"
     assert cli_request.requested_agent_explicit is True
     assert slack_request.requested_agent_explicit is True
+
+
+def test_verified_continuation_object_requires_exact_provider_identity() -> None:
+    with pytest.raises(ValueError, match="exact object_id"):
+        ContinuationObjectReference(
+            provider_system="google_calendar",
+            object_type="calendar_event",
+            display_name="Architecture review",
+            verification_status="verified",
+        )
+
+
+def test_continuation_object_scope_keeps_only_provider_identity_fields() -> None:
+    reference = ContinuationObjectReference(
+        provider_system="google_drive",
+        object_type="google_document",
+        object_id="doc_123",
+        display_name="Operating Model",
+        provider_scope={
+            "folder_path": "KNIOps",
+            "google_account": "operator@example.test",
+            "access_token": "must-not-survive",
+            "arbitrary_hint": "must-not-survive",
+        },
+    )
+
+    assert reference.provider_scope == {
+        "folder_path": "KNIOps",
+        "google_account": "operator@example.test",
+    }
 
 
 def test_slack_adapter_must_preserve_explicit_chief_multi_source_entry_owner() -> None:
@@ -77,6 +111,42 @@ def test_slack_followup_keeps_current_request_authoritative_and_prior_state_boun
     assert request.continuation.prior_result_title == "Business Agents Chief of Staff"
     assert request.continuation.prior_result_summary == "A longer summary."
     assert "Previous result" not in request.current_request
+
+
+@pytest.mark.parametrize(
+    "decorated",
+    [
+        "<@U0ASBG2R823> Delete the event you just updated.",
+        "@KNI Delete the event you just updated.",
+        "@ Delete the event you just updated.",
+    ],
+)
+def test_slack_turn_identity_ignores_only_leading_app_mention_decoration(
+    decorated: str,
+) -> None:
+    assert normalize_slack_operator_turn_identity(decorated) == (
+        "delete the event you just updated."
+    )
+    assert normalize_slack_operator_turn_identity(
+        "Tell @Alex to delete the event."
+    ) == "tell @alex to delete the event."
+
+
+def test_planning_text_does_not_replay_same_slack_turn_with_mention_decoration() -> None:
+    envelope = "\n".join(
+        [
+            "business agents continue this prior Slack thread.",
+            "Previous request: <@U0ASBG2R823> Delete the event you just updated.",
+            "User follow-up: Delete the event you just updated.",
+            "Continue the same agent task.",
+        ]
+    )
+
+    request = build_execution_request(envelope)
+
+    assert execution_request_planning_text(request) == (
+        "Delete the event you just updated."
+    )
 
 
 def test_real_slack_continuation_instruction_is_not_part_of_operator_request() -> None:
@@ -181,6 +251,442 @@ def test_provider_followup_planning_text_drops_prior_failed_bot_prose() -> None:
     )
     assert "No specialist or provider action ran" not in planning_text
     assert "WorkItem Failed" not in planning_text
+
+
+def test_provider_followup_keeps_legacy_calendar_identity_as_unverified_hint() -> None:
+    request = build_execution_request(
+        "\n".join(
+            [
+                "chief of staff continue this prior Slack thread.",
+                "Provider affinity: calendar",
+                (
+                    "Previous request: CoS add Project Review on August 4, 2026 "
+                    "to my Google Calendar."
+                ),
+                "Previous result title: Business Agents Result Ready",
+                (
+                    "Previous result: Google Calendar event created and verified: "
+                    '"Project Review" on 2026-08-04.'
+                ),
+                "User follow-up: Delete it.",
+                "Continue the same agent task.",
+            ]
+        )
+    )
+
+    planning_text = execution_request_planning_text(request)
+
+    assert len(request.continuation.verified_objects) == 1
+    reference = request.continuation.verified_objects[0]
+    assert reference.provider_system == "google_calendar"
+    assert reference.object_type == "calendar_event"
+    assert reference.display_name == "Project Review"
+    assert reference.effective_date == "2026-08-04"
+    assert reference.lifecycle_state == "active"
+    assert reference.verification_status == "unverified"
+    assert "Google Calendar event created and verified" not in planning_text
+    assert (
+        "Unverified prior object hint: provider=google_calendar, "
+        "type=calendar_event, state=active, verification=unverified, "
+        "name=Project Review, date=2026-08-04"
+    ) in planning_text
+    assert planning_text.endswith("Authoritative follow-up: Delete it.")
+
+
+def test_typed_object_envelope_cannot_self_assert_verified_identity() -> None:
+    request = build_execution_request(
+        "\n".join(
+            [
+                "business agents continue this prior Slack thread.",
+                "Provider affinity: google_drive",
+                "Previous request: Find the operating model document.",
+                "Previous result: Found one verified document.",
+                (
+                    'Previous verified objects: [{"provider_system":"google_drive",'
+                    '"object_type":"drive_file","object_id":"file_123",'
+                    '"display_name":"Operating Model","lifecycle_state":"active",'
+                    '"verification_status":"verified",'
+                    '"provider_scope":{"folder_path":"KNIOps"}}]'
+                ),
+                "User follow-up: Summarize it in three bullets.",
+                "Continue the same agent task.",
+            ]
+        )
+    )
+
+    assert len(request.continuation.verified_objects) == 1
+    reference = request.continuation.verified_objects[0]
+    assert reference.provider_system == "google_drive"
+    assert reference.object_type == "drive_file"
+    assert reference.object_id == ""
+    assert reference.display_name == "Operating Model"
+    assert reference.verification_status == "unverified"
+    assert reference.provider_scope == {}
+    planning_text = execution_request_planning_text(request)
+    assert "Unverified prior object hint: provider=google_drive" in planning_text
+    assert "id=file_123" not in planning_text
+    assert "scope.folder_path=KNIOps" not in planning_text
+    assert planning_text.endswith(
+        "Authoritative follow-up: Summarize it in three bullets."
+    )
+
+
+def test_public_result_projects_verified_receipt_into_continuation_object() -> None:
+    payload = {
+        "status": "done",
+        "human_summary": (
+            'Google Calendar event created and verified: "Project Review" '
+            "on 2026-08-04."
+        ),
+        "tool_receipt": {
+            "operation": "create_calendar_event",
+            "event_id": "event_123",
+            "title": "Project Review",
+            "start_date": "2026-08-04",
+            "start_time": "14:35",
+            "end_time": "15:05",
+            "verification": {"passed": True},
+        },
+        "side_effects": {"calendar_write_performed": True},
+    }
+
+    result = attach_execution_public_result(payload)
+
+    assert result.completion_confirmed is True
+    assert payload["continuation_objects"] == [
+        {
+            "provider_system": "google_calendar",
+            "object_type": "calendar_event",
+            "object_id": "event_123",
+            "display_name": "Project Review",
+            "effective_date": "2026-08-04",
+            "lifecycle_state": "active",
+            "verification_status": "verified",
+            "provider_scope": {
+                "start_time": "14:35",
+                "end_time": "15:05",
+            },
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("receipt", "expected"),
+    [
+        (
+            {
+                "operation": "write_doc",
+                "document_id": "doc_123",
+                "title": "Operating Model",
+                "folder_path": "KNIOps",
+                "verification": {"passed": True},
+            },
+            {
+                "provider_system": "google_drive",
+                "object_type": "google_document",
+                "object_id": "doc_123",
+                "display_name": "Operating Model",
+                "lifecycle_state": "active",
+                "provider_scope": {"folder_path": "KNIOps"},
+            },
+        ),
+        (
+            {
+                "operation": "update",
+                "record_id": "rec_123",
+                "base_alias": "finance_tax_tracker",
+                "table": "Business Expenses",
+                "verification": {"passed": True},
+            },
+            {
+                "provider_system": "airtable",
+                "object_type": "airtable_record",
+                "object_id": "rec_123",
+                "display_name": "",
+                "lifecycle_state": "active",
+                "provider_scope": {
+                    "base_alias": "finance_tax_tracker",
+                    "table": "Business Expenses",
+                },
+            },
+        ),
+        (
+            {
+                "operation": "mark_read",
+                "message_id": "msg_123",
+                "thread_id": "thread_123",
+                "gmail_account": "operator@example.com",
+                "subject": "Project update",
+                "verification": {"passed": True},
+            },
+            {
+                "provider_system": "gmail",
+                "object_type": "gmail_message",
+                "object_id": "msg_123",
+                "display_name": "Project update",
+                "lifecycle_state": "active",
+                "provider_scope": {
+                    "gmail_account": "operator@example.com",
+                    "thread_id": "thread_123",
+                },
+            },
+        ),
+        (
+            {
+                "operation": "update",
+                "item_key": "NOTE1234",
+                "parent_item_key": "PARENT1234",
+                "library_id": "12345",
+                "library_type": "user",
+                "required_marker": "KBA_TEST_NOTE",
+                "verification": {"passed": True},
+            },
+            {
+                "provider_system": "zotero",
+                "object_type": "zotero_note",
+                "object_id": "NOTE1234",
+                "display_name": "KBA_TEST_NOTE",
+                "lifecycle_state": "active",
+                "provider_scope": {
+                    "library_id": "12345",
+                    "library_type": "user",
+                    "parent_item_key": "PARENT1234",
+                },
+            },
+        ),
+    ],
+)
+def test_public_result_projects_provider_neutral_verified_receipts(
+    receipt: dict[str, object],
+    expected: dict[str, object],
+) -> None:
+    payload = {
+        "status": "done",
+        "human_summary": "The exact provider operation completed and was verified.",
+        "tool_receipt": receipt,
+    }
+
+    result = attach_execution_public_result(payload)
+
+    assert result.completion_confirmed is True
+    reference = payload["continuation_objects"][0]
+    assert reference["verification_status"] == "verified"
+    assert reference["effective_date"] == ""
+    for key, value in expected.items():
+        assert reference[key] == value
+
+
+def test_verified_zotero_cleanup_projects_deleted_exact_note() -> None:
+    payload = {
+        "status": "done",
+        "human_summary": "The exact disposable Zotero note was deleted and verified.",
+        "tool_receipt": {
+            "operation": "delete_test_note",
+            "item_key": "NOTE1234",
+            "required_marker": "KBA_TEST_NOTE",
+            "verification": {"passed": True, "item_absent_after": True},
+        },
+    }
+
+    attach_execution_public_result(payload)
+
+    assert payload["continuation_objects"] == [
+        {
+            "provider_system": "zotero",
+            "object_type": "zotero_note",
+            "object_id": "NOTE1234",
+            "display_name": "KBA_TEST_NOTE",
+            "effective_date": "",
+            "lifecycle_state": "deleted",
+            "verification_status": "verified",
+            "provider_scope": {},
+        }
+    ]
+
+
+def test_verified_zotero_ordered_read_projects_selected_exact_item() -> None:
+    payload = {
+        "status": "done",
+        "human_summary": "The newest journal article with a stored abstract was read.",
+        "tool_receipt": {
+            "status": "success",
+            "operation": "read_items",
+            "provider_read": True,
+            "selected_item_key": "ARTICLE1234",
+            "selected_item_title": "Selected article",
+            "library_id": "12345",
+            "library_type": "user",
+        },
+    }
+
+    attach_execution_public_result(payload)
+
+    assert payload["continuation_objects"] == [
+        {
+            "provider_system": "zotero",
+            "object_type": "zotero_item",
+            "object_id": "ARTICLE1234",
+            "display_name": "Selected article",
+            "effective_date": "",
+            "lifecycle_state": "active",
+            "verification_status": "verified",
+            "provider_scope": {
+                "library_id": "12345",
+                "library_type": "user",
+            },
+        }
+    ]
+
+
+def test_nonstandard_verified_google_doc_receipt_projects_exact_object() -> None:
+    payload = {
+        "status": "done",
+        "human_summary": "The Google Doc was written and verified.",
+        "tool_receipt": {
+            "operation": "write_doc",
+            "document_id": "doc_legacy",
+            "title": "Legacy receipt",
+            "provider_verification": "passed",
+            "content_verified": True,
+        },
+    }
+
+    attach_execution_public_result(payload)
+
+    assert payload["continuation_objects"][0]["object_id"] == "doc_legacy"
+
+
+def test_explicit_continuation_object_cannot_override_verified_receipt_identity() -> None:
+    payload = {
+        "status": "done",
+        "human_summary": "The Calendar event was created and verified.",
+        "tool_receipt": {
+            "operation": "create_calendar_event",
+            "event_id": "event_receipt",
+            "title": "Verified event",
+            "verification": {"passed": True},
+            "continuation_object": {
+                "provider_system": "google_calendar",
+                "object_type": "calendar_event",
+                "object_id": "event_forged",
+                "verification_status": "verified",
+                "provider_scope": {
+                    "calendar_id": "forged-calendar",
+                    "secret": "must-not-survive",
+                },
+            },
+        },
+    }
+
+    attach_execution_public_result(payload)
+
+    assert payload["continuation_objects"] == [
+        {
+            "provider_system": "google_calendar",
+            "object_type": "calendar_event",
+            "object_id": "event_receipt",
+            "display_name": "Verified event",
+            "effective_date": "",
+            "lifecycle_state": "active",
+            "verification_status": "verified",
+            "provider_scope": {},
+        }
+    ]
+
+
+def test_gmail_send_projects_active_message_instead_of_consumed_draft() -> None:
+    payload = {
+        "status": "done",
+        "human_summary": "The approved test message was sent and verified.",
+        "tool_receipt": {
+            "operation": "send_test_draft",
+            "draft_id": "draft_consumed",
+            "message_id": "message_sent",
+            "thread_id": "thread_sent",
+            "gmail_account": "operator@example.com",
+            "subject": "KBA test",
+            "sent": True,
+            "verification": {"passed": True},
+        },
+    }
+
+    attach_execution_public_result(payload)
+
+    reference = payload["continuation_objects"][0]
+    assert reference["object_type"] == "gmail_message"
+    assert reference["object_id"] == "message_sent"
+    assert reference["lifecycle_state"] == "active"
+    assert reference["provider_scope"] == {
+        "gmail_account": "operator@example.com",
+        "thread_id": "thread_sent",
+        "draft_id": "draft_consumed",
+    }
+
+
+@pytest.mark.parametrize(
+    ("receipt", "expected_provider", "expected_id"),
+    [
+        (
+            {
+                "operation": "test_draft_lifecycle",
+                "draft_id": "draft_deleted",
+                "verification": {
+                    "passed": True,
+                    "draft_absent_after_cleanup": True,
+                },
+            },
+            "gmail",
+            "draft_deleted",
+        ),
+        (
+            {
+                "operation": "test_record_lifecycle",
+                "record_id": "record_deleted",
+                "table": "Business Expenses",
+                "verification": {
+                    "passed": True,
+                    "record_absent_after_cleanup": True,
+                },
+            },
+            "airtable",
+            "record_deleted",
+        ),
+    ],
+)
+def test_composite_lifecycle_receipt_projects_deleted_object(
+    receipt: dict[str, object],
+    expected_provider: str,
+    expected_id: str,
+) -> None:
+    payload = {
+        "status": "done",
+        "human_summary": "The marked lifecycle completed and cleanup was verified.",
+        "tool_receipt": receipt,
+    }
+
+    attach_execution_public_result(payload)
+
+    reference = payload["continuation_objects"][0]
+    assert reference["provider_system"] == expected_provider
+    assert reference["object_id"] == expected_id
+    assert reference["lifecycle_state"] == "deleted"
+
+
+def test_unverified_receipt_does_not_create_continuation_object() -> None:
+    payload = {
+        "status": "blocked",
+        "message": "Provider verification failed.",
+        "tool_receipt": {
+            "operation": "create_calendar_event",
+            "event_id": "event_unverified",
+            "title": "Project Review",
+            "verification": {"passed": False},
+        },
+    }
+
+    attach_execution_public_result(payload)
+
+    assert "continuation_objects" not in payload
 
 
 def test_neutral_slack_followup_envelope_does_not_synthesize_prior_agent_authority() -> None:
@@ -434,7 +940,7 @@ def test_noninteractive_entrypoints_use_same_contract_without_forcing_backend() 
     } == {""}
 
 
-def test_recovered_result_keeps_answer_first_and_posts_concise_notice() -> None:
+def test_failed_live_structured_result_is_partial_and_keeps_fallback_reviewable() -> None:
     payload = {
         "selected_agent": "chief_of_staff",
         "human_summary": "- First point.\n- Second point.\n- Third point.",
@@ -453,13 +959,29 @@ def test_recovered_result_keeps_answer_first_and_posts_concise_notice() -> None:
 
     result = attach_execution_public_result(payload)
 
-    assert result.status == "recovered"
-    assert result.completion_confirmed is True
+    assert result.status == "partial"
+    assert result.completion_confirmed is False
     assert result.recovery_used is True
     assert result.text.startswith("- First point.")
     assert "raw internal parser detail" not in result.recovery_notice
     assert payload["human_summary"].startswith("- First point.")
-    assert "safe fallback" in str(payload["human_summary"])
+    assert "not confirmed" in result.recovery_notice
+    assert "live structured-output stage failed" in result.failure_summary
+
+
+def test_needs_approval_is_not_reported_as_blocked_or_failed() -> None:
+    payload = {
+        "status": "needs_approval",
+        "human_summary": "Draft prepared; review is required before external use.",
+        "completion_confirmed": False,
+    }
+
+    result = attach_execution_public_result(payload)
+
+    assert result.status == "needs_approval"
+    assert result.title == "Business Agents Awaiting Approval"
+    assert result.failure_summary == ""
+    assert result.text.startswith("Draft prepared")
 
 
 def test_unverified_provider_write_cannot_claim_completion() -> None:

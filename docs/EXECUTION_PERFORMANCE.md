@@ -20,13 +20,13 @@ At the current checkpoint, the compact profile is 33,106 characters versus
 regression test requires the compact profile to remain no more than 60% of the
 full profile while the route and safety contract checks continue to pass.
 
-OpenAI requests receive a stable operator-scoped prompt-cache key derived from
+OpenAI requests receive a stable privacy-scoped prompt-cache key derived from
 the instruction profile, agent, model, ordered tools, and output schema. The
 key excludes request text, Slack content, thread identifiers, provider data,
 and secrets.
 
 An exact planner-decision cache may reuse an eligible prior plan when the
-normalized request, requested agent, operator scope, bounded context revision,
+normalized request, requested agent, privacy scope, bounded context revision,
 and planner profile all match. This cache is advisory: it never bypasses
 deterministic reconciliation. Temporal/current, sensitive, mutating,
 approval-gated, clarification-dependent, outreach, durable multi-owner, and
@@ -43,7 +43,8 @@ Relevant settings:
 
 Provider reads can share a bounded request-local context containing typed read
 plans, provider clients, and safe snapshots. The kernel enforces call, item,
-page, byte, deadline, and concurrency limits and records content-free
+page, byte, deadline, and concurrency limits and records privacy-safe,
+content-free
 fingerprints rather than raw queries, identities, provider payloads, or tokens.
 
 Initial adoption covers:
@@ -54,6 +55,9 @@ Initial adoption covers:
 - Google Workspace Drive and Docs read tools, which reuse the same service
   bundle within one matching read context, consume bounded read-call slots,
   and emit content-free read receipts.
+- Google Calendar read and resolve tools, which reuse one Calendar client for a
+  canonical read-only Chief of Staff plan, consume bounded read-call slots, and
+  emit content-free receipts without event titles, calendar IDs, or event IDs.
 
 An offline lifecycle regression now proves the same request-scoped context is
 active through both WorkItem and LangGraph specialist execution, reuses one
@@ -70,9 +74,8 @@ No provider permission, read/write distinction, approval gate, or receipt
 requirement is removed. Cross-request provider-result caching is intentionally
 out of scope.
 
-Calendar adoption remains a later incremental slice. Its existing provider
-behavior and concurrent implementation work are preserved; this checkpoint
-does not claim that Calendar reads use the fast-read kernel.
+Calendar writes remain outside the fast-read kernel. Their existing exact-ID,
+approval, provider read-back, and verification contracts are unchanged.
 
 ### Research quality modes
 
@@ -92,10 +95,16 @@ is characterized before competitor discovery, does not consume the requested
 competitor count, cannot be returned as its own competitor, and must satisfy the
 same official/product/requested-feature evidence floor as comparison targets.
 Direct specialist wrappers and WorkItem retrieval consume the same canonical
-mode. Query planning may improve search wording inside a mode. FAST remains
-strictly bounded; BALANCED preserves the established deeper initial-query floor
-for time-sensitive company research, while DEEP alone enables the full
-source-intensive budget.
+mode. Query planning may improve search wording inside a mode, but it cannot
+silently raise FAST or BALANCED result ceilings to the DEEP budget.
+
+The mode time budgets are active stage-aware retrieval deadlines: FAST receives
+45 seconds, BALANCED 120 seconds, and DEEP 300 seconds. Once a deadline is
+reached, research stops starting additional queries or enrichment stages,
+retains already retrieved evidence, and marks the result partial. It does not
+kill an in-flight provider request or discard partial evidence. This keeps deep
+research capable while preventing fast and balanced runs from silently
+continuing through extra search and extraction work.
 
 ## Measurement Contract
 
@@ -141,8 +150,8 @@ The 2026-07-27 offline implementation checkpoint passed:
 
 - focused contract and integration tests;
 - a 1,116-test cross-system integration gate;
-- the ordinary repository suite on the reorganized `origin/main` architecture:
-  4,714 passed and 17 intentionally skipped;
+- the reconciled ordinary repository suite with `KEYSTONE_TEST_MODE=1`:
+  4,995 passed and one intentionally skipped;
 - repository-wide Ruff checks; and
 - `git diff --check`.
 
@@ -258,8 +267,7 @@ The local gate passed 14 focused wrapper tests, a secret-free preview, a cold
 import proof for `keystone_agents`, telemetry, and provider-read modules, and a
 zero-call canonical Workspace ask. The synthetic bridge database argument was
 rewritten successfully: only the isolated canary database was created. The full
-repository gate on the reorganized architecture then passed 4,714 tests with
-17 intentional skips.
+reconciled repository gate then passed 4,995 tests with one intentional skip.
 
 ### Post-fix acceptance canaries
 

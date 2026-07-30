@@ -107,6 +107,7 @@ from keystone_agents.run import (
     prompt_from_typed_input,
     run_retrieved_sdk_synthesis,
     run_typed_sdk_agent,
+    sdk_run_failure_metadata,
 )
 from keystone_agents.schemas.announcement_feed import AnnouncementFeedItem
 from keystone_agents.schemas.chief_of_staff import (
@@ -120,6 +121,7 @@ from keystone_agents.schemas.email_triage import (
     GmailCandidateRankingResult,
     GmailPriorityGroupingResult,
 )
+from keystone_agents.schemas.manual_request_plan import AskShapePolicy, ManualRequestPlan
 from keystone_agents.schemas.operational_context import (
     AirtableContextResult,
     GoogleWorkspaceContextResult,
@@ -1192,6 +1194,115 @@ def test_run_typed_sdk_agent_retries_live_structured_output_once_without_session
     assert result.request_cache["structured_output_retry_session_reset"] is True
 
 
+def test_run_typed_sdk_agent_attaches_failed_attempt_count_when_usage_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KEYSTONE_SDK_RATE_LIMIT_MAX_RETRIES", "0")
+    monkeypatch.setenv("KEYSTONE_SDK_STRUCTURED_OUTPUT_MAX_RETRIES", "0")
+
+    class FakeAgent:
+        name = "chief_of_staff"
+        model = "gpt-test"
+
+    def fail_run(*_args: Any, **_kwargs: Any) -> Any:
+        raise ModelBehaviorError("invalid JSON when parsing structured output")
+
+    monkeypatch.setattr("keystone_agents.run.run_typed_sdk_sync", fail_run)
+
+    with pytest.raises(ModelBehaviorError) as raised:
+        run_typed_sdk_agent(
+            agent=FakeAgent(),
+            typed_input={"request": "return a strict result"},
+            output_type=ChiefOfStaffResult,
+            live=True,
+            config=ModelConfig(provider="openai", model="gpt-test", api_key="test-key"),
+        )
+
+    failure = sdk_run_failure_metadata(raised.value)
+    assert failure["attempt_count"] == 1
+    assert failure["usage"]["requests"] == 1
+    assert failure["usage"]["model_attempts_started"] == 1
+    assert failure["usage"]["provider_request_count_confirmed"] is True
+    assert failure["usage"]["available"] is False
+    assert failure["cost"]["available"] is False
+    assert failure["execution_telemetry"]["status"] == "failed"
+
+
+def test_run_typed_sdk_agent_attaches_bounded_guardrail_failure_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KEYSTONE_SDK_RATE_LIMIT_MAX_RETRIES", "0")
+    monkeypatch.setenv("KEYSTONE_SDK_STRUCTURED_OUTPUT_MAX_RETRIES", "0")
+
+    class FakeAgent:
+        name = "outreach_composer"
+        model = "gpt-test"
+
+    class FakeGuardrailOutput:
+        output_info = {
+            "risk_flags": ("unsupported_claim",),
+            "reasons": ("unsupported outreach claim: proven results",),
+        }
+
+    class FakeGuardrailResult:
+        output = FakeGuardrailOutput()
+
+    class FakeGuardrailError(Exception):
+        guardrail_result = FakeGuardrailResult()
+
+    def fail_run(*_args: Any, **_kwargs: Any) -> Any:
+        raise FakeGuardrailError("output guardrail rejected the result")
+
+    monkeypatch.setattr("keystone_agents.run.run_typed_sdk_sync", fail_run)
+
+    with pytest.raises(FakeGuardrailError) as raised:
+        run_typed_sdk_agent(
+            agent=FakeAgent(),
+            typed_input={"request": "draft grounded outreach"},
+            output_type=OutreachDraft,
+            live=True,
+            config=ModelConfig(provider="openai", model="gpt-test", api_key="test-key"),
+        )
+
+    failure = sdk_run_failure_metadata(raised.value)
+    assert failure["guardrail"] == {
+        "risk_flags": ["unsupported_claim"],
+        "reasons": ["unsupported outreach claim: proven results"],
+    }
+
+
+def test_run_typed_sdk_agent_does_not_count_pre_provider_import_failure_as_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KEYSTONE_SDK_RATE_LIMIT_MAX_RETRIES", "0")
+    monkeypatch.setenv("KEYSTONE_SDK_STRUCTURED_OUTPUT_MAX_RETRIES", "0")
+
+    class FakeAgent:
+        name = "outreach_composer"
+        model = "gpt-test"
+
+    def fail_run(*_args: Any, **_kwargs: Any) -> Any:
+        raise ModuleNotFoundError("No module named 'missing_dependency'", name="missing_dependency")
+
+    monkeypatch.setattr("keystone_agents.run.run_typed_sdk_sync", fail_run)
+
+    with pytest.raises(ModuleNotFoundError) as raised:
+        run_typed_sdk_agent(
+            agent=FakeAgent(),
+            typed_input={"request": "draft grounded outreach"},
+            output_type=OutreachDraft,
+            live=True,
+            config=ModelConfig(provider="openai", model="gpt-test", api_key="test-key"),
+        )
+
+    failure = sdk_run_failure_metadata(raised.value)
+    assert failure["attempt_count"] == 1
+    assert failure["usage"]["requests"] == 0
+    assert failure["usage"]["model_attempts_started"] == 1
+    assert failure["usage"]["provider_request_count_confirmed"] is False
+    assert failure["missing_module"] == "missing_dependency"
+
+
 def test_run_typed_sdk_agent_preserves_write_receipt_across_structured_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1671,6 +1782,61 @@ def test_direct_specialist_sdk_turn_policy_supports_quality_and_explicit_overrid
         max_turns=2,
     )
     assert captured["max_turns"] == 2
+
+
+def test_direct_research_wrappers_use_canonical_plan_for_turns_and_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_research: dict[str, Any] = {}
+    captured_scout: dict[str, Any] = {}
+    quick_plan = ManualRequestPlan(
+        source="llm",
+        target_agent="business_research_analyst",
+        intent="research_brief",
+        objective="Run a bounded source scan.",
+        task_objective="source_research",
+        expected_artifact_type="source_summary",
+        requires_live_search=True,
+        ask_shape=AskShapePolicy(
+            ask_breadth="narrow",
+            evidence_depth="quick",
+            cost_mode="minimize",
+        ),
+    )
+
+    monkeypatch.setattr(
+        business_research_module,
+        "run_typed_sdk_agent",
+        lambda **kwargs: captured_research.update(kwargs) or kwargs,
+    )
+    monkeypatch.setattr(
+        opportunity_scout_module,
+        "run_typed_sdk_agent",
+        lambda **kwargs: captured_scout.update(kwargs) or kwargs,
+    )
+
+    run_business_research_analyst_sdk(
+        BusinessResearchSDKInput(
+            company_name="OpenAI",
+            context="The operator used generic research wording.",
+        ),
+        live=True,
+        manual_request_plan=quick_plan,
+    )
+    run_opportunity_scout_sdk(
+        OpportunityScoutSDKInput(topic="behavioral health opportunities"),
+        live=True,
+        manual_request_plan=quick_plan,
+    )
+
+    assert captured_research["max_turns"] == 4
+    assert captured_scout["max_turns"] == 4
+    assert "search_web" not in {
+        str(getattr(tool, "name", "")) for tool in captured_research["agent"].tools
+    }
+    assert "search_web" not in {
+        str(getattr(tool, "name", "")) for tool in captured_scout["agent"].tools
+    }
 
 
 def test_business_research_analyst_focused_brief_runtime_uses_llm_output_contract(
@@ -3451,6 +3617,39 @@ def test_outreach_constrained_sdk_rejects_unsupported_keystone_claims(
         )
 
 
+def test_outreach_sdk_guardrail_does_not_treat_blocked_facts_as_draft_claims(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    typed_input = OutreachComposerSDKInput(
+        company_name="Curebase",
+        approved_context="Approved fixture context.",
+    )
+    model = FakeModel(
+        outputs=[
+            [
+                _structured_message(
+                    _outreach_draft_payload(
+                        blocked_facts=["Keystone has helped companies reduce enrollment delays."],
+                    )
+                )
+            ]
+        ]
+    )
+    provider = FakeProvider(model)
+
+    result = run_outreach_composer_sdk(
+        typed_input,
+        run_config=build_local_run_config(provider),
+    )
+
+    assert isinstance(result.final_output, OutreachDraft)
+    assert result.final_output.blocked_facts == [
+        "Keystone has helped companies reduce enrollment delays."
+    ]
+
+
 def test_specialist_agent_runs_with_fake_model_without_openai_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3647,6 +3846,11 @@ def test_high_confidence_manifest_match_resolves_preprints_without_model() -> No
         "update that same Airtable expense record",
         "create a Google Doc in Drive and verify it",
         "create a Gmail draft to myself and do not send it",
+        (
+            "list all events tomorrow from every Google Calendar I can read, "
+            "including selected shared calendars"
+        ),
+        "what is on my Google Calendar tomorrow?",
     ],
 )
 def test_chief_native_command_resolver_does_not_intercept_provider_actions(

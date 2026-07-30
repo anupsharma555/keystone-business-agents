@@ -19,13 +19,20 @@ from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from datetime import datetime, timedelta
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from keystone_agents.agent_mentions import AgentMention, parse_agent_mention
 from keystone_agents.agent_registry import AGENT_REGISTRY, agent_cards
-from keystone_agents.agents.calendar_action_interpreter import resolve_calendar_action_plan
+from keystone_agents.agents.calendar_action_interpreter import (
+    calendar_lookup_response_scope,
+    calendar_lookup_target_from_plan,
+    canonical_calendar_read_plan,
+    resolve_calendar_action_plan,
+    resolve_calendar_lookup_answer,
+)
 from keystone_agents.agents.chief_of_staff import (
     plan_chief_of_staff_request,
 )
@@ -72,10 +79,12 @@ from keystone_agents.execution_admission import (
     admit_provider_action,
 )
 from keystone_agents.execution_request import (
+    attach_verified_continuation_objects,
     build_execution_request,
     continuation_owner_advice,
     execution_request_planning_text,
     latest_slack_operator_request,
+    normalize_slack_operator_turn_identity,
     slack_work_item_control_requested,
 )
 from keystone_agents.execution_telemetry import (
@@ -112,6 +121,7 @@ from keystone_agents.live_retrieval import (
 from keystone_agents.local_file_inputs import local_file_input_bundle_from_text
 from keystone_agents.model_provider import get_runtime_agent_model_config
 from keystone_agents.models import RunMode
+from keystone_agents.multi_target_research import should_run_multi_target_research
 from keystone_agents.operator_failures import (
     known_exception_to_operator_failure,
     operator_failure_from_mapping,
@@ -164,8 +174,10 @@ from keystone_agents.schemas.approval import (
 )
 from keystone_agents.schemas.email_triage import EmailTriageResult
 from keystone_agents.schemas.execution_request import (
+    ContinuationObjectReference,
     DirectAgentResponse,
     DirectAgentResponseInput,
+    ExecutionRequest,
 )
 from keystone_agents.schemas.manual_request_plan import (
     ManualProviderResultSetScope,
@@ -214,6 +226,7 @@ from keystone_agents.tools.google_calendar_tool import (
     GoogleCalendarError,
     create_google_calendar_event_impl,
     delete_google_calendar_event_impl,
+    read_google_calendar_event_impl,
     read_google_calendar_window_impl,
     resolve_google_calendar_event_impl,
     update_google_calendar_event_impl,
@@ -290,7 +303,6 @@ _ASK_ENTRY_TELEMETRY: ContextVar[_CLIEntryTelemetryScope | None] = ContextVar(
     "keystone_cli_ask_entry_telemetry",
     default=None,
 )
-
 
 CONTEXT_AGENT_ROUTES = {
     "airtable_context_agent",
@@ -737,11 +749,14 @@ def execute_direct_calendar_action(
         "calendar-direct:" + hashlib.sha256(input_text.encode("utf-8")).hexdigest()[:16]
     )
     resolved_event_id = plan.event_id
+    resolved_calendar_id = plan.calendar_id
+    resolved_events: list[dict[str, Any]] = []
     calendar_lookup: dict[str, Any] | None = None
     window_read = plan.operation == "read" and plan.read_scope in {
         "time_window",
         "filtered_window",
     }
+    exact_id_read = plan.operation == "read" and bool(resolved_event_id)
     try:
         if window_read:
             time_min, time_max = _calendar_window_bounds(plan, now=now)
@@ -750,8 +765,12 @@ def execute_direct_calendar_action(
                 time_max,
                 calendar_id=plan.calendar_id,
                 calendar_scope=plan.calendar_scope,
-                query=plan.query,
+                # Retrieve the bounded day across readable calendars before
+                # semantic selection. Provider text search cannot infer that an
+                # event on a care calendar answers a generic "medical appointment."
+                query="" if plan.read_scope == "filtered_window" else plan.query,
                 max_results=100,
+                display_timezone=plan.timezone,
                 live=live,
             )
             if not live:
@@ -773,7 +792,11 @@ def execute_direct_calendar_action(
                 }
             events = sorted(
                 (event for event in calendar_lookup.get("events", []) if isinstance(event, dict)),
-                key=lambda event: str(event.get("start") or ""),
+                key=lambda event: (
+                    str(event.get("display_start_date") or event.get("start_date") or ""),
+                    str(event.get("display_start_time") or event.get("start_time") or ""),
+                    str(event.get("title") or ""),
+                ),
             )
             selected_event = (
                 events[0]
@@ -793,11 +816,48 @@ def execute_direct_calendar_action(
                 },
                 "send_enabled": False,
             }
+        elif exact_id_read:
+            calendar_lookup = read_google_calendar_event_impl(
+                resolved_event_id,
+                calendar_id=resolved_calendar_id,
+                display_timezone=plan.timezone,
+                include_description=_calendar_description_requested(input_text),
+                live=live,
+            )
+            if not live:
+                return {
+                    "status": "dry-run",
+                    "mode": "dry_run",
+                    "selected_agent": "chief_of_staff",
+                    "route": "chief_of_staff",
+                    "input": input_text,
+                    "calendar_action": plan.__dict__,
+                    "calendar_lookup": calendar_lookup,
+                    "openai_requests": openai_requests,
+                    "send_enabled": False,
+                    "side_effects": {
+                        "calendar_write_performed": False,
+                        "email_sent": False,
+                        "slack_message_posted": False,
+                    },
+                }
         elif plan.operation != "create" and not resolved_event_id:
+            lookup_start_date = plan.event_reference_date
+            lookup_start_time = plan.event_reference_time
+            if plan.operation in {"read", "delete"}:
+                lookup_start_date = lookup_start_date or plan.start_date
+                lookup_start_time = lookup_start_time or plan.start_time
             calendar_lookup = resolve_google_calendar_event_impl(
                 plan.event_reference,
-                start_date=plan.event_reference_date or plan.start_date,
+                start_date=lookup_start_date,
+                start_time=lookup_start_time,
                 calendar_id=plan.calendar_id,
+                calendar_scope=(
+                    plan.calendar_scope
+                    if plan.calendar_scope != "configured"
+                    else "all_readable"
+                ),
+                display_timezone=plan.timezone,
                 live=live,
             )
             if not live:
@@ -825,13 +885,51 @@ def execute_direct_calendar_action(
                     "Name the event more specifically or include its date."
                 )
             if lookup_status == "ambiguous":
+                matches = [
+                    item
+                    for item in calendar_lookup.get("matches", [])
+                    if isinstance(item, dict)
+                ]
+                if (
+                    plan.operation == "delete"
+                    and plan.target_count > 1
+                    and len(matches) == plan.target_count
+                ):
+                    resolved_events = matches
+                elif plan.target_count > 1:
+                    raise GoogleCalendarError(
+                        f'Expected exactly {plan.target_count} active Calendar events '
+                        f'matching "{plan.event_reference}", but found {len(matches)}. '
+                        "No events were deleted."
+                    )
+                else:
+                    raise GoogleCalendarError(
+                        f'More than one active Calendar event matched "{plan.event_reference}". '
+                        "Include the event date or a more specific title."
+                    )
+            if (
+                plan.operation in {"update", "delete"}
+                and str(calendar_lookup.get("title_match_kind") or "") != "exact"
+            ):
                 raise GoogleCalendarError(
-                    f'More than one active Calendar event matched "{plan.event_reference}". '
-                    "Include the event date or a more specific title."
+                    "Calendar mutation requires an exact event-title match. "
+                    "No event was changed."
                 )
             resolved_event_id = str(calendar_lookup.get("event_id") or "")
-            if plan.operation != "read" and not resolved_event_id:
+            resolved_calendar_id = str(
+                calendar_lookup.get("calendar_id") or plan.calendar_id
+            )
+            if plan.operation != "read" and not resolved_event_id and not resolved_events:
                 raise GoogleCalendarError("Calendar event lookup returned no exact identity.")
+            if (
+                plan.operation in {"update", "delete"}
+                and resolved_event_id
+                and str(calendar_lookup.get("access_role") or "").lower()
+                in {"reader", "freebusyreader"}
+            ):
+                raise GoogleCalendarError(
+                    "The exact Calendar match is read-only. No event was changed."
+                )
         if window_read:
             pass
         elif plan.operation == "read":
@@ -865,28 +963,86 @@ def execute_direct_calendar_action(
             update_start_date = plan.start_date
             if plan.start_time and not update_start_date:
                 update_start_date = plan.event_reference_date or str(
-                    (calendar_lookup or {}).get("start_date") or ""
+                    (calendar_lookup or {}).get("display_start_date")
+                    or (calendar_lookup or {}).get("start_date")
+                    or ""
                 )
+            duration_minutes = _resolved_calendar_duration_minutes(
+                calendar_lookup,
+            )
             result = update_google_calendar_event_impl(
                 resolved_event_id,
                 title=plan.title,
                 start_date=update_start_date,
                 description=plan.description,
-                calendar_id=plan.calendar_id,
+                calendar_id=resolved_calendar_id,
                 timezone=plan.timezone,
                 start_time=plan.start_time,
                 end_time=plan.end_time,
+                duration_minutes=duration_minutes,
                 append_description=plan.append_description,
                 approval_reference=approval_reference,
                 live=live,
             )
         else:
-            result = delete_google_calendar_event_impl(
-                resolved_event_id,
-                calendar_id=plan.calendar_id,
-                approval_reference=approval_reference,
-                live=live,
-            )
+            if resolved_events:
+                non_writable = [
+                    item
+                    for item in resolved_events
+                    if str(item.get("access_role") or "").lower()
+                    in {"reader", "freebusyreader"}
+                ]
+                if non_writable:
+                    raise GoogleCalendarError(
+                        "At least one exact Calendar match is read-only. "
+                        "No events were deleted."
+                    )
+                receipts: list[dict[str, Any]] = []
+                failure = ""
+                for event in resolved_events:
+                    try:
+                        receipts.append(
+                            delete_google_calendar_event_impl(
+                                str(event.get("event_id") or ""),
+                                calendar_id=str(
+                                    event.get("calendar_id") or plan.calendar_id
+                                ),
+                                approval_reference=approval_reference,
+                                live=live,
+                            )
+                        )
+                    except (GoogleCalendarError, RuntimeError, ValueError) as exc:
+                        failure = str(exc)
+                        break
+                deleted_count = sum(
+                    bool((receipt.get("verification") or {}).get("passed"))
+                    for receipt in receipts
+                )
+                all_deleted = deleted_count == plan.target_count and not failure
+                result = {
+                    "status": "success" if all_deleted else "partial",
+                    "operation": "delete_calendar_events",
+                    "title": plan.event_reference,
+                    "start_date": plan.event_reference_date or plan.start_date,
+                    "start_time": plan.event_reference_time or plan.start_time,
+                    "target_count": plan.target_count,
+                    "deleted_count": deleted_count,
+                    "receipts": receipts,
+                    "failure": failure,
+                    "verification": {
+                        "status": "verified" if all_deleted else "partial",
+                        "passed": all_deleted,
+                        "events_absent_after": deleted_count,
+                    },
+                    "send_enabled": False,
+                }
+            else:
+                result = delete_google_calendar_event_impl(
+                    resolved_event_id,
+                    calendar_id=resolved_calendar_id,
+                    approval_reference=approval_reference,
+                    live=live,
+                )
     except (GoogleCalendarError, RuntimeError, ValueError) as exc:
         payload = {
             "status": "blocked",
@@ -903,6 +1059,17 @@ def execute_direct_calendar_action(
             payload["interpretation_warnings"] = list(interpretation_warnings)
         return payload
 
+    receipt_verification = result.get("verification")
+    if live and isinstance(receipt_verification, dict):
+        requested_changes_match = _calendar_receipt_covers_requested_changes(
+            plan,
+            result,
+        )
+        receipt_verification["requested_changes_match"] = requested_changes_match
+        if not requested_changes_match:
+            receipt_verification["passed"] = False
+            receipt_verification["status"] = "verification_failed"
+            result["status"] = "verification_failed"
     passed = bool((result.get("verification") or {}).get("passed"))
     human_summary = _direct_calendar_human_summary(plan, result)
     payload = {
@@ -925,7 +1092,14 @@ def execute_direct_calendar_action(
         "openai_requests": openai_requests,
         "send_enabled": False,
         "side_effects": {
-            "calendar_write_performed": bool(live and passed and plan.operation != "read"),
+            "calendar_write_performed": bool(
+                live
+                and plan.operation != "read"
+                and (
+                    passed
+                    or int(result.get("deleted_count") or 0) > 0
+                )
+            ),
             "email_sent": False,
             "slack_message_posted": False,
         },
@@ -935,11 +1109,56 @@ def execute_direct_calendar_action(
     return payload
 
 
+def _calendar_receipt_covers_requested_changes(
+    plan: CalendarActionPlan,
+    result: Mapping[str, Any],
+) -> bool:
+    """Require the provider receipt to prove every concrete requested mutation."""
+
+    if plan.operation not in {"create", "update"}:
+        return True
+    verification = result.get("verification")
+    if not isinstance(verification, Mapping):
+        return False
+    if plan.title and str(result.get("title") or "") != plan.title:
+        return False
+    if plan.start_date and str(result.get("start_date") or "") != plan.start_date:
+        return False
+    if plan.start_time and str(result.get("start_time") or "")[:5] != plan.start_time[:5]:
+        return False
+    if plan.description and verification.get("description_match") is not True:
+        return False
+    if (
+        plan.operation == "update"
+        and plan.append_description
+        and result.get("description_mode") != "append"
+    ):
+        return False
+    return True
+
+
 def _direct_calendar_human_summary(
     plan: CalendarActionPlan,
     result: dict[str, Any],
 ) -> str:
     """Render a verified Calendar result without exposing workflow metadata."""
+
+    if plan.operation == "delete" and plan.target_count > 1:
+        deleted_count = int(result.get("deleted_count") or 0)
+        date_suffix = (
+            f" on {plan.event_reference_date or plan.start_date}"
+            if plan.event_reference_date or plan.start_date
+            else ""
+        )
+        if deleted_count == plan.target_count:
+            return (
+                f'Deleted and verified {deleted_count} Google Calendar events titled '
+                f'"{plan.event_reference}"{date_suffix}.'
+            )
+        return (
+            f'Deleted and verified {deleted_count} of {plan.target_count} requested '
+            f'Google Calendar events titled "{plan.event_reference}"{date_suffix}.'
+        )
 
     if plan.operation == "read" and plan.read_scope in {
         "time_window",
@@ -949,9 +1168,17 @@ def _direct_calendar_human_summary(
         selected_event = result.get("selected_event")
         if isinstance(selected_event, dict):
             title = str(selected_event.get("title") or "Untitled event").strip()
-            start_date = str(selected_event.get("start_date") or plan.start_date).strip()
-            start_time = str(selected_event.get("start_time") or "").strip()
-            end_time = str(selected_event.get("end_time") or "").strip()
+            start_date = str(
+                selected_event.get("display_start_date")
+                or selected_event.get("start_date")
+                or plan.start_date
+            ).strip()
+            start_time = str(
+                selected_event.get("display_start_time") or selected_event.get("start_time") or ""
+            ).strip()
+            end_time = str(
+                selected_event.get("display_end_time") or selected_event.get("end_time") or ""
+            ).strip()
             time_suffix = _calendar_human_time_suffix(start_time, end_time)
             if plan.read_selection == "next" and plan.date_scope == "today":
                 return f'Your next Google Calendar event today is "{title}"{time_suffix}.'
@@ -968,12 +1195,27 @@ def _direct_calendar_human_summary(
             lines = [f"{heading}:"]
             for event in events[:10]:
                 title = str(event.get("title") or "Untitled event").strip()
-                start_date = str(event.get("start_date") or plan.start_date).strip()
-                start_time = str(event.get("start_time") or "").strip()
-                end_time = str(event.get("end_time") or "").strip()
+                start_date = str(
+                    event.get("display_start_date") or event.get("start_date") or plan.start_date
+                ).strip()
+                start_time = str(
+                    event.get("display_start_time") or event.get("start_time") or ""
+                ).strip()
+                end_time = str(event.get("display_end_time") or event.get("end_time") or "").strip()
                 date_suffix = f" on {start_date}" if start_date else ""
+                source_calendar = str(event.get("source_calendar_name") or "").strip()
+                source_suffix = (
+                    f" ({source_calendar})"
+                    if (
+                        source_calendar
+                        and "@" not in source_calendar
+                        and not event.get("source_calendar_primary")
+                    )
+                    else ""
+                )
                 lines.append(
-                    f'- "{title}"{date_suffix}{_calendar_human_time_suffix(start_time, end_time)}'
+                    f'- "{title}"{source_suffix}{date_suffix}'
+                    f"{_calendar_human_time_suffix(start_time, end_time)}"
                 )
             return "\n".join(lines)
         if plan.read_selection == "next" and plan.date_scope == "today":
@@ -988,15 +1230,31 @@ def _direct_calendar_human_summary(
 
     title = str(result.get("title") or plan.title or plan.event_reference).strip()
     start_date = str(
-        result.get("start_date") or plan.start_date or plan.event_reference_date
+        result.get("display_start_date")
+        or result.get("start_date")
+        or plan.start_date
+        or plan.event_reference_date
     ).strip()
-    start_time = str(result.get("start_time") or plan.start_time).strip()
-    end_time = str(result.get("end_time") or plan.end_time).strip()
+    start_time = str(
+        result.get("display_start_time") or result.get("start_time") or plan.start_time
+    ).strip()
+    end_time = str(
+        result.get("display_end_time") or result.get("end_time") or plan.end_time
+    ).strip()
     time_suffix = _calendar_human_time_suffix(start_time, end_time)
     if plan.operation == "read":
         if result.get("found") is True:
             date_suffix = f" on {start_date}" if start_date else ""
-            return f'Yes - "{title}" is on your Google Calendar{date_suffix}{time_suffix}.'
+            summary = (
+                f'Yes - "{title}" is on your Google Calendar'
+                f"{date_suffix}{time_suffix}."
+            )
+            if "description" in result:
+                description = str(result.get("description") or "").strip()
+                rendered_description = description or "(none)"
+                punctuation = "" if rendered_description.endswith((".", "!", "?")) else "."
+                summary += f" Description: {rendered_description}{punctuation}"
+            return summary
         date_suffix = f" on {start_date}" if start_date else ""
         return (
             f'No - I did not find an active event named "{title}"'
@@ -1033,6 +1291,20 @@ def _calendar_window_bounds(
         local_now = local_now.astimezone(timezone)
     day_start = datetime.combine(window_date, datetime.min.time(), tzinfo=timezone)
     day_end = day_start + timedelta(days=1)
+    if plan.start_time:
+        try:
+            start_clock = datetime.strptime(plan.start_time, "%H:%M").time()
+        except ValueError as exc:
+            raise ValueError("Calendar window start time must use HH:MM.") from exc
+        day_start = datetime.combine(window_date, start_clock, tzinfo=timezone)
+    if plan.end_time:
+        try:
+            end_clock = datetime.strptime(plan.end_time, "%H:%M").time()
+        except ValueError as exc:
+            raise ValueError("Calendar window end time must use HH:MM.") from exc
+        day_end = datetime.combine(window_date, end_clock, tzinfo=timezone)
+    if day_start >= day_end:
+        raise ValueError("Calendar window end time must be after the start time.")
     window_start = (
         max(local_now, day_start)
         if plan.read_selection == "next" and window_date == local_now.date()
@@ -1041,6 +1313,18 @@ def _calendar_window_bounds(
     if window_start >= day_end:
         raise ValueError("The requested Calendar window has already ended.")
     return window_start.isoformat(), day_end.isoformat()
+
+
+def _calendar_description_requested(input_text: str) -> bool:
+    """Select an optional read field without deciding or authorizing the operation."""
+
+    return bool(
+        re.search(
+            r"\b(?:description|details?|notes?)\b",
+            input_text,
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def _calendar_human_time_suffix(start_time: str, end_time: str) -> str:
@@ -1060,6 +1344,23 @@ def _human_calendar_clock(value: str) -> str:
         return value
 
 
+def _resolved_calendar_duration_minutes(
+    calendar_lookup: Mapping[str, Any] | None,
+) -> int:
+    """Return the provider-resolved event duration for a time-only move."""
+
+    lookup = calendar_lookup or {}
+    raw_start = str(lookup.get("start") or "").strip()
+    raw_end = str(lookup.get("end") or "").strip()
+    try:
+        start = datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(raw_end.replace("Z", "+00:00"))
+    except ValueError:
+        return 60
+    duration = int((end - start).total_seconds() // 60)
+    return duration if 1 <= duration <= 1440 else 60
+
+
 def run_direct_calendar_action(
     input_text: str,
     plan: CalendarActionPlan,
@@ -1072,7 +1373,12 @@ def run_direct_calendar_action(
     manual_plan: ManualRequestPlan | None = None,
     orchestrator_preflight: OrchestratorPreflight | None = None,
     database_url: str | None = None,
+    orchestrator_preflight_ms: float = 0.0,
+    ask_started_at: float | None = None,
+    execution_context: Mapping[str, Any] | None = None,
 ) -> int:
+    direct_started_at = perf_counter()
+    provider_started_at = perf_counter()
     payload = execute_direct_calendar_action(
         input_text,
         plan,
@@ -1080,6 +1386,69 @@ def run_direct_calendar_action(
         openai_requests=openai_requests,
         interpretation_warnings=interpretation_warnings,
     )
+    provider_action_ms = round((perf_counter() - provider_started_at) * 1000, 3)
+    lookup_synthesis_ms = 0.0
+    if (
+        live
+        and plan.operation == "read"
+        and payload.get("status") == "done"
+        and isinstance(payload.get("tool_receipt"), dict)
+    ):
+        receipt = payload["tool_receipt"]
+        events = [event for event in receipt.get("events", []) if isinstance(event, dict)]
+        response_scope = calendar_lookup_response_scope(manual_plan, plan)
+        lookup_started_at = perf_counter()
+        answer_resolution = resolve_calendar_lookup_answer(
+            input_text,
+            events,
+            lookup_target=calendar_lookup_target_from_plan(manual_plan),
+            response_scope=response_scope,
+            fallback=str(payload.get("human_summary") or "").strip(),
+            live=True,
+        )
+        lookup_synthesis_ms = round((perf_counter() - lookup_started_at) * 1000, 3)
+        payload["calendar_lookup_synthesis"] = {
+            "status": answer_resolution.status,
+            "response_scope": answer_resolution.response_scope,
+            "selected_event_indexes": list(answer_resolution.selected_event_indexes),
+            "related_event_groups": [
+                list(group) for group in getattr(answer_resolution, "related_event_groups", ())
+            ],
+        }
+        payload["calendar_lookup_synthesis_warnings"] = list(answer_resolution.warnings)
+        payload["openai_requests"] = (
+            int(payload.get("openai_requests") or 0) + answer_resolution.openai_requests
+        )
+        payload["human_summary"] = answer_resolution.text
+        payload["slack_display_text"] = answer_resolution.text
+        payload["display_text"] = answer_resolution.text
+        payload["summary"] = answer_resolution.text
+        public_result = payload.get("public_result")
+        if isinstance(public_result, dict):
+            public_result["text"] = answer_resolution.text
+    direct_calendar_total_ms = round(
+        (perf_counter() - direct_started_at) * 1000,
+        3,
+    )
+    ask_total_ms = (
+        round((perf_counter() - ask_started_at) * 1000, 3)
+        if ask_started_at is not None
+        else direct_calendar_total_ms
+    )
+    payload["performance"] = {
+        "orchestrator_preflight_ms": round(max(orchestrator_preflight_ms, 0.0), 3),
+        "pre_calendar_overhead_ms": round(
+            max(
+                ask_total_ms - max(orchestrator_preflight_ms, 0.0) - direct_calendar_total_ms,
+                0.0,
+            ),
+            3,
+        ),
+        "provider_action_ms": provider_action_ms,
+        "lookup_synthesis_ms": lookup_synthesis_ms,
+        "direct_calendar_total_ms": direct_calendar_total_ms,
+        "ask_total_ms": ask_total_ms,
+    }
     if execution_admission is not None:
         payload["execution_admission"] = execution_admission.__dict__
     if live and manual_plan is not None:
@@ -1087,6 +1456,7 @@ def run_direct_calendar_action(
     if live and orchestrator_preflight is not None:
         payload["orchestrator_preflight"] = _orchestrator_preflight_payload(orchestrator_preflight)
     if live:
+        _attach_slack_run_provenance(payload, execution_context)
         _persist_direct_calendar_run(
             input_text=input_text,
             payload=payload,
@@ -1278,6 +1648,7 @@ def _run_live_ask_with_environment(args: argparse.Namespace) -> int:
 
 
 def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
+    ask_started_at = perf_counter()
     raw_input = _ask_input(args)
     slack_context_input = _context_file_is_slack_context(args.context_file)
     linked_work_item = _validated_slack_linked_work_item(
@@ -1322,13 +1693,12 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         or (mention.route if mention.explicit else None)
     )
     execution_input_text = (
-        planning_input
-        if slack_continuation and planning_input
-        else current_input_text
+        planning_input if slack_continuation and planning_input else current_input_text
     )
     semantic_input_text = current_input_text
     cost_directive = parse_cost_tracking_directive(current_input_text)
     input_text = (cost_directive.cleaned_text or current_input_text).strip()
+    downstream_input_text = execution_input_text if slack_continuation else input_text
     if semantic_input_text != current_input_text:
         semantic_cost_directive = parse_cost_tracking_directive(semantic_input_text)
         semantic_input_text = (semantic_cost_directive.cleaned_text or semantic_input_text).strip()
@@ -1369,9 +1739,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     calendar_candidate = bool(
         calendar_plan is not None or is_calendar_action_candidate(calendar_input_text)
     )
-    live_search_capability_enabled = args.live_search or (
-        live_sdk and cli_default_live_research()
-    )
+    live_search_capability_enabled = args.live_search or (live_sdk and cli_default_live_research())
     live_search = live_search_capability_enabled
     if live_search and (
         _request_forbids_live_research(semantic_input_text)
@@ -1381,10 +1749,9 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     live_manual_plan_requested = (
         live_sdk if args.live_manual_plan is None else bool(args.live_manual_plan)
     )
-    # Natural-language wording never bypasses semantic planning. Harnesses that
-    # deliberately omit the planner must use the typed --no-live-manual-plan
-    # control instead of embedding magic phrases such as "bounded smoke" in
-    # the operator request.
+    # The planner owns operation semantics for every live natural-language
+    # Calendar ask. Deterministic parsing remains a field-extraction and
+    # validation boundary only.
     live_manual_plan = live_manual_plan_requested
     request_estimate = _estimate_ask_openai_requests(
         args,
@@ -1397,15 +1764,8 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     # Semantic interpretation is a single bounded request. Do not block that
     # planner call using the unresolved worst-case manager/graph estimate.
     # Recompute and enforce the actual route ceiling immediately after preflight.
-    live_unowned_calendar_followup = bool(
-        live_sdk
-        and slack_continuation
-        and args.agent is None
-        and not execution_request.requested_agent_explicit
-    )
     calendar_route_eligible = bool(
-        (not live_sdk or live_unowned_calendar_followup)
-        and calendar_candidate
+        calendar_candidate
         and requested_route
         in {
             None,
@@ -1430,6 +1790,15 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         database_url=args.database_url,
         work_item=linked_work_item,
     )
+    execution_request = _execution_request_with_workflow_verified_objects(
+        execution_request,
+        direct_workflow_state,
+    )
+    planning_input = execution_request_planning_text(execution_request)
+    execution_input_text = (
+        planning_input if slack_continuation and planning_input else current_input_text
+    )
+    downstream_input_text = execution_input_text if slack_continuation else input_text
     if slack_continuation:
         direct_workflow_state = _merge_direct_workflow_state(
             direct_workflow_state,
@@ -1448,12 +1817,17 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             prior_request=execution_request.continuation.prior_request,
         )
         calendar_plan = infer_calendar_action_plan(calendar_input_text)
+    preflight_started_at = perf_counter()
     orchestrator_preflight = run_orchestrator_preflight(
         semantic_input_text,
         requested_agent=requested_route,
         live_manual_plan=live_manual_plan,
         database_url=args.database_url,
         workflow_state=direct_workflow_state,
+    )
+    orchestrator_preflight_ms = round(
+        (perf_counter() - preflight_started_at) * 1000,
+        3,
     )
     orchestrator_preflight = _apply_continuation_provider_affinity(
         orchestrator_preflight,
@@ -1506,9 +1880,6 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         and manual_plan.provider_system == "google_calendar"
         and manual_plan.target_agent == "chief_of_staff"
         and manual_plan.intent in {"business_system_write", "context_lookup"}
-        and (
-            manual_plan.intent == "context_lookup" or not live_sdk or live_unowned_calendar_followup
-        )
     )
     calendar_interpretation_eligible = bool(
         calendar_semantic_candidate
@@ -1520,12 +1891,31 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     )
     if calendar_interpretation_eligible:
         preflight_requests = _orchestrator_preflight_request_count(orchestrator_preflight)
+        reusable_calendar_plan = (
+            canonical_calendar_read_plan(
+                calendar_input_text,
+                manual_plan=manual_plan,
+            )
+            if live_sdk
+            else None
+        )
+        calendar_interpreter_requests = (
+            0 if reusable_calendar_plan is not None else 1 if live_sdk else 0
+        )
+        calendar_lookup_synthesis_requests = (
+            1 if live_sdk and manual_plan.intent == "context_lookup" else 0
+        )
         calendar_request_estimate = {
-            "min": preflight_requests + (1 if live_sdk else 0),
-            "max": preflight_requests + (1 if live_sdk else 0),
+            "min": preflight_requests + calendar_interpreter_requests,
+            "max": (
+                preflight_requests
+                + calendar_interpreter_requests
+                + calendar_lookup_synthesis_requests
+            ),
             "stages": [
                 *(["manual_request_planner"] if preflight_requests else []),
-                *(["calendar_action_interpreter"] if live_sdk else []),
+                *(["calendar_action_interpreter"] if calendar_interpreter_requests else []),
+                *(["calendar_lookup_synthesizer"] if calendar_lookup_synthesis_requests else []),
             ],
         }
         if args.max_openai_requests is not None and (
@@ -1550,6 +1940,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             manual_plan=manual_plan,
             semantic_candidate=calendar_semantic_candidate,
             live=live_sdk,
+            verified_objects=execution_request.continuation.verified_objects,
         )
         if calendar_resolution.plan is not None:
             calendar_admission = admit_provider_action(
@@ -1571,6 +1962,9 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                     manual_plan=manual_plan,
                     orchestrator_preflight=orchestrator_preflight,
                     database_url=args.database_url,
+                    orchestrator_preflight_ms=orchestrator_preflight_ms,
+                    ask_started_at=ask_started_at,
+                    execution_context=direct_workflow_state,
                 )
     interpreted_lifecycle_route = str(manual_plan.target_agent or "").strip()
     interpreted_lifecycle_scope = _interpreted_lifecycle_scope_text(
@@ -1711,7 +2105,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             explicit_route=mention.route if mention.explicit else None,
         ):
             return _run_ask_opportunity_to_outreach_loop(
-                semantic_input_text,
+                downstream_input_text,
                 live_search=live_search,
                 live_sdk=live_sdk,
                 json_output=args.json,
@@ -1734,9 +2128,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             orchestrator_preflight,
             request_text=semantic_input_text,
         ):
-            requested_work_item_route = _preflight_work_item_entry_route(
-                orchestrator_preflight
-            )
+            requested_work_item_route = _preflight_work_item_entry_route(orchestrator_preflight)
             return _run_ask_work_item(
                 execution_input_text,
                 database_url=args.database_url,
@@ -1771,7 +2163,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 route = manual_plan.target_agent
             if route == "orchestrator":
                 return _run_ask_orchestrator(
-                    input_text,
+                    downstream_input_text,
                     live_sdk=True,
                     json_output=args.json,
                     manual_plan=manual_plan,
@@ -1785,7 +2177,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 )
             return _run_ask_specialist_live(
                 route,
-                execution_input_text if route == "chief_of_staff" else input_text,
+                downstream_input_text,
                 json_output=args.json,
                 manual_plan=manual_plan,
                 orchestrator_preflight=orchestrator_preflight,
@@ -1868,9 +2260,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         orchestrator_preflight,
         request_text=semantic_input_text,
     ):
-        requested_work_item_route = _preflight_work_item_entry_route(
-            orchestrator_preflight
-        )
+        requested_work_item_route = _preflight_work_item_entry_route(orchestrator_preflight)
         return _run_ask_work_item(
             execution_input_text,
             database_url=args.database_url,
@@ -1893,7 +2283,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     if route == "orchestrator":
         if _context_file_is_work_item_source_bundle(args.context_file):
             return _run_ask_work_item(
-                input_text,
+                downstream_input_text,
                 database_url=args.database_url,
                 live_search=live_search,
                 live_sdk=live_sdk,
@@ -1911,7 +2301,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 cost_tracking_requested=cost_directive.requested,
             )
         return _run_ask_orchestrator(
-            input_text,
+            downstream_input_text,
             live_sdk=live_sdk,
             json_output=args.json,
             manual_plan=manual_plan,
@@ -1928,7 +2318,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         route = _route_with_manual_plan_advice(route, manual_plan)
         if route == "orchestrator":
             return _run_ask_orchestrator(
-                input_text,
+                downstream_input_text,
                 live_sdk=True,
                 json_output=args.json,
                 manual_plan=manual_plan,
@@ -1948,7 +2338,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             route = manual_plan.target_agent
             if route == "orchestrator":
                 return _run_ask_orchestrator(
-                    input_text,
+                    downstream_input_text,
                     live_sdk=True,
                     json_output=args.json,
                     manual_plan=manual_plan,
@@ -1963,7 +2353,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 )
         return _run_ask_specialist_live(
             route,
-            execution_input_text if route == "chief_of_staff" else input_text,
+            downstream_input_text,
             json_output=args.json,
             manual_plan=manual_plan,
             orchestrator_preflight=orchestrator_preflight,
@@ -1980,7 +2370,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         )
     return _print_ask_dry_run(
         route,
-        execution_input_text if route == "chief_of_staff" else input_text,
+        downstream_input_text,
         json_output=args.json,
         manual_plan=manual_plan,
         orchestrator_preflight=orchestrator_preflight,
@@ -2110,7 +2500,8 @@ def _calendar_continuation_input_text(
     if (
         previous_request
         and root_request
-        and " ".join(previous_request.lower().split()) != " ".join(root_request.lower().split())
+        and normalize_slack_operator_turn_identity(previous_request)
+        != normalize_slack_operator_turn_identity(root_request)
     ):
         task_anchor = f"{root_request} Most recent operator turn: {previous_request}"
     else:
@@ -2137,12 +2528,12 @@ def _latest_distinct_slack_operator_turn(
     messages = workflow_state.get("recent_slack_thread")
     if not isinstance(messages, list):
         return ""
-    current = " ".join(current_request.lower().split())
+    current = normalize_slack_operator_turn_identity(current_request)
     for message in reversed(messages):
         if not isinstance(message, Mapping) or message.get("role") != "operator":
             continue
         candidate = _bounded_redacted_text(message.get("text"), max_chars=2400)
-        if candidate and " ".join(candidate.lower().split()) != current:
+        if candidate and normalize_slack_operator_turn_identity(candidate) != current:
             return candidate
     return ""
 
@@ -3276,7 +3667,7 @@ def _manual_plan_is_bounded_provider_free_response(
         and manual_plan.ask_shape.source_type_preference
         and all(
             re.search(
-                r"\b(?:attached|local|file|image|pdf|document)\b",
+                r"\b(?:attached|local)\b",
                 str(source_type or ""),
                 re.IGNORECASE,
             )
@@ -3320,6 +3711,8 @@ def _should_run_direct_supplied_response(
 ) -> bool:
     """Let a live semantic plan decide whether tools/providers are unnecessary."""
 
+    if requested_route not in _DIRECT_SUPPLIED_RESPONSE_ROUTES:
+        return False
     authority = ExecutionIntentAuthority.from_value(manual_plan)
     if authority.canonical and manual_plan is not None:
         return _manual_plan_is_bounded_provider_free_response(
@@ -3371,35 +3764,28 @@ def _direct_specialist_request_estimate(
             # The compact supplied-evidence adapter performs one tool-free synthesis.
             return 1
         authority = ExecutionIntentAuthority.from_value(manual_plan)
-        if (
-            route == "zotero_context_agent"
-            and (
-                (
-                    authority.canonical
-                    and authority.plan is not None
-                    and authority.plan.provider_system == "zotero"
-                    and authority.plan.provider_selection_order == "latest"
-                    and "abstract" in authority.plan.zotero_requested_fields
-                )
-                or (
-                    authority.fallback_allowed
-                    and "abstract" in normalized
-                    and re.search(
-                        r"\b(?:latest|most\s+recent(?:ly)?\s+added)\b",
-                        normalized,
-                    )
+        if route == "zotero_context_agent" and (
+            (
+                authority.canonical
+                and authority.plan is not None
+                and authority.plan.provider_system == "zotero"
+                and authority.plan.provider_selection_order == "latest"
+                and "abstract" in authority.plan.zotero_requested_fields
+            )
+            or (
+                authority.fallback_allowed
+                and "abstract" in normalized
+                and re.search(
+                    r"\b(?:latest|most\s+recent(?:ly)?\s+added)\b",
+                    normalized,
                 )
             )
         ):
             # The ordered provider read is acquired before the specialist call.
             return 1
-        if _is_bounded_composite_lifecycle_request(
-            route,
-            input_text=input_text,
-            manual_plan=plan,
-        ):
-            # One guarded provider helper owns the complete marked lifecycle;
-            # reserve one model turn for the call and one for synthesis.
+        if profile["bounded_composite_lifecycle"]:
+            # Guarded lifecycle helpers perform their provider operations in
+            # one bounded tool call, followed by one synthesis turn.
             return 2
         if plan.intent == "business_system_write":
             if (
@@ -3417,10 +3803,10 @@ def _direct_specialist_request_estimate(
             # Allow a separate target/schema read, mutation, and final synthesis.
             return 3
         if route == "google_workspace_context_agent":
-            # A bounded provider-backed read may need one model turn to resolve
-            # an exact target, one to read it, and one to synthesize the answer.
-            # This is a ceiling rather than a required number of calls, so exact
-            # reads that finish earlier keep their fast path.
+            # Workspace reads may need Drive discovery before the selected
+            # Docs/Sheets/Slides read. Keep enough room for both provider-tool
+            # turns plus the final source-grounded synthesis. This is a ceiling;
+            # simple one-tool reads may still finish earlier.
             return 3
         # One model request may select a bounded read tool; the second synthesizes
         # its result. Provider calls do not count as OpenAI requests.
@@ -3466,9 +3852,7 @@ def _direct_specialist_runtime_profile(
             len(
                 {
                     operation
-                    for operation in authority.effective_provider_operations(
-                        plan.provider_system
-                    )
+                    for operation in authority.effective_provider_operations(plan.provider_system)
                     if operation in {"create", "update", "delete", "attach"}
                 }
             )
@@ -3853,10 +4237,20 @@ def _preflight_requires_work_item(
 ) -> bool:
     """Use durable state only when the semantic plan or workflow requires it."""
 
-    del request_text
+    plan = preflight.manual_request_plan
+    effective_request_text = str(request_text or preflight.request_text or "")
     return bool(
         len(_preflight_workflow_routes(preflight)) > 1
-        or preflight.manual_request_plan.requires_durable_state
+        or plan.requires_durable_state
+        or (
+            plan.target_agent == "business_research_analyst"
+            and plan.intent in {"company_research", "research_brief"}
+            and should_run_multi_target_research(
+                request_text=effective_request_text,
+                manual_plan=plan.model_dump(mode="json"),
+                target=plan.primary_target,
+            )
+        )
     )
 
 
@@ -3877,8 +4271,7 @@ def _preflight_work_item_entry_route(
                 and plan.task_objective == "context_lookup"
                 and plan.expected_artifact_type == "context_summary"
                 and all(
-                    route in {*CONTEXT_AGENT_ROUTES, "gmail_triage"}
-                    for route in workflow_routes
+                    route in {*CONTEXT_AGENT_ROUTES, "gmail_triage"} for route in workflow_routes
                 )
             )
         )
@@ -3886,10 +4279,7 @@ def _preflight_work_item_entry_route(
         return "chief_of_staff"
     if workflow_routes:
         return workflow_routes[0]
-    return (
-        str(plan.target_agent or preflight.route_result.route or "").strip()
-        or None
-    )
+    return str(plan.target_agent or preflight.route_result.route or "").strip() or None
 
 
 def _orchestrator_preflight_payload(
@@ -4174,6 +4564,7 @@ def _orchestrator_workflow_state_from_cli_context(
     slack_context = {
         key: payload.get(key)
         for key in (
+            "team_id",
             "channel_id",
             "channel_name",
             "selected_message_ts",
@@ -4229,32 +4620,93 @@ def _attach_verified_provider_scope_from_slack_thread(
     *,
     database_url: str | None,
 ) -> dict[str, Any]:
-    """Attach verified provider identity for an ordinary Slack thread follow-up."""
+    """Attach verified collection and exact-object identity for a Slack follow-up."""
 
-    if isinstance(state.get("prior_provider_result_scope"), Mapping):
-        return state
     slack_scope = state.get("slack_context")
     if not isinstance(slack_scope, Mapping):
         return state
     channel_id = str(slack_scope.get("channel_id") or "").strip()
     thread_ts = str(slack_scope.get("thread_ts") or "").strip()
-    if not channel_id or not thread_ts:
+    team_id = str(slack_scope.get("team_id") or "").strip()
+    request_ts = str(slack_scope.get("request_ts") or "").strip()
+    if not team_id or not channel_id or not thread_ts or not request_ts:
         return state
     from keystone_agents.slack_actions import (
+        latest_verified_provider_objects_for_slack_thread,
         latest_verified_provider_result_scope_for_slack_thread,
     )
 
-    scope = latest_verified_provider_result_scope_for_slack_thread(
-        channel_id=channel_id,
-        thread_ts=thread_ts,
-        database_url=database_url,
-    )
-    if scope is None:
-        return state
-    return {
-        **state,
-        "prior_provider_result_scope": scope.model_dump(mode="json"),
+    updated = dict(state)
+    if not isinstance(state.get("prior_provider_result_scope"), Mapping):
+        scope = latest_verified_provider_result_scope_for_slack_thread(
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            database_url=database_url,
+            team_id=team_id,
+            before_request_ts=request_ts,
+        )
+        if scope is not None:
+            updated["prior_provider_result_scope"] = scope.model_dump(mode="json")
+    if not isinstance(state.get("verified_provider_objects"), list | tuple):
+        references = latest_verified_provider_objects_for_slack_thread(
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            database_url=database_url,
+            team_id=team_id,
+            before_request_ts=request_ts,
+        )
+        if references:
+            updated["verified_provider_objects"] = [
+                reference.model_dump(mode="json") for reference in references
+            ]
+    return updated
+
+
+def _execution_request_with_workflow_verified_objects(
+    request: ExecutionRequest,
+    workflow_state: Mapping[str, Any],
+) -> ExecutionRequest:
+    """Merge persisted verified identity without changing current-turn authority."""
+
+    raw_references = workflow_state.get("verified_provider_objects")
+    if not isinstance(raw_references, list | tuple):
+        return request
+    references = [
+        reference
+        for reference in request.continuation.verified_objects
+        if reference.verification_status == "verified"
+    ]
+    for value in raw_references:
+        if not isinstance(value, Mapping):
+            continue
+        try:
+            reference = ContinuationObjectReference.model_validate(value)
+        except (TypeError, ValueError):
+            continue
+        if (
+            reference.verification_status == "verified"
+            and reference not in references
+        ):
+            references.append(reference)
+    if tuple(references[:8]) == request.continuation.verified_objects:
+        return request
+    provider_affinity = request.continuation.provider_affinity
+    active_providers = {
+        reference.provider_system
+        for reference in references
+        if reference.lifecycle_state == "active"
     }
+    if not provider_affinity and len(active_providers) == 1:
+        provider_affinity = {
+            "google_drive": "google_workspace",
+        }.get(next(iter(active_providers)), next(iter(active_providers)))
+    continuation = request.continuation.model_copy(
+        update={
+            "provider_affinity": provider_affinity,
+            "verified_objects": tuple(references[:8]),
+        }
+    )
+    return request.model_copy(update={"continuation": continuation})
 
 
 def _slack_history_messages_for_planner(
@@ -4347,8 +4799,19 @@ def _planner_current_work_item_context(work_item: WorkItem) -> dict[str, Any]:
                 work_item.target.external_id,
                 max_chars=180,
             ),
+            "email": _bounded_redacted_text(
+                work_item.target.email,
+                max_chars=240,
+            ),
+            "url": _bounded_redacted_text(
+                work_item.target.url,
+                max_chars=500,
+            ),
+            "continuation_context": _planner_safe_continuation_fields(
+                work_item.target.metadata
+            ),
         }.items()
-        if value
+        if value not in ("", {})
     }
     selected_artifacts = [
         {
@@ -4368,8 +4831,15 @@ def _planner_current_work_item_context(work_item: WorkItem) -> dict[str, Any]:
                 ),
                 "title": _bounded_redacted_text(artifact.title, max_chars=240),
                 "summary": _bounded_redacted_text(artifact.summary, max_chars=480),
+                "approval_state": _bounded_redacted_text(
+                    artifact.approval_state,
+                    max_chars=80,
+                ),
+                "continuation_context": _planner_safe_continuation_fields(
+                    artifact.metadata
+                ),
             }.items()
-            if value
+            if value not in ("", {})
         }
         for artifact in work_item.artifact_refs
         if artifact.selected
@@ -4418,6 +4888,29 @@ def _planner_current_work_item_context(work_item: WorkItem) -> dict[str, Any]:
     }
 
 
+def _planner_safe_continuation_fields(metadata: Mapping[str, Any]) -> dict[str, str]:
+    """Admit only bounded identity and revision fields needed for a follow-up."""
+
+    aliases = {
+        "company_name": "company_name",
+        "recipient": "recipient",
+        "recipient_email": "recipient_email",
+        "manual_recipient": "recipient",
+        "thread_id": "thread_id",
+        "message_id": "message_id",
+        "email_subject": "email_subject",
+        "revision_max_words": "revision_max_words",
+    }
+    safe: dict[str, str] = {}
+    for source_key, target_key in aliases.items():
+        if source_key not in metadata or target_key in safe:
+            continue
+        value = _bounded_redacted_text(metadata.get(source_key), max_chars=320)
+        if value:
+            safe[target_key] = value
+    return safe
+
+
 def _planner_historical_work_item_facts(work_item: WorkItem) -> dict[str, Any]:
     """Carry bounded facts without granting a blocked WorkItem execution authority."""
 
@@ -4464,6 +4957,7 @@ def _direct_specialist_execution_context(
         scope = {
             key: _bounded_redacted_text(slack_context.get(key), max_chars=180)
             for key in (
+                "team_id",
                 "channel_id",
                 "channel_name",
                 "selected_message_ts",
@@ -4564,15 +5058,29 @@ def _attach_slack_run_provenance(
         return
     slack_scope = execution_context.get("slack_scope")
     if not isinstance(slack_scope, Mapping):
+        slack_scope = execution_context.get("slack_context")
+    if not isinstance(slack_scope, Mapping):
         return
     provenance = {
         key: _bounded_redacted_text(slack_scope.get(key), max_chars=180)
-        for key in ("channel_id", "thread_ts", "request_ts", "selected_message_ts")
+        for key in (
+            "team_id",
+            "channel_id",
+            "thread_ts",
+            "request_ts",
+            "selected_message_ts",
+        )
         if _bounded_redacted_text(slack_scope.get(key), max_chars=180)
     }
-    if provenance.get("channel_id") and provenance.get("thread_ts"):
+    if (
+        provenance.get("team_id")
+        and provenance.get("channel_id")
+        and provenance.get("thread_ts")
+        and provenance.get("request_ts")
+    ):
         payload["slack_run_provenance"] = {
             "schema": "keystone.slack.run_provenance.v1",
+            "context_validated": True,
             **provenance,
         }
 
@@ -4881,6 +5389,11 @@ def _run_ask_work_item(
             json_output=json_output,
         )
         existing_work_item = store.get_work_item(work_item_id) if work_item_id else None
+        prior_openai_requests = (
+            _stored_work_item_openai_requests(store, existing_work_item.id)
+            if existing_work_item is not None
+            else 0
+        )
         request = WorkflowRunRequest(
             request_text=input_text,
             work_item_id=work_item_id,
@@ -4939,6 +5452,10 @@ def _run_ask_work_item(
             # into the user-facing business answer.
             eval_record = None
     graph_metadata = _stored_work_item_langgraph_metadata(store, result.work_item.id)
+    total_openai_requests = _stored_work_item_openai_requests(
+        store,
+        result.work_item.id,
+    )
     return _print_work_item_result(
         result,
         json_output=json_output,
@@ -4948,10 +5465,8 @@ def _run_ask_work_item(
             "live_sdk": live_sdk,
             "live_search": live_search,
             "langgraph": graph_metadata is not None,
-            "openai_requests": _stored_work_item_openai_requests(
-                store,
-                result.work_item.id,
-            ),
+            "openai_requests": max(total_openai_requests - prior_openai_requests, 0),
+            "work_item_openai_requests_total": total_openai_requests,
         },
     )
 
@@ -6944,9 +7459,7 @@ def _strict_requested_display_text(
             )
             if re.search(pattern, requested_field_text)
         }
-    if titles and {"title", "authors", "publication_title"}.issubset(
-        requested_zotero_fields
-    ):
+    if titles and {"title", "authors", "publication_title"}.issubset(requested_zotero_fields):
         diagnostic_values = {
             str(item.get("key") or "").strip(): str(item.get("value") or "").strip()
             for item in output.get("diagnostics") or []
@@ -7800,9 +8313,11 @@ def _run_ask_context_agent_live(
         tool_receipts,
     )
     strict_display = _strict_requested_display_text(output_payload, manual_plan)
-    candidate_summary = _verified_context_agent_write_summary(
-        tool_receipts
-    ) or strict_display or _context_agent_human_summary(output_payload, manual_plan)
+    candidate_summary = (
+        _verified_context_agent_write_summary(tool_receipts)
+        or strict_display
+        or _context_agent_human_summary(output_payload, manual_plan)
+    )
     instruction_resolution = resolve_instruction_following_response(
         candidate_summary,
         original_request=input_text,
@@ -7879,6 +8394,7 @@ def _run_ask_context_agent_live(
             "evidence_complete": not bool(execution_blocker),
         },
     }
+    attach_verified_continuation_objects(payload, tool_receipts)
     _attach_slack_run_provenance(payload, execution_context)
     usage = extract_sdk_usage(raw_result)
     if usage.get("available"):
@@ -8461,13 +8977,22 @@ def _context_agent_tool_receipts(raw_result: object) -> list[dict[str, object]]:
                 "status",
                 "operation",
                 "provider",
+                "gmail_account",
+                "draft_id",
+                "message_id",
+                "thread_id",
+                "subject",
+                "sent",
                 "base_alias",
                 "table",
                 "record_id",
                 "duplicate_record_id",
                 "target_estimated_tax_period",
                 "item_key",
+                "selected_item_key",
                 "parent_item_key",
+                "library_id",
+                "library_type",
                 "document_id",
                 "file_id",
                 "spreadsheet_id",
@@ -8729,9 +9254,9 @@ def _direct_zotero_provider_preflight(
     )
     if semantic_authority:
         assert manual_plan is not None
-        provider_steps = ExecutionIntentAuthority.from_value(
-            manual_plan
-        ).provider_action_steps("zotero")
+        provider_steps = ExecutionIntentAuthority.from_value(manual_plan).provider_action_steps(
+            "zotero"
+        )
         ordered_collection_item_read = bool(
             manual_plan.target_type == "zotero_collection"
             and manual_plan.provider_selection_order == "latest"
@@ -8777,18 +9302,14 @@ def _direct_zotero_provider_preflight(
     if not latest_journal_requested:
         return "", [], ""
     require_abstract = bool(
-        "abstract" in requested_zotero_fields
-        if semantic_authority
-        else "abstract" in normalized
+        "abstract" in requested_zotero_fields if semantic_authority else "abstract" in normalized
     )
     try:
         if require_abstract:
             payload = (
                 read_latest_zotero_journal_abstract_metadata()
                 if selection_rank == 1
-                else read_latest_zotero_journal_abstract_metadata(
-                    selection_rank=selection_rank
-                )
+                else read_latest_zotero_journal_abstract_metadata(selection_rank=selection_rank)
             )
         else:
             payload = (
@@ -8840,10 +9361,7 @@ def _direct_zotero_provider_preflight(
         or not item_key
     ):
         available_count = payload.get("available_item_count")
-        if (
-            isinstance(available_count, int)
-            and available_count < selection_rank
-        ):
+        if isinstance(available_count, int) and available_count < selection_rank:
             return (
                 "",
                 [receipt],
@@ -8890,9 +9408,7 @@ def _direct_zotero_provider_preflight(
             "provider_link": provider_link,
             "verification": {
                 "status": "verified",
-                "passed": (
-                    int(payload.get("selection_rank") or 1) == selection_rank
-                ),
+                "passed": (int(payload.get("selection_rank") or 1) == selection_rank),
                 "item_key_match": True,
                 "provider_order_match": True,
             },
@@ -9212,6 +9728,8 @@ def _context_agent_public_payload(
 
     public_output = json.loads(json.dumps(output_payload, default=str))
     public_receipts = json.loads(json.dumps(tool_receipts, default=str))
+    redacted_receipts = _public_lifecycle_receipt(public_receipts)
+    public_receipts = redacted_receipts if isinstance(redacted_receipts, list) else []
     identity_field = ""
     lifecycle_operation = ""
     if route == "airtable_context_agent":
@@ -9224,6 +9742,11 @@ def _context_agent_public_payload(
     elif route == "zotero_context_agent":
         identity_field = "item_key"
         lifecycle_operation = "test_note_lifecycle"
+        public_output["zotero_item_keys"] = []
+        for receipt in public_receipts:
+            if isinstance(receipt, dict):
+                receipt.pop("selected_item_key", None)
+                receipt.pop("library_id", None)
     else:
         return public_output, public_receipts
     lifecycle_receipts = [
@@ -9259,8 +9782,6 @@ def _context_agent_public_payload(
                     for item in field_mapping
                     if not (isinstance(item, dict) and item.get("key") == "record_id")
                 ]
-    else:
-        public_output["zotero_item_keys"] = []
     for receipt in public_receipts:
         if isinstance(receipt, dict) and receipt.get("operation") == lifecycle_operation:
             receipt.pop(identity_field, None)
@@ -10568,8 +11089,10 @@ def _run_ask_gmail_triage_live(
 _PUBLIC_LIFECYCLE_RECEIPT_PRIVATE_KEYS = frozenset(
     {
         "approval_reference",
+        "calendar_id",
         "document_id",
         "draft_id",
+        "gmail_account",
         "message_id",
         "record_id",
         "thread_id",
@@ -10612,6 +11135,7 @@ def _persist_direct_provider_lifecycle_run(
 
     stored_payload = dict(payload)
     stored_payload["tool_receipt"] = internal_receipt
+    attach_execution_public_result(stored_payload)
     try:
         run_id = SQLiteStore(database_url or database_url_from_env()).save_agent_run(
             agent_name=route,
@@ -11866,9 +12390,7 @@ def _print_ask_live_payload(payload: dict[str, object], *, json_output: bool) ->
                     f"{specialist_review.get('status')} "
                     f"({specialist_review.get('overall_score')}/100)"
                 )
-                next_step = str(
-                    specialist_review.get("recommended_next_step") or ""
-                ).strip()
+                next_step = str(specialist_review.get("recommended_next_step") or "").strip()
                 if next_step:
                     print(f"Specialist feedback: {next_step}")
         missing = payload.get("missing_information")
@@ -12198,13 +12720,20 @@ def _run_automations_audit(args: argparse.Namespace) -> int:
 def _run_work_items_advance(args: argparse.Namespace) -> int:
     return _run_with_entry_telemetry(
         args,
-        lambda: _run_work_items_advance_with_current_environment(args),
+        lambda: (
+            _run_live_work_items_advance_with_environment(args)
+            if args.live_sdk is True
+            else _run_work_items_advance_with_current_environment(args)
+        ),
     )
 
 
-def _run_work_items_advance_with_current_environment(
-    args: argparse.Namespace,
-) -> int:
+@with_cli_environment(force_dotenv=True)
+def _run_live_work_items_advance_with_environment(args: argparse.Namespace) -> int:
+    return _run_work_items_advance_with_current_environment(args)
+
+
+def _run_work_items_advance_with_current_environment(args: argparse.Namespace) -> int:
     store = SQLiteStore(args.database_url or database_url_from_env())
     _register_entry_store(store)
     input_text = _read_input(args.input)
@@ -12215,6 +12744,11 @@ def _run_work_items_advance_with_current_environment(
         json_output=args.json,
     )
     existing_work_item = store.get_work_item(work_item_id) if work_item_id else None
+    prior_openai_requests = (
+        _stored_work_item_openai_requests(store, existing_work_item.id)
+        if existing_work_item is not None
+        else 0
+    )
     preflight_requested_agent = _work_item_preflight_requested_agent(existing_work_item)
     substantive_request = str(input_text or "").strip().lower() not in {"", "continue", "resume"}
     orchestrator_preflight = None
@@ -12288,6 +12822,10 @@ def _run_work_items_advance_with_current_environment(
             max_steps=args.max_manager_steps,
             feedback_callback=None if args.json else _print_manager_loop_feedback,
         )
+    total_openai_requests = _stored_work_item_openai_requests(
+        store,
+        result.work_item.id,
+    )
     return _print_work_item_result(
         result,
         json_output=args.json,
@@ -12296,10 +12834,8 @@ def _run_work_items_advance_with_current_environment(
             "live_sdk": bool(args.live_sdk),
             "live_search": bool(args.live_search),
             "langgraph": graph_metadata is not None,
-            "openai_requests": _stored_work_item_openai_requests(
-                store,
-                result.work_item.id,
-            ),
+            "openai_requests": max(total_openai_requests - prior_openai_requests, 0),
+            "work_item_openai_requests_total": total_openai_requests,
         },
     )
 

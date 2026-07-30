@@ -94,7 +94,11 @@ from keystone_agents.reporting import (
     render_outreach_oc1_test_pack_report,
     to_json,
 )
-from keystone_agents.run import SDKSynthesisOutcome, run_retrieved_sdk_synthesis
+from keystone_agents.run import (
+    SDKSynthesisOutcome,
+    run_retrieved_sdk_synthesis,
+    sdk_run_failure_metadata,
+)
 from keystone_agents.schemas.approval import (
     ApprovalScope,
     ApprovalState,
@@ -1222,6 +1226,10 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
         args,
         run_config_factory=SDK_RUN_CONFIG_FACTORY,
     )
+    if live:
+        get_runtime_agent_model_config(
+            "outreach_composer"
+        ).require_live_execution_ready()
     founder_fit_profile = load_founder_fit_profile(args.founder_fit_profile)
     if args.max_variants == 1:
         outcome = _run_single_sdk_synthesis(
@@ -1348,6 +1356,34 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
     return payload
 
 
+def _failed_sdk_synthesis_payload(exc: BaseException) -> dict[str, Any] | None:
+    """Return a structured no-side-effect failure when the SDK call was attempted."""
+
+    failure = sdk_run_failure_metadata(exc)
+    if not failure:
+        return None
+    return {
+        "mode": "sdk-synthesis",
+        "agent_name": "outreach_composer",
+        "status": "failed",
+        "live_sdk": failure.get("run_mode") == "live_sdk",
+        "sdk_run_invoked": True,
+        "failure_kind": failure.get("failure_kind") or type(exc).__name__,
+        "usage": failure.get("usage") or {},
+        "cost": failure.get("cost") or {},
+        "request_cache": failure.get("request_cache") or {},
+        "sdk_failure": failure,
+        "draft_created": False,
+        "approval_required": True,
+        "send_enabled": False,
+        "sent": False,
+        "audit_notes": [
+            "The SDK attempt failed before a validated draft was accepted.",
+            "No send, post, schedule, Gmail draft, or other external side effect occurred.",
+        ],
+    }
+
+
 @with_cli_environment()
 def main() -> int:
     args = apply_orchestrator_preflight_to_args(
@@ -1363,6 +1399,7 @@ def main() -> int:
             "brief-only outreach is synthesized by the LLM path."
         )
     if sdk_execution_requested(args):
+        exit_code = 0
         try:
             payload = _run_sdk_synthesis(args)
         except ValueError as exc:
@@ -1381,7 +1418,15 @@ def main() -> int:
             else:
                 raise SystemExit(message) from exc
         except RuntimeError as exc:
-            raise SystemExit(str(exc)) from exc
+            payload = _failed_sdk_synthesis_payload(exc)
+            if payload is None:
+                raise SystemExit(str(exc)) from exc
+            exit_code = 1
+        except Exception as exc:
+            payload = _failed_sdk_synthesis_payload(exc)
+            if payload is None:
+                raise
+            exit_code = 1
         attach_orchestrator_preflight_payload(payload, args)
         if args.json or not args.markdown:
             print(json.dumps(payload, indent=2, sort_keys=True))
@@ -1397,7 +1442,7 @@ def main() -> int:
             if review_markdown:
                 lines.extend(["", review_markdown])
             Console().print("\n".join(lines), markup=False)
-        return 0
+        return exit_code
 
     try:
         if args.live_slack:

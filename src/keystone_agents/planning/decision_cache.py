@@ -367,6 +367,42 @@ def planner_context_revision_payload(
             if key in {"work_item_id", "prior_agent", "provider_affinity", "prior_request"}
             and str(value or "").strip()
         }
+        raw_verified_objects = continuation.get("verified_objects")
+        if isinstance(raw_verified_objects, list | tuple):
+            verified_objects: list[dict[str, str]] = []
+            for value in raw_verified_objects[:8]:
+                if not isinstance(value, Mapping):
+                    continue
+                if str(value.get("verification_status") or "") != "verified":
+                    continue
+                provider_scope = value.get("provider_scope")
+                scope_payload = (
+                    {
+                        str(key)[:64]: str(item)[:500]
+                        for key, item in provider_scope.items()
+                        if str(key or "").strip() and str(item or "").strip()
+                    }
+                    if isinstance(provider_scope, Mapping)
+                    else {}
+                )
+                identity = {
+                    "provider_system": str(value.get("provider_system") or "")[:120],
+                    "object_type": str(value.get("object_type") or "")[:120],
+                    "object_id_hash": _hash_text(str(value.get("object_id") or "")),
+                    "display_name_hash": _hash_text(
+                        str(value.get("display_name") or "")
+                    ),
+                    "effective_date": str(value.get("effective_date") or "")[:40],
+                    "lifecycle_state": str(value.get("lifecycle_state") or "")[:40],
+                    "provider_scope_hash": (
+                        _hash_json(scope_payload) if scope_payload else ""
+                    ),
+                }
+                verified_objects.append(
+                    {key: item for key, item in identity.items() if item}
+                )
+            if verified_objects:
+                payload["verified_objects"] = verified_objects
     work_item = context.get("current_work_item")
     if isinstance(work_item, Mapping):
         payload["work_item"] = {
@@ -382,7 +418,7 @@ def planner_context_revision_payload(
                 "source_run_id",
                 "provider_system",
                 "provider_read_scope",
-                "result_count",
+                "item_count",
                 "complete",
                 "item_refs",
             )

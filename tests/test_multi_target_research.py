@@ -323,6 +323,7 @@ def test_multi_target_uses_retrieval_max_results_quality_budget_field() -> None:
     )
     search_limits: list[int] = []
     profile_limits: list[int] = []
+    profile_deadlines: list[int | None] = []
     search_results = [
         SearchResult(
             title="Beacon audit trail",
@@ -353,6 +354,7 @@ def test_multi_target_uses_retrieval_max_results_quality_budget_field() -> None:
     def retrieve_profile(**kwargs: Any):
         company = str(kwargs["company"])
         profile_limits.append(int(kwargs["max_results"]))
+        profile_deadlines.append(kwargs.get("retrieval_deadline_seconds"))
         domain = company.lower()
         profile = research_company_fixture(company_name=company).model_copy(
             update={
@@ -375,6 +377,7 @@ def test_multi_target_uses_retrieval_max_results_quality_budget_field() -> None:
             agent_name="business_research_analyst",
             mode=QualityMode.FAST,
             retrieval_max_results=3,
+            max_seconds=45,
         ),
         search_provider_builder=provider_builder,
         retrieve_profile=retrieve_profile,
@@ -383,6 +386,7 @@ def test_multi_target_uses_retrieval_max_results_quality_budget_field() -> None:
     assert result.comparison_ready
     assert search_limits and set(search_limits) == {3}
     assert profile_limits and set(profile_limits) == {3}
+    assert profile_deadlines and set(profile_deadlines) == {45}
 
 
 def test_parallel_discovery_keeps_candidates_from_productive_lane() -> None:
