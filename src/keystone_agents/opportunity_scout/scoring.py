@@ -313,8 +313,8 @@ def business_research_analyst_handoff_recommendation(
     criteria = handoff_reason or "source-backed signal requires validation"
     needs = "; ".join(research_needed[:3]) if research_needed else "validate fit and buyer context"
     return (
-        f"Business Research Analyst handoff criteria: {criteria}. Validate {needs} before any "
-        "outreach drafting; do not generate outreach copy in Scout."
+        f"Business Research Analyst handoff criteria: {criteria}. Required research before "
+        f"any outreach drafting: {needs}. Do not generate outreach copy in Scout."
     )
 
 

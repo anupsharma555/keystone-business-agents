@@ -17,6 +17,9 @@ from keystone_agents.founder_profile import FounderFitProfile, founder_profile_c
 from keystone_agents.guardrails import assess_unsupported_outreach_claims, keystone_guardrails
 from keystone_agents.models import OutreachComposerSDKInput, TypedAgentRunResult
 from keystone_agents.outreach_composer.text import (
+    bounded_outreach_goal as _bounded_outreach_goal,
+)
+from keystone_agents.outreach_composer.text import (
     clean_copy as _clean_copy,
 )
 from keystone_agents.outreach_composer.text import (
@@ -1050,9 +1053,8 @@ def compose_outreach_draft_fixture(
     greeting = _style_greeting(salutation_name, style_profile)
     title = _clean_copy(contact_title)
     role_context = f" given your work as {title}" if title else ""
-    goal = (
-        _clean_copy(outreach_goal)
-        or "compare notes on clinical AI evaluation and research operations"
+    goal = _bounded_outreach_goal(outreach_goal) or (
+        "compare notes on clinical AI evaluation and research operations"
     )
 
     company_context = _clean_copy(company_profile.fit_summary or company_profile.description)
@@ -1108,7 +1110,7 @@ def compose_outreach_draft_fixture(
         unsupported_explanations.append(explanation)
 
     signal_claim = recent_signal_claim or opportunity_context_claim or company_context_claim
-    signal = signal_claim.claim_text if signal_claim else ""
+    signal = _shorten_text(signal_claim.claim_text, 320) if signal_claim else ""
 
     if signal:
         opening = _fixture_outreach_opening(company_name, signal)

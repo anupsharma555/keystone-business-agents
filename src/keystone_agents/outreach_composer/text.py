@@ -39,6 +39,23 @@ def shorten_text(value: str, max_chars: int) -> str:
     return shortened or cleaned[:max_chars].rstrip(" .,;:")
 
 
+def bounded_outreach_goal(
+    value: str | None,
+    *,
+    max_words: int = 32,
+    max_chars: int = 240,
+) -> str:
+    """Keep workflow objectives from becoming unbounded outbound copy."""
+
+    cleaned = " ".join(clean_copy(value).split())
+    if not cleaned:
+        return ""
+    words = cleaned.split()
+    if len(words) > max_words:
+        cleaned = " ".join(words[:max_words]).rstrip(" .,;:")
+    return shorten_text(cleaned, max_chars)
+
+
 def normalized_text(value: str) -> str:
     """Normalize text for approximate matching."""
 

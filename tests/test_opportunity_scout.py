@@ -2273,6 +2273,10 @@ def test_live_search_enriches_source_bundles_dedupes_state_and_explains_handoff(
     assert "Business Research Analyst" in record.recommended_next_step
     assert "handoff criteria" in record.business_research_analyst_handoff_recommendation
     assert "before any outreach" in record.business_research_analyst_handoff_recommendation
+    assert (
+        "validate validate"
+        not in record.business_research_analyst_handoff_recommendation.lower()
+    )
     assert record.score_breakdown.component_rationales
     assert record.score_breakdown.source_confidence_score == (
         record.source_quality_summary.overall_score
@@ -3684,6 +3688,18 @@ def test_cli_result_output_option_persists_before_rendering(
     cli._persist_requested_result(args, payload)
 
     assert json.loads(output.read_text(encoding="utf-8")) == payload
+
+
+def test_cli_can_force_fixture_only_search_when_environment_defaults_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.run_opportunity_scout as cli
+
+    monkeypatch.setattr(cli, "cli_default_live_research", lambda: True)
+
+    args = cli.build_parser().parse_args(["--no-live-search"])
+
+    assert args.live_search is False
 
 
 def test_next_normalization_plan_uses_exact_recovered_source_packet(

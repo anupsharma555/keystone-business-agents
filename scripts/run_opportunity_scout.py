@@ -103,9 +103,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-results", type=int, default=5, help="Maximum records to return.")
     parser.add_argument(
         "--live-search",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=live_search_default,
-        help="Use live search through the configured provider instead of local fixture data.",
+        help=(
+            "Use live search through the configured provider instead of local fixture "
+            "data. Use --no-live-search to force fixture-only SDK synthesis when the "
+            "environment enables live research by default."
+        ),
     )
     parser.add_argument(
         "--live-search-plan",

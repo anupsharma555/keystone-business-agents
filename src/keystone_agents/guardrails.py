@@ -540,9 +540,15 @@ def keystone_output_guardrail(
     agent: Agent,
     output: Any,
 ) -> GuardrailFunctionOutput:
+    check_outreach_claims = _should_check_sdk_outreach_claims(agent)
+    scan_text = (
+        stringify_payload_for_outreach_claim_scan(output)
+        if check_outreach_claims
+        else stringify_payload(output)
+    )
     assessment = assess_text_guardrails(
-        stringify_payload(output),
-        check_outreach_claims=_should_check_sdk_outreach_claims(agent),
+        scan_text,
+        check_outreach_claims=check_outreach_claims,
     )
     return GuardrailFunctionOutput(
         output_info={"risk_flags": assessment.risk_flags, "reasons": assessment.reasons},

@@ -3451,6 +3451,39 @@ def test_outreach_constrained_sdk_rejects_unsupported_keystone_claims(
         )
 
 
+def test_outreach_sdk_guardrail_does_not_treat_blocked_facts_as_draft_claims(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    typed_input = OutreachComposerSDKInput(
+        company_name="Curebase",
+        approved_context="Approved fixture context.",
+    )
+    model = FakeModel(
+        outputs=[
+            [
+                _structured_message(
+                    _outreach_draft_payload(
+                        blocked_facts=["Keystone has helped companies reduce enrollment delays."],
+                    )
+                )
+            ]
+        ]
+    )
+    provider = FakeProvider(model)
+
+    result = run_outreach_composer_sdk(
+        typed_input,
+        run_config=build_local_run_config(provider),
+    )
+
+    assert isinstance(result.final_output, OutreachDraft)
+    assert result.final_output.blocked_facts == [
+        "Keystone has helped companies reduce enrollment delays."
+    ]
+
+
 def test_specialist_agent_runs_with_fake_model_without_openai_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

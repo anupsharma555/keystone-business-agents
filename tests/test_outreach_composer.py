@@ -1146,6 +1146,23 @@ def test_call_prep_uses_only_source_backed_internal_context() -> None:
     )
 
 
+def test_fixture_bounds_long_workflow_objective_before_building_email() -> None:
+    long_objective = " ".join(
+        ["Draft a careful follow-up that preserves every workflow constraint"] * 60
+    )
+
+    draft = compose_outreach_draft_fixture(
+        company_profile=load_company_profile("sample_company_curebase"),
+        opportunity_record=load_opportunity_record("sample_lead_curebase"),
+        outreach_goal=long_objective,
+    )
+
+    assert len(draft.outreach_goal.split()) <= 32
+    assert len(draft.email_body.split()) <= 180
+    assert draft.approval_required is True
+    assert draft.send_enabled is False
+
+
 def test_call_prep_excludes_unbacked_personalization() -> None:
     draft = compose_outreach_draft_fixture(
         company_profile=load_company_profile("sample_company_curebase"),
