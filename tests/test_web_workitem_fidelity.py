@@ -14,7 +14,7 @@ from test_context_agent_fake_model_matrix import (
 from test_supplied_research_sdk import _item, _output
 
 from keystone_agents import workflow_runner
-from keystone_agents.langgraph_workflow import run_work_item_langgraph
+from keystone_agents.langgraph_workflow import langgraph_available, run_work_item_langgraph
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.work_item import WorkflowRunRequest, WorkItemRoute
 from keystone_agents.sdk import build_local_run_config
@@ -22,6 +22,7 @@ from keystone_agents.storage import SQLiteStore
 from keystone_agents.tools import website_extraction_tool as web
 
 
+@pytest.mark.skipif(not langgraph_available(), reason="optional LangGraph is not installed")
 def test_selected_web_source_access_survives_projection_storage_and_graph(tmp_path, monkeypatch):
     url = "https://example.org/selected-research"
     marker = "NOT approved until independent prospective validation."

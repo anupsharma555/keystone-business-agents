@@ -28,6 +28,7 @@ from keystone_agents.gmail_triage.handoff_context import (
     gmail_context_source_refs,
     selected_provider_context,
 )
+from keystone_agents.langgraph_workflow import langgraph_available
 from keystone_agents.schemas.research import ResearchBrief
 from keystone_agents.schemas.work_item import (
     WorkflowRunRequest,
@@ -223,7 +224,15 @@ def test_handoff_rejects_mixed_or_unverifiable_windows(monkeypatch, corruption):
     assert selected_provider_context(selection(), entries) is None
 
 
-@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("graph", [
+    False,
+    pytest.param(
+        True,
+        marks=pytest.mark.skipif(
+            not langgraph_available(), reason="optional LangGraph is not installed"
+        ),
+    ),
+])
 def test_actual_sdk_retains_and_reads_long_source_after_parent_workitem_reload(
     monkeypatch, tmp_path, graph
 ):
