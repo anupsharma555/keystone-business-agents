@@ -40,11 +40,12 @@ compatibility facade, parity test, and independently revertible commit.
 ```text
 authority/       semantic and stage-output authority
 planning/        planning, completeness, bounded compatibility parsing
-capabilities/    tool, model, retrieval, write, and cost admission
+capabilities/    request tool scope plus model, retrieval, write, and cost admission
 receipts/        mutation classification, normalization, idempotency, recovery
 operations/      provider-neutral application operations using existing tools
 orchestration/   WorkItem steps, manager loop, and graph coordination
-runtime/         one request-scoped composition root
+runtime/         request composition, decision validation, tool execution,
+                 provider context, execution attempts, and telemetry
 presentation/    canonical public-result assembly and pure renderers
 ```
 
@@ -91,7 +92,7 @@ Run the offline benchmark with:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 \
-/Users/anup/gitProjects/keystone-business-agents/.venv/bin/python \
+.venv/bin/python \
 scripts/benchmark_architecture_latency.py \
   --iterations 30 \
   --json-output docs/architecture/pre_reorganization_latency.json
@@ -135,6 +136,68 @@ boundaries:
   renderers;
 - `entrypoints/cli_impl.py` owns the existing CLI command implementation while
   `keystone_agents.cli` remains a lightweight public entry facade.
+
+The current working architecture extends those boundaries without creating a
+second execution kernel:
+
+- `agent_decision_policy.py` states which semantic choices belong to each
+  registered agent and which checks remain deterministic;
+- `agent_decision_contracts.py` binds structured decisions to the exact
+  candidate/evidence universe for each supported stage;
+- `runtime/decision_validation.py` validates model-visible evidence and returns
+  fail-closed or bounded-repair outcomes without replacing the agent's choice;
+- `runtime/tool_execution.py` separates attachment, model calls, workflow
+  calls, helpers, pre-acquired context, provider attempts, and receipts while
+  enforcing required/optional/forbidden tool postconditions;
+- `runtime/provider_context.py` validates read-only cross-provider selections
+  and typed downstream handoffs;
+- `runtime/execution_attempt.py`, `execution_telemetry.py`, and
+  `runtime/decision_trace_harness.py` preserve attempt, stage, tool, decision,
+  receipt, and external-write evidence without making telemetry authoritative.
+
+`ManualRequestPlan` remains a supported schema and compatibility/constraint
+envelope. The standalone model planner is optional; no planner artifact may
+override an agent-owned substantive decision or deterministic authority gate.
+
+These modules are shared contracts, not proof of a uniform dispatcher. In the
+current snapshot, `WorkflowRunner` does not dispatch the direct live Airtable,
+Workspace, or Zotero routes owned by `entrypoints/cli_impl.py`; RSS and
+Preprints use the signal runtime; Chief nested context agents use validated
+child wrappers over agent tools. Validation and recovery coverage must therefore
+be claimed from the active call site and trace, not inferred from registry or
+trace-harness membership.
+
+Validated Chief child decision records are attached durably through SDK tool
+custom data, deliberately outside the model-visible and public result
+envelopes, and ingested into the unified privacy-safe trace. A live
+parent-supplied `run_config` is labeled `live_sdk`; nested live read tools
+enforce `live=true` on isolated copies, while mutation tools remain absent.
+
+Observability coverage is also path-specific. The production compiler now
+hydrates nested decision attempts, linked manager/specialist run IDs, actual
+model/tool/context/provider origins, and a privacy-safe trace join pointer while
+preserving unknown historical evidence as unknown. The declarative
+one-wrapper-per-agent matrix remains contract/test metadata rather than a
+production capture. Correlated compiler/storage/CLI hydration is now stable.
+
+The shared runner and signal-runtime integration have advanced beyond the
+original snapshot: completed evidence is retained across one correction;
+completed reads/mutations are disabled before retry; failed/unknown mutation
+completion blocks automatic retry; RSS/Preprints repair replays verified
+candidates without another history read; Calendar lookup and verified Gmail
+continuation have one tool-free semantic repair; A/W/Z have bounded missing-tool
+and semantic repair; supplied-response admission is restricted to evidenced
+provider-free synthesis; and Calendar decision telemetry reaches the CLI trace.
+Live Research/Opportunity WorkItems now use agent-owned SDK retrieval,
+selection, ranking, and handoff over model-visible stable provider candidate
+IDs, with one no-reread semantic repair. Python validates identity, bounds, and
+formal gates. A/W/Z remain outside first-class `WorkflowRunner` specialist
+dispatch.
+
+For A/W/Z specifically, provider-authoritative candidate binding, semantic
+repair, bounded missing-tool correction, cumulative telemetry, and mutation-safe
+evidence are stable; only first-class `WorkflowRunner` dispatch parity remains
+an architectural distinction.
 
 Legacy module paths remain import-compatible facades, so operational scripts,
 tests, direct calls, Slack, WorkItem, manager-loop, and LangGraph consumers can
@@ -206,7 +269,7 @@ environment rather than the frozen checkout's shared interpreter and run:
 
 ```bash
 .venv/bin/python scripts/assert_runtime_checkout.py \
-  --expected-root /Users/anup/gitProjects/keystone-business-agents-architecture \
+  --expected-root /path/to/keystone-business-agents \
   --require-worktree-venv \
   --json
 ```

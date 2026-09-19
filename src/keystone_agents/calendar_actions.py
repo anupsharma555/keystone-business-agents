@@ -484,6 +484,120 @@ def is_calendar_action_candidate(request_text: str) -> bool:
     )
 
 
+def is_calendar_read_candidate(request_text: str) -> bool:
+    """Recognize an explicit, side-effect-free Calendar lookup.
+
+    This is a routing hint only. The typed provider-read contract, time-window
+    parser, live gate, provider receipt, and result validation remain required
+    before a Calendar answer can be confirmed.
+    """
+
+    normalized = _without_negated_calendar_action_clauses(request_text)
+    if not normalized:
+        return False
+    explicit_provider = bool(
+        re.search(
+            r"\b(?:google\s+calendar|my\s+calendar|our\s+calendar|calendar)\b",
+            normalized,
+            re.I,
+        )
+    )
+    if not explicit_provider and not _looks_like_implicit_calendar_read(normalized):
+        return False
+    if (
+        _explicit_calendar_mutation_requested(normalized)
+        or _looks_like_implicit_calendar_deadline(normalized)
+        or _looks_like_implicit_calendar_change(normalized)
+    ):
+        return False
+    if (
+        re.search(r"\b(?:email|gmail|inbox|mailbox|message|thread)\b", normalized, re.I)
+        and not re.search(
+            r"\b(?:google\s+calendar|my\s+calendar|our\s+calendar|calendar\s+account)\b",
+            normalized,
+            re.I,
+        )
+        and re.search(
+            r"\b(?:extract|stage|staged|parse|pull\s+out)\b[^.!?]{0,140}"
+            r"\b(?:calendar|event|meeting)\s+(?:details?|time|fields?)\b",
+            normalized,
+            re.I,
+        )
+    ):
+        # Calendar-shaped details extracted from a message are Gmail evidence,
+        # not a Calendar provider read.  A later Calendar write remains a
+        # separately gated operation after the selected message is interpreted.
+        return False
+    return bool(
+        re.search(
+            r"\b(?:list|show|find|read|check|review|look\s+up|tell\s+me)\b"
+            r"|\b(?:what|which|when)\b[^.!?]{0,120}"
+            r"\b(?:calendar|appointments?|interviews?|meetings?|calls?|events?|"
+            r"deadlines?|webinars?|sessions?|reservations?|trips?)\b"
+            r"|\b(?:schedule|agenda)\b",
+            normalized,
+            re.I,
+        )
+    )
+
+
+def _looks_like_implicit_calendar_read(text: str) -> bool:
+    """Recognize a personal schedule lookup without requiring provider jargon.
+
+    The ownership, time-window, question, and schedulable-object signals must
+    all be present. This keeps general meeting notes, transcripts, research,
+    and email-derived event-detail extraction on their owning paths.
+    """
+
+    normalized = " ".join(str(text or "").split()).strip()
+    if not normalized or re.search(
+        r"\b(?:email|gmail|inbox|mailbox|message|thread|notes?|minutes|"
+        r"transcript|recording|summary|draft)\b",
+        normalized,
+        re.I,
+    ):
+        return False
+    schedulable_object = bool(
+        re.search(
+            r"\b(?:appointments?|interviews?|meetings?|calls?|events?|"
+            r"deadlines?|webinars?|sessions?|reservations?|trips?)\b",
+            normalized,
+            re.I,
+        )
+    )
+    personal_scope = bool(
+        re.search(
+            r"\b(?:my|our)\s+(?:upcoming\s+|next\s+)?(?:appointments?|"
+            r"interviews?|meetings?|calls?|events?|deadlines?|webinars?|"
+            r"sessions?|reservations?|trips?)\b"
+            r"|\b(?:do\s+i|do\s+we|am\s+i|are\s+we)\s+(?:have|scheduled|"
+            r"booked|attending)\b",
+            normalized,
+            re.I,
+        )
+    )
+    time_scope = bool(
+        re.search(
+            r"\b(?:today|tomorrow|tonight|this\s+(?:morning|afternoon|"
+            r"evening|week|month)|next\s+(?:week|month|monday|tuesday|"
+            r"wednesday|thursday|friday|saturday|sunday)|"
+            r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b"
+            r"|\b(?:on|for)\s+(?:20\d{2}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/20\d{2})\b",
+            normalized,
+            re.I,
+        )
+    )
+    read_shape = bool(
+        re.search(
+            r"\b(?:what|which|when|where|show|list|find|check|tell\s+me|"
+            r"do\s+i|do\s+we|am\s+i|are\s+we)\b",
+            normalized,
+            re.I,
+        )
+    )
+    return schedulable_object and personal_scope and time_scope and read_shape
+
+
 def _explicit_calendar_mutation_requested(text: str) -> bool:
     """Require the mutation verb to be bound to a Calendar object or destination."""
 
@@ -512,7 +626,8 @@ def _explicit_calendar_mutation_requested(text: str) -> bool:
     calendar_destination = (
         rf"\b(?:{create_verb}|{mutate_verb})\b"
         r"(?:(?![.!?;]).){0,120}\b"
-        r"(?:to|on|into|from)\s+(?:my|the|our)?\s*calendar\b"
+        r"(?:to|on|into|from)\s+(?:my|the|our)?\s*"
+        r"(?:google\s+)?calendar\b"
     )
     object_first = (
         rf"\b{calendar_object}\b"
@@ -688,17 +803,21 @@ def calendar_thread_event_context(
 
 
 def _operation(lower: str) -> str:
-    if re.search(r"\b(?:delete|remove|cancel)\b", lower):
-        return "delete"
-    if re.search(
-        r"\b(?:update|modify|change|rename|move|reschedule|shift|edit|"
-        r"add\s+(?:a\s+)?note)\b",
-        lower,
-    ):
-        return "update"
-    if re.search(r"\b(?:add|create|schedule|put)\b", lower):
-        return "create"
-    return ""
+    patterns = (
+        (
+            "update",
+            r"\b(?:update|modify|change|rename|move|reschedule|shift|edit|"
+            r"add\s+(?:a\s+)?note)\b",
+        ),
+        ("create", r"\b(?:add|create|schedule|put)\b"),
+        ("delete", r"\b(?:delete|remove|cancel)\b"),
+    )
+    matches = [
+        (match.start(), index, operation)
+        for index, (operation, pattern) in enumerate(patterns)
+        if (match := re.search(pattern, lower)) is not None
+    ]
+    return min(matches)[2] if matches else ""
 
 
 def _event_date(text: str, *, today: date | None) -> str:

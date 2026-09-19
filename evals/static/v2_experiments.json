@@ -1,0 +1,592 @@
+{
+  "schema": "keystone.v2_experiment_catalog.v1",
+  "experiments": [
+    {
+      "experiment_id": "same_agent_stages",
+      "title": "Durable phases within one agent",
+      "book_concept": "Chapters 1, 4, 5: planning, execution and review nodes",
+      "hypothesis": "Phase checkpoints avoid repeating completed evidence acquisition without adding agent roles.",
+      "prerequisites": [
+        "SQLite checkpointer installed",
+        "Track A route/evidence fixes"
+      ],
+      "variants": [
+        "baseline",
+        "self_review"
+      ],
+      "fault_cases": [
+        "failure after evidence acquisition",
+        "restarted process",
+        "duplicate phase completion"
+      ],
+      "acceptance": [
+        "Verified acquisition executes once after resume",
+        "Same owner and source identities survive"
+      ],
+      "rejection": [
+        "Extra phases only add calls",
+        "Resume repeats completed evidence work"
+      ],
+      "later_live_question": "Does phase recovery reduce repeated live work without lowering answer quality?",
+      "owners": [
+        "ANU-168",
+        "ANU-310"
+      ]
+    },
+    {
+      "experiment_id": "independent_critic",
+      "title": "Independent source-bound criticism",
+      "book_concept": "Chapters 2, 6: reflection and adversarial review",
+      "hypothesis": "An independent critic catches consequential errors missed by the author and mechanical validation.",
+      "prerequisites": [
+        "Stable source identities",
+        "Bounded review schema"
+      ],
+      "variants": [
+        "baseline",
+        "self_review",
+        "independent_critic"
+      ],
+      "fault_cases": [
+        "unknown claim ID",
+        "unknown evidence ID",
+        "critic attempts approval",
+        "false objection",
+        "omitted requested obligation",
+        "unknown obligation ID"
+      ],
+      "acceptance": [
+        "Criticism binds an existing claim and source",
+        "Blinded review finds fewer material errors"
+      ],
+      "rejection": [
+        "More false objections than useful corrections",
+        "No benefit above self-review"
+      ],
+      "later_live_question": "Does an independent critic improve held-out factual decisions at acceptable cost?",
+      "owners": [
+        "ANU-125",
+        "ANU-62"
+      ]
+    },
+    {
+      "experiment_id": "complementary_research",
+      "title": "Complementary evidence investigators",
+      "book_concept": "Chapters 6, 8: parallel investigation and evidence communication",
+      "hypothesis": "Independent source scopes improve coverage and reveal contradictions without duplicated search.",
+      "prerequisites": [
+        "Shared aggregate budget",
+        "Typed evidence merge"
+      ],
+      "variants": [
+        "baseline",
+        "complementary_investigators"
+      ],
+      "fault_cases": [
+        "duplicate source",
+        "contradictory evidence",
+        "one branch fails"
+      ],
+      "acceptance": [
+        "All surviving evidence retains source identity",
+        "Disagreement remains visible"
+      ],
+      "rejection": [
+        "Agreement replaces evidence",
+        "Duplicate sources inflate corroboration"
+      ],
+      "later_live_question": "Do complementary investigators improve coverage or latency under an equal aggregate allowance?",
+      "owners": [
+        "ANU-122",
+        "ANU-168"
+      ]
+    },
+    {
+      "experiment_id": "targeted_repair",
+      "title": "Supervisor-directed bounded repair",
+      "book_concept": "Chapters 1, 5, 6: review and targeted recovery",
+      "hypothesis": "Source-bound repair instructions correct the actual deficit rather than repeating the whole workflow.",
+      "prerequisites": [
+        "Validated critic output",
+        "One repair maximum"
+      ],
+      "variants": [
+        "baseline",
+        "targeted_repair"
+      ],
+      "fault_cases": [
+        "invented source request",
+        "missing source",
+        "repeated repair",
+        "omitted requested obligation",
+        "unknown obligation ID"
+      ],
+      "acceptance": [
+        "At most one repair",
+        "Missing evidence produces a precise stop"
+      ],
+      "rejection": [
+        "Generic research-more loop",
+        "Unsupported facts added during correction"
+      ],
+      "later_live_question": "Does targeted correction recover more valid answers per additional model request?",
+      "owners": [
+        "ANU-124",
+        "ANU-310"
+      ]
+    },
+    {
+      "experiment_id": "context_memory",
+      "title": "Minimum-sufficient context and history",
+      "book_concept": "Chapters 2, 7, 9: context injection and progressive disclosure",
+      "hypothesis": "One authoritative packet with equivalent history policy lowers context cost while preserving current intent.",
+      "prerequisites": [
+        "Latest request has explicit authority",
+        "Current WorkItem context available"
+      ],
+      "variants": [
+        "baseline",
+        "compact_context"
+      ],
+      "fault_cases": [
+        "stale prior answer",
+        "repeated packet",
+        "latest correction at tail"
+      ],
+      "acceptance": [
+        "Every unique source and latest instruction retained",
+        "Exact duplicate packet removed"
+      ],
+      "rejection": [
+        "Chronology or identity lost",
+        "Shorter prompt causes more repair"
+      ],
+      "later_live_question": "Do deduplicated packets preserve decisions and reduce tokens on held-out continuations?",
+      "owners": [
+        "ANU-228",
+        "ANU-283"
+      ]
+    },
+    {
+      "experiment_id": "checkpoint_replay",
+      "title": "Isolated checkpoint inspection and forks",
+      "book_concept": "Chapter 5: time-travel debugging",
+      "hypothesis": "Read-only checkpoint inspection and isolated forks make failures reproducible without replaying effects.",
+      "prerequisites": [
+        "Durable execution store",
+        "Diagnostic fork API"
+      ],
+      "variants": [
+        "baseline",
+        "checkpoint_replay"
+      ],
+      "fault_cases": [
+        "unknown checkpoint",
+        "attempted live flag patch",
+        "changed evidence"
+      ],
+      "acceptance": [
+        "Source execution and checkpoint are linked",
+        "Fork cannot inherit approvals or live capabilities"
+      ],
+      "rejection": [
+        "Fork replays a provider mutation",
+        "Original execution is modified"
+      ],
+      "later_live_question": "Does a controlled historical fork shorten diagnosis of a real failure?",
+      "owners": [
+        "ANU-168",
+        "ANU-310"
+      ]
+    },
+    {
+      "experiment_id": "layout_evidence",
+      "title": "Document text versus text plus selected page images",
+      "book_concept": "Chapters 2, 5, 13: preserving decisive document layout evidence",
+      "hypothesis": "A selected page image recovers a decisive table cell absent from extracted text, without letting the model invent the missing value.",
+      "prerequisites": [
+        "Verified synthetic document/page hashes",
+        "Trusted native-image attachment path"
+      ],
+      "variants": [
+        "text_only",
+        "text_plus_page_images"
+      ],
+      "fault_cases": [
+        "Decisive table cell missing from text extraction",
+        "Page bytes do not match manifest",
+        "Image silently omitted",
+        "Gold answer leaks into text-only prompt"
+      ],
+      "acceptance": [
+        "Both variants use the same document and extracted text",
+        "Image variant contains the exact verified page PNG",
+        "Text-only answer acknowledges extraction uncertainty",
+        "Paired model/human review assesses factual improvement"
+      ],
+      "rejection": [
+        "Image is ignored or misread",
+        "Text-only prompt includes hidden gold facts",
+        "Fixture result is generalized to untested documents"
+      ],
+      "later_live_question": "Does the selected page image correctly recover prospective-evaluation status that the extracted text cannot establish?",
+      "owners": [
+        "ANU-228",
+        "ANU-125",
+        "ANU-206"
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "pilot-development",
+      "split": "development",
+      "request": "Assess whether the supplied digital-health pilot supports a partnership recommendation. Distinguish feasibility from established efficacy; do not take any action.",
+      "sources": [
+        {
+          "source_id": "pilot-primary",
+          "kind": "first_party",
+          "text": "A synthetic company tested a workflow with 18 volunteers. The announcement reports acceptable usability and plans a larger study."
+        },
+        {
+          "source_id": "pilot-independent",
+          "kind": "independent",
+          "text": "An independent synthetic review notes the uncontrolled pilot has no efficacy endpoint and cannot establish clinical benefit."
+        }
+      ],
+      "scripted_answer": {
+        "claims": [
+          {
+            "claim_id": "c1",
+            "text": "The pilot reports acceptable usability.",
+            "source_ids": [
+              "pilot-primary"
+            ]
+          },
+          {
+            "claim_id": "c2",
+            "text": "The pilot establishes clinical efficacy.",
+            "source_ids": [
+              "pilot-independent"
+            ]
+          }
+        ],
+        "recommendation": "Consider further evidence review before recommending a partnership.",
+        "limitations": [
+          "The study is small and uncontrolled."
+        ],
+        "next_step": "Request the study protocol for review.",
+        "actions_executed": false
+      },
+      "planted_error_claim_ids": [
+        "c2"
+      ],
+      "applicable_experiments": [
+        "same_agent_stages",
+        "independent_critic",
+        "complementary_research",
+        "targeted_repair",
+        "context_memory",
+        "checkpoint_replay"
+      ],
+      "obligations": [
+        {
+          "obligation_id": "o_evidence_limits",
+          "description": "Distinguish feasibility from established clinical efficacy."
+        },
+        {
+          "obligation_id": "o_partnership",
+          "description": "Assess whether the supplied pilot supports a partnership recommendation."
+        }
+      ]
+    },
+    {
+      "case_id": "validation-held-out",
+      "split": "held_out",
+      "request": "Explain whether these results justify routine deployment. Preserve the difference between retrospective performance and prospective clinical benefit.",
+      "sources": [
+        {
+          "source_id": "validation-independent",
+          "kind": "independent",
+          "text": "External reviewers describe a retrospective comparison with no prospective evaluation or patient-outcome measurement."
+        },
+        {
+          "source_id": "validation-primary",
+          "kind": "first_party",
+          "text": "A synthetic vendor reports high retrospective accuracy on a selected dataset. Prospective evaluation is planned and not completed."
+        }
+      ],
+      "scripted_answer": {
+        "claims": [
+          {
+            "claim_id": "h1",
+            "text": "Retrospective accuracy was reported.",
+            "source_ids": [
+              "validation-primary"
+            ]
+          },
+          {
+            "claim_id": "h2",
+            "text": "Prospective patient benefits have been established.",
+            "source_ids": [
+              "validation-independent"
+            ]
+          }
+        ],
+        "recommendation": "Request prospective evaluation before routine deployment.",
+        "limitations": [
+          "No prospective outcomes are available."
+        ],
+        "next_step": "Review the evaluation plan.",
+        "actions_executed": false
+      },
+      "planted_error_claim_ids": [
+        "h2"
+      ],
+      "applicable_experiments": [
+        "same_agent_stages",
+        "independent_critic",
+        "complementary_research",
+        "targeted_repair",
+        "context_memory",
+        "checkpoint_replay"
+      ],
+      "obligations": [
+        {
+          "obligation_id": "o_prospective_difference",
+          "description": "Distinguish retrospective performance from prospective clinical benefit."
+        },
+        {
+          "obligation_id": "o_deployment",
+          "description": "Explain whether the results justify routine deployment."
+        }
+      ]
+    },
+    {
+      "case_id": "thread-development",
+      "split": "development",
+      "request": "Summarize the current state of this synthetic thread and whether another scheduling reply is needed. Do not use Gmail or send a message.",
+      "sources": [
+        {
+          "source_id": "thread-earlier",
+          "kind": "thread",
+          "text": "July 1: the collaborator requested scheduling availability."
+        },
+        {
+          "source_id": "thread-latest",
+          "kind": "thread",
+          "text": "July 8: the meeting is complete; the collaborator thanked the operator and invited future ideas."
+        }
+      ],
+      "scripted_answer": {
+        "claims": [
+          {
+            "claim_id": "t1",
+            "text": "The meeting is complete.",
+            "source_ids": [
+              "thread-latest"
+            ]
+          },
+          {
+            "claim_id": "t2",
+            "text": "The latest message still requests scheduling availability.",
+            "source_ids": [
+              "thread-earlier"
+            ]
+          }
+        ],
+        "recommendation": "No scheduling reply is needed.",
+        "limitations": [
+          "Only the supplied messages were considered."
+        ],
+        "next_step": "Develop a concrete collaboration idea.",
+        "actions_executed": false
+      },
+      "planted_error_claim_ids": [
+        "t2"
+      ],
+      "applicable_experiments": [
+        "same_agent_stages",
+        "independent_critic",
+        "complementary_research",
+        "targeted_repair",
+        "context_memory",
+        "checkpoint_replay"
+      ],
+      "obligations": [
+        {
+          "obligation_id": "o_current_state",
+          "description": "Summarize the current state of the supplied thread."
+        },
+        {
+          "obligation_id": "o_reply_need",
+          "description": "State whether another scheduling reply is needed."
+        }
+      ]
+    },
+    {
+      "case_id": "correction-held-out",
+      "split": "held_out",
+      "request": "Use the newest correction: the review is tomorrow, not today. Return a short status and no external action.",
+      "sources": [
+        {
+          "source_id": "correction-old",
+          "kind": "thread",
+          "text": "Earlier automated summary: review is today."
+        },
+        {
+          "source_id": "correction-current",
+          "kind": "thread",
+          "text": "Newest human correction: review is tomorrow. The earlier date is wrong."
+        }
+      ],
+      "scripted_answer": {
+        "claims": [
+          {
+            "claim_id": "k1",
+            "text": "The human correction moves the review to tomorrow.",
+            "source_ids": [
+              "correction-current"
+            ]
+          },
+          {
+            "claim_id": "k2",
+            "text": "The current review date is today.",
+            "source_ids": [
+              "correction-old"
+            ]
+          }
+        ],
+        "recommendation": "Use tomorrow as the review date.",
+        "limitations": [
+          "No calendar was read or changed."
+        ],
+        "next_step": "Prepare the review materials.",
+        "actions_executed": false
+      },
+      "planted_error_claim_ids": [
+        "k2"
+      ],
+      "applicable_experiments": [
+        "same_agent_stages",
+        "independent_critic",
+        "complementary_research",
+        "targeted_repair",
+        "context_memory",
+        "checkpoint_replay"
+      ],
+      "obligations": [
+        {
+          "obligation_id": "o_current_correction",
+          "description": "Use the newest human correction instead of the obsolete date."
+        },
+        {
+          "obligation_id": "o_short_status",
+          "description": "Return a short status without external action."
+        }
+      ]
+    },
+    {
+      "case_id": "document-layout-development",
+      "split": "development",
+      "request": "Using this document, was prospective clinical outcome evaluation performed and what was its result? Cite the page source; if the relevant cells are absent, say that their values are unknown.",
+      "sources": [
+        {
+          "source_id": "layout-page-1",
+          "kind": "first_party",
+          "text": "Synthetic validation summary\nEvaluation | Performed? | Result\nRetrospective development | Yes | AUROC 0.91\nExternal retrospective holdout | Yes | AUROC 0.88\nProspective clinical outcomes | [cell not extracted] | [cell not extracted]\nSynthetic fixture only.\n"
+        }
+      ],
+      "scripted_answer": {
+        "claims": [
+          {
+            "claim_id": "layout-c1",
+            "text": "Retrospective development AUROC is 0.91.",
+            "source_ids": [
+              "layout-page-1"
+            ]
+          },
+          {
+            "claim_id": "layout-c2",
+            "text": "The supplied text does not contain the prospective-evaluation cells.",
+            "source_ids": [
+              "layout-page-1"
+            ]
+          }
+        ],
+        "recommendation": "Inspect the selected source page before interpreting the missing cells.",
+        "limitations": [
+          "The extracted text omits two relevant cells."
+        ],
+        "next_step": "Review page 1.",
+        "actions_executed": false
+      },
+      "planted_error_claim_ids": [],
+      "applicable_experiments": [
+        "layout_evidence"
+      ],
+      "document_fixture": "v2_document_layout",
+      "obligations": [
+        {
+          "obligation_id": "o_performed",
+          "description": "State whether prospective clinical outcome evaluation was performed, if visible."
+        },
+        {
+          "obligation_id": "o_result",
+          "description": "Report the prospective result if visible; otherwise acknowledge missing cell values."
+        }
+      ]
+    },
+    {
+      "case_id": "document-layout-held-out",
+      "split": "held_out",
+      "request": "Which type of validation is still unresolved in the provided evidence? Distinguish a missing extracted value from a visible statement that an evaluation was not performed.",
+      "sources": [
+        {
+          "source_id": "layout-page-1",
+          "kind": "first_party",
+          "text": "Synthetic validation summary\nEvaluation | Performed? | Result\nRetrospective development | Yes | AUROC 0.91\nExternal retrospective holdout | Yes | AUROC 0.88\nProspective clinical outcomes | [cell not extracted] | [cell not extracted]\nSynthetic fixture only.\n"
+        }
+      ],
+      "scripted_answer": {
+        "claims": [
+          {
+            "claim_id": "layout-c1",
+            "text": "Retrospective development AUROC is 0.91.",
+            "source_ids": [
+              "layout-page-1"
+            ]
+          },
+          {
+            "claim_id": "layout-c2",
+            "text": "The supplied text does not contain the prospective-evaluation cells.",
+            "source_ids": [
+              "layout-page-1"
+            ]
+          }
+        ],
+        "recommendation": "Inspect the selected source page before interpreting the missing cells.",
+        "limitations": [
+          "The extracted text omits two relevant cells."
+        ],
+        "next_step": "Review page 1.",
+        "actions_executed": false
+      },
+      "planted_error_claim_ids": [],
+      "applicable_experiments": [
+        "layout_evidence"
+      ],
+      "document_fixture": "v2_document_layout",
+      "obligations": [
+        {
+          "obligation_id": "o_validation_gap",
+          "description": "Identify the unresolved type of validation."
+        },
+        {
+          "obligation_id": "o_extraction_uncertainty",
+          "description": "Distinguish unavailable extraction from a visible statement that evaluation was not performed."
+        }
+      ]
+    }
+  ]
+}

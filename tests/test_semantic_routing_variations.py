@@ -52,7 +52,10 @@ def _interpreted_plan(prompt: str, expected: dict) -> ManualRequestPlan:
         provider_system=(
             expected["provider"]
             if expected["provider"]
-            in {"airtable", "google_workspace", "gmail", "google_calendar", "zotero", "slack"}
+            in {
+                "airtable", "google_workspace", "gmail", "google_calendar",
+                "zotero", "slack", "openai_vector_store",
+            }
             else "unspecified"
         ),
         provider_operations=(
@@ -323,3 +326,22 @@ def test_equivalent_multi_owner_asks_keep_one_graph_and_context_contract() -> No
             pack.ask_shape == plan.ask_shape
             for pack in packs
         ), variant
+
+
+def test_explicit_rag_variations_preserve_corpus_scope_without_live_retrieval() -> None:
+    group = next(
+        item for item in _payload()["groups"] if item["id"] == "rag_semantic_article_lookup"
+    )
+    for variant in group["variants"]:
+        mention = parse_agent_mention(variant["prompt"])
+        plan = _interpreted_plan(variant["prompt"], group["expected"])
+
+        assert mention.explicit is True
+        assert mention.route == "rag_retrieval_specialist"
+        assert plan.provider_system == "openai_vector_store"
+        assert plan.provider_operations == ["read"]
+        assert plan.target_type == "vector_store_corpus"
+        assert plan.task_objective == "corpus_retrieval"
+        assert plan.expected_artifact_type == "rag_retrieval_result"
+        assert plan.requires_live_search is False
+        assert plan.side_effect_policy == "draft_or_read_only"

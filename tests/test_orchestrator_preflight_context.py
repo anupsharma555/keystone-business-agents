@@ -8,6 +8,7 @@ from keystone_agents.orchestrator.preflight_context import (
     ORCHESTRATOR_PREFLIGHT_ENV,
     ORCHESTRATOR_ROUTE_RESULT_ENV,
     SPECIALIST_EXECUTION_CONTEXT_ENV,
+    load_orchestrator_route_result_from_env,
     load_specialist_execution_context_from_env,
     orchestrator_preflight_context_text,
     orchestrator_preflight_env,
@@ -437,6 +438,78 @@ def test_preflight_env_carries_only_explicit_bounded_specialist_context(monkeypa
     assert "current operator request is authoritative" in text
 
 
+def test_private_route_handoff_preserves_model_decisions_without_public_expansion(
+    monkeypatch,
+) -> None:
+    env = orchestrator_preflight_env(
+        {
+            "request_text": "Create the requested Calendar event.",
+            "selected_agent": "chief_of_staff",
+            "execution_allowed": True,
+            "route_result": {
+                "route": "chief_of_staff",
+                "workflow": ["chief_of_staff"],
+                "routing_mode": "llm",
+                "decision": {
+                    "decision_owner": "orchestrator",
+                    "decision_stage": "orchestrator_route_selection",
+                    "selected_candidate_id": "chief_of_staff",
+                    "reasoning": "Chief owns the bounded provider action.",
+                },
+                "provider_context_decisions": [
+                    {
+                        "decision_owner": "orchestrator",
+                        "decision_stage": "provider_capability_selection",
+                        "selected_candidate_id": "google_calendar:create",
+                        "reasoning": "The operator requested one Calendar create.",
+                    }
+                ],
+                "workflow_state_summary": {
+                    "recent_slack_thread": [{"summary": "private thread text"}]
+                },
+            },
+        }
+    )
+
+    public_preflight = json.loads(env[ORCHESTRATOR_PREFLIGHT_ENV])
+    private_route = json.loads(env[ORCHESTRATOR_ROUTE_RESULT_ENV])
+
+    assert "decision" not in public_preflight["route_result"]
+    assert "provider_context_decisions" not in public_preflight["route_result"]
+    assert private_route["decision"]["selected_candidate_id"] == "chief_of_staff"
+    assert private_route["provider_context_decisions"][0]["selected_candidate_id"] == (
+        "google_calendar:create"
+    )
+    assert "workflow_state_summary" not in private_route
+    assert "private thread text" not in json.dumps(env, sort_keys=True)
+
+    monkeypatch.setenv(ORCHESTRATOR_ROUTE_RESULT_ENV, env[ORCHESTRATOR_ROUTE_RESULT_ENV])
+    assert load_orchestrator_route_result_from_env() == private_route
+
+    args = type(
+        "Args",
+        (),
+        {
+            "orchestrator_preflight": public_preflight,
+            "orchestrator_route_result": private_route,
+            "manual_request_plan": None,
+        },
+    )()
+    context = orchestrator_preflight_context_text(args)
+    assert "Validated Orchestrator decision for specialist interpretation" in context
+    assert "google_calendar:create" in context
+    assert "Chief owns the bounded provider action" in context
+    assert "private thread text" not in context
+    assert "not provider-write authority" in context
+
+    args.orchestrator_preflight = {
+        "route_result": {"route": "chief_of_staff", "refused": False}
+    }
+    fallback_context = orchestrator_preflight_context_text(args)
+    assert "google_calendar:create" in fallback_context
+    assert "Chief owns the bounded provider action" in fallback_context
+
+
 def test_preflight_memo_includes_temporal_depth_policy() -> None:
     env = orchestrator_preflight_env(
         {
@@ -455,6 +528,44 @@ def test_preflight_memo_includes_temporal_depth_policy() -> None:
     assert {"latest", "2026"}.issubset(set(policy["trigger_terms"]))
     assert policy["independent_validation"] == "required_when_available"
     assert "not enough evidence yet" in policy["completion_rule"]
+
+
+def test_specialist_context_omits_compatibility_planner_query_rewrite() -> None:
+    raw_request = (
+        "Find the recent interview conversation where they confirmed receiving my "
+        "follow-up, compare related cancellations, and tell me if a reply is warranted."
+    )
+    bad_query = '"find the recent"'
+    args = type(
+        "Args",
+        (),
+        {
+            "orchestrator_preflight": {
+                "request_text": raw_request,
+                "preflight_memo": {
+                    "raw_request": raw_request,
+                    "selected_agent": "gmail_triage",
+                    "manual_request_plan": {
+                        "objective": "shortened planner objective",
+                        "gmail_query": bad_query,
+                    },
+                },
+            },
+            "orchestrator_route_result": None,
+            "manual_request_plan": {
+                "objective": "shortened planner objective",
+                "gmail_query": bad_query,
+            },
+        },
+    )()
+
+    context = orchestrator_preflight_context_text(args)
+
+    assert raw_request in context
+    assert "current operator request supplied to the specialist is authoritative" in context
+    assert "gmail_query" not in context
+    assert bad_query not in context
+    assert "shortened planner objective" not in context
 
 
 def test_preflight_memo_does_not_treat_calendar_now_as_web_freshness() -> None:

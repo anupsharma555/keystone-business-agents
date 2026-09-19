@@ -17,6 +17,7 @@ from keystone_agents.schemas.approval import (
 )
 from keystone_agents.schemas.company_profile import ClaimEvidenceRecord, CompanyProfile
 from keystone_agents.schemas.contact_context import ContactRecord, CRMAccountContext
+from keystone_agents.schemas.decision_ownership import AgentDecisionRecord
 from keystone_agents.schemas.email_style import EmailStyleProfile
 from keystone_agents.schemas.request_coverage import RequestCoverage
 
@@ -594,6 +595,7 @@ class OutreachDraft(BaseModel):
     email_subject: str = ""
     email_body: str = ""
     linkedin_note: str = ""
+    supporting_summary: str = Field(default="", max_length=6000)
     personalization_rationale: str = ""
     facts_used: list[ClaimEvidenceRecord] = Field(default_factory=list)
     blocked_facts: list[str] = Field(default_factory=list)
@@ -630,6 +632,12 @@ class OutreachDraft(BaseModel):
     body: str | None = None
     retrieval_diagnostics: SkipJsonSchema[dict[str, Any]] = Field(default_factory=dict)
     request_coverage: RequestCoverage = Field(default_factory=RequestCoverage)
+    decision: AgentDecisionRecord = Field(
+        default_factory=lambda: AgentDecisionRecord(
+            decision_stage="outreach_evidence_selection",
+            needs_more_context=True,
+        )
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -695,7 +703,7 @@ class OutreachDraft(BaseModel):
     def _safe_internal_lists(cls, values: list[str]) -> list[str]:
         return [_validate_internal_copy(value.strip()) for value in values if value.strip()]
 
-    @field_validator("revision_request", "revised_from_draft_id")
+    @field_validator("revision_request", "revised_from_draft_id", "supporting_summary")
     @classmethod
     def _safe_revision_request(cls, value: str) -> str:
         return _validate_internal_copy(value.strip())
@@ -830,6 +838,12 @@ class OutreachDraftVariantSet(BaseModel):
     approval_required: bool = True
     approval_scope: ApprovalScope = ApprovalScope.EXTERNAL_USE
     send_enabled: bool = False
+    decision: AgentDecisionRecord = Field(
+        default_factory=lambda: AgentDecisionRecord(
+            decision_stage="outreach_evidence_selection",
+            needs_more_context=True,
+        )
+    )
 
     @field_validator("requested_variant_labels")
     @classmethod
@@ -946,6 +960,7 @@ class OutreachLLMDraftPayload(BaseModel):
     email_subject: str = ""
     email_body: str = ""
     linkedin_note: str = ""
+    supporting_summary: str = Field(default="", max_length=6000)
     personalization_rationale: str = ""
     source_ids_used: list[str] = Field(default_factory=list)
     reply_recommended: bool = True
@@ -954,6 +969,12 @@ class OutreachLLMDraftPayload(BaseModel):
     collaboration_ideas: list[str] = Field(default_factory=list, max_length=4)
     deferral_reason: str = ""
     request_coverage: RequestCoverage = Field(default_factory=RequestCoverage)
+    decision: AgentDecisionRecord = Field(
+        default_factory=lambda: AgentDecisionRecord(
+            decision_stage="outreach_evidence_selection",
+            needs_more_context=True,
+        )
+    )
 
 
 class OutreachLLMDraftVariantPayload(BaseModel):
@@ -977,6 +998,12 @@ class OutreachLLMVariantSetPayload(BaseModel):
 
     company_name: str = Field(min_length=1)
     variants: list[OutreachLLMDraftVariantPayload] = Field(min_length=1, max_length=3)
+    decision: AgentDecisionRecord = Field(
+        default_factory=lambda: AgentDecisionRecord(
+            decision_stage="outreach_evidence_selection",
+            needs_more_context=True,
+        )
+    )
 
     @model_validator(mode="after")
     def _validate_labels_are_unique(self) -> OutreachLLMVariantSetPayload:

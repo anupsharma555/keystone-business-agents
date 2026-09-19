@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from keystone_agents.agent_mentions import parse_agent_mention
 
 
@@ -153,3 +155,40 @@ def test_parse_without_mention_defaults_to_orchestrator_context() -> None:
     assert mention.explicit is False
     assert mention.route is None
     assert mention.input_text == "research Curebase"
+
+
+@pytest.mark.parametrize("prefix", ["@KNI", "<@U123>"])
+@pytest.mark.parametrize(
+    "alias",
+    [
+        "RAG retrieval specialist",
+        "RAG retrieval",
+        "vector database specialist",
+        "vector db specialist",
+        "semantic retrieval specialist",
+    ],
+)
+def test_parse_explicit_rag_aliases_preserves_natural_request(prefix: str, alias: str) -> None:
+    request = (
+        "find the nearest articles about clinician trust; cite passages and keep this read-only"
+    )
+    mention = parse_agent_mention(f"{prefix} {alias}: {request}")
+
+    assert mention.explicit is True
+    assert mention.route == "rag_retrieval_specialist"
+    assert mention.agent_name == "RAG Retrieval Specialist"
+    assert mention.input_text == request
+
+
+def test_rag_bare_alias_requires_trusted_input_opt_in() -> None:
+    request = "RAG retrieval specialist find the nearest article about clinician trust"
+    ordinary = parse_agent_mention(request)
+    trusted = parse_agent_mention(request, allow_bare_agent_aliases=True)
+    general = parse_agent_mention("@KNI find articles about clinician trust")
+
+    assert ordinary.explicit is False
+    assert ordinary.route is None
+    assert ordinary.input_text == request
+    assert trusted.route == "rag_retrieval_specialist"
+    assert trusted.input_text == "find the nearest article about clinician trust"
+    assert general.route == "orchestrator"

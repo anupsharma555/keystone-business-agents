@@ -14,6 +14,7 @@ from keystone_agents.calendar_actions import (
     compact_calendar_interpretation_request,
     infer_calendar_action_plan,
     is_calendar_action_candidate,
+    is_calendar_read_candidate,
 )
 from keystone_agents.schemas.calendar_action import (
     CalendarActionInterpretation,
@@ -111,6 +112,39 @@ def test_incidental_calendar_language_does_not_enter_calendar_fast_path(
     assert (
         infer_calendar_action_plan(request_text, today=date(2026, 7, 19)) is None
     )
+
+
+def test_email_event_detail_extraction_is_not_a_calendar_provider_read() -> None:
+    request = (
+        "If my latest email includes a meeting time, extract the calendar details "
+        "and show me the staged event details. Do not add it to the calendar."
+    )
+
+    assert is_calendar_read_candidate(request) is False
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "What interviews do I have tomorrow?",
+        "Could you show me my appointments this afternoon?",
+        "Which calls do we have next Tuesday?",
+    ],
+)
+def test_personal_schedule_reads_do_not_require_calendar_jargon(request_text: str) -> None:
+    assert is_calendar_read_candidate(request_text) is True
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Summarize my interview notes from tomorrow's planning document.",
+        "Which meetings are mentioned in this transcript for next week?",
+        "Extract the appointment time from my latest email tomorrow.",
+    ],
+)
+def test_noncalendar_schedule_language_stays_off_calendar_path(request_text: str) -> None:
+    assert is_calendar_read_candidate(request_text) is False
 
 
 @pytest.mark.parametrize(
@@ -2316,6 +2350,9 @@ def test_canonical_bounded_calendar_read_uses_current_window_not_prior_event(
     [
         ("medical appointment", "medical appointment"),
         ("my medical appointments for tomorrow", "medical appointments"),
+        ("show me tomorrow's appointments Read-only", "appointments"),
+        ("which meetings do I have tomorrow", "meetings"),
+        ("Could you list the next two calls", "calls"),
         ("Google Calendar events tomorrow", ""),
     ],
 )
@@ -2522,7 +2559,7 @@ def test_canonical_calendar_delete_reuse_rejects_planner_disagreement(
     )
 
 
-def test_canonical_create_recomputes_blockers_after_title_contains_delete() -> None:
+def test_canonical_create_ignores_operation_words_inside_event_title() -> None:
     request = (
         "Add this event to Google Calendar: "
         "Topic: KBA_TEST_CALENDAR Compact Delete Latency Check. "
@@ -2531,9 +2568,10 @@ def test_canonical_create_recomputes_blockers_after_title_contains_delete() -> N
     fallback = infer_calendar_action_plan(request, today=date(2026, 7, 29))
 
     assert fallback is not None
-    assert fallback.operation == "delete"
+    assert fallback.operation == "create"
     assert fallback.title == "KBA_TEST_CALENDAR Compact Delete Latency Check"
-    assert fallback.blockers == ("event name or exact event id",)
+    assert fallback.complete is True
+    assert fallback.blockers == ()
 
     authorized = interpreter._calendar_fallback_for_authorized_operations(
         fallback,

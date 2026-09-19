@@ -13,6 +13,7 @@ from keystone_agents.schemas.automation import (
     AutomationInventoryReport,
     ChiefOfStaffWriteRequest,
 )
+from keystone_agents.schemas.decision_ownership import AgentDecisionRecord
 from keystone_agents.schemas.handoff_types import HandoffTypeContract
 from keystone_agents.schemas.memory import ChiefOfStaffMemoryContext
 
@@ -400,6 +401,14 @@ class ChiefOfStaffResult(BaseModel):
     )
     durable_handoff: ChiefDurableHandoff | None = None
     context_handoffs: list[ChiefContextHandoff] = Field(default_factory=list)
+    provider_context_decisions: list[AgentDecisionRecord] = Field(default_factory=list)
+    decision: AgentDecisionRecord = Field(
+        default_factory=lambda: AgentDecisionRecord(
+            decision_owner="chief_of_staff",
+            decision_stage="chief_delegation_selection",
+            needs_more_context=True,
+        )
+    )
     recommended_actions: list[str] = Field(default_factory=list)
     blocked_side_effects: list[str] = Field(
         default_factory=lambda: [

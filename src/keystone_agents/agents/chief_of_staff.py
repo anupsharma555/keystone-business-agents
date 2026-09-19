@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from keystone_agents.agent_decision_contracts import chief_of_staff_decision_contract
 from keystone_agents.agent_tool_policy import (
     AIRTABLE_WRITE_ALLOWED_TOOLS,
     CALENDAR_WRITE_TOOL_NAMES,
@@ -22,9 +23,19 @@ from keystone_agents.agent_tool_policy import (
     PUBLISH_TOOL_NAMES,
     tool_name_for_policy,
 )
-from keystone_agents.authority.semantic import ExecutionIntentAuthority
+from keystone_agents.authority.semantic import (
+    ExecutionIntentAuthority,
+    is_read_only_work_item_inspection_plan,
+)
 from keystone_agents.automation_inventory import build_automation_inventory_report
 from keystone_agents.calendar_actions import infer_calendar_action_plan
+from keystone_agents.capabilities.tool_scope import (
+    ToolScopeMode,
+    attach_tool_scope_receipt,
+    scope_tools_for_request,
+    tool_scope_receipt_for_agent,
+    tool_scope_trace_metadata_for_agent,
+)
 from keystone_agents.config import parse_bool
 from keystone_agents.file_search import append_configured_file_search_tools
 from keystone_agents.finance_expense_receipts import (
@@ -56,6 +67,10 @@ from keystone_agents.quality_budget import (
     chief_of_staff_quality_budget,
 )
 from keystone_agents.run import run_typed_sdk_agent
+from keystone_agents.runtime.tool_execution import (
+    ToolEvidenceGroup,
+    ToolExecutionContract,
+)
 from keystone_agents.schemas.automation import (
     AutomationArtifactRef,
     AutomationWriteDestination,
@@ -83,10 +98,12 @@ from keystone_agents.sdk import (
 from keystone_agents.skill_sets import select_agent_skill_names
 from keystone_agents.specialist_agent_tools import (
     SpecialistToolMode,
+    bind_validated_nested_context_replay_boundary,
     build_specialist_agent_tools,
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
 from keystone_agents.tools.automation_inventory_tool import (
+    inspect_active_work_item_execution_summary,
     inspect_active_work_items,
     list_automation_specs,
     list_channel_automation_bindings,
@@ -157,11 +174,15 @@ from keystone_agents.tools.operations_publisher_tool import (
 from keystone_agents.tools.playwright_tool import render_page
 from keystone_agents.tools.serper_tool import search_web
 from keystone_agents.tools.web_structuring_tool import structure_web_data_for_schema
+from keystone_agents.tools.work_item_receipt_tool import (
+    inspect_work_item_execution_receipts,
+)
 
 CHIEF_OF_STAFF_REASONING_EFFORT = "low"
 CHIEF_OF_STAFF_VERBOSITY = "low"
 CHIEF_OF_STAFF_MAX_TOKENS = 2_500
 CHIEF_OF_STAFF_SPECIALIST_TOOLS_ENV = "KEYSTONE_CHIEF_OF_STAFF_SPECIALIST_TOOLS"
+_WORK_ITEM_ID_PATTERN = re.compile(r"\bwi_[A-Za-z0-9_-]+\b")
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -364,6 +385,8 @@ def _chief_of_staff_tools(
     authority = ExecutionIntentAuthority.from_value(manual_request_plan)
     if authority.invalid:
         return []
+    if is_read_only_work_item_inspection_plan(manual_request_plan):
+        return _chief_read_only_work_item_tools(request_text)
     if authority.canonical:
         assert authority.plan is not None
         return _canonical_chief_of_staff_tools(
@@ -371,10 +394,7 @@ def _chief_of_staff_tools(
             authority,
             specialist_tools=specialist_tools,
         )
-    if (
-        manual_request_plan is not None
-        and manual_request_plan.provider_system == "google_calendar"
-    ):
+    if manual_request_plan is not None and manual_request_plan.provider_system == "google_calendar":
         calendar_tools = [read_google_calendar_window]
         if manual_request_plan.intent == "business_system_write":
             operation_tools = {
@@ -420,7 +440,9 @@ def _chief_of_staff_tools(
         list_channel_automation_bindings,
         summarize_automation_health,
         list_pending_automation_approvals,
+        inspect_active_work_item_execution_summary,
         inspect_active_work_items,
+        inspect_work_item_execution_receipts,
         publish_document_report,
         publish_table_mirror,
         publish_slack_summary,
@@ -482,6 +504,12 @@ def _canonical_chief_of_staff_tools(
     tools: list[Any] = list(specialist_tools or [])
     provider = plan.provider_system
     operations = set(authority.effective_provider_operations(provider))
+    if any(
+        requirement.provider_system == "google_calendar"
+        and set(requirement.operations) <= {"read", "search", "verify"}
+        for requirement in plan.provider_context_requirements
+    ):
+        tools.append(read_google_calendar_window)
 
     if provider == "google_calendar":
         tools.append(read_google_calendar_window)
@@ -490,9 +518,7 @@ def _canonical_chief_of_staff_tools(
             "update": update_google_calendar_event,
             "delete": delete_google_calendar_event,
         }
-        tools.extend(
-            tool for operation, tool in operation_tools.items() if operation in operations
-        )
+        tools.extend(tool for operation, tool in operation_tools.items() if operation in operations)
         return _unique_tools(tools)
 
     if (
@@ -524,14 +550,19 @@ def _canonical_chief_of_staff_tools(
         return _unique_tools(tools)
 
     if provider == "google_workspace":
-        workspace_tools = google_workspace_tools()
+        exact_drive_media_read = bool(plan.primary_target) and any(
+            step.operation in {"read", "verify"}
+            and step.resource_type == "google_drive_file"
+            for step in plan.provider_action_steps
+        )
+        workspace_tools = google_workspace_tools(
+            include_media_ocr=exact_drive_media_read,
+        )
         include_names = set(GOOGLE_WORKSPACE_READ_TOOLS)
         if operations.intersection({"create", "update", "delete", "attach"}):
             include_names.update(GOOGLE_WORKSPACE_WRITE_TOOLS)
         tools.extend(
-            tool
-            for tool in workspace_tools
-            if tool_name_for_policy(tool) in include_names
+            tool for tool in workspace_tools if tool_name_for_policy(tool) in include_names
         )
         return _unique_tools(tools)
 
@@ -569,11 +600,72 @@ def _canonical_chief_of_staff_tools(
         if explicit_full_article_read_requested(request_text):
             tools.append(read_linked_article)
 
-    if plan.intent == "continue_work_item" or plan.requires_durable_state:
-        tools.append(inspect_active_work_items)
+    if plan.intent == "continue_work_item":
+        tools.extend(
+            [
+                inspect_active_work_items,
+                inspect_work_item_execution_receipts,
+                list_pending_automation_approvals,
+            ]
+        )
+    elif plan.requires_durable_state:
+        tools.append(inspect_active_work_item_execution_summary)
     if plan.target_type == "operator_reference":
         tools.append(retrieve_chief_of_staff_memory)
     return _unique_tools(tools)
+
+
+def _chief_read_only_work_item_tools(request_text: str) -> list[Any]:
+    """Select one bounded operational read surface for the request shape."""
+
+    if _WORK_ITEM_ID_PATTERN.search(str(request_text or "")):
+        return [inspect_work_item_execution_receipts]
+    return [inspect_active_work_item_execution_summary]
+
+
+def _chief_work_item_execution_contract(
+    request_text: str,
+) -> ToolExecutionContract:
+    if _WORK_ITEM_ID_PATTERN.search(str(request_text or "")):
+        return ToolExecutionContract.required(
+            ToolEvidenceGroup(
+                "work_item_receipts",
+                ("inspect_work_item_execution_receipts",),
+            ),
+            stage="chief_of_staff_work_item_inspection",
+        )
+    return ToolExecutionContract.required(
+        ToolEvidenceGroup(
+            "active_work_item_execution_summary",
+            ("inspect_active_work_item_execution_summary",),
+        ),
+        stage="chief_of_staff_work_item_inspection",
+    )
+
+
+def _chief_provider_context_execution_contract(
+    plan: ManualRequestPlan,
+) -> ToolExecutionContract | None:
+    groups: list[ToolEvidenceGroup] = []
+    if any(
+        requirement.provider_system == "google_calendar"
+        and requirement.required
+        for requirement in plan.provider_context_requirements
+    ):
+        groups.append(
+            ToolEvidenceGroup(
+                "google_calendar_context",
+                ("read_google_calendar_window",),
+            )
+        )
+    return (
+        ToolExecutionContract.required(
+            *groups,
+            stage="chief_of_staff_provider_context_selection",
+        )
+        if groups
+        else None
+    )
 
 
 def _unique_tools(tools: list[Any]) -> list[Any]:
@@ -645,27 +737,19 @@ def _scope_chief_write_tools(
             else:
                 allowed_writes.update(AIRTABLE_WRITE_ALLOWED_TOOLS)
         elif manual_request_plan.provider_system == "google_workspace":
-            if (
-                not authority.canonical
-                or effective_operations.intersection(
-                    {"create", "update", "delete", "attach"}
-                )
+            if not authority.canonical or effective_operations.intersection(
+                {"create", "update", "delete", "attach"}
             ):
                 allowed_writes.update(GOOGLE_WORKSPACE_WRITE_TOOLS)
     blocked_writes = INTERNAL_WRITE_TOOL_NAMES | PUBLISH_TOOL_NAMES
     return [
         tool
         for tool in tools
-        if (
-            (name := tool_name_for_policy(tool)) not in blocked_writes
-            or name in allowed_writes
-        )
+        if ((name := tool_name_for_policy(tool)) not in blocked_writes or name in allowed_writes)
     ]
 
 
-def build_chief_slack_command_resolver_agent(
-    *, model: str | None = None
-) -> Agent:
+def build_chief_slack_command_resolver_agent(*, model: str | None = None) -> Agent:
     """Build the compact Chief mode that only selects a native KS command."""
 
     return build_sdk_agent(
@@ -1102,9 +1186,7 @@ def _chief_request_plan(
                 "A supplied execution plan was invalid. Chief of Staff did not "
                 "reinterpret the raw request through compatibility heuristics."
             ),
-            planner_warnings=[
-                "Repair or regenerate the canonical plan before execution."
-            ],
+            planner_warnings=["Repair or regenerate the canonical plan before execution."],
         )
     plan = authority.plan or infer_manual_request_plan(
         request_text,
@@ -1181,11 +1263,14 @@ def _chief_of_staff_sdk_input_for_request(
     latest_request = _latest_slack_followup_request(raw_request_text)
     active_request = latest_request or str(raw_request_text or "")
     if not latest_request and not _looks_like_operator_supplied_synthesis_request(active_request):
-        return _with_finance_expense_receipt_context(
+        prepared_input = _with_finance_expense_receipt_context(
             typed_input,
             active_request,
             manual_request_plan=manual_request_plan,
         )
+        if isinstance(prepared_input, Mapping):
+            return {**prepared_input, "raw_request": active_request}
+        return prepared_input
 
     data: dict[str, Any]
     if isinstance(typed_input, Mapping):
@@ -1193,6 +1278,7 @@ def _chief_of_staff_sdk_input_for_request(
     else:
         data = {"request": str(typed_input or "")}
     data["request"] = active_request
+    data["raw_request"] = active_request
     if latest_request:
         data["latest_operator_request"] = latest_request
         data["raw_slack_thread_request"] = raw_request_text
@@ -1255,9 +1341,11 @@ def _with_finance_expense_receipt_context(
         "field names and attachment-field availability. Read and reason over the "
         "attached receipt PDF/image for vendor, date, amount, total, and estimated-tax "
         "period; do not infer receipt values from the filename alone. Then stage a "
-        "reviewable Airtable create-and-attach plan and route approved execution to "
-        "Airtable Context or the approved Airtable action handler. Chief of Staff "
-        "does not execute Airtable record writes or attachment uploads directly."
+        "reviewable Airtable create-and-attach plan. An unqualified provider-local "
+        "request should route to Airtable Context. When Chief of Staff is explicitly "
+        "selected and its exact Airtable write tool is admitted, Chief may execute the "
+        "single approved mutation through that shared tool. A nested Airtable Context "
+        "call remains read/plan-only. Never let both layers execute the same mutation."
     )
     approval_reference = str(data.get("approval_reference") or "").strip()
     data["finance_expense_receipt_tool_plan"] = {
@@ -1280,10 +1368,11 @@ def _with_finance_expense_receipt_context(
             "Explain any unmapped or review-required fields.",
         ],
         "side_effect_boundary": (
-            "Do not execute the create/upload in Chief of Staff. Persist this as a "
-            "reviewable handoff plan for Airtable Context or the approved Airtable "
-            "action handler; execution still requires live write/upload gates and a "
-            "scoped approval_reference."
+            "Use exactly one mutation owner. Prefer direct Airtable Context for a "
+            "provider-local request. If Chief of Staff was explicitly selected, its "
+            "admitted shared Airtable tool may execute the one approved create/upload; "
+            "the nested Airtable Context specialist must remain read/plan-only. Live "
+            "write/upload gates and a scoped approval_reference remain required."
         ),
     }
     return data
@@ -1312,8 +1401,7 @@ def _finance_expense_receipt_live_preflight_blocker(
     return result.model_copy(
         update={
             "summary": (
-                result.summary
-                + " Live execution is blocked before the model/tool call because "
+                result.summary + " Live execution is blocked before the model/tool call because "
                 "`AIRTABLE_ALLOW_ATTACHMENT_UPLOADS=true` is not set; this avoids "
                 "creating an expense record without attaching the receipt."
             ),
@@ -1627,11 +1715,15 @@ def _plan_finance_expense_receipt_create_request(
     *,
     live: bool,
 ) -> ChiefOfStaffResult:
-    context = {item["key"]: item["value"] for item in _finance_expense_receipt_provider_context(text)}
+    context = {
+        item["key"]: item["value"] for item in _finance_expense_receipt_provider_context(text)
+    }
     table = context.get("airtable_target_table") or _finance_tracker_table_from_text(text)
     receipt_path = context.get("receipt_local_path", "")
     receipt_name = Path(receipt_path).name if receipt_path else "operator-supplied receipt"
-    file_status = "present" if receipt_path and Path(receipt_path).expanduser().is_file() else "unverified"
+    file_status = (
+        "present" if receipt_path and Path(receipt_path).expanduser().is_file() else "unverified"
+    )
     receipt_evidence = extract_finance_receipt_evidence(receipt_path) if receipt_path else None
     evidence_preview = receipt_evidence.supported_field_preview() if receipt_evidence else {}
     evidence_summary = (
@@ -2531,7 +2623,11 @@ def _schema_fields_for_named_table(
         if not isinstance(table, Mapping) or table.get("name") != table_name:
             continue
         fields = table.get("fields", [])
-        return [field for field in fields if isinstance(field, Mapping)] if isinstance(fields, list) else []
+        return (
+            [field for field in fields if isinstance(field, Mapping)]
+            if isinstance(fields, list)
+            else []
+        )
     return []
 
 
@@ -2545,11 +2641,7 @@ def _finance_receipt_schema_mapping_summary(
     attachment = schema_mapping.get("attachment_field")
     select_candidates = schema_mapping.get("select_candidates")
     field_names = ", ".join(sorted(fields)) if isinstance(fields, Mapping) else ""
-    attachment_name = (
-        str(attachment.get("name") or "")
-        if isinstance(attachment, Mapping)
-        else ""
-    )
+    attachment_name = str(attachment.get("name") or "") if isinstance(attachment, Mapping) else ""
     select_names = (
         ", ".join(sorted(select_candidates))
         if isinstance(select_candidates, Mapping) and select_candidates
@@ -2923,8 +3015,7 @@ def _compute_airtable_topic_aggregate(
                 )
                 if category:
                     category_totals[category] = (
-                        category_totals.get(category, Decimal("0"))
-                        + normalized_record.amount
+                        category_totals.get(category, Decimal("0")) + normalized_record.amount
                     )
                 else:
                     uncategorized_count += 1
@@ -4397,12 +4488,16 @@ def _chief_semantic_tools_required(
     manual_request_plan: ManualRequestPlan | None,
 ) -> bool:
     return bool(
-        ExecutionIntentAuthority.from_value(manual_request_plan).canonical
-        and manual_request_plan is not None
-        and (
-            manual_request_plan.provider_system != "unspecified"
-            or manual_request_plan.provider_operations
-            or manual_request_plan.workflow
+        is_read_only_work_item_inspection_plan(manual_request_plan)
+        or (
+            ExecutionIntentAuthority.from_value(manual_request_plan).canonical
+            and manual_request_plan is not None
+            and (
+                manual_request_plan.provider_system != "unspecified"
+                or manual_request_plan.provider_operations
+                or manual_request_plan.workflow
+                or manual_request_plan.requires_live_search
+            )
         )
     )
 
@@ -4863,10 +4958,7 @@ def _internal_handoff_command_text(lowered: str) -> str:
         return "Chief of Staff -> Outreach Composer Agent"
     if "opportunity scout agent" in lowered:
         return "Chief of Staff -> Opportunity Scout Agent"
-    if (
-        "google workspace context agent" in lowered
-        or "google drive context agent" in lowered
-    ):
+    if "google workspace context agent" in lowered or "google drive context agent" in lowered:
         return "Chief of Staff -> Google Workspace Context Agent"
     if "airtable context agent" in lowered and "business research agent" not in lowered:
         return "Chief of Staff -> Airtable Context Agent"
@@ -4926,10 +5018,7 @@ def _internal_context_handoffs(
                 durable_handoff=durable_handoff,
             )
         )
-    if (
-        "google workspace context agent" in lowered
-        or "google drive context agent" in lowered
-    ):
+    if "google workspace context agent" in lowered or "google drive context agent" in lowered:
         handoffs.append(
             _internal_context_handoff(
                 "google_workspace_context_agent",
@@ -5106,9 +5195,7 @@ def _plan_local_kni_document_lookup_request(text: str) -> ChiefOfStaffResult:
     diagnostics.setdefault("send_enabled", False)
     diagnostics["candidate_document_count"] = len(packet.get("candidate_documents") or [])
     candidate_documents = [
-        doc
-        for doc in list(packet.get("candidate_documents") or [])
-        if isinstance(doc, Mapping)
+        doc for doc in list(packet.get("candidate_documents") or []) if isinstance(doc, Mapping)
     ]
     evidence_paths = [
         str(doc.get("relative_path") or "")
@@ -5116,9 +5203,7 @@ def _plan_local_kni_document_lookup_request(text: str) -> ChiefOfStaffResult:
         if str(doc.get("relative_path") or "")
     ]
     lookup_kind = str(
-        diagnostics.get("effective_lookup_kind")
-        or diagnostics.get("lookup_kind")
-        or "generic"
+        diagnostics.get("effective_lookup_kind") or diagnostics.get("lookup_kind") or "generic"
     )
     answer_focus = str(diagnostics.get("effective_answer_focus") or "")
 
@@ -5296,15 +5381,10 @@ def plan_chief_of_staff_request(
             _plan_finance_tracker_request(active_text, live=False),
             action="allowed_finance_tracker_shortcut",
         )
-    if (
-        _chief_plan_requests_local_kni_documents(
-            request_plan,
-            request_text=active_text,
-        )
-        and (
-            _looks_like_local_kni_document_lookup_request(active_text)
-        )
-    ):
+    if _chief_plan_requests_local_kni_documents(
+        request_plan,
+        request_text=active_text,
+    ) and (_looks_like_local_kni_document_lookup_request(active_text)):
         return planned(
             _plan_local_kni_document_lookup_request(active_text),
             action="allowed_local_kni_document_lookup",
@@ -6104,6 +6184,8 @@ def build_chief_of_staff_agent(
     context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
     attach_tools: bool = True,
+    nested_live_execution: bool = False,
+    tool_scope_mode: ToolScopeMode | str = ToolScopeMode.AUTO,
 ) -> Agent:
     """Build the KNI Chief of Staff SDK agent."""
 
@@ -6143,9 +6225,7 @@ def build_chief_of_staff_agent(
         else _env_flag_enabled(CHIEF_OF_STAFF_SPECIALIST_TOOLS_ENV)
     )
     resolved_specialist_tool_mode = _normalize_specialist_tool_mode(specialist_tool_mode)
-    selected_specialist_routes = _chief_specialist_routes_from_plan(
-        manual_request_plan
-    )
+    selected_specialist_routes = _chief_specialist_routes_from_plan(manual_request_plan)
     specialist_tools = (
         build_specialist_agent_tools(
             manager_agent_name="chief_of_staff",
@@ -6153,6 +6233,7 @@ def build_chief_of_staff_agent(
             raw_operator_request=request_text,
             manual_request_plan=manual_request_plan,
             include_routes=selected_specialist_routes,
+            live_execution=nested_live_execution,
         )
         if resolved_include_specialist_tools
         and (selected_specialist_routes is None or selected_specialist_routes)
@@ -6161,24 +6242,53 @@ def build_chief_of_staff_agent(
     resolved_attach_tools = bool(
         attach_tools
         and not direct_supplied_synthesis
-        and (
-            budget.max_tool_calls != 0
-            or _chief_semantic_tools_required(manual_request_plan)
-        )
+        and (budget.max_tool_calls != 0 or _chief_semantic_tools_required(manual_request_plan))
     )
-    return build_sdk_agent(
+    candidate_tools = (
+        _chief_of_staff_tools(
+            request_text,
+            manual_request_plan=manual_request_plan,
+            specialist_tools=specialist_tools,
+        )
+        if resolved_attach_tools
+        else []
+    )
+    resolved_scope_mode = tool_scope_mode
+    scope_authority = ExecutionIntentAuthority.from_value(manual_request_plan)
+    if str(tool_scope_mode) == ToolScopeMode.AUTO.value:
+        if (
+            scope_authority.canonical
+            and len(candidate_tools) <= 15
+            and (
+                scope_authority.plan is None
+                or scope_authority.plan.intent != "continue_work_item"
+            )
+        ):
+            # The existing Chief semantic compiler already reduced this request to
+            # an exact provider, local-document, or specialist surface.
+            resolved_scope_mode = ToolScopeMode.FULL
+        elif request_text:
+            resolved_scope_mode = ToolScopeMode.REQUEST_SCOPED
+    attachment = scope_tools_for_request(
+        "chief_of_staff",
+        candidate_tools,
+        manual_request_plan=manual_request_plan,
+        tool_tier=budget.tool_tier or ("deep_retrieval" if specialist_tools else None),
+        mode=resolved_scope_mode,
+        required_tool_names=(
+            *(str(getattr(tool, "name", "") or "") for tool in specialist_tools),
+            *(
+                ("read_linked_article",)
+                if explicit_full_article_read_requested(request_text)
+                else ()
+            ),
+        ),
+    )
+    agent = build_sdk_agent(
         name="chief_of_staff",
         instructions=instructions,
         output_type=ChiefOfStaffResult,
-        tools=(
-            _chief_of_staff_tools(
-                request_text,
-                manual_request_plan=manual_request_plan,
-                specialist_tools=specialist_tools,
-            )
-            if resolved_attach_tools
-            else []
-        ),
+        tools=list(attachment.tools),
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="chief_of_staff",
@@ -6193,6 +6303,8 @@ def build_chief_of_staff_agent(
             "business-agent, and Slack workflows."
         ),
     )
+    agent = attach_tool_scope_receipt(agent, attachment.scope)
+    return bind_validated_nested_context_replay_boundary(agent)
 
 
 def run_chief_of_staff_sdk(
@@ -6293,9 +6405,7 @@ def run_chief_of_staff_sdk(
         and not (
             live
             and _looks_like_finance_tracker_mutation_request(active_request_text)
-            and not _looks_like_expense_total_sync_request(
-                _normalized_text(active_request_text)
-            )
+            and not _looks_like_expense_total_sync_request(_normalized_text(active_request_text))
         )
         and _manual_plan_allows_finance_tracker_shortcut(request_plan, active_request_text)
     ):
@@ -6335,17 +6445,61 @@ def run_chief_of_staff_sdk(
         live_sdk=live,
         manual_request_plan=request_plan,
     )
+    agent = build_chief_of_staff_agent(
+        model=model,
+        quality_budget=budget,
+        include_specialist_tools=include_specialist_tools,
+        specialist_tool_mode=specialist_tool_mode,
+        request_text=request_text,
+        manual_request_plan=request_plan,
+        context_flags=context_flags,
+        attach_tools=attach_tools,
+        nested_live_execution=live,
+    )
+    scope_receipt = tool_scope_receipt_for_agent(agent)
+    if (
+        live
+        and attach_tools
+        and _chief_semantic_tools_required(request_plan)
+        and int(scope_receipt.get("selected_tool_count") or 0) == 0
+    ):
+        admission_failure = ChiefOfStaffResult(
+            mode="llm_unavailable",
+            intent=active_request_text,
+            summary=(
+                "Chief of Staff could not inspect the requested current state because "
+                "the required bounded tool surface was empty. No model or provider "
+                "action ran."
+            ),
+            recommended_route=ChiefOfStaffRouteRecommendation(
+                workflow_type="clarification",
+                target_channel="current-thread",
+                rationale=(
+                    "Retry after the semantic plan and required read-only tools agree, "
+                    "or provide bounded verified context for tool-free synthesis."
+                ),
+                requires_human_approval_before_post=True,
+            ),
+            recommended_actions=[
+                "Inspect the request-tool scope receipt and repair the missing capability mapping."
+            ],
+            audit_notes=[
+                "Required-tool admission failed before model execution.",
+                "Zero selected tools was not treated as intentional tool-free synthesis.",
+            ],
+        )
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=admission_failure,
+            raw_result={
+                "blocked": "required_tool_scope_empty",
+                "request_tool_scope": scope_receipt,
+            },
+            live=False,
+            request_cache={"request_tool_scope": scope_receipt},
+        )
     result = run_typed_sdk_agent(
-        agent=build_chief_of_staff_agent(
-            model=model,
-            quality_budget=budget,
-            include_specialist_tools=include_specialist_tools,
-            specialist_tool_mode=specialist_tool_mode,
-            request_text=request_text,
-            manual_request_plan=request_plan,
-            context_flags=context_flags,
-            attach_tools=attach_tools,
-        ),
+        agent=agent,
         typed_input=typed_input_for_run,
         output_type=ChiefOfStaffResult,
         run_config=run_config,
@@ -6357,31 +6511,27 @@ def run_chief_of_staff_sdk(
             "quality_max_turns": budget.max_turns,
             "quality_reasoning_effort": budget.reasoning_effort,
             "quality_output_budget": budget.max_tokens,
+            **tool_scope_trace_metadata_for_agent(agent),
         },
+        tool_execution_contract=(
+            _chief_work_item_execution_contract(active_request_text)
+            if live
+            and run_config is None
+            and is_read_only_work_item_inspection_plan(request_plan)
+            else _chief_provider_context_execution_contract(request_plan)
+            if request_plan.provider_context_requirements
+            else None
+        ),
+        decision_contract=chief_of_staff_decision_contract(),
     )
+    request_cache = getattr(result, "request_cache", None)
+    if isinstance(request_cache, dict):
+        request_cache["request_tool_scope"] = scope_receipt
     note = (
         f"Chief of Staff quality budget used: {budget.mode.value}; "
         f"max_turns={budget.max_turns}; reasoning_effort={budget.reasoning_effort}."
     )
     output = result.output
-    if _chief_direct_supplied_synthesis(active_request_text, request_plan):
-        output = output.model_copy(
-            update={
-                "recommended_route": ChiefOfStaffRouteRecommendation(
-                    workflow_type="project-context-review",
-                    command_text="",
-                    target_channel="current-thread",
-                    rationale=(
-                        "The operator supplied sufficient context for a direct "
-                        "provider-free answer."
-                    ),
-                    requires_live_connector=False,
-                    requires_human_approval_before_post=True,
-                ),
-                "durable_handoff": None,
-                "context_handoffs": [],
-            }
-        )
     audit_notes = list(output.audit_notes)
     if note not in audit_notes:
         audit_notes.append(note)

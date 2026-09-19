@@ -286,6 +286,9 @@ def _compact_manual_planner_context(
     if not workflow_state:
         return {}
     state = dict(workflow_state)
+    from keystone_agents.orchestrator.preflight_context import source_bundle_routing_context
+
+    supplied_sources = source_bundle_routing_context(state.get("supplied_source_bundle"))
     slack_context = state.get("slack_context")
     nested_slack_context = dict(slack_context) if isinstance(slack_context, Mapping) else {}
     transcript = str(
@@ -303,6 +306,8 @@ def _compact_manual_planner_context(
     current_work_item = state.get("current_work_item")
     execution_continuation = state.get("execution_continuation")
     compact: dict[str, Any] = {}
+    if supplied_sources:
+        compact["supplied_source_bundle"] = supplied_sources
     receipt: dict[str, Any] = {
         "policy": "preserve_root_and_latest",
     }
@@ -636,13 +641,22 @@ def _apply_contextual_route_hint(
     )
     if target is None:
         return fallback
+    prior_write_plan = _approved_prior_provider_write_plan(
+        request_text=request_text,
+        continuation=continuation,
+        provider_affinity=provider_affinity,
+        prior_owner=prior_owner,
+    )
     write_requested = bool(
         fallback.ask_shape.permission_state != "read_only"
-        and re.search(
-            r"\b(?:add|append|attach|change|create|delete|edit|label|mark|modify|move|"
-            r"remove|rename|replace|revise|save|set|shorten|tag|update|write)\b",
-            request_text,
-            flags=re.I,
+        and (
+            prior_write_plan is not None
+            or re.search(
+                r"\b(?:add|append|attach|change|create|delete|edit|label|mark|modify|move|"
+                r"remove|rename|replace|revise|save|set|shorten|tag|update|write)\b",
+                request_text,
+                flags=re.I,
+            )
         )
     )
     updates: dict[str, Any] = {
@@ -658,6 +672,25 @@ def _apply_contextual_route_hint(
             if "did not contain enough information" not in warning
         ],
     }
+    if prior_write_plan is not None:
+        updates.update(
+            {
+                "source": "canonical:approved_provider_write_continuation",
+                "primary_target": prior_write_plan.primary_target,
+                "provider_operations": list(prior_write_plan.provider_operations),
+                "provider_action_steps": list(prior_write_plan.provider_action_steps),
+                "provider_read_scope": prior_write_plan.provider_read_scope,
+                "provider_result_mode": prior_write_plan.provider_result_mode,
+                "requires_live_search": False,
+                "requires_approved_context": False,
+                "requires_durable_state": False,
+                "rationale": (
+                    "The current turn explicitly authorized the exact prior provider "
+                    "operation. The prior request supplies bounded operation and target "
+                    "continuity; the current operator turn remains authoritative."
+                ),
+            }
+        )
     if target in {
         "airtable_context_agent",
         "google_workspace_context_agent",
@@ -769,6 +802,79 @@ def _apply_contextual_route_hint(
             }
         )
     return fallback.model_copy(update=updates)
+
+
+def _approved_prior_provider_write_plan(
+    *,
+    request_text: str,
+    continuation: Mapping[str, Any] | object,
+    provider_affinity: str,
+    prior_owner: str,
+) -> ManualRequestPlan | None:
+    """Preserve an exact prior write only for an explicit approval continuation.
+
+    This is provider-neutral continuation normalization, not a new semantic
+    selector.  The current turn must explicitly authorize proceeding, the Slack
+    continuation must name the same provider, and the prior request must already
+    compile to one bounded provider mutation.  A generic acknowledgement without
+    that typed continuity cannot create write authority.
+    """
+
+    if not isinstance(continuation, Mapping):
+        return None
+    normalized = " ".join(str(request_text or "").lower().split()).strip(" .!?")
+    if not re.fullmatch(
+        r"(?:yes[ ,:-]*)?(?:approved?|authorized?|go\s+ahead|proceed|do\s+it|"
+        r"please\s+proceed|you\s+can\s+proceed)(?:\s+to\s+(?:write|create|update|"
+        r"delete|modify|save|add|attach)\s+(?:it|that|this))?",
+        normalized,
+    ):
+        return None
+    prior_request = str(continuation.get("prior_request") or "").strip()
+    if not prior_request:
+        return None
+    provider = {
+        "calendar": "google_calendar",
+        "google calendar": "google_calendar",
+        "google_calendar": "google_calendar",
+        "gmail": "gmail",
+        "airtable": "airtable",
+        "google workspace": "google_workspace",
+        "google_workspace": "google_workspace",
+        "zotero": "zotero",
+        "slack": "slack",
+    }.get(str(provider_affinity or "").strip().lower())
+    if not provider:
+        return None
+    prior_plan = infer_manual_request_plan(
+        prior_request,
+        requested_agent=prior_owner or None,
+    )
+    mutations = {
+        operation
+        for operation in prior_plan.provider_operations
+        if operation in {"create", "update", "delete", "attach"}
+    }
+    if (
+        prior_plan.intent != "business_system_write"
+        or prior_plan.provider_system != provider
+        or len(mutations) != 1
+    ):
+        return None
+    return prior_plan.model_copy(
+        update={
+            "source": "canonical:approved_provider_write_continuation",
+            "objective": request_text,
+            "requires_live_search": False,
+            "requires_approved_context": False,
+            "requires_durable_state": False,
+            "rationale": (
+                "The current turn explicitly authorized the exact prior provider "
+                "operation. The prior request supplies bounded operation and target "
+                "continuity; the current operator turn remains authoritative."
+            ),
+        }
+    )
 
 
 def _verified_provider_affinity_from_prior_owner(
@@ -900,6 +1006,7 @@ def _explicit_source_owner_from_text(text: str) -> str | None:
 
     checks = (
         (r"\bairtable\b", "airtable_context_agent"),
+        (r"\b(?:google\s+calendar|calendar)\b", "chief_of_staff"),
         (
             r"\b(?:google\s+docs?|google\s+sheets?|google\s+drive|google\s+workspace)\b",
             "google_workspace_context_agent",

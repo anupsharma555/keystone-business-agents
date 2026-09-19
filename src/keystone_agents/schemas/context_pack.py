@@ -12,6 +12,7 @@ from keystone_agents.schemas.handoff_types import (
     build_handoff_type_contract,
 )
 from keystone_agents.schemas.manual_request_plan import AskShapePolicy
+from keystone_agents.schemas.signal_lifecycle import SignalTriggerContext
 from keystone_agents.schemas.work_item import (
     WorkItemApprovalGate,
     WorkItemArtifactRef,
@@ -119,7 +120,26 @@ class ContextPackBase(BaseModel):
     limitation_notes: list[str] = Field(default_factory=list)
     relevant_memory_refs: list[MemoryContextRef] = Field(default_factory=list)
     project_context: ProjectContextPack | None = None
+    signal_trigger: SignalTriggerContext | None = None
     summary: dict[str, Any] = Field(default_factory=dict)
+
+    def without_duplicate_context(self) -> ContextPackBase:
+        """Keep a typed model view while removing only exactly equal mirrors."""
+        values = self.model_dump(mode="json")
+        summary = dict(values["summary"])
+        for alias, field in (
+            ("id", "work_item_id"), ("status", "current_status"),
+            ("current_route", "route"), ("target", "target"),
+            ("facts", "approved_facts"), ("sources", "source_refs"),
+            ("artifact_refs", "selected_artifacts"), ("open_blockers", "blockers"),
+            ("next_action", "allowed_next_action"),
+        ):
+            if alias in summary and summary[alias] == values[field]:
+                del summary[alias]
+        updates: dict[str, Any] = {"summary": summary}
+        if values["retrieved_sources"] == values["source_refs"]:
+            updates["retrieved_sources"] = []
+        return self.model_copy(update=updates)
 
     @field_serializer("source_triage")
     def _serialize_source_triage(self, value: SourceTriageSummary) -> dict[str, Any]:
@@ -154,6 +174,36 @@ class ResearchContextPack(ContextPackBase):
     missing_evidence: list[str] = Field(default_factory=list)
     approved_company_facts: list[MemoryContextRef] = Field(default_factory=list)
     retrieval_performance_notes: list[MemoryContextRef] = Field(default_factory=list)
+
+
+class RAGRetrievalContextPack(ContextPackBase):
+    """Context contract for explicit vector-store retrieval."""
+
+    pack_type: Literal["rag_retrieval"] = "rag_retrieval"
+    handoff_type_contract: HandoffTypeContract = Field(
+        default_factory=lambda: build_handoff_type_contract(
+            source_agent="work_item_manager",
+            target_agent="rag_retrieval_specialist",
+            source_output_type="keystone_agents.schemas.work_item.WorkItem",
+            target_input_type="keystone_agents.schemas.context_pack.RAGRetrievalContextPack",
+            target_output_type="keystone_agents.schemas.rag_retrieval.RAGRetrievalResult",
+            payload_mode="adapted",
+            parsed_output_status="parsed",
+            compatibility_notes=[
+                "WorkItem state has been adapted into a RAGRetrievalContextPack before retrieval."
+            ],
+        )
+    )
+    satisfies_input_type: str = "keystone_agents.schemas.context_pack.RAGRetrievalContextPack"
+    expected_output_type: str = "keystone_agents.schemas.rag_retrieval.RAGRetrievalResult"
+    next_input_type: str = "keystone_agents.schemas.context_pack.ResearchContextPack"
+    type_compatibility_status: str = "compatible"
+    route: WorkItemRoute = WorkItemRoute.RAG_RETRIEVAL_SPECIALIST
+    query: str = ""
+    retrieval_mode: Literal["single_article", "semantic_search", "hybrid"] = (
+        "semantic_search"
+    )
+    max_matches: int = Field(default=6, ge=1, le=20)
 
 
 class OpportunityContextPack(ContextPackBase):
@@ -277,5 +327,9 @@ class GmailContextPack(ContextPackBase):
 
 
 ContextPack: TypeAlias = (
-    ResearchContextPack | OpportunityContextPack | OutreachContextPack | GmailContextPack
+    ResearchContextPack
+    | RAGRetrievalContextPack
+    | OpportunityContextPack
+    | OutreachContextPack
+    | GmailContextPack
 )

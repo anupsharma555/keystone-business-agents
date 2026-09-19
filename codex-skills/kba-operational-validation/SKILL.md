@@ -1,12 +1,19 @@
 ---
 name: kba-operational-validation
-description: Repo-local validation coordinator for <repo>. Use only in this repo when validating realistic KBA jobs through bounded direct-agent routes, Orchestrator-first WorkItems, optional LangGraph workflows, typed provider evidence, approval gates, OpenAI request and cost caps, backend receipts, and Slack content and visual acceptance.
+description: End-to-end operational acceptance for realistic KBA jobs in the keystone-business-agents repo. Use only in this repo when validating execution, provider evidence, useful output, safety, recovery, and Slack delivery across direct or Orchestrator/WorkItem routes. Use run diagnosis separately when the goal is reconstructing one failed evidence packet.
 ---
 
 # KBA Operational Validation
 
-Use this skill only for `<repo>`. If the working directory is
-not this repo, stop and switch to the correct checkout before continuing.
+Use this skill only for `<repo>`. A selected isolated worktree of this same
+project is also valid when the task explicitly scopes work there. If the working directory is
+not this repo or one of those selected worktrees, stop and switch to the correct checkout before continuing.
+
+This skill decides end-to-end operational acceptance. A diagnostic collector
+`PASS` means only that its selected evidence packet has no detected failure or
+gap; it is not certification of answer quality, provider correctness, Slack
+presentation, recovery, or live readiness. Apply this skill's full acceptance
+evidence before calling a capability operationally accepted.
 
 ## First Reads
 
@@ -83,3 +90,7 @@ When reporting request consumption, distinguish the configured ceiling, conserva
 Update local status documents after material evidence changes. Update Linear only for a major pass milestone or blocker; prefer updating an existing checkpoint over adding routine comments. Report capability, selected execution path, backend evidence, Slack acceptance, safety, request/usage/cost evidence, remaining boundary, and the next bounded proof.
 
 Do not mark the operational-readiness goal complete until every agent family has current direct evidence across the required dimensions.
+
+Use `tests/test_codex_repo_skills.py` for repo-skill structure and metadata
+validation. This check does not replace capability-specific offline tests or
+the bounded live/provider/Slack evidence required by the acceptance case.

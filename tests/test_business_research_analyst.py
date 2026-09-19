@@ -38,6 +38,7 @@ from keystone_agents.schemas.company_profile import (
     CompanyResearchComparison,
     CompanyResearchFocusedBrief,
 )
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.research import (
     ResearchArticleSummary,
     ResearchBrief,
@@ -131,6 +132,7 @@ def test_build_business_research_analyst_agent() -> None:
         "load_contact_context",
         "load_crm_account_context",
         "search_web",
+        "extract_selected_urls_to_source_bundle",
         "fetch_company_page",
         "extract_research_claims_from_html",
         "fetch_linkedin_or_profile_placeholder",
@@ -155,6 +157,7 @@ def test_build_business_research_analyst_research_brief_agent() -> None:
         "search_local_context",
         "read_local_context_file",
         "search_web",
+        "extract_selected_urls_to_source_bundle",
         "extract_research_claims_from_html",
         "dedupe_and_rank_sources",
     } <= {getattr(tool, "name", "") for tool in agent.tools}
@@ -164,6 +167,33 @@ def test_build_business_research_analyst_research_brief_agent_can_detach_tools()
     agent = build_business_research_analyst_research_brief_agent(attach_tools=False)
 
     assert agent.tools == []
+
+
+def test_selected_url_extraction_is_attached_only_at_deep_retrieval_tier() -> None:
+    plan = ManualRequestPlan(
+        source="canonical:stored_work_item",
+        target_agent="business_research_analyst",
+        intent="research_brief",
+        primary_target="Example Health",
+        target_type="company",
+        provider_operations=["search", "read"],
+        requires_live_search=True,
+    )
+    deep_agent = build_business_research_analyst_agent(
+        tool_tier="deep_retrieval",
+        manual_request_plan=plan,
+    )
+    web_search_agent = build_business_research_analyst_agent(
+        tool_tier="web_search",
+        manual_request_plan=plan,
+    )
+
+    assert "extract_selected_urls_to_source_bundle" in {
+        getattr(tool, "name", "") for tool in deep_agent.tools
+    }
+    assert "extract_selected_urls_to_source_bundle" not in {
+        getattr(tool, "name", "") for tool in web_search_agent.tools
+    }
 
 
 def test_research_sdk_input_describes_zotero_collection_contract() -> None:

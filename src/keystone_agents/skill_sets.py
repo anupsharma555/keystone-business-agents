@@ -39,6 +39,7 @@ CORE_SKILL_NAMES = (
 SPECIALIST_SKILL_NAMES = {
     "gmail_triage": "gmail_triage_specialist_contracts",
     "business_research_analyst": "business_research_specialist_contracts",
+    "rag_retrieval_specialist": "rag_retrieval_specialist_contracts",
     "opportunity_scout": "opportunity_scout_specialist_contracts",
     "outreach_composer": "outreach_composer_specialist_contracts",
     "airtable_context_agent": "airtable_context_specialist_contracts",
@@ -59,6 +60,19 @@ AGENT_SKILL_NAMES: dict[str, tuple[str, ...]] = {
     "business_research_analyst": (
         *SHARED_REASONING_SKILL_NAMES,
         "business_research_specialist_contracts",
+    ),
+    "rag_retrieval_specialist": (
+        "ask_to_target_resolution",
+        "identity_and_record_resolution",
+        "evidence_attribution_and_claim_mapping",
+        "source_triage_decision",
+        "context_permission_gating",
+        "action_boundary_enforcement",
+        "unsupported_claim_and_gap_handling",
+        "tool_result_resilience",
+        "structured_output_quality_review",
+        "handoff_contract_packaging",
+        "rag_retrieval_specialist_contracts",
     ),
     "opportunity_scout": (
         *SHARED_REASONING_SKILL_NAMES,
@@ -144,6 +158,14 @@ DEFAULT_ROUTE_SKILL_NAMES: dict[str, tuple[str, ...]] = {
         "writing_style_adaptation",
     ),
     "business_research_analyst": (
+        "identity_and_record_resolution",
+        "evidence_attribution_and_claim_mapping",
+        "source_triage_decision",
+        "unsupported_claim_and_gap_handling",
+        "handoff_contract_packaging",
+    ),
+    "rag_retrieval_specialist": (
+        "ask_to_target_resolution",
         "identity_and_record_resolution",
         "evidence_attribution_and_claim_mapping",
         "source_triage_decision",
@@ -523,9 +545,17 @@ def explain_agent_skill_selection(
         for skill_name in DEFAULT_ROUTE_SKILL_NAMES.get(agent_name, ()):
             _add_reason(reasons, skill_name, "route_default")
 
+    # Optional procedures follow positive task intent, not negated actions or
+    # substrings inside unrelated words/schema field names. Core guidance above
+    # still receives the complete request and is never removed by this projection.
+    from keystone_agents.planning.compatibility import positive_capability_text
+
+    positive_text = positive_capability_text(lowered)
     for skill_name, triggers in CONDITIONAL_SKILL_TRIGGERS.items():
         for trigger in triggers:
-            if trigger in lowered:
+            left = r"(?<!\w)" if trigger[0].isalnum() or trigger[0] == "_" else ""
+            right = r"(?!\w)" if trigger[-1].isalnum() or trigger[-1] == "_" else ""
+            if re.search(left + re.escape(trigger) + right, positive_text):
                 _add_reason(reasons, skill_name, f"request_trigger:{trigger}")
                 break
     if context_flags:

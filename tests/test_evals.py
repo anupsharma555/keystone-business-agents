@@ -52,6 +52,60 @@ def test_static_eval_scoring_runs() -> None:
     assert all(result["dataset"] for result in payload["results"])
 
 
+def test_scout_strategic_fit_requires_typed_domain_signal_rationale_and_evidence() -> None:
+    expected = {
+        "strategic_fit": {
+            "opportunity_types": ["behavioral health AI"],
+            "required_signals": ["validation study"],
+            "source_confidence_min": 70,
+        }
+    }
+    valid_record = {
+        "company_name": "KBA Test Health",
+        "opportunity_type": "behavioral health AI",
+        "source_signals": ["validation study"],
+        "keystone_fit_reason": "Supported behavioral-health validation fit.",
+        "source_quality_summary": {"overall_score": 82},
+        "approval_required_before_outreach": True,
+    }
+
+    valid = score_output_against_expected(
+        {"records": [valid_record], "outreach_generated": False},
+        expected,
+        agent="scout",
+    )
+    assert next(check for check in valid.checks if check.name == "strategic_fit").passed
+
+    invalid_records = {
+        "wrong_domain": {
+            **valid_record,
+            "opportunity_type": "contract or RFP opportunity",
+        },
+        "unsupported_signal": {
+            **valid_record,
+            "source_signals": ["conference activity"],
+        },
+        "empty_rationale": {
+            **valid_record,
+            "keystone_fit_reason": "",
+        },
+        "inadequate_evidence": {
+            **valid_record,
+            "source_quality_summary": {"overall_score": 40},
+        },
+    }
+    for failure_kind, record in invalid_records.items():
+        result = score_output_against_expected(
+            {"records": [record], "outreach_generated": False},
+            expected,
+            agent="scout",
+        )
+        strategic_fit = next(
+            check for check in result.checks if check.name == "strategic_fit"
+        )
+        assert strategic_fit.passed is False, failure_kind
+
+
 def test_static_eval_subset_runs() -> None:
     summary = run_static_evals(agent="gmail")
 
@@ -92,7 +146,7 @@ def test_eval_report_renders() -> None:
     assert "Skill labels" in report
     assert "Average score" in report
     assert "Prompt versions" in report
-    assert "outreach_composer@2026-07-11.1" in report
+    assert "outreach_composer@2026-09-11.2" in report
 
 
 def test_eval_cli_json_output(capsys) -> None:

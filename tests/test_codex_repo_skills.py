@@ -8,12 +8,14 @@ SKILLS_ROOT = PROJECT_ROOT / "codex-skills"
 REPO_PATH = "<repo>"
 EXPECTED_SKILLS = {
     "kba-agent-contract-change",
+    "kba-agent-run-diagnosis",
     "kba-eval-readiness-triage",
     "kba-new-agent",
     "kba-search-provider-eval",
     "kba-workitem-orchestrator-ops",
     "kba-live-sdk-smoke-and-cost",
     "kba-operational-validation",
+    "kba-propagate-agent-fixes",
 }
 LOCAL_PATH_PREFIXES = (
     "AGENTS.md",
@@ -74,7 +76,10 @@ def test_repo_local_codex_skills_are_repo_scoped_and_actionable() -> None:
         frontmatter = _frontmatter(skill_path)
 
         assert frontmatter["name"] == skill_dir.name
-        assert REPO_PATH in frontmatter["description"]
+        assert (
+            REPO_PATH in frontmatter["description"]
+            or "keystone-business-agents repo" in frontmatter["description"]
+        )
         assert "Use only in this repo" in frontmatter["description"]
         assert REPO_PATH in text
         assert "If the working directory is\nnot this repo" in text

@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from keystone_agents.schemas.signal_lifecycle import SignalTriggerContext
+from keystone_agents.schemas.source_evidence import (
+    SourceEvidenceAccess,
+    SourceEvidencePage,
+    source_evidence_access,
+)
+from keystone_agents.schemas.web_source import WebSourceAccess
 
 
 def utc_now_iso() -> str:
@@ -26,6 +35,7 @@ class WorkItemKind(StrEnum):
     GMAIL_THREAD = "gmail_thread"
     COMPANY_RESEARCH = "company_research"
     RESEARCH_BRIEF = "research_brief"
+    RAG_RETRIEVAL = "rag_retrieval"
     OPPORTUNITY = "opportunity"
     OUTREACH = "outreach"
     WEEKLY_SCAN = "weekly_scan"
@@ -52,6 +62,7 @@ class WorkItemRoute(StrEnum):
     ORCHESTRATOR = "orchestrator"
     GMAIL_TRIAGE = "gmail_triage"
     BUSINESS_RESEARCH_ANALYST = "business_research_analyst"
+    RAG_RETRIEVAL_SPECIALIST = "rag_retrieval_specialist"
     OPPORTUNITY_SCOUT = "opportunity_scout"
     OUTREACH_COMPOSER = "outreach_composer"
     CHIEF_OF_STAFF = "chief_of_staff"
@@ -78,6 +89,7 @@ class WorkItemSourceRef(BaseModel):
     url: str = ""
     source_type: str = ""
     source_id: str = ""
+    provider_candidate_id: str = Field(default="", max_length=200)
     supported_claim: str = ""
     provider: str = ""
     extraction_status: str = ""
@@ -86,6 +98,22 @@ class WorkItemSourceRef(BaseModel):
     key_facts: list[str] = Field(default_factory=list)
     evidence_excerpt: str = ""
     zotero_key: str = ""
+    evidence_pages: list[SourceEvidencePage] = Field(default_factory=list)
+    evidence_access: SourceEvidenceAccess | None = None
+    web_source_access: WebSourceAccess | None = None
+
+    @model_validator(mode="after")
+    def bind_evidence_snapshot(self) -> WorkItemSourceRef:
+        if self.evidence_pages:
+            actual = source_evidence_access(self.evidence_pages)
+            if self.evidence_access is not None and self.evidence_access != actual:
+                raise ValueError("Retained source pages do not match their evidence snapshot.")
+            self.evidence_access = actual
+        return self
+
+    def model_context(self) -> WorkItemSourceRef:
+        """Keep an exact read handle while excluding retained pages from the prompt."""
+        return self.model_copy(update={"evidence_pages": []})
 
 
 class WorkItemFact(BaseModel):
@@ -167,6 +195,7 @@ class WorkItem(BaseModel):
     title: str
     request_text: str = ""
     target: WorkItemTarget = Field(default_factory=WorkItemTarget)
+    signal_trigger: SignalTriggerContext | None = None
     current_route: WorkItemRoute = WorkItemRoute.ORCHESTRATOR
     facts: list[WorkItemFact] = Field(default_factory=list)
     sources: list[WorkItemSourceRef] = Field(default_factory=list)
@@ -190,6 +219,9 @@ class WorkflowRunRequest(BaseModel):
     """Input for one deterministic WorkItem advancement."""
 
     request_text: str = ""
+    execution_id: str = ""
+    origin_event_id: str = ""
+    model_request_limit: int | None = Field(default=None, ge=0)
     work_item_id: str | None = None
     save: bool = True
     database_url: str | None = None
@@ -197,10 +229,17 @@ class WorkflowRunRequest(BaseModel):
     live_sdk: bool = False
     live_rss_slack_read: bool = False
     max_results: int = Field(default=3, ge=1, le=20)
+    max_results_explicit: bool = Field(
+        default=False,
+        description=(
+            "Whether max_results is an explicit caller ceiling rather than a fallback default."
+        ),
+    )
     requested_route: WorkItemRoute | None = None
     manual_request_plan: dict[str, Any] | None = None
     orchestrator_preflight: dict[str, Any] | None = None
     context_file_path: str = ""
+    context_file_snapshot: dict[str, Any] | None = Field(default=None, repr=False)
     external_context: dict[str, Any] | None = None
     slack_query_prompt: dict[str, Any] | None = None
     sdk_session_enabled: bool | None = None
@@ -213,6 +252,23 @@ class WorkflowRunRequest(BaseModel):
     hosted_web_search_max_calls: int | None = Field(default=None, ge=0, le=20)
     reuse_existing_research: bool = False
     cost_tracking_requested: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def capture_result_limit_origin(cls, value: Any) -> Any:
+        if isinstance(value, Mapping):
+            payload = dict(value)
+            payload.setdefault("max_results_explicit", "max_results" in payload)
+            return payload
+        return value
+
+    @classmethod
+    def from_checkpoint(cls, value: Any) -> WorkflowRunRequest:
+        """Read persisted provenance; legacy snapshots never establish an explicit cap."""
+        if isinstance(value, Mapping):
+            value = dict(value)
+            value.setdefault("max_results_explicit", False)
+        return cls.model_validate(value)
 
 
 class WorkflowExecutionProvenance(BaseModel):
@@ -271,3 +327,4 @@ class WorkflowRunResult(BaseModel):
         default_factory=WorkflowExecutionProvenance
     )
     execution_steps: list[WorkflowExecutionStep] = Field(default_factory=list)
+    tool_execution: dict[str, Any] = Field(default_factory=dict)

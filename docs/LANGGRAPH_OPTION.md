@@ -2,10 +2,11 @@
 
 ## Position
 
-OpenAI Agents SDK remains the core specialist-agent layer for Keystone. The four specialists stay as SDK agents:
+OpenAI Agents SDK remains the core specialist-agent layer for Keystone. The workflow specialists stay as SDK agents:
 
 - Gmail Triage
 - Business Research Analyst
+- RAG Retrieval Specialist (explicit vector-store requests only)
 - Opportunity Scout
 - Outreach Composer
 
@@ -31,8 +32,30 @@ Current implementation:
 Install the optional runtime only in environments that need graph execution:
 
 ```bash
-.venv/bin/python -m pip install -e ".[orchestration]"
+.venv/bin/python -m pip install --no-build-isolation -e ".[orchestration]" -c constraints/ci.txt
 ```
+
+## V2 persistence and recovery
+
+Saved compiled-graph executions now use a SQLite checkpointer and a companion
+execution journal. Each logical execution has its own `execution_id`, which is
+the native LangGraph thread cursor. The older `checkpoint_key` remains a
+caller-compatible reference and can reflect a WorkItem grouping identifier.
+Use `execution_id` explicitly when resuming native execution. Unsaved runs and the dependency-free fallback do not create native
+LangGraph checkpoints.
+
+Use `scripts/kba_execution.py` with the exact business database to list, inspect,
+and resume native executions. Approval interrupts are enabled by default for
+saved graphs; `--approved` requires an already persisted approval and does not
+grant it. Resume checks current WorkItem state and runtime compatibility. The
+journal preserves model consumption and provider-operation evidence, while
+provider gates still own permission. Unknown effects require reconciliation.
+
+Direct execution remains supported and shares the operation/budget contract.
+SDK conversation sessions, business WorkItems, and native graph checkpoints are
+separate stores with separate purposes. Diagnostic fork export does not execute
+historical provider actions. See [V2 implementation](KBA_V2_IMPLEMENTATION.md)
+for current coverage, commands, and proof boundaries.
 
 ## Operational Use
 
@@ -43,10 +66,19 @@ WorkItem/context preparation, specialist execution, finalization, and approval
 checkpointing, then returns the same `WorkflowRunResult` shape used by the CLI,
 Slack handlers, tests, and renderers.
 It is downstream of Orchestrator preflight: Keystone captures the raw request
-and compact context, obtains Orchestrator route advice/review context, then
-passes that memo into the typed `WorkflowRunRequest`. LangGraph may checkpoint
-or resume the run, but it does not replace Orchestrator planning, specialist
-SDK agents, deterministic safety gates, or output review.
+and compact context, obtains the Orchestrator's typed semantic route/workflow
+decision, and passes the validated internal decision plus the public-safe memo
+into the execution boundary. LangGraph may checkpoint or resume the run, but it
+does not replace Orchestrator interpretation, specialist SDK agents,
+deterministic safety gates, or output review.
+
+Graph execution does not imply that every tool is model-called. A graph stage
+may acquire bounded provider context or execute an exact workflow-owned helper;
+a specialist may instead choose among admitted tools inside its SDK loop. The
+downstream model must still see any evidence that materially affects its
+decision. Runtime summaries distinguish model-called tools, workflow-called
+tools/helpers, and pre-acquired context rather than collapsing them into one
+`tools_used` claim.
 
 CLI usage:
 
@@ -122,7 +154,8 @@ For example, "Chief of Staff, plan the safest workflow and state the route"
 should return a plan through the Orchestrator/Chief path; "run the workflow"
 can enter the graph when the backend sees a real multi-step execution boundary.
 
-Planner and backend-selection logic may detect structural controls such as
+The typed compatibility/constraint envelope and backend-selection logic may
+detect structural controls such as
 target agent, target entity, requested count, live-search denial, read-only
 scope, no-send/no-write constraints, and whether the request asks for a
 multi-step handoff. It must not interpret LLM-owned business substance such as
@@ -147,6 +180,12 @@ CRM/Airtable write, or other live side effect.
 
 The SDK agents are the stable unit of behavior. They own prompts, output schemas, tool access, and guardrails. This keeps each agent testable without a larger workflow engine and prevents orchestration concerns from leaking into specialist prompts.
 
+They also own the substantive domain decisions assigned by
+`agent_decision_policy.py`. LangGraph owns durable ordering and checkpoints;
+Python owns admission, validation, permissions, provider verification, and
+state transitions. The graph must not infer a semantic decision from incidental
+prose when a typed agent decision or handoff exists.
+
 Keeping the SDK layer first also supports:
 
 - simpler fixture-mode tests
@@ -161,7 +200,7 @@ LangGraph improves orchestration rather than individual agent reasoning:
 
 - It creates explicit node boundaries inside WorkItem advancement.
 - It gives the project a durable checkpoint point before approval-gated next actions.
-- It lets future Slack or scheduled runs resume from a graph thread id instead of rerouting.
+- Native saved executions can resume by execution ID; Slack transport continuation still needs its own correlated acceptance.
 - It can add retry policies per node without changing specialist agents.
 - It can support branching workflows for inbound Gmail, account research, opportunity scoring, and outreach.
 - It preserves SQLite WorkItems as canonical audit state while allowing LangGraph checkpoints.
@@ -184,7 +223,7 @@ Do not use LangGraph merely to call one specialist agent or to hide business log
 - `stage_google_workspace_context`: Stages a read-only Google Workspace
   artifact/write plan as a selected WorkItem artifact/source and approval gate
   when the operator asks for internal Drive, Docs, Sheets, or sharing planning.
-- Route-specific specialist nodes: `run_business_research`, `run_opportunity_scout`, `run_gmail_triage`, `run_outreach_composer`, `run_chief_of_staff`, and `run_unsupported_route`.
+- Route-specific specialist nodes: `run_business_research`, `run_rag_retrieval`, `run_opportunity_scout`, `run_gmail_triage`, `run_outreach_composer`, `run_chief_of_staff`, and `run_unsupported_route`. `run_rag_retrieval` is admitted only by an explicit named-agent request or typed workflow route during the initial rollout.
 - `finalize_step`: Attaches final context and persists the WorkItem. Normal one-step runs may synthesize the user-facing response here; manager-loop graph runs defer generic final synthesis so each live specialist edge can stay inside an explicit API-call budget.
 - `manager_loop_continue`: Converts a successful non-approval next action into a `continue` request for the next distinct specialist when the operator asked for a multi-step workflow.
 - `manager_loop_finalize`: Records the bounded graph-loop stop reason, step

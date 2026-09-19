@@ -209,7 +209,7 @@ def normalize_source_record(
         return None
     title = str(payload.get("title") or payload.get("name") or url).strip()
     claims = _payload_claims(payload, company_name=company_name)
-    if not claims:
+    if not claims and not (payload.get("web_source_access") and payload.get("evidence_excerpt")):
         return None
     declared_source_type = str(payload.get("source_type") or default_source_type).strip()
     quality = score_source_quality(
@@ -227,6 +227,8 @@ def normalize_source_record(
         url=url,
         source_type=quality.source_type,
         supported_claims=claims,
+        evidence_excerpt=str(payload.get("evidence_excerpt") or ""),
+        web_source_access=payload.get("web_source_access"),
         confidence=round(quality.overall_score / 100, 2),
         published_at=payload.get("published_at") or payload.get("date"),
         source_quality=quality,
@@ -244,10 +246,23 @@ def dedupe_and_rank_source_records(
     merged: dict[str, SourceRecord] = {}
     order: dict[str, int] = {}
     for index, source in enumerate(sources):
-        if not source.supported_claims:
+        if not source.supported_claims and not (
+            source.web_source_access and source.evidence_excerpt
+        ):
             continue
         key = _source_key(source)
         existing = merged.get(key)
+        if (
+            existing is not None
+            and existing.web_source_access is not None
+            and source.web_source_access is not None
+            and (existing.web_source_access.snapshot_sha256
+                 != source.web_source_access.snapshot_sha256)
+        ):
+            # Same URL can have distinct saved revisions. Never merge their
+            # claims under one snapshot handle.
+            key = f"{key}:snapshot:{source.web_source_access.snapshot_sha256}"
+            existing = merged.get(key)
         if existing is None:
             merged[key] = _ensure_scored(source, company_url=company_url)
             order[key] = index
@@ -258,9 +273,13 @@ def dedupe_and_rank_source_records(
         existing_score = existing.source_quality.overall_score if existing.source_quality else 0
         scored_score = scored.source_quality.overall_score if scored.source_quality else 0
         base = scored if scored_score > existing_score else existing
+        # A search hit must not discard the extracted snapshot when URLs merge.
+        evidence = source if source.web_source_access else existing
         merged[key] = base.model_copy(
             update={
                 "source_id": existing.source_id,
+                "evidence_excerpt": evidence.evidence_excerpt or base.evidence_excerpt,
+                "web_source_access": evidence.web_source_access,
                 "supported_claims": claims,
                 "confidence": confidence,
                 "source_quality": (

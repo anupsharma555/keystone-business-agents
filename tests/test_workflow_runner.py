@@ -12,6 +12,7 @@ from keystone_agents.agents.business_research_analyst import research_company_fi
 from keystone_agents.agents.gmail_triage import run_gmail_triage_fixture
 from keystone_agents.agents.opportunity_scout import scout_opportunities_fixture
 from keystone_agents.agents.orchestrator import run_orchestrator_preflight
+from keystone_agents.instruction_following import resolve_instruction_following_response
 from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.multi_target_research import (
@@ -36,7 +37,12 @@ from keystone_agents.schemas.chief_of_staff import (
     ChiefOfStaffSourceRef,
 )
 from keystone_agents.schemas.company_profile import SourceRecord
+from keystone_agents.schemas.decision_ownership import (
+    AgentDecisionRecord,
+    DecisionCandidateAssessment,
+)
 from keystone_agents.schemas.email_triage import (
+    EmailTriageResult,
     GmailCandidateRankingItem,
     GmailCandidateRankingResult,
     GmailThreadSummaryMessage,
@@ -44,13 +50,14 @@ from keystone_agents.schemas.email_triage import (
 )
 from keystone_agents.schemas.manual_request_plan import AskShapePolicy, ManualRequestPlan
 from keystone_agents.schemas.memory import MemoryItem
+from keystone_agents.schemas.operational_context import RssContextResult
 from keystone_agents.schemas.opportunity import (
     FilteredOpportunityCandidate,
     OpportunityRecord,
     OpportunityScoutResult,
     OpportunitySource,
 )
-from keystone_agents.schemas.outreach import OutreachDraft
+from keystone_agents.schemas.outreach import OutreachDraft, OutreachLLMDraftPayload
 from keystone_agents.schemas.request_coverage import RequestCoverage
 from keystone_agents.schemas.research import (
     ResearchArticleSummary,
@@ -74,10 +81,16 @@ from keystone_agents.schemas.work_item import (
     WorkItemStatus,
     WorkItemTarget,
 )
+from keystone_agents.source_enrichment import SourceBundle
 from keystone_agents.storage.sqlite_store import SQLiteStore
 from keystone_agents.test_pack_specs import get_test_pack_spec
 from keystone_agents.tools.email_style_tool import load_email_style_profile_from_storage
-from keystone_agents.tools.website_extraction_tool import WebsiteExtractionResult
+from keystone_agents.tools.search_provider import SearchResult, search_result_candidate_id
+from keystone_agents.tools.website_extraction_tool import (
+    SelectedUrlExtractionDiagnostic,
+    SelectedUrlSourceBundleResult,
+    WebsiteExtractionResult,
+)
 from keystone_agents.work_items import (
     apply_slack_approval_to_work_item_gate,
     approve_artifact_context,
@@ -743,6 +756,235 @@ def _database_url(tmp_path: Path) -> str:
     return f"sqlite:///{tmp_path / 'workflow_runner.db'}"
 
 
+def test_live_gmail_workitem_uses_agent_owned_query_and_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_text = (
+        "Find the current QuillBridge onboarding conversation, compare the likely "
+        "threads, and give me a short reply here. Keep it in Slack and don't create "
+        "or send an email."
+    )
+    captured: dict[str, object] = {}
+    decision = AgentDecisionRecord(
+        decision_owner="specialist_agent",
+        decision_stage="gmail_candidate_selection",
+        selected_candidate_id="thread-current",
+        candidate_assessments=[
+            DecisionCandidateAssessment(
+                candidate_id="thread-current",
+                disposition="selected",
+                rationale="This is the current unanswered onboarding conversation.",
+            ),
+            DecisionCandidateAssessment(
+                candidate_id="thread-old",
+                disposition="excluded",
+                rationale="This thread concerns the superseded introduction.",
+            ),
+        ],
+        reasoning="The current thread matches the request and still needs a reply.",
+    )
+    triage = EmailTriageResult(
+        message_id="msg-current",
+        thread_id="thread-current",
+        received_at="2026-08-03T14:00:00Z",
+        subject="QuillBridge onboarding follow-up",
+        sender_name="QuillBridge Team",
+        sender_email="team@quillbridge.example",
+        category="collaboration_opportunity",
+        confidence=0.96,
+        priority="high",
+        summary="QuillBridge answered the open onboarding question.",
+        reasoning="The current unanswered follow-up is the relevant conversation.",
+        needs_reply=True,
+        recommended_labels=["Keystone/Triage"],
+        recommended_next_agent="human_review",
+        recommended_action="Review the Slack-only reply copy.",
+        draft_reply="Thanks for clarifying. Looking forward to the next step.",
+        approval_required=True,
+        requires_human_review=True,
+        decision=decision,
+    )
+
+    def fake_run_gmail_triage_sdk(typed_input, **kwargs):
+        captured["typed_input"] = typed_input
+        captured["kwargs"] = kwargs
+        return TypedAgentRunResult(
+            agent_name="gmail_triage",
+            output=triage,
+            raw_result=SimpleNamespace(),
+            live=True,
+            usage={"requests": 1, "input_tokens": 900, "output_tokens": 180},
+            cost={"estimated_usd": 0.002},
+            request_cache={
+                "decision_ownership": {
+                    "decision_owner": "specialist_agent",
+                    "validator_outcome": {"status": "accepted"},
+                },
+                "tool_execution": {
+                    "mode": "model_called",
+                    "model_called_tool_names": [
+                        "query_gmail_message_summaries",
+                        "read_gmail_context",
+                    ],
+                    "model_tool_call_count": 3,
+                },
+            },
+            execution_telemetry={"attempt_count": 1},
+            tool_receipts=[{"tool_name": "read_gmail_context", "status": "read"}],
+        )
+
+    monkeypatch.setattr(workflow_runner, "run_gmail_triage_sdk", fake_run_gmail_triage_sdk)
+    monkeypatch.setattr(workflow_runner, "_live_gmail_retrieval_enabled", lambda _r: True)
+    monkeypatch.setattr(
+        workflow_runner,
+        "_try_live_gmail_thread_retrieval",
+        lambda *_args, **_kwargs: pytest.fail(
+            "live WorkItem must not use Python Gmail acquisition/ranking"
+        ),
+    )
+    store = SQLiteStore(_database_url(tmp_path))
+    work_item = WorkItem(
+        id="wi_agent_owned_gmail",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Choose the current Gmail conversation",
+        request_text=request_text,
+        current_route=WorkItemRoute.GMAIL_TRIAGE,
+        target=WorkItemTarget(name="QuillBridge", object_type="gmail_thread"),
+    )
+    store.save_work_item(work_item)
+
+    result = workflow_runner._advance_gmail_triage(
+        work_item,
+        request=WorkflowRunRequest(
+            request_text=request_text,
+            live_sdk=True,
+            manual_request_plan={"target_agent": "gmail_triage"},
+        ),
+        store=store,
+    )
+
+    typed_input = captured["typed_input"]
+    kwargs = captured["kwargs"]
+    assert request_text in typed_input.request
+    assert typed_input.gmail_query_hint == (
+        workflow_runner.resolve_gmail_execution_plan(request_text).gmail_query
+    )
+    assert typed_input.gmail_query_hint
+    assert kwargs["provider_selection_required"] is True
+    assert kwargs["provider_context_read_required"] is False
+    assert result.status == WorkItemStatus.DONE
+    assert result.artifact_refs[0].metadata["selected_thread_id"] == "thread-current"
+    assert result.artifact_refs[0].metadata["decision_ownership"][
+        "validator_outcome"
+    ]["status"] == "accepted"
+    assert result.tool_execution["model_called_tool_names"] == [
+        "query_gmail_message_summaries",
+        "read_gmail_context",
+    ]
+    assert "Looking forward to the next step" in result.human_summary
+
+
+def test_live_gmail_workitem_continuation_reuses_verified_identity_without_query(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    decision = AgentDecisionRecord(
+        decision_owner="specialist_agent",
+        decision_stage="gmail_verified_continuation",
+        selected_candidate_id="thread-verified",
+        candidate_assessments=[
+            DecisionCandidateAssessment(
+                candidate_id="thread-verified",
+                disposition="selected",
+                rationale="This is the exact previously verified Gmail thread.",
+            )
+        ],
+        reasoning="The verified continuation needs a short acknowledgement.",
+    )
+    triage = EmailTriageResult(
+        message_id="msg-verified",
+        thread_id="thread-verified",
+        subject="Verified follow-up",
+        sender_name="Synthetic Partner",
+        sender_email="partner@example.test",
+        category="collaboration_opportunity",
+        confidence=0.95,
+        summary="The verified follow-up is ready for review.",
+        reasoning="The exact prior thread was read and remains current.",
+        needs_reply=True,
+        recommended_next_agent="human_review",
+        recommended_action="Review a short acknowledgement.",
+        draft_reply="Thanks, looking forward to it.",
+        approval_required=True,
+        decision=decision,
+    )
+
+    def fake_run_gmail_triage_sdk(typed_input, **kwargs):
+        captured["typed_input"] = typed_input
+        captured["kwargs"] = kwargs
+        return TypedAgentRunResult(
+            agent_name="gmail_triage",
+            output=triage,
+            raw_result=SimpleNamespace(),
+            live=True,
+            request_cache={
+                "decision_ownership": {"validator_outcome": {"status": "accepted"}},
+                "tool_execution": {
+                    "mode": "model_called",
+                    "model_called_tool_names": ["read_gmail_context"],
+                },
+            },
+        )
+
+    monkeypatch.setattr(workflow_runner, "run_gmail_triage_sdk", fake_run_gmail_triage_sdk)
+    store = SQLiteStore(_database_url(tmp_path))
+    work_item = WorkItem(
+        id="wi_verified_gmail_continuation",
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Continue the verified Gmail thread",
+        request_text="Find the relevant email and prepare a reply.",
+        current_route=WorkItemRoute.GMAIL_TRIAGE,
+        target=WorkItemTarget(name="Synthetic Partner", object_type="gmail_thread"),
+        artifact_refs=[
+            WorkItemArtifactRef(
+                artifact_type="gmail_triage_report",
+                artifact_id="prior-gmail-run",
+                source_agent=WorkItemRoute.GMAIL_TRIAGE.value,
+                selected=True,
+                metadata={
+                    "gmail_live_read_only": True,
+                    "selected_message_id": "msg-verified",
+                    "selected_thread_id": "thread-verified",
+                },
+            )
+        ],
+    )
+    store.save_work_item(work_item)
+    follow_up = "Use that same thread and give me a shorter reply here. Don't send it."
+
+    result = workflow_runner._try_live_gmail_agent_owned_triage(
+        work_item,
+        request=WorkflowRunRequest(request_text=follow_up, live_sdk=True),
+        store=store,
+        gmail_plan=workflow_runner.resolve_gmail_execution_plan(follow_up),
+    )
+
+    typed_input = captured["typed_input"]
+    kwargs = captured["kwargs"]
+    assert typed_input.message_id == "msg-verified"
+    assert typed_input.thread_id == "thread-verified"
+    assert typed_input.gmail_query_hint == ""
+    assert follow_up in typed_input.request
+    assert typed_input.request == follow_up
+    assert work_item.request_text in typed_input.advisory_context
+    assert work_item.request_text in typed_input.to_prompt()
+    assert kwargs["provider_selection_required"] is False
+    assert kwargs["provider_context_read_required"] is True
+    assert result.tool_execution["model_called_tool_names"] == ["read_gmail_context"]
+
+
 def test_live_gmail_retrieval_promotes_selected_thread_without_raw_body(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -827,6 +1069,7 @@ def test_live_gmail_retrieval_promotes_selected_thread_without_raw_body(
     assert result.status == WorkItemStatus.IN_PROGRESS
     assert result.next_action is not None
     assert result.next_action.agent == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    assert result.artifact_refs, result.model_dump(mode="json")
     artifact = result.artifact_refs[0]
     assert artifact.metadata["selected_thread_id"] == "thread-1"
     assert artifact.metadata["gmail_research_target"] == "Example Health"
@@ -1596,7 +1839,7 @@ def test_live_semantic_plan_not_raw_words_decides_planning_only() -> None:
     )
 
 
-def test_live_chief_handoff_uses_semantic_workflow_not_request_keywords() -> None:
+def test_live_chief_handoff_requires_structured_chief_selection() -> None:
     output = {"summary": "Research and draft terms appear only as background."}
     plan = {
         "source": "llm",
@@ -1607,11 +1850,38 @@ def test_live_chief_handoff_uses_semantic_workflow_not_request_keywords() -> Non
         output,
         "Do not let the words business research or Gmail change the selected owner.",
         manual_request_plan=plan,
+    ) is None
+    assert workflow_runner._chief_of_staff_delegated_next_agent(
+        {
+            **output,
+            "durable_handoff": {"agent": "opportunity_scout"},
+        },
+        "Do not let the words business research or Gmail change the selected owner.",
+        manual_request_plan=plan,
     ) == workflow_runner.WorkItemRoute.OPPORTUNITY_SCOUT
+    assert workflow_runner._chief_of_staff_delegated_next_agent(
+        {
+            **output,
+            "durable_handoff": {"agent": "business_research_analyst"},
+        },
+        "Use the bounded workflow without inventing a substitute owner.",
+        manual_request_plan=plan,
+    ) is None
     assert workflow_runner._chief_of_staff_delegated_next_agent(
         output,
         "Delegate to business research according to these incidental notes.",
         manual_request_plan={"source": "llm", "workflow": []},
+    ) is None
+
+
+def test_noncanonical_chief_plan_workflow_does_not_substitute_for_handoff() -> None:
+    assert workflow_runner._chief_of_staff_delegated_next_agent(
+        {"summary": "Chief completed its bounded review without a handoff."},
+        "Review the supplied context and return the result here.",
+        manual_request_plan={
+            "source": "legacy",
+            "workflow": ["business_research_analyst", "opportunity_scout"],
+        },
     ) is None
 
 
@@ -4314,8 +4584,34 @@ def test_chief_link_followup_live_sdk_uses_read_only_source_summary(
         ],
     )
 
-    def fail_run_chief_of_staff_sdk(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("narrow source-link follow-up should not call Chief SDK")
+    sdk_calls = []
+
+    def fake_run_chief_of_staff_sdk(sdk_input, **kwargs):
+        sdk_calls.append(sdk_input)
+        assert kwargs["live"] is True and kwargs["force_sdk_interpretation"] is True
+        assert kwargs["attach_tools"] is False
+        assert sdk_input["selected_source_followup"]["index"] == 1
+        assert "privacy, safety, and clinician oversight" in json.dumps(
+            sdk_input["selected_source_context"]
+        )
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff", live=True,
+            raw_result=None,
+            output=ChiefOfStaffResult(
+                mode="llm", summary="Model-authored review of generative AI chatbots.",
+                recommended_route=ChiefOfStaffRouteRecommendation(workflow_type="slack-article-review"),
+                sources=[ChiefOfStaffSourceRef(title="APA advisory", url=work_item.sources[0].url)],
+                decision=AgentDecisionRecord(
+                    decision_owner="chief_of_staff", decision_stage="chief_delegation_selection",
+                    selected_candidate_id="workflow:slack-article-review",
+                    candidate_assessments=[DecisionCandidateAssessment(
+                        candidate_id="workflow:slack-article-review", disposition="selected",
+                        rationale="Explain the selected supplied source.",
+                    )], reasoning="The selected evidence supports a bounded explanation.",
+                ),
+            ),
+            usage={"available": True, "requests": 1},
+        )
 
     def fake_read_linked_article_impl(*_args: object, **_kwargs: object) -> dict[str, object]:
         return {
@@ -4329,7 +4625,7 @@ def test_chief_link_followup_live_sdk_uses_read_only_source_summary(
             ),
         }
 
-    monkeypatch.setattr(workflow_runner, "run_chief_of_staff_sdk", fail_run_chief_of_staff_sdk)
+    monkeypatch.setattr(workflow_runner, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
     monkeypatch.setattr(
         workflow_runner,
         "read_linked_article_impl",
@@ -4346,11 +4642,11 @@ def test_chief_link_followup_live_sdk_uses_read_only_source_summary(
         store=None,
     )
 
-    assert result.status == WorkItemStatus.IN_PROGRESS
-    assert "Link 1 summary" in result.human_summary
-    assert "generative AI chatbots" in result.human_summary
-    assert "Search providers: not used for this narrow source follow-up" in result.human_summary
-    assert "Deterministic source-link follow-up summary executed." in result.audit_notes
+    assert result.status == WorkItemStatus.DONE
+    assert len(sdk_calls) == 1
+    assert "Model-authored review of generative AI chatbots" in result.human_summary
+    assert result.artifact_refs[0].artifact_type == "chief_of_staff_plan"
+    assert "Deterministic source-link follow-up summary executed." not in result.audit_notes
     assert result.artifact_refs[0].metadata["source_context_status"]["extracted_url_count"] == 1
 
 
@@ -4446,7 +4742,7 @@ def test_source_link_followup_uses_business_research_artifact_source_refs(
             database_url=database_url,
             save=True,
             requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
-            live_sdk=True,
+            live_sdk=False,  # This control covers deterministic artifact-source lookup.
         )
     )
 
@@ -4505,7 +4801,7 @@ def test_source_link_followup_uses_opportunity_artifact_source_refs(
             database_url=database_url,
             save=True,
             requested_route=WorkItemRoute.OPPORTUNITY_SCOUT,
-            live_sdk=True,
+            live_sdk=False,  # Live semantic owner execution is covered separately.
         )
     )
 
@@ -6484,6 +6780,48 @@ def test_goal_based_cos_workflow_uses_packet_target_and_internal_slack_copy(
         == "unassessed"
     )
     assert workflow_runner._result_has_canonical_outreach_draft(result) is False
+
+
+def test_synthetic_notes_and_no_posting_preserve_internal_graph_context(
+    tmp_path: Path,
+) -> None:
+    request_text = (
+        "CoS, use only these approved synthetic notes: KBA_TEST_ORG is weighing a "
+        "clinical AI pilot before November, direct specialist tasks have one owner, "
+        "and multi-step work should preserve state. Review the evidence tradeoffs, "
+        "prioritize the most important validation gap, and draft a short internal "
+        "Slack recommendation for me. Keep assumptions labeled; no web search, "
+        "email, posting, or provider changes."
+    )
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="chief_of_staff",
+    )
+
+    result = advance_work_item_manager_loop(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=_database_url(tmp_path),
+            requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            manual_request_plan=plan.model_dump(mode="json"),
+            live_sdk=False,
+            live_search=False,
+            save=True,
+        ),
+        max_steps=3,
+    )
+
+    assert plan.workflow == [
+        "business_research_analyst",
+        "opportunity_scout",
+        "outreach_composer",
+    ]
+    assert result.status == WorkItemStatus.DONE
+    assert result.work_item.target.name == "KBA_TEST_ORG"
+    assert result.work_item.artifact_refs[-1].metadata["internal_slack_copy"] is True
+    assert "outreach_requires_approved_context" not in {
+        blocker.code for blocker in result.work_item.blockers
+    }
 
 
 def test_internal_slack_llm_copy_is_compacted_before_shared_draft_validation() -> None:
@@ -8492,6 +8830,159 @@ def test_natural_rss_request_executes_explicit_read_only_slack_provider(
     assert latest_review["review_status"] == "pass"
 
 
+def test_live_rss_workitem_persists_agent_synthesis_decision_and_usage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    settings_loads: list[bool] = []
+    monkeypatch.setattr(
+        workflow_runner,
+        "load_settings",
+        lambda *, force_dotenv=False: settings_loads.append(force_dotenv),
+    )
+    candidate = {
+        "feed_item_id": "rss-agent-owned",
+        "title": "Agent-owned clinical AI signal",
+        "url": "https://example.test/rss-agent-owned",
+        "source": "Example Health Feed",
+        "published_at": "2026-08-03",
+        "summary": "Provider summary.",
+        "tags": ["clinical-ai"],
+    }
+    agent_output = RssContextResult(
+        mode="llm",
+        summary="Agent chose this signal because it directly supports validation work.",
+        query="clinical AI validation",
+        retrieved_item_ids=["rss-agent-owned"],
+        articles=[
+            {
+                **candidate,
+                "relevance_status": "selected",
+                "selection_reason": "Direct validation relevance.",
+                "relevance_to_keystone": "Supports a KNI evidence-validation decision.",
+            }
+        ],
+        opportunity_signals=["Agent-owned opportunity interpretation."],
+        recommended_actions=["Ask Business Research to validate the linked claims."],
+        human_work_context={
+            "integration_surfaces": ["business_research_analyst"],
+            "follow_up_actions": ["Validate the linked claims."],
+        },
+        decision={
+            "decision_owner": "specialist_agent",
+            "decision_stage": "signal_relevance_selection",
+            "selected_candidate_ids": ["rss-agent-owned"],
+            "candidate_assessments": [
+                {
+                    "candidate_id": "rss-agent-owned",
+                    "disposition": "selected",
+                    "rationale": "Directly supports the requested validation objective.",
+                }
+            ],
+            "reasoning": "The selected item is the strongest bounded match.",
+        },
+    )
+    raw_result = SimpleNamespace(
+        new_items=[
+            {
+                "type": "tool_call_item",
+                "call_id": "rss-history",
+                "tool_name": "retrieve_rss_announcement_history",
+            },
+            {
+                "type": "tool_call_output_item",
+                "call_id": "rss-history",
+                "output": json.dumps({"status": "success", "items": [candidate]}),
+            },
+        ]
+    )
+    decision_ownership = {
+        "decision_owner": "specialist_agent",
+        "decision_stage": "signal_relevance_selection",
+        "selected_candidate_ids": ["rss-agent-owned"],
+        "validator_outcome": {"status": "accepted"},
+    }
+    monkeypatch.setattr(
+        workflow_runner,
+        "run_signal_context_sdk",
+        lambda *_args, **_kwargs: TypedAgentRunResult(
+            agent_name="rss_context_agent",
+            output=agent_output,
+            raw_result=raw_result,
+            live=True,
+            usage={"requests": 2, "input_tokens": 120, "output_tokens": 40},
+            cost={"estimated_usd": 0.0012},
+            request_cache={
+                "decision_ownership": decision_ownership,
+                "tool_execution": {
+                    "model_called_tool_names": [
+                        "retrieve_rss_announcement_history"
+                    ]
+                },
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        workflow_runner,
+        "get_runtime_agent_model_config",
+        lambda _agent_name: SimpleNamespace(provider="openai", model="test-signal-model"),
+    )
+    store = SQLiteStore(database_url)
+    work_item = WorkItem(
+        kind=WorkItemKind.WEEKLY_SCAN,
+        title="Review RSS signals",
+        request_text="Which RSS signal best supports KNI validation work?",
+        current_route=WorkItemRoute.RSS_CONTEXT_AGENT,
+        target=WorkItemTarget(name="RSS validation signals"),
+    )
+    store.save_work_item(work_item)
+
+    result = workflow_runner._advance_announcement_context_agent(
+        work_item,
+        request=WorkflowRunRequest(
+            request_text=work_item.request_text,
+            database_url=database_url,
+            save=True,
+            live_sdk=True,
+            max_results=3,
+            manual_request_plan={
+                "source": "test",
+                "requested_agent": "rss_context_agent",
+                "target_agent": "rss_context_agent",
+                "intent": "context_lookup",
+                "provider_system": "slack",
+                "provider_operations": ["read"],
+            },
+        ),
+        store=store,
+        route=WorkItemRoute.RSS_CONTEXT_AGENT,
+    )
+
+    assert result.artifact_refs, result.model_dump(mode="json")
+    artifact = result.artifact_refs[0]
+    assert artifact.summary.startswith("Agent chose this signal")
+    assert artifact.metadata["openai_requests"] == 2
+    assert artifact.metadata["decision_ownership"] == decision_ownership
+    assert artifact.metadata["opportunity_signals"] == [
+        "Agent-owned opportunity interpretation."
+    ]
+    assert [item["agent"] for item in artifact.metadata["downstream_handoffs"]] == [
+        "business_research_analyst"
+    ]
+    assert "2 OpenAI request(s)" in result.human_summary
+    saved_run = next(
+        row
+        for row in store.fetch_all("agent_runs")
+        if row["agent_name"] == "rss_context_agent"
+    )
+    assert saved_run["model"] == "test-signal-model"
+    saved_output = json.loads(saved_run["output_json"])
+    assert saved_output["result"]["summary"].startswith("Agent chose this signal")
+    assert saved_output["_sdk_usage"]["requests"] == 2
+    assert settings_loads == [False]
+
+
 def test_attached_source_bundle_research_blocks_without_attached_sources(tmp_path: Path) -> None:
     prompt = (
         "Do not use live search; summarize only the attached source bundle and cite every "
@@ -9856,6 +10347,7 @@ def test_gmail_workitem_inline_email_completes_read_only_triage_without_gmail_wr
     assert gate["evidence"]["unsafe_flags"] == []
 
 
+@pytest.mark.usefixtures("fake_supplied_gmail_sdk", "supplied_research_fake_sdk")
 def test_inline_gmail_research_thread_draft_uses_triage_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -9874,6 +10366,8 @@ def test_inline_gmail_research_thread_draft_uses_triage_context(
     def fake_run_retrieved_sdk_synthesis(**kwargs):
         context = kwargs["retrieve"]()
         typed_input = kwargs["normalize"](context)
+        approved_context = context["approved_context"]
+        selected_source_ids = list(approved_context.allowed_source_ids)
 
         class Outcome:
             usage = {
@@ -9901,7 +10395,31 @@ def test_inline_gmail_research_thread_draft_uses_triage_context(
                 "personalization_rationale": (
                     "Used the sanitized inbound email and thread-local Slack context."
                 ),
-                "source_ids_used": ["gmail_thread:inline_email"],
+                "source_ids_used": selected_source_ids,
+                "decision": {
+                    "decision_owner": "specialist_agent",
+                    "decision_stage": "outreach_evidence_selection",
+                    "selected_candidate_ids": selected_source_ids,
+                    "candidate_assessments": [
+                        {
+                            "candidate_id": source_id,
+                            "disposition": "selected",
+                            "rationale": (
+                                "This approved source supports the grounded thread-local "
+                                "draft and its Keystone positioning."
+                            ),
+                        }
+                        for source_id in selected_source_ids
+                    ],
+                    "reasoning": (
+                        "Selected the approved Gmail context and the supplied Keystone "
+                        "profile before drafting."
+                    ),
+                    "limitations": [
+                        "The output is Slack-thread copy only and was not sent or saved."
+                    ],
+                    "needs_more_context": False,
+                },
             }
 
         return Outcome()
@@ -10709,12 +11227,278 @@ def test_advance_work_item_opportunity_scout_attaches_opportunity_artifacts(
     assert result.next_action.agent == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
 
 
+def test_business_research_selected_public_url_uses_exact_extraction_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    supplied_research_fake_sdk,
+) -> None:
+    selected_url = "https://www.neuroflow.com/"
+    slack_rendered_url = f"<{selected_url}|neuroflow.com>"
+    request_text = (
+        "Business Research Analyst, use only this selected public URL: "
+        f"{slack_rendered_url}. Extract a bounded source bundle and give exactly "
+        "two source-supported facts plus one cautious relevance sentence. Do not "
+        "search beyond this URL, find contacts, or modify anything."
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="business_research_analyst",
+        target_agent="business_research_analyst",
+        workflow=["business_research_analyst"],
+        intent="research_brief",
+        primary_target=f"{selected_url}|neuroflow.com>",
+        target_type="url",
+        provider_operations=["read"],
+        objective="Read the selected public URL and summarize bounded evidence.",
+        task_objective="source_research",
+        expected_artifact_type="source_summary",
+        requires_live_search=False,
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(
+            source_type_preference=["selected_public_url"],
+            prior_context_dependency="selected_context",
+            permission_state="read_only",
+        ),
+    ).model_dump(mode="json")
+    captured: dict[str, object] = {}
+
+    def fake_selected_url_bundle(**kwargs: object) -> SelectedUrlSourceBundleResult:
+        captured.update(kwargs)
+        source = SourceRecord(
+            source_id="selected-url:neuroflow",
+            title="NeuroFlow",
+            url=selected_url,
+            source_type="website",
+            supported_claims=[
+                "NeuroFlow describes a platform for behavioral health care workflows.",
+                "The site describes measurement and analytics capabilities for care teams.",
+            ],
+            evidence_excerpt=(
+                "NeuroFlow describes behavioral health care workflows and measurement "
+                "analytics for care teams."
+            ),
+            confidence=0.9,
+        )
+        return SelectedUrlSourceBundleResult(
+            mode="live",
+            company_name="neuroflow.com",
+            selected_url_count=1,
+            extracted_source_count=1,
+            source_bundle=SourceBundle(
+                company_name="neuroflow.com",
+                company_url=selected_url,
+                sources=[source],
+                claim_candidates=source.supported_claims,
+            ),
+            diagnostics=[
+                SelectedUrlExtractionDiagnostic(
+                    source_id=source.source_id,
+                    selected_url=selected_url,
+                    resolved_url=selected_url,
+                    provider="trafilatura",
+                    status="success",
+                    extraction_strategy="static_first",
+                    included_in_bundle=True,
+                    text_length=len(source.evidence_excerpt),
+                    claim_count=2,
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "build_selected_url_source_bundle",
+        fake_selected_url_bundle,
+    )
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    work_item = WorkItem(
+        id="wi_selected_public_url",
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        title="Read selected NeuroFlow URL",
+        request_text=request_text,
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        target=WorkItemTarget(
+            name=f"{selected_url}|neuroflow.com>",
+            object_type="url",
+            metadata={"manual_request_plan": plan},
+        ),
+    )
+    store.save_work_item(work_item)
+
+    assert workflow_runner._is_source_provided_business_research_request(
+        work_item,
+        request_text,
+        manual_plan=plan,
+    ) is False
+
+    result = workflow_runner._advance_research(
+        work_item,
+        request=WorkflowRunRequest(
+            request_text=request_text,
+            live_sdk=True,
+            live_search=False,
+            manual_request_plan=plan,
+            database_url=database_url,
+        ),
+        store=store,
+    )
+
+    assert captured["selected_urls"] == [selected_url]
+    assert captured["live_extraction"] is True
+    assert result.advanced is True
+    assert len(supplied_research_fake_sdk) == 1
+    assert [artifact.artifact_type for artifact in result.artifact_refs] == [
+        "research_brief"
+    ]
+    artifact = result.artifact_refs[0]
+    assert artifact.metadata["schema"] == "keystone.supplied_business_research_sdk.v1"
+    assert artifact.metadata["retrieval_diagnostics"]["selected_urls"] == [selected_url]
+    assert artifact.metadata["research_brief"]["send_enabled"] is False
+    assert "Scripted research interpretation" in result.human_summary
+    assert artifact.metadata["source_refs"][0]["url"] == selected_url
+    assert not any(
+        source.url.startswith("fixture://") for source in result.work_item.sources
+    )
+    events = store.list_work_item_events(work_item.id)
+    receipt = next(
+        event for event in events if event.event_type == "selected_url_extraction_completed"
+    )
+    assert receipt.metadata["broad_search_performed"] is False
+    assert receipt.metadata["external_write_performed"] is False
+
+
+def test_staged_selected_public_url_read_survives_topic_normalization_for_drafting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected_url = "https://www.cartwheelcare.org/"
+    request_text = (
+        "Please use one WorkItem to identify one pilot opportunity for KNI from "
+        "Cartwheel's public homepage, research the company using only that page, then "
+        "prepare a 70-word outreach draft for internal review. Show the URL. Do not "
+        "send or save the draft, and do not look beyond this page: "
+        f"{selected_url}"
+    )
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="orchestrator",
+    )
+    assert plan.source == "heuristic"
+    assert plan.workflow == [
+        "opportunity_scout",
+        "business_research_analyst",
+        "outreach_composer",
+    ]
+
+    def fake_selected_url_bundle(**_: object) -> SelectedUrlSourceBundleResult:
+        source = SourceRecord(
+            source_id="selected-url:cartwheel",
+            title="Cartwheel",
+            url=selected_url,
+            source_type="website",
+            supported_claims=[
+                "Cartwheel describes virtual mental health services for school communities.",
+                "The page presents collaboration with schools as part of its care model.",
+            ],
+            evidence_excerpt=(
+                "Cartwheel describes virtual mental health services and collaboration "
+                "with school communities."
+            ),
+            confidence=0.9,
+        )
+        return SelectedUrlSourceBundleResult(
+            mode="live",
+            company_name="cartwheelcare.org",
+            selected_url_count=1,
+            extracted_source_count=1,
+            source_bundle=SourceBundle(
+                company_name="cartwheelcare.org",
+                company_url=selected_url,
+                sources=[source],
+                claim_candidates=source.supported_claims,
+            ),
+            diagnostics=[
+                SelectedUrlExtractionDiagnostic(
+                    source_id=source.source_id,
+                    selected_url=selected_url,
+                    resolved_url=selected_url,
+                    provider="mock-provider",
+                    status="success",
+                    extraction_strategy="provider_mock",
+                    included_in_bundle=True,
+                    text_length=len(source.evidence_excerpt),
+                    claim_count=2,
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "build_selected_url_source_bundle",
+        fake_selected_url_bundle,
+    )
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    plan_payload = plan.model_dump(mode="json")
+    work_item = WorkItem(
+        id="wi_staged_selected_url",
+        kind=WorkItemKind.COMPANY_RESEARCH,
+        title="Research Cartwheel from its selected page",
+        request_text=request_text,
+        current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+        target=WorkItemTarget(
+            name="Cartwheel pilot opportunity",
+            object_type="topic",
+            metadata={"manual_request_plan": plan_payload},
+        ),
+    )
+    store.save_work_item(work_item)
+
+    result = workflow_runner._advance_research(
+        work_item,
+        request=WorkflowRunRequest(
+            request_text=request_text,
+            live_sdk=False,
+            live_search=False,
+            manual_request_plan=plan_payload,
+            database_url=database_url,
+        ),
+        store=store,
+    )
+
+    assert result.advanced is True
+    assert result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    assert result.status == WorkItemStatus.DONE
+    assert result.work_item.target.object_type == "topic"
+    assert [source.url for source in result.work_item.sources] == [selected_url]
+    artifact = result.artifact_refs[0]
+    assert artifact.approval_state == ApprovalState.APPROVED_FOR_DRAFTING.value
+    assert artifact.selected is True
+    assert artifact.metadata["selected_urls"] == [selected_url]
+    assert artifact.metadata["operator_approved_thread_local_drafting"] is True
+    assert artifact.metadata["external_write_performed"] is False
+
+def test_request_url_source_candidates_normalize_slack_decorated_link() -> None:
+    candidates = workflow_runner._request_url_source_candidates(
+        "Read <https://www.neuroflow.com/|neuroflow.com> and nothing else."
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0]["url"] == "https://www.neuroflow.com/"
+    assert candidates[0]["source_type"] == "user_supplied_url"
+    assert candidates[0]["provider"] == "user_supplied_url"
+
+
 @pytest.mark.parametrize("live_search", [True, False])
 def test_advance_opportunity_scout_no_external_context_skips_live_retrieval(
     tmp_path: Path,
     monkeypatch,
     live_search: bool,
+    supplied_opportunity_fake_sdk,
 ) -> None:
+    supplied_opportunity_fake_sdk.subject = "Rowan Recovery"
+    supplied_opportunity_fake_sdk.count = 2
     def fail_live_retrieval(**_: object):
         raise AssertionError("live retrieval should not run for no-external context")
 
@@ -10744,15 +11528,17 @@ def test_advance_opportunity_scout_no_external_context_skips_live_retrieval(
     assert result.route == WorkItemRoute.OPPORTUNITY_SCOUT
     assert len(result.artifact_refs) == 2
     source_refs = result.artifact_refs[0].metadata["source_refs"]
-    assert source_refs[0]["title"] == "Provided inline context"
-    assert source_refs[0]["url"] == "fixture://source-provided/slack-context"
+    assert source_refs[0]["title"] == "Operator-supplied excerpt"
+    assert source_refs[0]["url"].startswith("workitem://")
+    assert len(supplied_opportunity_fake_sdk.calls) == 1
+    assert result.artifact_refs[0].metadata["sdk_agent_run_id"]
     assert not any(
         str(ref.get("url", "")).startswith(("http://", "https://"))
         for artifact in result.artifact_refs
         for ref in artifact.metadata["source_refs"]
     )
-    assert any("forbids external research" in note.lower() for note in result.audit_notes)
-    assert any("source-provided" in note.lower() for note in result.audit_notes)
+    assert any("no retrieval or provider tools" in note.lower() for note in result.audit_notes)
+    assert any("supplied workitem evidence" in note.lower() for note in result.audit_notes)
     assert "Rowan Recovery" in result.artifact_refs[0].title
 
 
@@ -11513,49 +12299,11 @@ def test_state_followup_records_orchestrator_preflight_sdk_usage(
     )
 
 
-def test_live_sdk_opportunity_work_item_uses_named_agent_search_plan(
+def test_opportunity_live_search_without_sdk_uses_deterministic_facade_without_planner(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     captured: dict[str, object] = {}
-    fake_plan = object()
-
-    def fake_resolve_plan(
-        topic: str | None,
-        *,
-        desired_count: int = 5,
-        live: bool = False,
-        cost_callback=None,
-        **_: object,
-    ) -> object:
-        captured["planned_topic"] = topic
-        captured["desired_count"] = desired_count
-        captured["planner_live"] = live
-        if cost_callback is not None:
-            cost_callback(
-                type(
-                    "FakePlannerSDKResult",
-                    (),
-                    {
-                        "usage": {
-                            "input_tokens": 1000,
-                            "cached_input_tokens": 500,
-                            "output_tokens": 100,
-                            "cache_hit_rate": 0.5,
-                        },
-                        "cost": {
-                            "estimated_usd": 0.01,
-                            "pricing_provider": "openai",
-                            "pricing_model": "gpt-5.4-mini",
-                        },
-                        "request_cache": {
-                            "static_prefix_sha256": "planner-static",
-                            "dynamic_prompt_chars": 500,
-                        },
-                    },
-                )()
-            )
-        return fake_plan
 
     def fake_run_live(
         *,
@@ -11597,10 +12345,6 @@ def test_live_sdk_opportunity_work_item_uses_named_agent_search_plan(
         )
 
     monkeypatch.setattr(
-        "keystone_agents.workflow_runner.resolve_opportunity_search_plan",
-        fake_resolve_plan,
-    )
-    monkeypatch.setattr(
         "keystone_agents.workflow_runner.run_opportunity_scout_live",
         fake_run_live,
     )
@@ -11611,29 +12355,20 @@ def test_live_sdk_opportunity_work_item_uses_named_agent_search_plan(
             database_url=_database_url(tmp_path),
             save=True,
             live_search=True,
-            live_sdk=True,
+            live_sdk=False,
             max_results=2,
         )
     )
 
     assert result.advanced is True
-    assert captured["planned_topic"] == captured["retrieval_topic"]
-    assert captured["desired_count"] == 2
-    assert captured["planner_live"] is True
-    assert captured["search_plan"] is fake_plan
-    assert "named-agent live search planning path" in " ".join(result.audit_notes)
+    assert captured["search_plan"] is None
+    assert "without model reasoning" in " ".join(result.audit_notes)
     assert (
         result.artifact_refs[0].metadata["retrieval_diagnostics"]["provider_summary"] == "searxng"
     )
     events = SQLiteStore(_database_url(tmp_path)).list_work_item_events(result.work_item.id)
     retrieval_event = next(
         event for event in events if event.event_type == "workflow_retrieval_usage"
-    )
-    planner_event = next(
-        event
-        for event in events
-        if event.event_type == "workflow_sdk_usage"
-        and event.metadata["agent_name"] == "opportunity_search_planner"
     )
     assert retrieval_event.actor == "opportunity_scout"
     assert retrieval_event.metadata["agent_name"] == "opportunity_scout"
@@ -11648,27 +12383,14 @@ def test_live_sdk_opportunity_work_item_uses_named_agent_search_plan(
         {"provider": "agents-web-search", "error_type": "timeout"}
     ]
     assert retrieval_event.metadata["fallback_used"] is True
-    assert planner_event.metadata["usage"]["input_tokens"] == 1000
+    assert not any(event.event_type == "workflow_sdk_usage" for event in events)
 
 
-def test_live_sdk_opportunity_work_item_prefers_manual_primary_target(
+def test_opportunity_deterministic_facade_prefers_manual_primary_target(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     captured: dict[str, object] = {}
-
-    def fake_resolve_plan(
-        topic: str | None,
-        *,
-        desired_count: int = 5,
-        live: bool = False,
-        **_: object,
-    ) -> None:
-        captured["planned_topic"] = topic
-        captured["desired_count"] = desired_count
-        captured["planner_live"] = live
-        captured["planner_context"] = _.get("planner_context")
-        return None
 
     def fake_run_live(
         *,
@@ -11685,10 +12407,6 @@ def test_live_sdk_opportunity_work_item_prefers_manual_primary_target(
         )
 
     monkeypatch.setattr(
-        "keystone_agents.workflow_runner.resolve_opportunity_search_plan",
-        fake_resolve_plan,
-    )
-    monkeypatch.setattr(
         "keystone_agents.workflow_runner.run_opportunity_scout_live",
         fake_run_live,
     )
@@ -11703,7 +12421,7 @@ def test_live_sdk_opportunity_work_item_prefers_manual_primary_target(
             database_url=_database_url(tmp_path),
             save=True,
             live_search=True,
-            live_sdk=True,
+            live_sdk=False,
             max_results=3,
             manual_request_plan={
                 "source": "llm",
@@ -11720,14 +12438,10 @@ def test_live_sdk_opportunity_work_item_prefers_manual_primary_target(
     )
 
     assert result.advanced is True
-    assert captured["planned_topic"] == (
+    assert captured["retrieval_topic"] == (
         "behavioral health AI partnership or advisory opportunities relevant to Keystone"
     )
-    assert captured["retrieval_topic"] == captured["planned_topic"]
-    assert captured["desired_count"] == 3
-    assert captured["planner_live"] is True
-    assert "Orchestrator memo for this specialist WorkItem run" in captured["planner_context"]
-    assert '"target_agent": "opportunity_scout"' in captured["planner_context"]
+    assert captured["search_plan"] is None
 
 
 def test_opportunity_source_summary_request_creates_source_summary_artifact(
@@ -11761,10 +12475,6 @@ def test_opportunity_source_summary_request_creates_source_summary_artifact(
         )
 
     monkeypatch.setattr(
-        "keystone_agents.workflow_runner.resolve_opportunity_search_plan",
-        lambda *_args, **_kwargs: None,
-    )
-    monkeypatch.setattr(
         "keystone_agents.workflow_runner.run_opportunity_scout_live",
         fake_run_live,
     )
@@ -11775,7 +12485,7 @@ def test_opportunity_source_summary_request_creates_source_summary_artifact(
             database_url=_database_url(tmp_path),
             save=True,
             live_search=True,
-            live_sdk=True,
+            live_sdk=False,
             manual_request_plan={
                 "source": "llm",
                 "requested_agent": "opportunity_scout",
@@ -11854,10 +12564,6 @@ def test_opportunity_source_summary_request_blocks_when_required_terms_do_not_ma
         )
 
     monkeypatch.setattr(
-        "keystone_agents.workflow_runner.resolve_opportunity_search_plan",
-        lambda *_args, **_kwargs: None,
-    )
-    monkeypatch.setattr(
         "keystone_agents.workflow_runner.run_opportunity_scout_live",
         fake_run_live,
     )
@@ -11868,7 +12574,7 @@ def test_opportunity_source_summary_request_blocks_when_required_terms_do_not_ma
             database_url=_database_url(tmp_path),
             save=True,
             live_search=True,
-            live_sdk=True,
+            live_sdk=False,
             manual_request_plan={
                 "source": "llm",
                 "requested_agent": "opportunity_scout",
@@ -11915,7 +12621,7 @@ def test_business_research_work_item_prefers_manual_primary_target(
             database_url=_database_url(tmp_path),
             save=True,
             live_search=True,
-            live_sdk=True,
+            live_sdk=False,
             manual_request_plan={
                 "source": "llm",
                 "requested_agent": "business_research_analyst",
@@ -12149,7 +12855,7 @@ def test_fast_business_research_keeps_query_builder_within_fast_retrieval_budget
             database_url=_database_url(tmp_path),
             save=True,
             live_search=True,
-            live_sdk=True,
+            live_sdk=False,
             requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
             manual_request_plan={
                 "source": "llm",
@@ -12701,7 +13407,7 @@ def test_slack_bridge_env_applies_conservative_cost_controls_without_context_fil
             database_url=_database_url(tmp_path),
             save=True,
             live_search=True,
-            live_sdk=True,
+            live_sdk=False,
             manual_request_plan={
                 "source": "llm",
                 "requested_agent": "business_research_analyst",
@@ -12722,7 +13428,7 @@ def test_slack_bridge_env_applies_conservative_cost_controls_without_context_fil
     assert advance_started.metadata["include_contact_enrichment"] is False
     assert advance_started.metadata["hosted_web_search_max_calls"] == 1
     assert advance_started.metadata["reuse_existing_research"] is True
-    assert advance_started.metadata["sdk_session"]["enabled"] is True
+    assert advance_started.metadata["sdk_session"]["enabled"] is False
     assert calls[0]["query_count"] <= 12
     assert calls[0]["agents_web_search_max_calls"] == 1
     assert calls[0]["agents_web_search_parallel"] is False
@@ -13085,10 +13791,67 @@ def test_live_work_item_runs_user_facing_response_synthesis(
 ) -> None:
     captured: dict[str, object] = {}
 
-    def fake_retrieve_company_profile_live(*, company: str, **_: object):
-        return research_company_fixture(company_name=company), {
-            "debug_notes": ["fake live retrieval"]
-        }
+    def fake_run_business_research_sdk(typed_input, **_: object):
+        source_url = "https://example.org/big-health"
+        candidate_id = search_result_candidate_id(source_url)
+        profile = research_company_fixture(company_name=typed_input.company_name)
+        source = profile.sources[0].model_copy(
+            update={
+                "provider_candidate_id": candidate_id,
+                "title": "Big Health company profile",
+                "url": source_url,
+            }
+        )
+        decision = AgentDecisionRecord(
+            decision_stage="research_source_selection",
+            selected_candidate_ids=[candidate_id],
+            candidate_assessments=[
+                DecisionCandidateAssessment(
+                    candidate_id=candidate_id,
+                    disposition="selected",
+                    rationale="This source identifies Big Health and supports the profile.",
+                )
+            ],
+            reasoning="Selected the bounded provider source relevant to Big Health.",
+        )
+        profile = profile.model_copy(
+            update={"sources": [source], "decision": decision}
+        )
+        search_output = SearchResult(
+            title="Big Health company profile",
+            link=source_url,
+            snippet="Big Health company profile and current digital mental health context.",
+        )
+        return TypedAgentRunResult(
+            agent_name="business_research_analyst",
+            output=profile,
+            raw_result=SimpleNamespace(
+                new_items=[
+                    {
+                        "type": "tool_call_item",
+                        "call_id": "search-1",
+                        "tool_name": "search_web",
+                    },
+                    {
+                        "type": "tool_call_output_item",
+                        "call_id": "search-1",
+                        "output": json.dumps([search_output.model_dump(mode="json")]),
+                    },
+                ]
+            ),
+            live=True,
+            usage={"available": True, "requests": 1},
+            cost={"available": True, "estimated_usd": 0.001},
+            request_cache={
+                "decision_ownership": {"repair_attempted": False},
+                "tool_execution": {
+                    "model_tool_call_count": 1,
+                    "model_called_tool_names": ["search_web"],
+                },
+            },
+            execution_telemetry={"agent_runs": 1, "model_requests": 1},
+            tool_receipts=[{"tool_name": "search_web", "status": "verified"}],
+        )
 
     class FakeSynthesis:
         title = "Big Health summary"
@@ -13141,8 +13904,8 @@ def test_live_work_item_runs_user_facing_response_synthesis(
         return FakeSDKResult()
 
     monkeypatch.setattr(
-        "keystone_agents.workflow_runner.retrieve_company_profile_live",
-        fake_retrieve_company_profile_live,
+        "keystone_agents.workflow_runner.run_business_research_analyst_sdk",
+        fake_run_business_research_sdk,
     )
     monkeypatch.setattr(
         "keystone_agents.workflow_runner.synthesize_user_facing_work_item_response_sdk_result",
@@ -13168,11 +13931,18 @@ def test_live_work_item_runs_user_facing_response_synthesis(
 
     assert captured["live"] is True
     assert captured["route"] == "business_research_analyst"
-    assert "company_profile" in captured["artifact_types"]
+    assert "company_profile" in captured["artifact_types"], "\n".join(
+        [*(blocker.message for blocker in result.blockers), *result.audit_notes]
+    )
     assert result.human_summary.startswith("Big Health summary")
     assert "Live user-facing response synthesis executed." in result.audit_notes
     events = SQLiteStore(_database_url(tmp_path)).list_work_item_events(result.work_item.id)
-    sdk_event = next(event for event in events if event.event_type == "workflow_sdk_usage")
+    sdk_event = next(
+        event
+        for event in events
+        if event.event_type == "workflow_sdk_usage"
+        and event.metadata["agent_name"] == "user_response_synthesizer"
+    )
     assert sdk_event.metadata["usage"]["cache_hit_rate"] == 0.75
     assert sdk_event.metadata["cost"]["pricing_model"] == "gpt-5.4"
     assert sdk_event.metadata["request_cache"]["static_prefix_sha256"] == "static-hash"
@@ -13301,6 +14071,54 @@ def test_advance_work_item_persists_manual_plan_and_uses_requested_route(
     assert events[0].metadata["orchestrator_preflight"]["selected_agent"] == "opportunity_scout"
 
 
+def test_persisted_work_item_recovers_raw_exact_item_constraint(
+    tmp_path: Path,
+) -> None:
+    request_text = "Summarize the supplied findings in exactly two bullet points."
+    incomplete_plan = {
+        "source": "llm",
+        "target_agent": "chief_of_staff",
+        "ask_shape": {
+            "output_constraints": {
+                "scope": "entire_response",
+                "item_count_mode": "exact",
+            }
+        },
+    }
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    work_item = WorkItem(
+        kind=WorkItemKind.RESEARCH_BRIEF,
+        title="Synthetic exact-item persistence",
+        request_text=request_text,
+        current_route=WorkItemRoute.CHIEF_OF_STAFF,
+        target=WorkItemTarget(
+            name="Synthetic findings",
+            metadata={"manual_request_plan": incomplete_plan},
+        ),
+    )
+    store.save_work_item(work_item)
+
+    loaded = store.get_work_item(work_item.id)
+    assert loaded is not None
+    persisted_plan = loaded.target.metadata["manual_request_plan"]
+    resolution = resolve_instruction_following_response(
+        "- Alpha is supported.\n- Beta is supported.\n- Gamma is extra.",
+        original_request=loaded.request_text,
+        manual_plan=persisted_plan,
+        live=False,
+    )
+
+    assert resolution.validation.passed is False
+    assert resolution.validation.item_count == 3
+    assert resolution.validation.violations == [
+        "item count 3 exceeds maximum 2"
+    ]
+    assert resolution.metadata()["constraint_admission_warnings"] == [
+        "item_count_metadata_recovered_from_raw_request"
+    ]
+
+
 def test_advance_work_item_outreach_blocks_without_approved_context(tmp_path: Path) -> None:
     result = advance_work_item(
         WorkflowRunRequest(
@@ -13382,6 +14200,360 @@ def test_thread_local_sample_reply_uses_inline_context_not_placeholder(
     assert "Thanks for reaching out. This sounds useful" not in result.human_summary
     assert store.count("outreach_drafts") == 1
     assert store.list_approval_items(object_type="outreach_draft") == []
+
+
+def test_thread_local_approved_fact_packet_is_represented_faithfully() -> None:
+    draft = workflow_runner._thread_local_outreach_draft(
+        "Outreach Composer, using only these approved facts, prepare an email "
+        "under 80 words: Company runs measurement-based behavioral health "
+        "programs; Keystone can help with evaluation design; draft only and "
+        "do not send."
+    )
+
+    assert draft.company_name == "Company"
+    assert "Company runs measurement-based behavioral health programs." in draft.email_body
+    assert "Keystone can help with evaluation design." in draft.email_body
+    assert "Open to comparing notes?" in draft.email_body
+    assert draft.personalization_rationale == "Used only approved inline facts."
+    assert draft.source_ids_used == ["operator:inline_facts"]
+    assert draft.send_enabled is False
+    assert draft.sent is False
+    assert draft.can_send_email is False
+
+
+@pytest.mark.parametrize("connector", ["with", "using"])
+def test_workitem_accepts_connective_led_approved_fact_labels(
+    connector: str,
+    tmp_path: Path,
+) -> None:
+    request_text = (
+        f"Outreach Composer, draft a LinkedIn note {connector} approved facts: "
+        "Harbor Signal Health runs a synthetic care-navigation pilot; Evaluation "
+        "Team can review its evaluation design; draft only and do not post."
+    )
+    context = workflow_runner._inline_outreach_context_from_request(request_text)
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=_database_url(tmp_path),
+            save=True,
+        )
+    )
+
+    assert context is not None
+    assert context["company"] == "Harbor Signal Health"
+    assert context["facts"] == [
+        "Harbor Signal Health runs a synthetic care-navigation pilot",
+        "Evaluation Team can review its evaluation design",
+    ]
+    assert context["recipient_name"] == ""
+    assert context["recipient_email"] == ""
+    assert result.status == WorkItemStatus.NEEDS_APPROVAL
+    assert any(ref.artifact_type == "outreach_draft" for ref in result.artifact_refs)
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        (
+            'Outreach Composer, draft a note about quoted source text: "using only '
+            "these approved facts, draft a LinkedIn note: Harbor Signal Health runs "
+            'a synthetic pilot; Evaluation Team can review it". Draft only and do not post.'
+        ),
+        (
+            "Outreach Composer, draft a note about source text that says using only "
+            "these approved facts, draft a LinkedIn note: Harbor Signal Health runs "
+            "a synthetic pilot; Evaluation Team can review it. Draft only and do not post."
+        ),
+    ],
+)
+def test_workitem_does_not_promote_non_operator_authority_to_context(
+    request_text: str,
+    tmp_path: Path,
+) -> None:
+    context = workflow_runner._inline_outreach_context_from_request(request_text)
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=_database_url(tmp_path),
+            save=True,
+        )
+    )
+
+    assert context is None
+    assert result.status == WorkItemStatus.BLOCKED
+    assert not any(ref.artifact_type == "outreach_draft" for ref in result.artifact_refs)
+
+
+@pytest.mark.parametrize(
+    ("request_text", "expected_facts"),
+    [
+        (
+            "Outreach Composer, using only these approved facts, draft a LinkedIn "
+            "note: Harbor Signal Health runs a synthetic care-navigation pilot; "
+            "Evaluation Team can review its evaluation design Do not post.",
+            [
+                "Harbor Signal Health runs a synthetic care-navigation pilot",
+                "Evaluation Team can review its evaluation design",
+            ],
+        ),
+        (
+            "Outreach Composer, Approved facts:\nHarbor Signal Health runs a synthetic "
+            "care-navigation pilot\nEvaluation Team can review its evaluation design\n"
+            "Draft only and do not post.",
+            [
+                "Harbor Signal Health runs a synthetic care-navigation pilot",
+                "Evaluation Team can review its evaluation design",
+            ],
+        ),
+        (
+            "Outreach Composer, Approved facts:\nHarbor Signal Health runs a program "
+            "whose care teams do not post raw transcripts to public channels.\n"
+            "Evaluation Team can review its evaluation design.\nDraft only and do not post.",
+            [
+                "Harbor Signal Health runs a program whose care teams do not post raw "
+                "transcripts to public channels",
+                "Evaluation Team can review its evaluation design",
+            ],
+        ),
+        (
+            "Outreach Composer, using only these approved facts, draft a LinkedIn "
+            "note: Company operates outpatient care programs; Clinics do not share "
+            "raw records outside their network. Draft only and do not post.",
+            [
+                "Company operates outpatient care programs",
+                "Clinics do not share raw records outside their network",
+            ],
+        ),
+        (
+            "Outreach Composer, using only these approved facts, draft a LinkedIn "
+            "note: Company operates outpatient care programs; Nurses do not post raw "
+            "transcripts in public channels. Draft only and do not post.",
+            [
+                "Company operates outpatient care programs",
+                "Nurses do not post raw transcripts in public channels",
+            ],
+        ),
+        (
+            "Outreach Composer, using only these approved facts, draft a LinkedIn "
+            "note: Company operates outpatient care programs; Hospitals do not send "
+            "patient data to advertisers. Draft only and do not post.",
+            [
+                "Company operates outpatient care programs",
+                "Hospitals do not send patient data to advertisers",
+            ],
+        ),
+        (
+            "Outreach Composer, using only these approved facts, draft a LinkedIn "
+            "note: Company operates outpatient care programs; Community health clinics "
+            "across three counties do not share raw records with outside vendors. "
+            "Draft only and do not post.",
+            [
+                "Company operates outpatient care programs",
+                "Community health clinics across three counties do not share raw records "
+                "with outside vendors",
+            ],
+        ),
+        (
+            "Outreach Composer, using only these approved facts, draft a LinkedIn "
+            "note: Company runs measurement-based behavioral health programs; "
+            "Evaluation Team can review its evaluation design Please do not post.",
+            [
+                "Company runs measurement-based behavioral health programs",
+                "Evaluation Team can review its evaluation design",
+            ],
+        ),
+    ],
+)
+def test_workitem_preserves_fact_boundaries_and_removes_instruction_tail(
+    request_text: str,
+    expected_facts: list[str],
+    tmp_path: Path,
+) -> None:
+    context = workflow_runner._inline_outreach_context_from_request(request_text)
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=_database_url(tmp_path),
+            save=True,
+        )
+    )
+
+    assert context is not None
+    assert context["facts"] == expected_facts
+    assert result.status == WorkItemStatus.NEEDS_APPROVAL
+    assert any(ref.artifact_type == "outreach_draft" for ref in result.artifact_refs)
+
+
+def test_thread_local_draft_withholds_nonconforming_deterministic_fallback(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    request_text = (
+        "Using this context: Mindful Care asked whether Keystone can help review a "
+        "measurement-based care workflow. Write a 12-word outreach draft as a "
+        "Slack-thread sample reply for review. Do not post, send, or save it externally."
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=request_text,
+            requested_route=WorkItemRoute.OUTREACH_COMPOSER,
+            manual_request_plan=infer_manual_request_plan(
+                request_text,
+                requested_agent="outreach_composer",
+            ).model_dump(mode="json"),
+            database_url=database_url,
+            save=True,
+        )
+    )
+
+    assert result.status == WorkItemStatus.BLOCKED
+    assert result.blockers[0].code == "outreach_output_constraints_not_satisfied"
+    assert "word count" in result.blockers[0].message
+    assert "Outreach output needs correction" in result.human_summary
+    assert "missing context" not in result.human_summary
+    assert "Provide the missing context" not in result.human_summary
+    from keystone_agents.presentation.public_result import (
+        attach_execution_public_result,
+        build_work_item_result_payload,
+    )
+
+    payload = build_work_item_result_payload(result, user_facing_result_verified=False)
+    public_result = attach_execution_public_result(payload)
+    assert public_result.status == "blocked"
+    assert public_result.completion_confirmed is False
+    assert "Need Input" not in public_result.title
+    assert SQLiteStore(database_url).count("outreach_drafts") == 0
+
+
+def test_thread_local_live_draft_repairs_output_contract_before_persisting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = _database_url(tmp_path)
+    request_text = (
+        "Using this context: Mindful Care asked whether Keystone can help review a "
+        "measurement-based care workflow. Write a 12-word outreach draft as a "
+        "Slack-thread sample reply for review. Do not post, send, or save it externally."
+    )
+    review_calls: list[list[str]] = []
+
+    def fake_compose(**kwargs: object) -> tuple[object, str, None, dict[str, object]]:
+        feedback = list(kwargs.get("review_feedback") or [])
+        review_calls.append(feedback)
+        return (
+            OutreachDraft(
+                company_name="Mindful Care",
+                email_subject="Workflow review",
+                email_body=(
+                    "Thanks for sharing."
+                    if not feedback
+                    else (
+                        "Thanks for sharing this. We can review the workflow evidence "
+                        "and steps."
+                    )
+                ),
+                personalization_rationale="Used only the thread-local context.",
+            ),
+            "Thread-local mocked live SDK draft; no side effect occurred.",
+            None,
+            {},
+        )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "_compose_thread_local_outreach_draft_for_work_item",
+        fake_compose,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=request_text,
+            requested_route=WorkItemRoute.OUTREACH_COMPOSER,
+            manual_request_plan=infer_manual_request_plan(
+                request_text,
+                requested_agent="outreach_composer",
+            ).model_dump(mode="json"),
+            database_url=database_url,
+            live_sdk=True,
+            save=True,
+        )
+    )
+
+    draft_row = SQLiteStore(database_url).fetch_all("outreach_drafts")[0]
+    assert review_calls[0] == []
+    assert review_calls[1] == ["word count 3 does not satisfy exact 12"]
+    assert len(str(draft_row["email_body"]).split()) == 12
+    assert result.blockers == []
+
+
+@pytest.mark.parametrize("size_rejection", [False, True])
+def test_thread_local_live_agent_failure_never_promotes_fixture_draft(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    size_rejection: bool,
+) -> None:
+    database_url = _database_url(tmp_path)
+    request_text = (
+        "Using this approved context: Northstar asked about an evidence review. "
+        "Write a short Slack-thread sample reply for review. Do not post or send it."
+    )
+
+    def failed_compose(**_kwargs: object) -> tuple[object, str, dict[str, object], dict]:
+        return (
+            OutreachDraft(
+                company_name="Northstar",
+                email_subject="Fixture fallback",
+                email_body="This fixture must never be promoted.",
+                personalization_rationale="Synthetic failure fixture.",
+            ),
+            "Outreach Composer model stage failed; no draft was accepted.",
+            {
+                "agent_reasoning_failed": True,
+                "failure": ({
+                    "detail": "canary_serialized_request_bound_exceeded",
+                    "measurements": {"input_bytes": 260000, "max_input_bytes": 240000,
+                                     "body_bytes": 270000, "max_body_bytes": 300000},
+                } if size_rejection else {}),
+                "usage": {},
+                "cost": {},
+                "request_cache": {},
+                "execution_telemetry": {},
+            },
+            {},
+        )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "_compose_thread_local_outreach_draft_for_work_item",
+        failed_compose,
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=request_text,
+            requested_route=WorkItemRoute.OUTREACH_COMPOSER,
+            manual_request_plan=infer_manual_request_plan(
+                request_text,
+                requested_agent="outreach_composer",
+            ).model_dump(mode="json"),
+            database_url=database_url,
+            live_sdk=True,
+            save=True,
+        )
+    )
+
+    assert result.status == WorkItemStatus.BLOCKED
+    assert result.blockers[0].code == (
+        "outreach_request_size_limit" if size_rejection else "outreach_agent_reasoning_failed"
+    )
+    assert "missing context" not in result.human_summary
+    if size_rejection:
+        assert "before the model call" in result.human_summary
+        assert "260,000 / 240,000" in result.human_summary
+    assert SQLiteStore(database_url).count("outreach_drafts") == 0
+    assert "fixture" not in result.human_summary.lower()
 
 
 def test_advance_work_item_outreach_accepts_approved_inline_context_labels(
@@ -13477,6 +14649,78 @@ def test_advance_work_item_outreach_accepts_flexible_inline_context_labels(
     assert store.count("outreach_drafts") == 1
 
 
+def test_advance_work_item_outreach_accepts_synthetic_org_identifier_without_caveat_label(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=(
+                "Outreach Composer, this is a synthetic drafting test. Prepare a draft-only "
+                "email paragraph and LinkedIn note. Target contact: Jordan Lee at KBA_TEST_ORG. "
+                "Approved evidence: KBA_TEST_ORG asked whether Keystone could review its "
+                "clinical AI evidence workflow. Do not send email, create a Gmail draft, "
+                "publish, post, save records, or schedule follow-ups."
+            ),
+            database_url=database_url,
+            save=True,
+        )
+    )
+
+    assert result.advanced is True
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.blockers == []
+    profile_refs = [
+        ref for ref in result.work_item.artifact_refs if ref.artifact_type == "company_profile"
+    ]
+    assert profile_refs
+    assert profile_refs[0].title == "KBA_TEST_ORG"
+    assert profile_refs[0].approval_state == ApprovalState.APPROVED_FOR_DRAFTING.value
+    assert profile_refs[0].metadata["inline_natural_language_context"] is True
+    assert result.work_item.target.name == "KBA_TEST_ORG"
+    assert "LinkedIn note:" in result.human_summary
+    assert store.count("outreach_drafts") == 1
+
+
+def test_advance_work_item_outreach_accepts_natural_recipient_at_test_org(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    request_text = (
+        "Outreach Composer, we're testing with made-up data only. Test Contact Beta "
+        "at KBA_TEST_RIVERSTONE is evaluating a measurement-based care pilot. "
+        "Approved evidence: its pilot brief calls for a 30-day implementation review "
+        "and weekly outcome checks. Could you give me a two-sentence email and a brief "
+        "LinkedIn note that use only that evidence and ask for a 20-minute conversation? "
+        "I just need the copy here; don't create a Gmail draft, send, post, save, "
+        "schedule, or update anything."
+    )
+
+    context = workflow_runner._inline_outreach_context_from_request(request_text)
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=database_url,
+            save=True,
+        )
+    )
+
+    assert context is not None
+    assert context["company"] == "KBA_TEST_RIVERSTONE"
+    assert context["recipient_name"] == "Test Contact Beta"
+    assert context["facts"] == [
+        "its pilot brief calls for a 30-day implementation review and weekly outcome checks"
+    ]
+    assert result.blockers == []
+    assert result.work_item.target.name == "KBA_TEST_RIVERSTONE"
+    assert result.work_item.target.metadata["recipient_name"] == "Test Contact Beta"
+    assert "LinkedIn note:" in result.human_summary
+    assert store.count("outreach_drafts") == 1
+
+
 def test_advance_work_item_outreach_accepts_supplied_fact_block(
     tmp_path: Path,
 ) -> None:
@@ -13530,6 +14774,140 @@ def test_advance_work_item_outreach_accepts_supplied_fact_block(
     assert draft_ref.metadata["gmail_draft_created"] is False
     assert draft_ref.metadata["external_write_performed"] is False
     assert "What should this outreach focus on?" not in result.human_summary
+
+
+@pytest.mark.parametrize(
+    ("request_text", "linkedin_requested"),
+    [
+        (
+            "Outreach Composer, using only these approved facts, draft a LinkedIn "
+            "note under 450 characters: Company runs measurement-based behavioral "
+            "health programs; Keystone can help with evaluation design; draft only "
+            "and do not post.",
+            True,
+        ),
+        (
+            "Outreach Composer, draft a LinkedIn note under 450 characters using "
+            "only these approved facts: Company runs measurement-based behavioral "
+            "health programs; Keystone can help with evaluation design; draft only "
+            "and do not post.",
+            True,
+        ),
+        (
+            "Outreach Composer, using only these approved facts — write a LinkedIn "
+            "note under 450 characters: Company runs measurement-based behavioral "
+            "health programs; Keystone can help with evaluation design; draft only "
+            "and do not post.",
+            True,
+        ),
+        (
+            "Outreach Composer, using only these approved facts,\ncompose a LinkedIn "
+            "note under 450 characters:\nCompany runs measurement-based behavioral "
+            "health programs; Keystone can help with evaluation design; draft only "
+            "and do not post.",
+            True,
+        ),
+        (
+            "Outreach Composer, using only these approved facts, prepare an email "
+            "under 80 words: Company runs measurement-based behavioral health programs; "
+            "Keystone can help with evaluation design; draft only and do not send.",
+            False,
+        ),
+    ],
+)
+def test_authority_first_inline_facts_create_bounded_draft_artifact(
+    request_text: str,
+    linkedin_requested: bool,
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+
+    context = workflow_runner._inline_outreach_context_from_request(request_text)
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=database_url,
+            save=True,
+        )
+    )
+
+    assert context is not None
+    assert context["company"] == "Company"
+    assert context["recipient_name"] == ""
+    assert context["recipient_email"] == ""
+    assert context["facts"] == [
+        "Company runs measurement-based behavioral health programs",
+        "Keystone can help with evaluation design",
+    ]
+    assert result.advanced is True
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.status == WorkItemStatus.NEEDS_APPROVAL
+    assert result.blockers == []
+    profile_ref = next(
+        ref for ref in result.work_item.artifact_refs if ref.artifact_type == "company_profile"
+    )
+    draft_ref = next(
+        ref for ref in result.artifact_refs if ref.artifact_type == "outreach_draft"
+    )
+    assert profile_ref.title == "Company"
+    assert profile_ref.approval_state == ApprovalState.APPROVED_FOR_DRAFTING.value
+    assert profile_ref.metadata["inline_natural_language_context"] is True
+    profile = store.load_company_profile(int(profile_ref.artifact_id))
+    supported_claims = list(profile.sources[0].supported_claims)
+    assert "Company runs measurement-based behavioral health programs" in supported_claims
+    assert "Keystone can help with evaluation design" in supported_claims
+    assert not any("draft only" in claim.lower() for claim in supported_claims)
+    assert not any("do not" in claim.lower() for claim in supported_claims)
+    assert "recipient_name" not in result.work_item.target.metadata
+    assert draft_ref.metadata["gmail_draft_created"] is False
+    assert draft_ref.metadata["send_enabled"] is False
+    assert draft_ref.metadata["external_write_performed"] is False
+    assert store.count("outreach_drafts") == 1
+    assert "measurement-based behavioral health programs" in result.human_summary.lower()
+    assert "improved outcomes" not in result.human_summary.lower()
+    assert "previously worked" not in result.human_summary.lower()
+    if linkedin_requested:
+        note = result.human_summary.split("LinkedIn note:\n", 1)[1]
+        note = note.split("\n\n*Review notes:*", 1)[0].strip()
+        assert 0 < len(note) <= 450
+    else:
+        assert "LinkedIn note:" not in result.human_summary
+
+
+def test_approved_synthetic_outreach_packet_is_not_rewritten_as_research(
+    tmp_path: Path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    request_text = (
+        "Here’s an approved synthetic setup for a practice: Pine Harbor Behavioral "
+        "Health says it runs measurement-based care across three community clinics "
+        "and wants cleaner reporting; no person or email has been approved. Write a "
+        "friendly organization-level introduction for internal review. Stay within "
+        "these facts. Don’t research, send, post, save, or update tracking."
+    )
+    context = workflow_runner._inline_outreach_context_from_request(request_text)
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=database_url,
+            save=True,
+            manual_request_plan=infer_manual_request_plan(
+                request_text,
+                requested_agent="outreach_composer",
+            ).model_dump(mode="json"),
+        )
+    )
+
+    assert context is not None
+    assert context["company"] == "Pine Harbor Behavioral Health"
+    assert context["facts"] == [
+        "Pine Harbor Behavioral Health says it runs measurement-based care across "
+        "three community clinics and wants cleaner reporting"
+    ]
+    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.blockers == []
+    assert result.work_item.target.name == "Pine Harbor Behavioral Health"
 
 
 @pytest.mark.parametrize(
@@ -13597,6 +14975,33 @@ def test_live_supplied_fact_outreach_contract_detects_word_limit_and_cta() -> No
 
     assert any("word count" in item for item in mismatches)
     assert any("20-minute call CTA" in item for item in mismatches)
+
+
+def test_live_approved_fact_outreach_contract_detects_word_range_violation() -> None:
+    request_text = (
+        "Outreach Composer, prepare a 100-130 word first-contact email. "
+        "Approved facts: Harbor Metric builds measurement dashboards and Keystone "
+        "supports clinical evidence strategy. Keep it draft-only and do not send."
+    )
+    request = WorkflowRunRequest(
+        request_text=request_text,
+        live_sdk=True,
+        manual_request_plan=infer_manual_request_plan(
+            request_text,
+            requested_agent="outreach_composer",
+        ).model_dump(mode="json"),
+    )
+    draft = workflow_runner.OutreachDraft(
+        email_body=" ".join(["word"] * 94),
+        request_coverage=RequestCoverage(status="complete"),
+    )
+
+    mismatches = workflow_runner._outreach_draft_contract_mismatches(
+        draft,
+        request=request,
+    )
+
+    assert "word count 94 is below minimum 100" in mismatches
 
 
 def test_live_supplied_fact_outreach_contract_accepts_detailed_bounded_draft() -> None:
@@ -13765,6 +15170,98 @@ def test_live_supplied_context_labels_repair_deficient_draft_before_retention(
     assert result.artifact_refs[0].metadata["external_write_performed"] is False
 
 
+def test_live_source_backed_outreach_repairs_exact_word_and_url_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected_url = "https://www.cartwheelcare.org/"
+    request_text = (
+        "Outreach Composer, using only this approved source-backed context, prepare "
+        "a 70-word draft for internal review and show the source URL. "
+        "Company: Cartwheel. Source: https://www.cartwheelcare.org/. Facts: "
+        "Cartwheel describes school-partnered mental health services and care "
+        "coordination with school communities. Do not send, save externally, post, "
+        "search, or modify anything."
+    )
+    repaired_body = (
+        "Hello Cartwheel team, your homepage describes school-partnered mental health "
+        "services and care coordination with school communities. Keystone could help "
+        "evaluate whether a focused pilot has clear outcomes, feasible measurement, and "
+        "practical implementation safeguards. I would suggest first validating the target "
+        "school population, decision-maker, success metrics, data availability, and "
+        "timeline. If that evidence supports readiness, would a brief conversation to "
+        "compare evaluation scope and timing be useful? Source: "
+        f"{selected_url} Sincerely, Anup"
+    )
+    compose_reviews: list[list[str]] = []
+
+    def fake_compose(**kwargs: object) -> tuple[object, str, None, dict[str, object]]:
+        review_feedback = list(kwargs.get("review_feedback") or [])
+        compose_reviews.append(review_feedback)
+        return (
+            OutreachDraft(
+                company_name="Cartwheel",
+                email_subject="School mental-health pilot evaluation",
+                email_body=(
+                    "Hello Cartwheel team, I would welcome a brief conversation."
+                    if not review_feedback
+                    else repaired_body
+                ),
+                personalization_rationale="Used only the approved selected-page facts.",
+                source_ids_used=["selected-url:cartwheel-homepage"],
+                request_coverage=RequestCoverage(status="complete"),
+            ),
+            "Outreach Composer mocked live SDK draft; no side effect occurred.",
+            None,
+            {
+                "reply_recommended": True,
+                "recommended_next_step": "Review the draft.",
+                "additional_information_needed": [],
+                "collaboration_ideas": [],
+                "deferral_reason": "",
+            },
+        )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "_compose_outreach_draft_for_work_item",
+        fake_compose,
+    )
+    database_url = _database_url(tmp_path)
+    manual_plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="outreach_composer",
+    ).model_copy(
+        update={
+            "target_agent": "outreach_composer",
+            "intent": "outreach_draft",
+            "task_objective": "outreach_draft",
+            "expected_artifact_type": "outreach_draft",
+        }
+    )
+
+    result = advance_work_item(
+        WorkflowRunRequest(
+            request_text=request_text,
+            requested_route=WorkItemRoute.OUTREACH_COMPOSER,
+            manual_request_plan=manual_plan.model_dump(mode="json"),
+            database_url=database_url,
+            live_sdk=True,
+            save=True,
+        )
+    )
+
+    draft_row = SQLiteStore(database_url).fetch_all("outreach_drafts")[0]
+    assert compose_reviews[0] == []
+    assert any("word count" in item for item in compose_reviews[1])
+    assert "visible source URL missing" in compose_reviews[1]
+    assert len(str(draft_row["email_body"]).split()) == 70
+    assert selected_url in draft_row["email_body"]
+    assert result.status == WorkItemStatus.NEEDS_APPROVAL
+    assert result.artifact_refs[0].artifact_type == "outreach_draft"
+    assert result.artifact_refs[0].metadata["external_write_performed"] is False
+
+
 def test_bounded_supplied_fact_draft_can_repair_model_deferral() -> None:
     request = WorkflowRunRequest(
         request_text=(
@@ -13784,6 +15281,14 @@ def test_bounded_supplied_fact_draft_can_repair_model_deferral() -> None:
             mismatches=["The draft omitted the requested 20-minute call."],
         )
         is True
+    )
+    assert (
+        workflow_runner._should_repair_outreach_with_model(
+            request.model_copy(update={"live_sdk": False}),
+            recommendation={"reply_recommended": True},
+            mismatches=["The draft omitted the requested 20-minute call."],
+        )
+        is False
     )
     assert (
         workflow_runner._outreach_draft_should_be_retained(
@@ -13875,7 +15380,7 @@ def test_live_work_item_rendering_suppresses_operational_footer() -> None:
     assert "Route:" not in rendered
 
 
-def test_thread_local_outreach_draft_without_live_sdk_requests_model_reasoning(
+def test_thread_local_gmail_reply_without_live_context_stops_at_gmail_owner(
     tmp_path: Path,
 ) -> None:
     database_url = _database_url(tmp_path)
@@ -13896,13 +15401,13 @@ def test_thread_local_outreach_draft_without_live_sdk_requests_model_reasoning(
     )
 
     assert result.advanced is False
-    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert result.route == WorkItemRoute.GMAIL_TRIAGE
     assert result.status == WorkItemStatus.BLOCKED
     assert [blocker.code for blocker in result.blockers] == [
-        "outreach_requires_approved_context"
+        "gmail_context_required"
     ]
     assert result.artifact_refs == []
-    assert "What should this outreach focus on?" in result.human_summary
+    assert "Gmail Triage needs email context" in result.human_summary
     assert store.count("outreach_drafts") == 0
     assert store.list_approval_items(object_type="outreach_draft") == []
 
@@ -14433,10 +15938,19 @@ def test_slack_thread_sample_outreach_live_sdk_synthesizes_thread_local_copy(
     assert artifact.metadata["gmail_draft_created"] is False
     assert artifact.metadata["send_enabled"] is False
     assert artifact.metadata["external_write_performed"] is False
+    assert result.tool_execution["mode"] == (
+        "workflow_preacquired_context_tool_free_synthesis"
+    )
+    assert result.tool_execution["model_tool_call_count"] == 0
+    assert result.tool_execution["workflow_called_tool_names"] == [
+        "compose_outreach_draft_llm_constrained"
+    ]
     draft_payload = json.loads(str(draft_row["draft_json"]))
     assert draft_payload["drafting_mode"] == "llm_constrained"
     assert "fixture:neuroflow" in draft_payload["source_ids_used"]
     assert "compare notes" in result.human_summary
+    assert "draft approval item" not in result.human_summary
+    assert "review the thread-local draft in Slack" in result.human_summary
     assert "live SDK draft created" in " ".join(result.audit_notes)
     assert store.list_approval_items(object_type="outreach_draft") == []
     sdk_event = next(
@@ -14513,7 +16027,11 @@ def test_gmail_triage_live_retrieval_reads_recent_matching_threads(
             }
 
     monkeypatch.setattr(workflow_runner, "GmailTool", FakeGmailTool)
-    monkeypatch.setattr(workflow_runner, "cli_default_live_gmail", lambda: True)
+    monkeypatch.setattr(
+        workflow_runner,
+        "_live_gmail_retrieval_enabled",
+        lambda _request: True,
+    )
 
     result = workflow_runner._advance_work_item_one_step(
         WorkflowRunRequest(
@@ -14524,7 +16042,7 @@ def test_gmail_triage_live_retrieval_reads_recent_matching_threads(
             requested_route=WorkItemRoute.GMAIL_TRIAGE,
             database_url=_database_url(tmp_path),
             save=True,
-            live_sdk=True,
+            live_sdk=False,
             max_results=3,
         ),
         synthesize_user_response=False,
@@ -14557,23 +16075,38 @@ def test_outreach_with_canonical_gmail_read_starts_with_gmail_context_owner(
             return [{"id": "msg-kni", "threadId": "thread-kni"}]
 
         def get_message(self, message_id: str) -> dict[str, object]:
-            calls.append(("get_message", message_id))
-            return {
-                "id": message_id,
-                "threadId": "thread-kni",
-                "from": "Alex Morgan <alex@example.test>",
-                "subject": "Clinical AI collaboration",
-                "snippet": "Open to a short conversation about clinical AI.",
-                "thread_context": "The sender invited a concise follow-up about clinical AI.",
-                "thread_summary": "Invited a concise collaboration follow-up.",
-                "received_at": "2026-07-21T18:30:00Z",
-                "prior_labels": ["INBOX"],
-                "body": raw_private_body,
-                "normalized_body": raw_private_body,
-            }
+            raise AssertionError(
+                f"candidate selection must compare thread context: {message_id}"
+            )
 
         def get_thread(self, thread_id: str) -> dict[str, object]:
-            raise AssertionError(f"single-email selection must not expand thread: {thread_id}")
+            calls.append(("get_thread", thread_id))
+            return {
+                "thread_id": thread_id,
+                "subject": "Clinical AI collaboration",
+                "summary": "Invited a concise collaboration follow-up.",
+                "thread_context": (
+                    "The sender invited a concise follow-up about clinical AI."
+                ),
+                "message_count": 1,
+                "latest_received_at": "2026-07-21T18:30:00Z",
+                "participants": [
+                    "Alex Morgan <alex@example.test>",
+                    "Operator <operator@example.com>",
+                ],
+                "messages": [
+                    {
+                        "id": "msg-kni",
+                        "received_at": "2026-07-21T18:30:00Z",
+                        "sender_name": "Alex Morgan",
+                        "sender_email": "alex@example.test",
+                        "subject": "Clinical AI collaboration",
+                        "snippet": "Open to a short conversation about clinical AI.",
+                        "thread_summary": "Invited a concise collaboration follow-up.",
+                        "body": raw_private_body,
+                    }
+                ],
+            }
 
     # Persisted planner object from the failed 2026-07-21 Slack run. The
     # selected_context dependency refers to the Slack thread, not selected
@@ -14670,7 +16203,7 @@ def test_outreach_with_canonical_gmail_read_starts_with_gmail_context_owner(
     assert gmail_query.startswith("to:me -in:sent after:")
     assert " before:" in gmail_query
     assert "newer_than:" not in gmail_query
-    assert calls[1] == ("get_message", "msg-kni")
+    assert calls[1] == ("get_thread", "thread-kni")
     assert result.route == WorkItemRoute.OUTREACH_COMPOSER
     assert result.status == WorkItemStatus.DONE
     assert result.blockers == []
@@ -15393,9 +16926,107 @@ def test_chief_of_staff_email_reply_workflow_delegates_to_gmail_then_outreach(
             request_cache={"prompt_cache_key_hash": "chief-cost-test"},
         )
 
+    def fake_run_gmail_triage_sdk(_typed_input, **_kwargs):
+        triage = EmailTriageResult(
+            message_id="msg-halo",
+            thread_id="thread-halo",
+            received_at="2026-05-31T15:00:00Z",
+            subject="Halo partnership note",
+            sender_name="Halo",
+            sender_email="hello@halo.example",
+            category="collaboration_opportunity",
+            confidence=0.96,
+            priority="high",
+            summary="Halo asked for a concise acknowledgement and next step.",
+            thread_summary="Halo asked if the operator can review a partnership note.",
+            thread_context="Halo wants a concise acknowledgement and next step.",
+            reasoning="The active Halo thread is the direct match and needs a reply.",
+            needs_reply=True,
+            recommended_labels=["Keystone/Triage"],
+            recommended_next_agent="outreach_composer",
+            recommended_action="Draft Slack-thread-only reply copy for review.",
+            approval_required=False,
+            decision=AgentDecisionRecord(
+                decision_owner="specialist_agent",
+                decision_stage="gmail_candidate_selection",
+                selected_candidate_id="thread-halo",
+                candidate_assessments=[
+                    DecisionCandidateAssessment(
+                        candidate_id="thread-halo",
+                        disposition="selected",
+                        rationale="This is the current Halo partnership conversation.",
+                    )
+                ],
+                reasoning="The current Halo thread matches the request.",
+            ),
+        )
+        return TypedAgentRunResult(
+            agent_name="gmail_triage",
+            output=triage,
+            raw_result=SimpleNamespace(),
+            live=True,
+            usage={"requests": 1},
+            request_cache={
+                "decision_ownership": {"validator_outcome": {"status": "accepted"}},
+                "tool_execution": {
+                    "mode": "model_called",
+                    "model_called_tool_names": [
+                        "query_gmail_message_summaries",
+                        "read_gmail_context",
+                    ],
+                },
+            },
+        )
+
     monkeypatch.setattr(workflow_runner, "GmailTool", FakeGmailTool)
     monkeypatch.setattr(workflow_runner, "cli_default_live_gmail", lambda: True)
     monkeypatch.setattr(workflow_runner, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+    monkeypatch.setattr(workflow_runner, "run_gmail_triage_sdk", fake_run_gmail_triage_sdk)
+
+    def fake_run_retrieved_sdk_synthesis(**kwargs: object) -> SimpleNamespace:
+        context = kwargs["retrieve"]()  # type: ignore[index,operator]
+        approved_context = context["approved_context"]
+        source_ids = list(approved_context.allowed_source_ids)
+        decision = {
+            "decision_owner": "specialist_agent",
+            "decision_stage": "outreach_evidence_selection",
+            "selected_candidate_ids": source_ids,
+            "candidate_assessments": [
+                {
+                    "candidate_id": source_id,
+                    "disposition": "selected",
+                    "rationale": "The approved thread context supports the reply.",
+                }
+                for source_id in source_ids
+            ],
+            "reasoning": "Used only the approved Gmail thread and Keystone context.",
+            "limitations": ["Slack-thread-only copy; no Gmail draft or send."],
+            "needs_more_context": False,
+        }
+        return SimpleNamespace(
+            final_output=OutreachLLMDraftPayload(
+                company_name="Halo",
+                email_subject="Re: Halo partnership note",
+                email_body=(
+                    "Hi,\n\nThanks for reaching out. I can take a look and follow up "
+                    "with a next step.\n\nSincerely,\nKeystone"
+                ),
+                linkedin_note="",
+                personalization_rationale="Acknowledges the approved thread request.",
+                source_ids_used=source_ids,
+                decision=decision,
+            ),
+            usage={"requests": 1},
+            cost={},
+            request_cache={"decision_ownership": {"validator_outcome": {"status": "accepted"}}},
+            execution_telemetry={},
+        )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "run_retrieved_sdk_synthesis",
+        fake_run_retrieved_sdk_synthesis,
+    )
     monkeypatch.setattr(
         workflow_runner,
         "synthesize_user_facing_work_item_response_sdk_result",
@@ -15478,6 +17109,7 @@ def test_chief_of_staff_negated_gmail_context_does_not_delegate_to_gmail(
 def test_chief_of_staff_handoff_to_business_research_executes_next_agent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_research_fake_sdk,
 ) -> None:
     def fake_run_chief_of_staff_sdk(
         sdk_input: dict[str, object],
@@ -15541,14 +17173,15 @@ def test_chief_of_staff_handoff_to_business_research_executes_next_agent(
     assert result.route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
     assert result.advanced is True
     assert result.artifact_refs[0].source_agent == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
-    assert "Source-provided Business Research" in " ".join(result.audit_notes)
+    assert len(supplied_research_fake_sdk) == 1
+    assert "Registered Research SDK" in " ".join(result.audit_notes)
     assert "Live company retrieval executed" not in " ".join(result.audit_notes)
     assert "Example Health" in result.human_summary
     assert "diag_" not in result.human_summary
     assert "Manager loop steps:" not in result.human_summary
 
 
-def test_chief_uses_prior_natural_workflow_without_copyable_slack_checkpoint(
+def test_chief_does_not_treat_prior_natural_workflow_as_its_own_handoff(
     tmp_path: Path,
 ) -> None:
     request_text = (
@@ -15582,10 +17215,10 @@ def test_chief_uses_prior_natural_workflow_without_copyable_slack_checkpoint(
 
     assert workflow_runner.looks_like_thread_local_draft_request(request_text)
     assert result.route == WorkItemRoute.CHIEF_OF_STAFF
-    assert result.status == WorkItemStatus.IN_PROGRESS
+    assert result.status == WorkItemStatus.DONE
     assert result.next_action is not None
-    assert result.next_action.action == "run_business_research"
-    assert result.next_action.agent == WorkItemRoute.BUSINESS_RESEARCH_ANALYST
+    assert result.next_action.action == "review_chief_of_staff_plan"
+    assert result.next_action.agent == WorkItemRoute.CHIEF_OF_STAFF
     assert result.next_action.requires_approval is False
 
 
@@ -15618,6 +17251,7 @@ def test_chief_of_staff_negated_business_research_handoff_stays_review_only(
 def test_chief_of_staff_handoff_to_opportunity_scout_executes_next_agent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_opportunity_fake_sdk,
 ) -> None:
     def fake_run_chief_of_staff_sdk(
         sdk_input: dict[str, object],
@@ -15688,6 +17322,7 @@ def test_chief_of_staff_handoff_to_opportunity_scout_executes_next_agent(
 def test_chief_of_staff_recommended_agent_executes_without_handoff_prompt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_opportunity_fake_sdk,
 ) -> None:
     def fake_run_chief_of_staff_sdk(
         sdk_input: dict[str, object],
@@ -16276,7 +17911,7 @@ def test_chief_of_staff_handoff_to_outreach_composer_executes_next_agent(
     assert result.next_action.requires_approval is True
 
 
-def test_chief_of_staff_email_reply_recovers_from_live_schema_error(
+def test_chief_of_staff_email_reply_blocks_on_live_schema_error_without_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -16343,16 +17978,18 @@ def test_chief_of_staff_email_reply_recovers_from_live_schema_error(
 
     events = SQLiteStore(database_url).list_work_item_events(result.work_item.id)
 
-    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
-    assert result.status == WorkItemStatus.DONE
-    assert "Hi Anna," in result.human_summary
-    assert "Cost tracking: requested" not in result.human_summary
-    assert result.artifact_refs[0].metadata["cost_tracking_requested"] is True
-    fallback_event = next(
-        event for event in events if event.event_type == "chief_of_staff_live_sdk_fallback"
+    assert result.route == WorkItemRoute.CHIEF_OF_STAFF
+    assert result.status == WorkItemStatus.BLOCKED
+    assert [blocker.code for blocker in result.blockers] == [
+        "chief_agent_decision_unavailable"
+    ]
+    assert result.artifact_refs == []
+    blocked_event = next(
+        event for event in events if event.event_type == "chief_of_staff_live_sdk_blocked"
     )
-    assert fallback_event.metadata["safe_to_continue"] is True
-    assert "Invalid JSON" in fallback_event.metadata["reason"]
+    assert blocked_event.metadata["safe_to_continue"] is False
+    assert blocked_event.metadata["fallback"] == "none"
+    assert "Invalid JSON" in blocked_event.metadata["reason"]
 
 
 def test_thread_local_gmail_draft_omits_marketing_snippet_from_reply_focus() -> None:
@@ -16363,7 +18000,7 @@ def test_thread_local_gmail_draft_omits_marketing_snippet_from_reply_focus() -> 
             "Our platform makes it easy for innovators to work with industry partners "
             "and move their science forward. Start by creating a profile."
         ),
-        participants=["Anna <anna@halo.science>", "Operator <operator@example.com>"],
+        participants=["Anna <anna@halo.example>", "Operator <operator@example.com>"],
         message_count=1,
     )
 
@@ -16387,7 +18024,7 @@ def test_thread_local_gmail_draft_uses_safe_concrete_detail_when_available() -> 
         thread_context=(
             "Start by creating a Partner Listing. Or, respond to active requests on Halo."
         ),
-        participants=["Anna <anna@halo.science>", "Operator <operator@example.com>"],
+        participants=["Anna <anna@halo.example>", "Operator <operator@example.com>"],
         message_count=1,
     )
 
@@ -16519,7 +18156,7 @@ def test_thread_local_gmail_summary_keeps_email_fields_in_main_body() -> None:
     summary = workflow_runner.GmailThreadSummaryResult(
         thread_id="thread-halo",
         subject="Welcome to Halo!",
-        participants=["Anna <anna@halo.science>", "Operator <operator@example.com>"],
+        participants=["Anna <anna@halo.example>", "Operator <operator@example.com>"],
         message_count=1,
         latest_received_at="2026-05-31T12:01:53Z",
     )
@@ -16537,7 +18174,7 @@ def test_thread_local_gmail_summary_keeps_email_fields_in_main_body() -> None:
     )
 
     assert "Heading: Draft email for Anna" in rendered
-    assert "To: anna@halo.science" in rendered
+    assert "To: anna@halo.example" in rendered
     assert "Context:" not in rendered
     assert "Read: 1 message, subject 'Welcome to Halo!', from Anna" not in rendered
     assert "no direct question or personal action item detected" not in rendered
@@ -17227,3 +18864,36 @@ def test_draft_only_gmail_plan_preserves_explicit_provider_draft_lifecycle() -> 
         "Create a Gmail draft from the selected thread.",
         manual_request_plan=plan,
     )
+
+
+def test_empty_provider_search_is_not_reported_as_candidate_ambiguity(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from keystone_agents.models import TypedAgentRunResult
+    from keystone_agents.schemas.email_triage import EmailTriageResult
+    monkeypatch.setenv("KEYSTONE_ENABLE_LIVE_GMAIL", "true")
+    triage = EmailTriageResult(
+        category="unrelated", confidence=0.1, summary="No messages matched the searches.",
+        recommended_action="Review the query filters.",
+        reasoning="The query filters produced no candidates.", needs_reply=False,
+    )
+    triage.decision.needs_more_context = True
+    monkeypatch.setattr(workflow_runner, "run_gmail_triage_sdk", lambda *a, **kw: TypedAgentRunResult(
+        agent_name="gmail_triage", output=triage, raw_result=SimpleNamespace(), live=True,
+        request_cache={"decision_ownership": {"candidate_count": 0, "query_output_count": 2,
+                       "query_provider_read_performed": True}},
+    ))
+    item = WorkItem(kind=WorkItemKind.GMAIL_THREAD, title="Find selected email",
+                    request_text="Read the Example update in my mailbox.",
+                    current_route=WorkItemRoute.GMAIL_TRIAGE)
+    store = SQLiteStore(_database_url(tmp_path))
+    store.save_work_item(item)
+    result = workflow_runner._try_live_gmail_agent_owned_triage(
+        item, request=WorkflowRunRequest(request_text=item.request_text, live_sdk=True),
+        store=store, gmail_plan=workflow_runner.resolve_gmail_execution_plan(item.request_text),
+    )
+    assert result.blockers[0].code == "gmail_search_no_matches"
+    assert result.next_action.action == "review_gmail_search_filters"
+    assert "email has not been read" in result.human_summary
+    assert "declined to guess" not in result.human_summary
+    assert "needs one more input" not in result.human_summary

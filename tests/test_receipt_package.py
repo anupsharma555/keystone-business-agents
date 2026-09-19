@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -12,7 +13,114 @@ from keystone_agents.receipts.mutations import (
     operation_is_mutation,
     receipt_reports_possible_write,
 )
-from keystone_agents.receipts.normalization import normalize_tool_output_receipt
+from keystone_agents.receipts.normalization import (
+    identity_fingerprint,
+    identity_fingerprints,
+    normalize_tool_output_receipt,
+)
+
+
+def test_tool_invocation_journal_counts_repeated_calls_and_terminal_failures() -> None:
+    async def invoke(_context: object, tool_input: str) -> str:
+        if tool_input == "fail-with-private-input":
+            raise RuntimeError("private provider response must not enter telemetry")
+        return json.dumps(
+            {
+                "status": "success",
+                "operation": "read_records",
+                "provider": "example",
+                "item_count": 1,
+            }
+        )
+
+    tool = SimpleNamespace(
+        name="read_example_records",
+        on_invoke_tool=invoke,
+        is_enabled=True,
+    )
+    agent = SimpleNamespace(tools=[tool])
+    journal.reset_tool_receipt_journal()
+    journal.instrument_agent_tools(agent)
+
+    asyncio.run(tool.on_invoke_tool(None, "first-private-input"))
+    asyncio.run(tool.on_invoke_tool(None, "second-private-input"))
+    with pytest.raises(RuntimeError):
+        asyncio.run(tool.on_invoke_tool(None, "fail-with-private-input"))
+
+    assert journal.tool_invocation_journal() == [
+        {
+            "tool_name": "read_example_records",
+            "invocation_index": 1,
+            "status": "started",
+            "arguments_sha256": journal.tool_payload_fingerprint("first-private-input"),
+        },
+        {
+            "tool_name": "read_example_records",
+            "invocation_index": 1,
+            "status": "completed",
+            "output_sha256": journal.tool_payload_fingerprint({
+                "status": "success", "operation": "read_records",
+                "provider": "example", "item_count": 1,
+            }),
+        },
+        {
+            "tool_name": "read_example_records",
+            "invocation_index": 2,
+            "status": "started",
+            "arguments_sha256": journal.tool_payload_fingerprint("second-private-input"),
+        },
+        {
+            "tool_name": "read_example_records",
+            "invocation_index": 2,
+            "status": "completed",
+            "output_sha256": journal.tool_payload_fingerprint({
+                "status": "success", "operation": "read_records",
+                "provider": "example", "item_count": 1,
+            }),
+        },
+        {
+            "tool_name": "read_example_records",
+            "invocation_index": 3,
+            "status": "started",
+            "arguments_sha256": journal.tool_payload_fingerprint("fail-with-private-input"),
+        },
+        {
+            "tool_name": "read_example_records",
+            "invocation_index": 3,
+            "status": "failed",
+            "error_type": "RuntimeError",
+        },
+    ]
+    serialized = json.dumps(journal.tool_invocation_journal())
+    assert "private-input" not in serialized
+    assert "private provider response" not in serialized
+
+
+def test_tool_invocation_journal_distinguishes_returned_dry_run_from_success() -> None:
+    async def invoke(_context: object, _tool_input: str) -> str:
+        return json.dumps(
+            {
+                "status": "dry-run",
+                "operation": "read_calendar_window",
+                "events": [],
+            }
+        )
+
+    tool = SimpleNamespace(
+        name="read_google_calendar_window",
+        on_invoke_tool=invoke,
+        is_enabled=True,
+    )
+    journal.reset_tool_receipt_journal()
+    journal.instrument_agent_tools(SimpleNamespace(tools=[tool]))
+
+    asyncio.run(tool.on_invoke_tool(None, "{}"))
+
+    assert journal.tool_invocation_journal()[-1] == {
+        "tool_name": "read_google_calendar_window",
+        "invocation_index": 1,
+        "status": "returned_unsuccessful",
+    }
 
 
 @pytest.mark.parametrize(
@@ -239,6 +347,29 @@ def test_recovery_rejects_unverified_gmail_label_receipt(tmp_path) -> None:
     assert store.state.receipts == []
 
 
+def test_verified_provider_write_summary_requires_current_identity_and_readback() -> None:
+    verified = {
+        "status": "success",
+        "operation": "update",
+        "tool_name": "airtable_write_record",
+        "provider": "airtable",
+        "table": "Business Expenses",
+        "record_id": "recVerified123",
+        "provider_write": True,
+        "verification": {"passed": True},
+    }
+
+    assert recovery.verified_provider_write_summary([verified]) == (
+        "Updated and provider-verified Business Expenses recVerified123 in place."
+    )
+    assert recovery.verified_provider_write_summary(
+        [{**verified, "verification": {"passed": False}}]
+    ) == ""
+    assert recovery.verified_provider_write_summary(
+        [{key: value for key, value in verified.items() if key != "record_id"}]
+    ) == ""
+
+
 def test_tool_output_normalization_preserves_the_existing_bounded_contract() -> None:
     receipt = normalize_tool_output_receipt(
         "calendar_create_event",
@@ -262,6 +393,90 @@ def test_tool_output_normalization_preserves_the_existing_bounded_contract() -> 
     }
     assert normalize_tool_output_receipt("tool", "not-json") is None
     assert normalize_tool_output_receipt("tool", SimpleNamespace()) is None
+
+
+def test_calendar_receipt_normalization_preserves_trace_safe_provider_proof() -> None:
+    receipt = normalize_tool_output_receipt(
+        "create_google_calendar_event",
+        {
+            "status": "success",
+            "operation": "create_calendar_event",
+            "provider": "google_calendar",
+            "provider_read": True,
+            "provider_write": True,
+            "provider_mutated": True,
+            "provider_request_attempt_count": 3,
+            "provider_request_success_count": 3,
+            "event_id": "event-fixture",
+            "verification": {"passed": True},
+            "verified": True,
+            "complete": True,
+            "private_body": "must not be retained",
+        },
+    )
+
+    assert receipt == {
+        "status": "success",
+        "operation": "create_calendar_event",
+        "provider": "google_calendar",
+        "provider_read": True,
+        "provider_write": True,
+        "provider_mutated": True,
+        "provider_request_attempt_count": 3,
+        "provider_request_success_count": 3,
+        "event_id": "event-fixture",
+        "verification": {"passed": True},
+        "verified": True,
+        "complete": True,
+        "tool_name": "create_google_calendar_event",
+    }
+
+
+def test_identity_fingerprints_hash_each_generator_item_and_remain_receipt_safe() -> None:
+    fingerprints = identity_fingerprints(value for value in ("record-a", "record-b"))
+
+    assert fingerprints == [
+        identity_fingerprint("record-a"),
+        identity_fingerprint("record-b"),
+    ]
+    receipt = normalize_tool_output_receipt(
+        "airtable_read_records",
+        {
+            "status": "success",
+            "identity_fingerprints": fingerprints,
+            "records": [{"id": "record-a", "private": "not journaled"}],
+        },
+    )
+    assert receipt == {
+        "status": "success",
+        "identity_fingerprints": fingerprints,
+        "tool_name": "airtable_read_records",
+    }
+
+
+def test_search_result_receipt_binds_urls_without_journaling_result_content() -> None:
+    receipt = normalize_tool_output_receipt(
+        "search_web",
+        [
+            {
+                "title": "Private-looking result title",
+                "link": "https://example.org/evidence",
+                "snippet": "This content must not enter the bounded receipt.",
+            }
+        ],
+    )
+
+    assert receipt == {
+        "status": "success",
+        "operation": "search",
+        "item_count": 1,
+        "identity_fingerprints": identity_fingerprints(
+            ["https://example.org/evidence"]
+        ),
+        "tool_name": "search_web",
+    }
+    assert "Private-looking" not in json.dumps(receipt)
+    assert "content must not" not in json.dumps(receipt)
 
 
 def test_legacy_receipt_and_recovery_imports_are_compatibility_facades() -> None:

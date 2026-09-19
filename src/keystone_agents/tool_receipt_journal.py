@@ -7,6 +7,7 @@ from keystone_agents.receipts.journal import (
     record_tool_output,
     reset_tool_receipt_journal,
     retry_receipt_context,
+    tool_invocation_journal,
     tool_receipt_journal,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "receipt_reports_possible_write",
     "reset_tool_receipt_journal",
     "retry_receipt_context",
+    "tool_invocation_journal",
     "tool_receipt_journal",
 ]

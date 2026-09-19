@@ -10,10 +10,12 @@ The current path is Orchestrator-first. The bridge passes the raw Slack request,
 selected-message context, compact thread replies, prior same-thread run
 summaries, WorkItem metadata, and channel automation hints into Keystone before
 specialist execution. Orchestrator preflight reads that context and writes
-route advice, blockers, retrieval hints, and planner rationale. Specialists
-then receive the raw request plus the Orchestrator memo/context; deterministic
-Python gates still own approvals, exact record identity, source sufficiency,
-and side-effect blocking.
+a typed semantic route/workflow decision, blockers, retrieval needs, and a
+compact public-safe memo. Specialists receive the raw request plus the validated
+internal decision and relevant model-visible context; deterministic Python gates
+still own approvals, exact record identity, source sufficiency, and side-effect
+blocking. The standalone model planner is optional and cannot override either
+the agent-owned semantic decision or Python authority gates.
 
 Named-agent and context-agent replies should stay in the Slack channel/thread
 that produced the request. The exported KBA contract exposes

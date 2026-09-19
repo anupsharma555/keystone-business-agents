@@ -92,6 +92,38 @@ def resolve_sdk_turn_policy(
     return SDKTurnPolicy(agent_name=normalized, max_turns=fixed, source="fixed_default")
 
 
+def resolve_sdk_tool_call_limit(
+    agent_name: str,
+    *,
+    request_text: str = "",
+    live_search: bool = False,
+    cost_profile: str = "standard",
+    manual_request_plan: ManualRequestPlan | dict[str, object] | None = None,
+    formal_opportunity: bool = False,
+    source_context_required: bool = False,
+) -> int | None:
+    """Resolve the quality budget's real total function-tool ceiling."""
+
+    normalized = _agent_key(agent_name)
+    if normalized == "business_research_analyst":
+        return business_research_quality_budget(
+            request_text=request_text,
+            live_search=live_search,
+            cost_profile=cost_profile,
+            manual_request_plan=manual_request_plan,
+        ).max_tool_calls
+    if normalized == "opportunity_scout":
+        return opportunity_scout_quality_budget(
+            request_text=request_text,
+            live_search=live_search,
+            cost_profile=cost_profile,
+            formal_opportunity=formal_opportunity,
+            source_context_required=source_context_required,
+            manual_request_plan=manual_request_plan,
+        ).max_tool_calls
+    return None
+
+
 def _agent_key(value: str) -> str:
     return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
 

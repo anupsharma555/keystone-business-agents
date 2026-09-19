@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from keystone_agents.schemas.decision_ownership import AgentDecisionRecord
+
 
 def _clean_text(value: object, *, max_chars: int = 500) -> str:
     text = " ".join(str(value or "").replace("\u2014", "-").split()).strip()
@@ -166,6 +168,12 @@ class AirtableContextResult(BaseModel):
     human_work_context: HumanWorkContext = Field(default_factory=HumanWorkContext)
     sources: list[OperationalContextSource] = Field(default_factory=list)
     diagnostics: list[OperationalContextEntry] = Field(default_factory=list)
+    decision: AgentDecisionRecord = Field(
+        default_factory=lambda: AgentDecisionRecord(
+            decision_stage="airtable_record_selection",
+            needs_more_context=True,
+        )
+    )
 
     @field_validator(
         "agent_name",
@@ -247,6 +255,12 @@ class GoogleWorkspaceContextResult(BaseModel):
     human_work_context: HumanWorkContext = Field(default_factory=HumanWorkContext)
     sources: list[OperationalContextSource] = Field(default_factory=list)
     diagnostics: list[OperationalContextEntry] = Field(default_factory=list)
+    decision: AgentDecisionRecord = Field(
+        default_factory=lambda: AgentDecisionRecord(
+            decision_stage="workspace_artifact_selection",
+            needs_more_context=True,
+        )
+    )
 
     @field_validator(
         "agent_name",
@@ -329,6 +343,12 @@ class ZoteroContextResult(BaseModel):
     human_work_context: HumanWorkContext = Field(default_factory=HumanWorkContext)
     sources: list[OperationalContextSource] = Field(default_factory=list)
     diagnostics: list[OperationalContextEntry] = Field(default_factory=list)
+    decision: AgentDecisionRecord = Field(
+        default_factory=lambda: AgentDecisionRecord(
+            decision_stage="zotero_item_selection",
+            needs_more_context=True,
+        )
+    )
 
     @field_validator("agent_name", "mode", "summary", "library_context", mode="before")
     @classmethod
@@ -444,6 +464,14 @@ class HistoricalFeedContextItem(BaseModel):
         return _clean_list(value)
 
 
+class SignalRelevanceDecisionRecord(AgentDecisionRecord):
+    """Signal selection with stage identity fixed by the owning output contract."""
+
+    decision_stage: Literal["signal_relevance_selection"] = (
+        "signal_relevance_selection"
+    )
+
+
 class HistoricalFeedContextResult(BaseModel):
     """Historical RSS/preprint context and Chief of Staff handoff guidance."""
 
@@ -471,6 +499,11 @@ class HistoricalFeedContextResult(BaseModel):
     human_work_context: HumanWorkContext = Field(default_factory=HumanWorkContext)
     sources: list[OperationalContextSource] = Field(default_factory=list)
     diagnostics: list[OperationalContextEntry] = Field(default_factory=list)
+    decision: SignalRelevanceDecisionRecord = Field(
+        default_factory=lambda: SignalRelevanceDecisionRecord(
+            needs_more_context=True,
+        )
+    )
 
     @field_validator(
         "agent_name",
@@ -503,6 +536,13 @@ class HistoricalFeedContextResult(BaseModel):
     @classmethod
     def _clean_lists(cls, value: object) -> list[str]:
         return _clean_list(value)
+
+    @field_validator("decision", mode="before")
+    @classmethod
+    def _validate_signal_decision_contract(cls, value: object) -> object:
+        if isinstance(value, AgentDecisionRecord):
+            return value.model_dump(mode="python")
+        return value
 
     @field_validator("diagnostics", mode="before")
     @classmethod

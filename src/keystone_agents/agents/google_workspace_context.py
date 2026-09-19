@@ -8,7 +8,16 @@ from typing import Any
 
 from keystone_agents.agent_tool_policy import filter_tools_for_tier
 from keystone_agents.authority.semantic import ExecutionIntentAuthority
+from keystone_agents.capabilities.tool_scope import (
+    ToolScopeMode,
+    attach_tool_scope_receipt,
+    scope_tools_for_request,
+)
 from keystone_agents.guardrails import keystone_guardrails
+from keystone_agents.planning.compatibility import (
+    has_positive_provider_read_action,
+    positive_capability_text,
+)
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.operational_context import GoogleWorkspaceContextResult
 from keystone_agents.sdk import (
@@ -26,6 +35,7 @@ from keystone_agents.tools.internal_data_tools import (
     google_drive_create_folder,
     google_drive_get_file_metadata,
     google_drive_list_folder,
+    google_drive_media_ocr_read,
     google_drive_remove_folder,
     google_drive_rename_folder,
     google_drive_search_files,
@@ -40,6 +50,7 @@ from keystone_agents.tools.internal_data_tools import (
     google_sheet_update_row,
     google_sheet_update_tab,
     google_slide_deck_read,
+    google_slide_deck_write,
     presentation_delete_test_artifact_local,
     presentation_extract_slide_copy_local,
     presentation_read_local,
@@ -77,7 +88,6 @@ _WORKSPACE_READ_TOOLS_BY_RESOURCE: dict[str, frozenset[str]] = {
     ),
     "google_drive_file": frozenset(
         {
-            "google_drive_list_folder",
             "google_drive_search_files",
             "google_drive_get_file_metadata",
         }
@@ -104,6 +114,84 @@ _WORKSPACE_READ_TOOLS_BY_RESOURCE: dict[str, frozenset[str]] = {
     ),
 }
 
+_GOOGLE_DRIVE_UNKNOWN_MIME_READ_TOOLS = frozenset(
+    {
+        "google_drive_search_files",
+        "google_drive_get_file_metadata",
+        "google_doc_read",
+        "google_sheet_list",
+        "google_sheet_read_table",
+        "google_slide_deck_read",
+        "google_drive_media_ocr_read",
+    }
+)
+
+
+def _requests_drive_media_content_read(normalized: str) -> bool:
+    """Return whether the operator asked to inspect PDF/image contents."""
+
+    media = r"(?:pdf|image|scan(?:ned)?)"
+    return bool(
+        has_positive_provider_read_action(normalized)
+        and re.search(rf"\b{media}\b", normalized)
+        or re.search(r"\b(?:read|extract)\s+(?:its\s+)?(?:content|text)\b", normalized)
+    )
+
+
+def _requests_generic_drive_content_read(normalized: str) -> bool:
+    """Return whether a MIME-unknown Drive artifact needs substantive content."""
+
+    if re.search(
+        r"\b(?:google\s+docs?|document|google\s+sheets?|spreadsheet|worksheet|"
+        r"slides?|presentation|deck|pdf|image|scan(?:ned)?)\b",
+        normalized,
+    ):
+        return False
+    return bool(
+        has_positive_provider_read_action(normalized)
+        and re.search(
+            r"\b(?:drive|files?|plan|brief|report|materials?|artifact)\b",
+            normalized,
+        )
+    )
+
+
+def _requests_drive_folder_listing(normalized: str) -> bool:
+    """Return whether the operator asked to enumerate a folder, not just search it."""
+
+    return bool(
+        re.search(
+            r"\b(?:list|show|browse|enumerate)\b[^.\n]{0,80}\b(?:folder|files?)\b",
+            normalized,
+        )
+        or re.search(r"\bwhat(?:'s| is)\s+in\b[^.\n]{0,80}\bfolder\b", normalized)
+    )
+
+
+def _requests_metadata_only(authority: ExecutionIntentAuthority) -> bool:
+    """Return whether the typed request contract excludes provider content."""
+
+    plan = authority.plan
+    return bool(
+        plan is not None
+        and (
+            any(
+                str(constraint or "").strip().casefold() == "metadata-section"
+                for constraint in plan.constraints
+            )
+            or any(
+                re.search(
+                    r"\b(?:do\s+not|don't|dont|without)\b[^.\n]{0,80}"
+                    r"\b(?:open|read|inspect|summarize|extract)\b[^.\n]{0,60}"
+                    r"\b(?:contents?|body|text)\b",
+                    str(constraint or "").strip().casefold(),
+                )
+                is not None
+                for constraint in plan.constraints
+            )
+        )
+    )
+
 _WORKSPACE_WRITE_TOOLS_BY_ACTION: dict[tuple[str, str], frozenset[str]] = {
     ("create", "google_document"): frozenset({"google_doc_write"}),
     ("update", "google_document"): frozenset({"google_doc_write"}),
@@ -119,6 +207,8 @@ _WORKSPACE_WRITE_TOOLS_BY_ACTION: dict[tuple[str, str], frozenset[str]] = {
     ("create", "google_drive_folder"): frozenset({"google_drive_create_folder"}),
     ("update", "google_drive_folder"): frozenset({"google_drive_rename_folder"}),
     ("delete", "google_drive_folder"): frozenset({"google_drive_remove_folder"}),
+    ("create", "google_slide_deck"): frozenset({"google_slide_deck_write"}),
+    ("update", "google_slide_deck"): frozenset({"google_slide_deck_write"}),
     ("create", "local_presentation"): frozenset(
         {"presentation_extract_slide_copy_local"}
     ),
@@ -142,7 +232,7 @@ def _canonical_google_workspace_tool_names(
     if not operations:
         return set()
     steps = authority.provider_action_steps("google_workspace")
-    normalized = " ".join(str(request_text or "").lower().split())
+    normalized = " ".join(positive_capability_text(request_text).lower().split())
     if steps:
         doc_operations = {
             step.operation
@@ -168,6 +258,31 @@ def _canonical_google_workspace_tool_names(
                         frozenset(),
                     )
                 )
+        if _requests_metadata_only(authority):
+            selected.difference_update(
+                {
+                    "google_doc_read",
+                    "google_sheet_read_table",
+                    "google_slide_deck_read",
+                    "presentation_read_local",
+                }
+            )
+        if any(step.resource_type == "google_drive_file" for step in steps):
+            if (
+                _requests_drive_media_content_read(normalized)
+                and not _requests_metadata_only(authority)
+            ):
+                selected.add("google_drive_media_ocr_read")
+            if (
+                _requests_generic_drive_content_read(normalized)
+                and not _requests_metadata_only(authority)
+            ):
+                selected.update(_GOOGLE_DRIVE_UNKNOWN_MIME_READ_TOOLS)
+            if (
+                _requests_drive_folder_listing(normalized)
+                and not _requests_metadata_only(authority)
+            ):
+                selected.add("google_drive_list_folder")
         return selected
 
     # Older canonical producers may not yet supply resource-level steps. Keep
@@ -177,6 +292,15 @@ def _canonical_google_workspace_tool_names(
     if operations & {"read", "search", "verify"}:
         for names in _WORKSPACE_READ_TOOLS_BY_RESOURCE.values():
             selected.update(names)
+    if _requests_metadata_only(authority):
+        selected.difference_update(
+            {
+                "google_doc_read",
+                "google_sheet_read_table",
+                "google_slide_deck_read",
+                "presentation_read_local",
+            }
+        )
     for operation in operations & {"create", "update", "delete"}:
         for (action, _resource_type), names in _WORKSPACE_WRITE_TOOLS_BY_ACTION.items():
             if action == operation:
@@ -194,7 +318,9 @@ def _google_workspace_context_tools(
         google_drive_list_folder,
         google_drive_search_files,
         google_drive_get_file_metadata,
+        google_drive_media_ocr_read,
         google_slide_deck_read,
+        google_slide_deck_write,
         presentation_search_local,
         presentation_read_local,
         presentation_extract_slide_copy_local,
@@ -217,10 +343,24 @@ def _google_workspace_context_tools(
         google_sheet_remove_tab,
         google_sheet_trash,
     ]
-    if tool_tier is None:
-        return tools
-    filtered = filter_tools_for_tier("google_workspace_context_agent", tools, tool_tier)
     authority = ExecutionIntentAuthority.from_value(manual_plan)
+    if authority.invalid:
+        return []
+    if tool_tier is None and authority.plan is None:
+        return tools
+    workspace_operations = set(authority.effective_provider_operations("google_workspace"))
+    resolved_tool_tier = (
+        tool_tier
+        if tool_tier is not None
+        else "internal_write"
+        if workspace_operations.intersection({"create", "update", "delete", "attach"})
+        else "core_read"
+    )
+    filtered = filter_tools_for_tier(
+        "google_workspace_context_agent",
+        tools,
+        resolved_tool_tier,
+    )
     if authority.canonical:
         selected_names = _canonical_google_workspace_tool_names(
             authority,
@@ -229,10 +369,8 @@ def _google_workspace_context_tools(
         return [
             tool for tool in filtered if getattr(tool, "name", "") in selected_names
         ]
-    if authority.invalid:
-        return []
-    normalized = " ".join(str(request_text or "").lower().split())
-    tier = str(tool_tier)
+    normalized = " ".join(positive_capability_text(request_text).lower().split())
+    tier = str(resolved_tool_tier)
     if tier not in {"core_read", "internal_write"}:
         return filtered
     selected_names: set[str] = set()
@@ -241,7 +379,9 @@ def _google_workspace_context_tools(
         re.search(r"\b(?:google\s+sheets?|spreadsheet|worksheet|tab|rows?|cells?)\b", normalized)
     )
     slide_request = bool(re.search(r"\b(?:slides?|presentation|deck)\b", normalized))
-    drive_request = bool(re.search(r"\b(?:drive|folder|files?|metadata)\b", normalized))
+    drive_request = bool(
+        re.search(r"\b(?:drive|folder|files?|metadata|pdf|image|scan(?:ned)?)\b", normalized)
+    )
     if doc_request:
         marked_test = bool(re.search(r"\bkba_test_doc(?:_[a-z0-9]+)*\b", normalized))
         requests_create = bool(re.search(r"\b(?:create|make|write|add)\b", normalized))
@@ -258,9 +398,10 @@ def _google_workspace_context_tools(
                 {
                     "google_drive_search_files",
                     "google_drive_get_file_metadata",
-                    "google_doc_read",
                 }
             )
+            if not _requests_metadata_only(authority):
+                selected_names.add("google_doc_read")
             if tier == "internal_write" and re.search(
                 r"\b(?:create|make|write|add|append|edit|modify|revise|update|replace)\b",
                 normalized,
@@ -310,6 +451,11 @@ def _google_workspace_context_tools(
                 "presentation_read_local",
             }
         )
+        if tier == "internal_write" and re.search(
+            r"\b(?:create|make|write|add|append|edit|modify|revise|update|replace)\b",
+            normalized,
+        ):
+            selected_names.add("google_slide_deck_write")
         if tier == "internal_write" and re.search(r"\b(?:extract|copy)\b", normalized):
             selected_names.add("presentation_extract_slide_copy_local")
         if tier == "internal_write" and re.search(r"\b(?:delete|remove)\b", normalized):
@@ -317,11 +463,25 @@ def _google_workspace_context_tools(
     if drive_request:
         selected_names.update(
             {
-                "google_drive_list_folder",
                 "google_drive_search_files",
                 "google_drive_get_file_metadata",
             }
         )
+        if (
+            _requests_drive_folder_listing(normalized)
+            and not _requests_metadata_only(authority)
+        ):
+            selected_names.add("google_drive_list_folder")
+        if (
+            _requests_drive_media_content_read(normalized)
+            and not _requests_metadata_only(authority)
+        ):
+            selected_names.add("google_drive_media_ocr_read")
+        if (
+            _requests_generic_drive_content_read(normalized)
+            and not _requests_metadata_only(authority)
+        ):
+            selected_names.update(_GOOGLE_DRIVE_UNKNOWN_MIME_READ_TOOLS)
         if tier == "internal_write" and re.search(
             r"\b(?:create|add|new)\b[^.\n]{0,80}\bfolder\b",
             normalized,
@@ -373,15 +533,27 @@ def build_google_workspace_context_agent(
         )
     )
     instructions = composer(*prompt_files, skill_files=skill_files)
-    return build_sdk_agent(
+    candidate_tools = _google_workspace_context_tools(
+        tool_tier=tool_tier,
+        request_text=request_text,
+        manual_plan=manual_plan,
+    )
+    attachment = scope_tools_for_request(
+        "google_workspace_context_agent",
+        candidate_tools,
+        manual_request_plan=manual_plan,
+        tool_tier=tool_tier,
+        mode=(
+            ToolScopeMode.REQUEST_SCOPED
+            if manual_plan is not None
+            else ToolScopeMode.FULL
+        ),
+    )
+    agent = build_sdk_agent(
         name="google_workspace_context_agent",
         instructions=instructions,
         output_type=GoogleWorkspaceContextResult,
-        tools=_google_workspace_context_tools(
-            tool_tier=tool_tier,
-            request_text=request_text,
-            manual_plan=manual_plan,
-        ),
+        tools=list(attachment.tools),
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="google_workspace_context_agent",
@@ -390,3 +562,4 @@ def build_google_workspace_context_agent(
             "direct approved Workspace writes when invoked as the selected agent."
         ),
     )
+    return attach_tool_scope_receipt(agent, attachment.scope)

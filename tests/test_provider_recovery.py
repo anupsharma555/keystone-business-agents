@@ -315,14 +315,18 @@ def test_sdk_retry_loads_checkpoint_and_disables_only_completed_mutation(
         **_kwargs: Any,
     ) -> tuple[Any, dict[str, Any]]:
         nonlocal first_attempt
+        active_tools = {tool.name: tool for tool in _agent.tools}
+        active_create_tool = active_tools["airtable_create_record"]
+        active_read_tool = active_tools["airtable_get_record"]
+        active_compensate_tool = active_tools["airtable_delete_record"]
         if first_attempt:
             first_attempt = False
-            assert create_tool.is_enabled is True
-            asyncio.run(create_tool.on_invoke_tool(None, "{}"))
+            assert active_create_tool.is_enabled is True
+            asyncio.run(active_create_tool.on_invoke_tool(None, "{}"))
             raise RuntimeError("attachment read-back failed after provider mutation")
-        assert create_tool.is_enabled is False
-        assert read_tool.is_enabled is True
-        assert compensate_tool.is_enabled is True
+        assert active_create_tool.is_enabled is False
+        assert active_read_tool.is_enabled is True
+        assert active_compensate_tool.is_enabled is True
         assert "Provider receipts:" in str(prompt)
         return SimpleNamespace(usage=None), {"status": "recovered"}
 

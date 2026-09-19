@@ -9,14 +9,17 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
 from keystone_agents.schemas.approval import ApprovalScope, ApprovalState
+from keystone_agents.schemas.decision_ownership import AgentDecisionRecord
 from keystone_agents.schemas.decision_trace import DecisionTrace
 from keystone_agents.schemas.feedback import OperatorFeedbackRequest
 from keystone_agents.schemas.handoff_types import HandoffTypeContract
+from keystone_agents.schemas.output_constraints import OutputScopeBindings
 from keystone_agents.schemas.retrieval import RetrievalHint
 
 RouteName = Literal[
     "gmail_triage",
     "business_research_analyst",
+    "rag_retrieval_specialist",
     "opportunity_scout",
     "outreach_composer",
     "chief_of_staff",
@@ -333,12 +336,39 @@ class OrchestratorWorkflowStateSummary(BaseModel):
         return getattr(self, key, default)
 
 
+class OrchestratorRouteDecision(AgentDecisionRecord):
+    """A completed routing choice, including choosing to ask for clarification."""
+
+    needs_more_context: Literal[False] = Field(
+        default=False,
+        description=(
+            "Always false for the main routing decision. Select the clarification route "
+            "and put the missing-input question in clarification_request when needed."
+        ),
+    )
+
+
 class OrchestratorResult(BaseModel):
     """Structured route decision with deterministic safety gates."""
 
     route: RouteName = "clarification"
     target_agent: str | None = None
-    workflow: list[str] = Field(default_factory=list)
+    workflow: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Complete ordered list of registered KBA agent route identities, including "
+            "the selected route. Never tool names, task actions, or prose workflow steps."
+        ),
+    )
+    output_scopes: OutputScopeBindings = Field(default_factory=OutputScopeBindings)
+    context_only_response: bool = Field(
+        default=False,
+        description=(
+            "True only for a single-owner answer or rewrite using the completed result "
+            "already supplied in this thread. No fresh provider read, tool, write, saved "
+            "draft, or external action is needed. False when evidence must be acquired."
+        ),
+    )
     routing_mode: RoutingMode = "deterministic"
     rationale: str = ""
     clarification_request: str | None = None
@@ -355,6 +385,13 @@ class OrchestratorResult(BaseModel):
     can_send_email: bool = False
     forbidden_actions: list[str] = Field(default_factory=lambda: ["send_email"])
     intended_handoffs: list[HandoffSpec] = Field(default_factory=list)
+    provider_context_decisions: list[AgentDecisionRecord] = Field(default_factory=list)
+    decision: OrchestratorRouteDecision = Field(
+        default_factory=lambda: OrchestratorRouteDecision(
+            decision_owner="orchestrator",
+            decision_stage="orchestrator_route_selection",
+        )
+    )
     retrieval_hint: RetrievalHint | None = None
     retrieval_diagnostics: SkipJsonSchema[dict[str, Any]] = Field(default_factory=dict)
     artifacts: OrchestratorArtifacts = Field(default_factory=OrchestratorArtifacts)
@@ -365,6 +402,15 @@ class OrchestratorResult(BaseModel):
     operator_feedback_request: OperatorFeedbackRequest | None = None
     decision_trace: DecisionTrace | None = None
     audit_notes: list[str] = Field(default_factory=list)
+
+    @field_validator("decision", mode="before")
+    @classmethod
+    def _accept_legacy_route_decision(cls, value: Any) -> Any:
+        if isinstance(value, AgentDecisionRecord) and not isinstance(
+            value, OrchestratorRouteDecision
+        ):
+            return value.model_dump(mode="python")
+        return value
 
     @model_validator(mode="after")
     def _enforce_no_send(self) -> OrchestratorResult:
@@ -423,6 +469,37 @@ class OrchestratorResult(BaseModel):
             )
             self.artifacts.notes = list(dict.fromkeys([*self.artifacts.notes, next_step]))
         return self
+
+
+class OrchestratorPlanningResult(OrchestratorResult):
+    """Tool-free route selection does not manufacture provider-read decisions."""
+
+    provider_context_decisions: SkipJsonSchema[list[AgentDecisionRecord]] = Field(
+        default_factory=list
+    )
+    # These are populated by the host or by later execution, not route reasoning.
+    target_agent: SkipJsonSchema[str | None] = None
+    routing_mode: SkipJsonSchema[RoutingMode] = "deterministic"
+    intended_handoffs: SkipJsonSchema[list[HandoffSpec]] = Field(default_factory=list)
+    artifacts: SkipJsonSchema[OrchestratorArtifacts] = Field(default_factory=OrchestratorArtifacts)
+    state_context_used: SkipJsonSchema[bool] = False
+    workflow_state_summary: SkipJsonSchema[OrchestratorWorkflowStateSummary] = Field(
+        default_factory=OrchestratorWorkflowStateSummary
+    )
+    decision_trace: SkipJsonSchema[DecisionTrace | None] = None
+    audit_notes: SkipJsonSchema[list[str]] = Field(default_factory=list)
+    approved_context_present: SkipJsonSchema[bool] = False
+    send_enabled: SkipJsonSchema[bool] = False
+    can_send_email: SkipJsonSchema[bool] = False
+
+    @field_validator("provider_context_decisions")
+    @classmethod
+    def no_provider_selections_before_execution(
+        cls, value: list[AgentDecisionRecord],
+    ) -> list[AgentDecisionRecord]:
+        if value:
+            raise ValueError("Tool-free planning cannot assert provider candidate selections.")
+        return value
 
 
 class OrchestratorOutputReviewScore(BaseModel):

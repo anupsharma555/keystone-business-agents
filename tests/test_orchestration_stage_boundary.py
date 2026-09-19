@@ -25,6 +25,7 @@ def test_stage_boundary_delegates_to_the_existing_single_kernel() -> None:
         stages.inline_gmail_fixture_from_request
         is workflow_runner._inline_gmail_fixture_from_request
     )
+    assert stages.load_workflow_external_context is workflow_runner._load_external_context
 
 
 def test_langgraph_uses_public_stage_boundary_not_private_runner_imports() -> None:

@@ -69,6 +69,16 @@ Before running these probes, confirm:
 
 ## Preflight
 
+The no-live ANU-60 preflight resolves `keystone-slack` from the ordinary sibling
+layout first and from the current Git common directory when KBA is running in an
+isolated worktree. To select a different local checkout explicitly, set
+`KEYSTONE_SLACK_REPO` to its absolute path. The resolver verifies the Git
+top-level, origin repository name, tracked bridge/test files, and all eight
+selected fixture methods before import. An invalid override, unrelated repo,
+missing checkout, or multiple valid candidates fails without fallback.
+On a clean checkout, the preflight generates the no-live 36-case expansion
+artifact before validating the proof packet that requires it.
+
 ```bash
 npm run eval:slack:anu60-preflight
 npm run eval:slack:strict-readiness -- --json

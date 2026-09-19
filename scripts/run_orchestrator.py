@@ -8,6 +8,7 @@ from pathlib import Path
 
 from keystone_agents.agents.manual_request_planner import resolve_manual_request_plan
 from keystone_agents.agents.orchestrator import (
+    reconcile_orchestrator_work_item_inspection,
     route_request,
     run_orchestrator_sdk,
 )
@@ -78,6 +79,7 @@ def _result_payload(
     output: object,
     input_text: str,
     manual_plan: object | None = None,
+    sdk_result: object | None = None,
 ) -> dict[str, object]:
     dumped = output.model_dump(mode="json") if hasattr(output, "model_dump") else output
     payload = {
@@ -95,6 +97,18 @@ def _result_payload(
             if hasattr(manual_plan, "model_dump")
             else manual_plan
         )
+    if sdk_result is not None:
+        for field in (
+            "usage",
+            "cost",
+            "budget_guard",
+            "request_cache",
+            "execution_telemetry",
+            "tool_receipts",
+        ):
+            value = getattr(sdk_result, field, None)
+            if value:
+                payload[field] = value
     return payload
 
 
@@ -139,22 +153,49 @@ def main(argv: list[str] | None = None) -> int:
             requested_agent="orchestrator",
             live=True,
         )
+    elif args.live_sdk:
+        manual_plan = resolve_manual_request_plan(
+            input_text,
+            requested_agent="orchestrator",
+            live=False,
+        )
     if args.live_sdk:
         load_settings(force_dotenv=True)
         model_config = get_runtime_agent_model_config("orchestrator")
-        typed_result = run_orchestrator_sdk(input_text, live=True)
+        typed_result = run_orchestrator_sdk(
+            input_text,
+            live=True,
+            manual_request_plan=manual_plan,
+        )
+        result = reconcile_orchestrator_work_item_inspection(
+            typed_result.output,
+            request_text=input_text,
+            manual_request_plan=manual_plan,
+            database_url=args.database_url,
+        )
         payload = _result_payload(
             mode="live_sdk",
             live_sdk=True,
             model=model_config.as_log_dict(),
-            output=typed_result.output,
+            output=result,
             input_text=input_text,
             manual_plan=manual_plan,
+            sdk_result=typed_result,
         )
+        if args.save:
+            payload["storage"] = StorageTool(args.database_url).save_agent_run(
+                agent_name="orchestrator",
+                input_payload={"input": input_text},
+                input_summary=input_text[:180],
+                output=result.model_dump(mode="json"),
+                model=str(model_config.model),
+                dry_run=False,
+                status="success",
+            )
         if args.json:
             print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
         else:
-            _print_human_result(typed_result.output)
+            _print_human_result(result)
         return 0
 
     if args.mode != RunMode.DRY_RUN.value:

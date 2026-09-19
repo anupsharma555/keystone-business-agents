@@ -7,6 +7,7 @@ from keystone_agents.workflow_runner import (
     _chief_workflow_requests_marked_airtable_test_lifecycle,
     _finalize_manager_loop_result,
     _inline_gmail_fixture_from_request,
+    _load_external_context,
     _manager_loop_request_is_planning_only,
     _manual_plan_requests_manager_continuation,
     _operator_requested_manager_continuation,
@@ -27,6 +28,7 @@ chief_workflow_requests_marked_airtable_test_lifecycle = (
 )
 finalize_manager_loop_result = _finalize_manager_loop_result
 inline_gmail_fixture_from_request = _inline_gmail_fixture_from_request
+load_workflow_external_context = _load_external_context
 manager_loop_request_is_planning_only = _manager_loop_request_is_planning_only
 manual_plan_requests_manager_continuation = (
     _manual_plan_requests_manager_continuation
@@ -44,6 +46,7 @@ __all__ = [
     "finalize_manager_loop_result",
     "finalize_prepared_work_item_step",
     "inline_gmail_fixture_from_request",
+    "load_workflow_external_context",
     "manager_loop_request_is_planning_only",
     "manual_plan_requests_manager_continuation",
     "normalize_workflow_request_for_graph",

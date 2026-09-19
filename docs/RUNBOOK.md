@@ -113,6 +113,25 @@ tool execution or token spend. SDK sessions, server-managed conversations, MCP s
 execution, and external trace processors should be introduced only behind explicit live flags,
 with dry-run fixtures and redaction reviewed first.
 
+## Model Request Budget And Recovery
+
+When `--max-openai-requests` or `KEYSTONE_MODEL_REQUEST_BUDGET_LIMIT` is set,
+Keystone enforces one hard request-local model ledger rather than relying only
+on an admission estimate. Parent turns, nested agent calls, reserved child
+processes, and sandbox SDK execution share or inherit the same correlation and
+remaining allowance. The next attempted model turn after the limit is rejected
+before provider dispatch.
+
+The pre-run estimate reports route-sensitive semantic `stage_rows`: the initial
+agent loop plus conditional required-tool correction and decision/validator
+repair rows where the active route supports them. These rows are a planning
+ceiling, not a billing forecast. Rate-limit transport retries and
+structured-output retries remain outside the semantic estimate; if either
+starts another model request, the hard ledger still admits/counts it and the
+attempt telemetry records it. At terminal status, inspect `request_budget` for
+`correlation_id`, `limit`, `consumed`, `remaining`, `exhausted`, and
+`exhaustion_stage`.
+
 ## Test And Health Check
 
 ```bash
@@ -295,8 +314,9 @@ Current architecture is Orchestrator-first and schema-light. For normal
 natural-language asks, Keystone captures the raw request and compact context,
 runs Orchestrator preflight, applies Python safety/source/approval gates, then
 calls the selected specialist with both the raw request and Orchestrator memo.
-The Orchestrator can also review the specialist output and feed back one repair
-or deepening pass when the manager loop permits it. Planning notes should stay
+The Orchestrator can also review specialist output and request bounded repair or
+deepening when the active call site and manager loop support it. Exact count and
+ordering are wrapper properties, not a registry-wide guarantee. Planning notes should stay
 in existing `ManualRequestPlan`, `OrchestratorResult`, WorkItem timeline events,
 `decision_trace`, audit notes, and context packs rather than new broad intent
 schemas.
@@ -1420,16 +1440,31 @@ history somewhere else with `--sdk-session-db`, or disable it with
 `--no-sdk-session`. Session ids are hashed before use; WorkItems and SQLite
 artifacts remain the canonical audit state.
 
-Use `--live-manual-plan` when you want the LLM planner to interpret a flexible
-manual request before execution. The planner and Orchestrator cooperate as the
-control plane: planner output is compact guidance for routing and constraints,
-while Orchestrator preflight reads the raw request and current context before
-specialists run. If the planner cannot run, Keystone falls back to local
-structured planning. The provider policy is controlled by
+The standalone LLM manual planner is disabled by default. Natural-language live
+entrypoints use Orchestrator interpretation and pass the original wording plus
+the validated internal decision into the selected agent path. The request has a
+bounded toolbox, but the call site determines whether evidence is model-called,
+workflow-called, or acquired before the model turn; inspect `tool_execution`
+rather than inferring execution from the registry. Deterministic preflight and
+Python gates remain authoritative for permissions, provider operations, exact
+record identity, approval state, and side effects.
+
+Where a model controls function tools, inspect `tool_call_budget` as well. It
+records request-local total and per-tool admissions across the initial turn and
+bounded repairs. Calls rejected at this boundary do not reach the provider.
+Research and Opportunity quality budgets are enforced here, RSS/Preprints use a
+single-history-read contract, and Gmail uses its distinct-candidate read ledger
+because cached repeats and rejected identities must not consume verified
+evidence slots.
+
+Use `--live-manual-plan` only for a deliberate comparison/evaluation run. Its
+output is advisory planning evidence and cannot broaden Python authority. If the
+optional planner cannot run, Keystone keeps the local structured plan. The
+planner experiment provider policy is controlled by
 `KEYSTONE_MANUAL_PLANNER_PROVIDER_POLICY`:
 
-- `openai` (default): use the dedicated OpenAI `gpt-5.4-mini` manual planner
-  profile for each new live natural-language ask.
+- `openai` (default within planner experiments): use the dedicated OpenAI
+  `gpt-5.4-mini` manual planner profile.
 - `target_with_openai_fallback`: try the target agent provider first, then
   the dedicated OpenAI planner.
 - `target`: use only the target agent provider.
@@ -1437,6 +1472,22 @@ structured planning. The provider policy is controlled by
 Use the target-provider policies only for controlled provider experiments.
 Target-agent provider overrides otherwise apply to specialist execution, not
 the planner.
+
+For a JSON result, review these fields before claiming a tool/provider action:
+
+- `decision_ownership`: model decision owner/stage, candidate coverage,
+  validator outcome, and bounded repair state;
+- `tool_execution`: attached tools, model-called tools, workflow-called
+  tools/helpers, pre-acquired context, provider attempts/successes, receipts,
+  and required-tool postcondition;
+- `side_effects.external_write_state`: `performed`, `not_performed`, or
+  `unknown`; missing receipt evidence must remain `unknown`;
+- `execution_telemetry`: correlated attempt and stage timing without raw prompt,
+  message, or provider-body content.
+
+A correction or retry may reuse verified read evidence and receipts. It must
+not repeat a completed mutation or turn a missing receipt into a successful
+write claim.
 
 With live SDK enabled, the CLI uses the supported script-backed execution paths
 for Business Research Analyst, Opportunity Scout, and Gmail Triage. Outreach

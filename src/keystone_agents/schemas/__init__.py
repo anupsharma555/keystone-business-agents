@@ -62,6 +62,18 @@ from keystone_agents.schemas.crm import (
     CRMWriteResult,
     CRMWriteStatus,
 )
+from keystone_agents.schemas.decision_ownership import (
+    AgentDecisionRecord as AgentDecisionRecord,
+)
+from keystone_agents.schemas.decision_ownership import (
+    DecisionCandidateAssessment as DecisionCandidateAssessment,
+)
+from keystone_agents.schemas.decision_ownership import (
+    DecisionTelemetryEvent as DecisionTelemetryEvent,
+)
+from keystone_agents.schemas.decision_ownership import (
+    DecisionValidatorOutcome as DecisionValidatorOutcome,
+)
 from keystone_agents.schemas.decision_trace import (
     DecisionTrace as DecisionTrace,
 )
@@ -73,11 +85,13 @@ from keystone_agents.schemas.email_triage import (
     EmailTriage,
     EmailTriageResult,
     GmailAttachmentMetadata,
+    GmailBodyEvidence,
     GmailContactLookupResult,
     GmailLinkRecord,
     GmailMessageEnvelope,
     GmailPriorityGroupedMessage,
     GmailPriorityGroupingResult,
+    GmailQuotationEvidence,
     GmailResolvedContact,
 )
 from keystone_agents.schemas.execution_request import (
@@ -303,11 +317,13 @@ __all__ = [
     "EmailTriage",
     "EmailTriageResult",
     "GmailAttachmentMetadata",
+    "GmailBodyEvidence",
     "GmailContactLookupResult",
     "GmailLinkRecord",
     "GmailMessageEnvelope",
     "GmailPriorityGroupedMessage",
     "GmailPriorityGroupingResult",
+    "GmailQuotationEvidence",
     "GmailResolvedContact",
     "ExecutionContinuation",
     "DirectAgentResponse",

@@ -1,6 +1,6 @@
 <!--
 prompt_name: airtable_context
-prompt_version: 2026-06-15.1
+prompt_version: 2026-09-17.1
 prompt_purpose: Provide Airtable schema, table, record, write execution, and write-plan context.
 prompt_safety_notes: Direct approved writes only when invoked as selected agent; no live writes from nested Chief calls.
 prompt_eval_datasets: tests/test_agent_registry.py, tests/test_chief_of_staff.py
@@ -23,6 +23,20 @@ Context or the approved Airtable action handler.
 
 - Start with schema when the base, table, field mapping, or record identity is
   uncertain.
+- Treat `airtable_get_base_schema` as a bounded discovery preview, not an
+  exhaustive schema. Preserve exact field/table IDs and names, validity,
+  computed/manual/unknown state, record-link versus inverse-field identity,
+  lookup/rollup lineage, nested result type/options, and each coverage object.
+  When a relevant field reports partial description, formula, choices,
+  references, table coverage, or field coverage, call
+  `airtable_read_schema_detail` with the exact continuation or stable IDs and
+  expected source snapshot before deciding. Continue bounded pages only as far
+  as the request requires; stop on `source_changed`, repeated/no-progress
+  continuation, ambiguous identity, or unsupported content.
+- Exact provider names, choice strings, and formulas are semantic source data.
+  Do not normalize their case, whitespace, punctuation, Unicode characters, or
+  quoted literals. A compact preview is never proof that later schema content
+  is absent.
 - For explicit finance tracker expense receipt asks, infer the target from the
   natural-language business object before asking for clarification: Airtable
   `business expenses` maps to `base_alias="finance_tax_tracker"` and table
@@ -53,6 +67,12 @@ Context or the approved Airtable action handler.
   category/type, amount, date, and status, and `note` for short ambiguity or
   caveat context. Do not include irrelevant fields, secrets, raw attachments, or
   broad dumps.
+- Preserve record IDs and raw provider value types, including zero, false,
+  blank strings, empty lists, nested objects, numbers, and link-ID lists. Honor
+  provider offsets and continuation metadata. Do not call a preview complete
+  when `has_more=true`, and do not count duplicate/repeated record IDs as new
+  evidence. Surface stalled cursors, conflicting repeated identities, and the
+  lack of cross-page snapshot isolation as limitations.
 - Explain why the recommended table or record is the safest match.
 - Separate facts from inferred mapping assumptions.
 - Include blockers when the target table, target record, field mapping, or
@@ -77,6 +97,9 @@ Context or the approved Airtable action handler.
   single selects to one configured option, multiple selects to configured
   option lists, and text/rich-text fields to strings. Formula, lookup, and
   rollup fields are read-only and must not be written.
+- Unknown field types or partial schema are not evidence of writability. Do not
+  authorize a field or select value that is absent from the bounded exact
+  schema already read; retrieve the relevant detail or return a blocker.
 - Choose the attachment tool by input type, not by the generic word
   "attachment":
   - an actual readable local filesystem PDF/image path ->
@@ -161,3 +184,13 @@ context:
   private logs.
 - If the requested write is unsafe or underspecified, return blockers and a
   safer next action instead of a write plan.
+
+## Agent-owned decision record
+
+Return `decision` with `decision_stage=airtable_record_selection`. After using
+the schema and record tools, assess every bounded candidate record ID, select
+the exact ID used by `recommended_record_identity`, mark alternatives
+`excluded`, and explain the table, field, and record mapping. If the provider
+evidence is ambiguous, set `needs_more_context=true` and select nothing. Python
+validates schema, identity, approval, write scope, and read-back; it must not
+silently choose a record or field mapping.

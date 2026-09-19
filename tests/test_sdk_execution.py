@@ -5,6 +5,7 @@ import hashlib
 import json
 import sys
 from collections.abc import AsyncIterator
+from itertools import count
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -15,7 +16,9 @@ import keystone_agents.agents.business_research_analyst as business_research_mod
 import keystone_agents.agents.gmail_triage as gmail_triage_module
 import keystone_agents.agents.opportunity_scout as opportunity_scout_module
 import keystone_agents.agents.outreach_composer as outreach_composer_module
+import keystone_agents.tools.gmail_query_tools as gmail_query_tools
 import keystone_agents.tools.internal_data_tools as internal_data_tools
+import keystone_agents.tools.website_extraction_tool as website_extraction_tool
 from keystone_agents.agents.airtable_context import build_airtable_context_agent
 
 try:
@@ -35,6 +38,9 @@ try:
 except ImportError:
     pytestmark = pytest.mark.skip(reason="OpenAI Agents SDK fake-model hooks unavailable.")
 
+from keystone_agents.agent_decision_contracts import (
+    opportunity_scout_synthesis_decision_contract,
+)
 from keystone_agents.agents.business_research_analyst import (
     build_business_research_analyst_agent,
     focused_brief_input_from_profile,
@@ -87,6 +93,7 @@ from keystone_agents.agents.zotero_context import build_zotero_context_agent
 from keystone_agents.company_research import research_company_fixture
 from keystone_agents.costing import AgentRunBudgetExceededError
 from keystone_agents.evals import score_output_against_expected
+from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.model_provider import (
     GEMINI_PROVIDER,
     MissingOpenAIAPIKeyError,
@@ -115,7 +122,11 @@ from keystone_agents.schemas.chief_of_staff import (
     ChiefSlackCommandResolution,
     ChiefSpecialistToolInput,
 )
-from keystone_agents.schemas.company_profile import CompanyProfile, CompanyResearchFocusedBrief
+from keystone_agents.schemas.company_profile import (
+    CompanyProfile,
+    CompanyResearchFocusedBrief,
+    SourceRecord,
+)
 from keystone_agents.schemas.email_triage import (
     EmailTriageResult,
     GmailCandidateRankingResult,
@@ -135,8 +146,20 @@ from keystone_agents.schemas.opportunity import (
 )
 from keystone_agents.schemas.orchestrator import OrchestratorOutputReview, OrchestratorResult
 from keystone_agents.schemas.outreach import OutreachDraft
-from keystone_agents.sdk import Runner, build_local_run_config, build_sqlite_session
+from keystone_agents.sdk import (
+    Runner,
+    build_local_run_config,
+    build_model_settings,
+    build_sdk_agent,
+    build_sqlite_session,
+    function_tool,
+)
+from keystone_agents.source_enrichment import SourceBundle
 from keystone_agents.storage.sqlite_store import SQLiteStore
+from keystone_agents.tools.website_extraction_tool import (
+    SelectedUrlExtractionDiagnostic,
+    SelectedUrlSourceBundleResult,
+)
 from promptfoo.eval_database import list_eval_trace_events
 
 RUNTIME_MODEL_ENV_VARS = (
@@ -395,6 +418,21 @@ def _company_profile_payload(**overrides: Any) -> dict[str, Any]:
         ],
         "risks": [],
         "missing_information": ["LinkedIn or profile URL not supplied."],
+        "decision": {
+            "decision_owner": "specialist_agent",
+            "decision_stage": "research_source_selection",
+            "selected_candidate_ids": ["fixture:curebase"],
+            "candidate_assessments": [
+                {
+                    "candidate_id": "fixture:curebase",
+                    "disposition": "selected",
+                    "rationale": "It is the bounded source supporting the returned profile.",
+                }
+            ],
+            "reasoning": "Selected the only bounded source supporting the returned claims.",
+            "limitations": ["Fixture evidence only."],
+            "needs_more_context": False,
+        },
     }
     payload.update(overrides)
     return payload
@@ -434,6 +472,21 @@ def _company_focused_brief_payload(**overrides: Any) -> dict[str, Any]:
         ],
         "raw_source_content_included": False,
         "send_enabled": False,
+        "decision": {
+            "decision_owner": "specialist_agent",
+            "decision_stage": "research_source_selection",
+            "selected_candidate_ids": ["fixture:curebase_company"],
+            "candidate_assessments": [
+                {
+                    "candidate_id": "fixture:curebase_company",
+                    "disposition": "selected",
+                    "rationale": "It supports the focused brief facts.",
+                }
+            ],
+            "reasoning": "Selected the supplied source used by the focused brief.",
+            "limitations": ["Fixture evidence only."],
+            "needs_more_context": False,
+        },
     }
     payload.update(overrides)
     return payload
@@ -453,9 +506,7 @@ def _research_brief_payload(**overrides: Any) -> dict[str, Any]:
                 "confidence": 0.82,
             }
         ],
-        "inferences": [
-            "Potential advisory relevance should be validated against current sources."
-        ],
+        "inferences": ["Potential advisory relevance should be validated against current sources."],
         "unknowns": ["Leadership and current traction need source review."],
         "limitations": ["Fixture data only."],
         "next_steps": ["Have Chief decide whether to request live research."],
@@ -470,6 +521,21 @@ def _research_brief_payload(**overrides: Any) -> dict[str, Any]:
         ],
         "raw_source_content_included": False,
         "send_enabled": False,
+        "decision": {
+            "decision_owner": "specialist_agent",
+            "decision_stage": "research_source_selection",
+            "selected_candidate_ids": ["fixture:curebase"],
+            "candidate_assessments": [
+                {
+                    "candidate_id": "fixture:curebase",
+                    "disposition": "selected",
+                    "rationale": "It supports the research brief facts.",
+                }
+            ],
+            "reasoning": "Selected the supplied source used in the brief.",
+            "limitations": ["Fixture evidence only."],
+            "needs_more_context": False,
+        },
     }
     payload.update(overrides)
     return payload
@@ -483,7 +549,7 @@ def _opportunity_scout_payload(**overrides: Any) -> dict[str, Any]:
             {
                 "company_name": "NeuroFlow",
                 "opportunity_type": "behavioral health AI",
-                "priority_score": 76,
+                "priority_score": 77,
                 "why_now_signal": (
                     "Payer partnership and outcomes evidence for behavioral health measurement."
                 ),
@@ -508,14 +574,38 @@ def _opportunity_scout_payload(**overrides: Any) -> dict[str, Any]:
                     "Signal intersects Keystone focus areas in clinical AI, neuroscience, "
                     "behavioral health, evidence generation, or clinical research operations."
                 ),
-                "outside_consulting_likelihood": 77,
+                "outside_consulting_likelihood": 88,
                 "handoff_to_business_research_analyst": True,
+                "handoff_reason": (
+                    "Buyer and implementation context require source-backed validation."
+                ),
+                "business_research_analyst_handoff_recommendation": (
+                    "Validate buyer context and current implementation evidence."
+                ),
+                "research_needed": [
+                    "Confirm the buyer and implementation scope from primary sources."
+                ],
                 "outreach_draft": None,
                 "approval_required_before_outreach": True,
             }
         ],
         "audit_notes": ["Fixture mode only; no live APIs were called."],
         "outreach_generated": False,
+        "decision": {
+            "decision_owner": "specialist_agent",
+            "decision_stage": "opportunity_candidate_selection",
+            "selected_candidate_ids": ["fixture:neuroflow-payer-partnership"],
+            "candidate_assessments": [
+                {
+                    "candidate_id": "fixture:neuroflow-payer-partnership",
+                    "disposition": "selected",
+                    "rationale": "It is the retained source-backed opportunity record.",
+                }
+            ],
+            "reasoning": "Selected the only retained opportunity candidate.",
+            "limitations": ["Fixture evidence only."],
+            "needs_more_context": False,
+        },
     }
     payload.update(overrides)
     return payload
@@ -563,8 +653,62 @@ def _outreach_draft_payload(**overrides: Any) -> dict[str, Any]:
         "approval_required": True,
         "approval_state": "pending",
         "approval_scope": "send",
+        "decision": {
+            "decision_owner": "specialist_agent",
+            "decision_stage": "outreach_evidence_selection",
+            "selected_candidate_ids": ["fixture:curebase", "fixture:lead"],
+            "candidate_assessments": [
+                {
+                    "candidate_id": "fixture:curebase",
+                    "disposition": "selected",
+                    "rationale": "It supports company identity.",
+                },
+                {
+                    "candidate_id": "fixture:lead",
+                    "disposition": "selected",
+                    "rationale": "It supports the outreach opportunity signal.",
+                },
+            ],
+            "reasoning": "Selected the approved claims used in the draft.",
+            "limitations": ["Draft remains pending approval."],
+            "needs_more_context": False,
+        },
     }
     payload.update(overrides)
+    if "decision" not in overrides:
+        selected_source_ids = list(
+            dict.fromkeys(
+                [
+                    str(item.get("source_id") or "").strip()
+                    for item in payload.get("facts_used", [])
+                    if isinstance(item, dict)
+                ]
+                + [
+                    str(item or "").strip()
+                    for item in payload.get("source_ids_used", [])
+                ]
+                + [
+                    str(item or "").strip()
+                    for item in payload.get("example_ids_used", [])
+                ]
+            )
+        )
+        payload["decision"] = {
+            "decision_owner": "specialist_agent",
+            "decision_stage": "outreach_evidence_selection",
+            "selected_candidate_ids": selected_source_ids,
+            "candidate_assessments": [
+                {
+                    "candidate_id": source_id,
+                    "disposition": "selected",
+                    "rationale": "It supports an approved claim used in the draft.",
+                }
+                for source_id in selected_source_ids
+            ],
+            "reasoning": "Selected the approved claims used in the draft.",
+            "limitations": ["Draft remains pending approval."],
+            "needs_more_context": False,
+        }
     return payload
 
 
@@ -584,6 +728,26 @@ def _orchestrator_payload(**overrides: Any) -> dict[str, Any]:
         "send_enabled": False,
         "can_send_email": False,
         "audit_notes": ["Fake model route."],
+        "decision": {
+            "decision_owner": "orchestrator",
+            "decision_stage": "orchestrator_route_selection",
+            "selected_candidate_id": "business_research_analyst",
+            "candidate_assessments": [
+                {
+                    "candidate_id": "business_research_analyst",
+                    "disposition": "selected",
+                    "rationale": "The request requires source-backed company research.",
+                },
+                {
+                    "candidate_id": "opportunity_scout",
+                    "disposition": "excluded",
+                    "rationale": "The request does not ask for opportunity discovery.",
+                },
+            ],
+            "reasoning": "Business Research is the bounded owner for this request.",
+            "limitations": ["Human review remains required."],
+            "needs_more_context": False,
+        },
     }
     payload.update(overrides)
     return payload
@@ -621,6 +785,26 @@ def _chief_of_staff_payload(**overrides: Any) -> dict[str, Any]:
         "write_requests": [],
         "artifact_refs": [],
         "audit_notes": ["Fake model CoS result."],
+        "decision": {
+            "decision_owner": "chief_of_staff",
+            "decision_stage": "chief_delegation_selection",
+            "selected_candidate_id": "workflow:slack-runtime-review",
+            "candidate_assessments": [
+                {
+                    "candidate_id": "workflow:slack-runtime-review",
+                    "disposition": "selected",
+                    "rationale": "The operator requested a bounded runtime review.",
+                },
+                {
+                    "candidate_id": "workflow:clarification",
+                    "disposition": "excluded",
+                    "rationale": "The review target is sufficiently clear.",
+                },
+            ],
+            "reasoning": "A read-only Slack runtime review best matches the request.",
+            "limitations": ["No Slack post or provider mutation is authorized."],
+            "needs_more_context": False,
+        },
     }
     payload.update(overrides)
     return payload
@@ -915,11 +1099,7 @@ def test_chief_specialist_agent_tools_invoke_nested_agents_with_fake_model(
 ) -> None:
     model = FakeModel(outputs=[[_structured_message(payload)]])
     agent = build_chief_of_staff_agent(include_specialist_tools=True)
-    tool = next(
-        item
-        for item in agent.tools
-        if getattr(item, "name", "") == tool_name
-    )
+    tool = next(item for item in agent.tools if getattr(item, "name", "") == tool_name)
     tool_input = ChiefSpecialistToolInput(
         raw_operator_request=(
             f"@KNI chief of staff use {route_name} for this #evals tracker question"
@@ -970,6 +1150,22 @@ def test_chief_specialist_agent_tools_invoke_nested_agents_with_fake_model(
 
     assert envelope["route_name"] == route_name
     assert envelope["tool_name"] == tool_name
+    validated_context_route = route_name in {
+        "gmail_triage",
+        "airtable_context_agent",
+        "google_workspace_context_agent",
+        "zotero_context_agent",
+    }
+    if validated_context_route:
+        assert envelope["parsed_output_status"] == "missing"
+        assert envelope["validation_status"] == "blocked"
+        assert envelope["summary"].startswith(
+            "Nested specialist execution was blocked"
+        )
+        records = getattr(tool, "nested_execution_records", {})
+        assert records["call_airtable_context_test"]["execution_state"] == "blocked"
+        assert model.calls
+        return
     assert envelope["parsed_output_status"] == "parsed"
     assert envelope["summary"]
     assert envelope["validation_status"] == expected_validation
@@ -996,11 +1192,219 @@ def test_chief_specialist_agent_tools_invoke_nested_agents_with_fake_model(
     assert "no_nested_live_write" in nested_prompt
 
 
-def _tool_call(name: str, arguments: dict[str, Any]) -> ResponseFunctionToolCall:
+def test_chief_selected_page_ask_calls_nested_research_extraction_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected_url = "https://mantrahealth.com/"
+    request = (
+        "Chief, have the business research analyst read only Mantra Health's public "
+        "homepage and assess whether it supports a pilot-readiness claim for a college "
+        "mental-health measurement partner, then give me the safest next step. Show "
+        "the source URL, don't search beyond that page, and don't approve or change "
+        f"anything: {selected_url}"
+    )
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+    captured: dict[str, Any] = {}
+
+    def fake_selected_url_bundle(**kwargs: Any) -> SelectedUrlSourceBundleResult:
+        captured.update(kwargs)
+        source = SourceRecord(
+            source_id="selected-url:mantra-health",
+            title="Mantra Health",
+            url=selected_url,
+            source_type="website",
+            supported_claims=[
+                "Mantra Health describes mental-health services for higher-education communities.",
+                "The page describes measurement-informed care support for college students.",
+            ],
+            evidence_excerpt=(
+                "Mantra Health describes mental-health services for higher-education "
+                "communities and measurement-informed care support."
+            ),
+            confidence=0.9,
+        )
+        return SelectedUrlSourceBundleResult(
+            mode="dry_run",
+            company_name="Mantra Health",
+            selected_url_count=1,
+            extracted_source_count=1,
+            source_bundle=SourceBundle(
+                company_name="Mantra Health",
+                company_url=selected_url,
+                sources=[source],
+                claim_candidates=source.supported_claims,
+            ),
+            diagnostics=[
+                SelectedUrlExtractionDiagnostic(
+                    source_id=source.source_id,
+                    selected_url=selected_url,
+                    resolved_url=selected_url,
+                    provider="mock-trafilatura",
+                    status="success",
+                    extraction_strategy="provider_mock",
+                    included_in_bundle=True,
+                    text_length=len(source.evidence_excerpt),
+                    claim_count=2,
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        website_extraction_tool,
+        "build_selected_url_source_bundle",
+        fake_selected_url_bundle,
+    )
+    specialist_input = ChiefSpecialistToolInput(
+        raw_operator_request="Use a rewritten broad research ask.",
+        specialist_task=(
+            "Read the exact selected page and assess only what it supports about "
+            "pilot readiness."
+        ),
+        decision_context={
+            "desired_deliverable": "cautious pilot-readiness assessment",
+            "success_criteria": "source URL and safest next step remain visible",
+        },
+        target_context={"company": "Mantra Health", "selected_url": selected_url},
+        provider_call_context={
+            "operation": "read selected public URL",
+            "source_scope": "exactly one page",
+            "selected_url": selected_url,
+        },
+        side_effect_boundaries=[
+            "nested_specialist_advisory_only",
+            "no_send",
+            "no_publish",
+            "no_nested_live_write",
+            "no_broad_search",
+        ],
+    ).model_dump(mode="json")
+    research_payload = _research_brief_payload(
+        target_name="Mantra Health",
+        research_goal="Assess a bounded pilot-readiness claim from one selected page.",
+        summary=(
+            "The selected page supports higher-education and measurement-informed care "
+            "context, but does not by itself prove pilot readiness."
+        ),
+        key_findings=[
+            "The page describes mental-health services for higher-education communities.",
+            "The page describes measurement-informed care support.",
+        ],
+        facts=[
+            {
+                "text": (
+                    "Mantra Health describes mental-health services for higher-education "
+                    "communities."
+                ),
+                "source_ids": ["selected-url:mantra-health"],
+                "confidence": 0.9,
+            }
+        ],
+        inferences=[
+            "A measurement partnership may be relevant, but pilot readiness needs validation."
+        ],
+        unknowns=["No validated pilot terms or implementation readiness were established."],
+        limitations=["Assessment is bounded to one selected public page."],
+        next_steps=["Verify a concrete pilot objective and evidence requirement before approval."],
+        source_ids_used=["selected-url:mantra-health"],
+        sources=[
+            {
+                "source_id": "selected-url:mantra-health",
+                "title": "Mantra Health",
+                "url": selected_url,
+                "source_type": "website",
+            }
+        ],
+    )
+    chief_payload = _chief_of_staff_payload(
+        summary=(
+            "Mantra's selected page supports cautious higher-education measurement "
+            "relevance, not a verified pilot-readiness claim."
+        ),
+        recommended_actions=[
+            "Validate a specific pilot objective and evidence threshold before approval."
+        ],
+        sources=[
+            {
+                "title": "Mantra Health",
+                "url": selected_url,
+                "source_type": "website",
+                "note": "Exact selected page only.",
+            }
+        ],
+        context_sources_considered=["business_research_analyst nested result"],
+        blocked_side_effects=["broad_search", "approval", "provider_write"],
+    )
+    model = FakeModel(
+        outputs=[
+            [
+                _tool_call(
+                    "business_research_analyst_as_specialist_tool",
+                    specialist_input,
+                )
+            ],
+            [
+                _tool_call(
+                    "extract_selected_urls_to_source_bundle",
+                    {
+                        "company_name": "Mantra Health",
+                        "selected_urls": [selected_url],
+                        "company_url": selected_url,
+                        "live_extraction": False,
+                    },
+                )
+            ],
+            [_structured_message(research_payload)],
+            [_structured_message(chief_payload)],
+        ]
+    )
+    agent = build_chief_of_staff_agent(
+        request_text=request,
+        manual_request_plan=plan,
+        include_specialist_tools=True,
+    )
+
+    result = _run_with_fake_model(agent, model, request)
+
+    assert isinstance(result.final_output, ChiefOfStaffResult)
+    assert len(model.calls) == 4
+    assert model.calls[0]["tool_names"] == [
+        "inspect_active_work_items",
+        "business_research_analyst_as_specialist_tool",
+    ]
+    assert model.calls[1]["tool_names"] == [
+        "extract_selected_urls_to_source_bundle", "read_web_source_window"
+    ]
+    assert "selected-url:mantra-health" in _model_input_text(model.calls[2]["input"])
+    assert selected_url in _model_input_text(model.calls[3]["input"])
+    assert request in _model_input_text(model.calls[1]["input"])
+    assert "Use a rewritten broad research ask." not in _model_input_text(
+        model.calls[1]["input"]
+    )
+    assert captured["selected_urls"] == [selected_url]
+    assert captured["live_extraction"] is False
+    outputs = [item for item in result.new_items if item.type == "tool_call_output_item"]
+    assert len(outputs) == 1
+    envelope = json.loads(str(outputs[0].output))
+    assert envelope["route_name"] == "business_research_analyst"
+    assert envelope["validation_status"] == "ok"
+    assert envelope["source_refs"][0]["url"] == selected_url
+    assert result.final_output.send_enabled is False
+    assert result.final_output.slack_post_allowed is False
+
+
+_FAKE_TOOL_CALL_IDS = count(1)
+
+
+def _tool_call(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    call_id: str | None = None,
+) -> ResponseFunctionToolCall:
     return ResponseFunctionToolCall(
         type="function_call",
         name=name,
-        call_id="fake-tool-call-1",
+        call_id=call_id or f"fake-tool-call-{next(_FAKE_TOOL_CALL_IDS)}",
         arguments=json.dumps(arguments),
         status="completed",
     )
@@ -1033,6 +1437,7 @@ class FakeModel(Model):
                 "system_instructions": system_instructions,
                 "input": input,
                 "tool_names": [tool.name for tool in tools],
+                "tool_choice": getattr(model_settings, "tool_choice", None),
                 "output_schema": output_schema,
             }
         )
@@ -1194,6 +1599,80 @@ def test_run_typed_sdk_agent_retries_live_structured_output_once_without_session
     assert result.request_cache["structured_output_retry_session_reset"] is True
 
 
+def test_structured_retry_clears_forced_choice_for_completed_read_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_calls = 0
+    monkeypatch.setattr(
+        "keystone_agents.run._sdk_structured_output_max_retries",
+        lambda **_kwargs: 1,
+    )
+
+    @function_tool
+    def read_google_calendar_window(query: str) -> str:
+        """Read a bounded synthetic calendar window."""
+
+        nonlocal read_calls
+        read_calls += 1
+        return json.dumps(
+            {
+                "status": "success",
+                "operation": "read_google_calendar_window",
+                "query": query,
+                "verification": {"passed": True},
+            }
+        )
+
+    agent = build_sdk_agent(
+        name="calendar_action_interpreter",
+        instructions="Use the bounded read once, then return the typed result.",
+        output_type=ChiefOfStaffResult,
+        tools=[read_google_calendar_window],
+        model="gpt-test",
+        model_settings=build_model_settings(
+            tool_choice="read_google_calendar_window"
+        ),
+        enforce_tool_policy=False,
+    )
+    model = FakeModel(
+        outputs=[
+            [
+                _tool_call(
+                    "read_google_calendar_window",
+                    {"query": "tomorrow"},
+                    call_id="calendar-read-1",
+                )
+            ],
+            [_message_output("not valid structured JSON")],
+            [
+                _structured_message(
+                    _chief_of_staff_payload(
+                        summary="Recovered from the already-read calendar evidence."
+                    )
+                )
+            ],
+        ]
+    )
+
+    result = run_typed_sdk_agent(
+        agent=agent,
+        typed_input={"request": "List tomorrow's interview."},
+        output_type=ChiefOfStaffResult,
+        run_config=build_local_run_config(FakeProvider(model)),
+        max_turns=3,
+    )
+
+    assert read_calls == 1
+    assert model.calls[-1]["tool_names"] == []
+    assert model.calls[-1]["tool_choice"] is None
+    assert result.output.summary == (
+        "Recovered from the already-read calendar evidence."
+    )
+    assert result.request_cache["retry_tool_choice_adjustments"][0][
+        "prior_choice"
+    ] == "read_google_calendar_window"
+
+
 def test_run_typed_sdk_agent_attaches_failed_attempt_count_when_usage_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1220,9 +1699,9 @@ def test_run_typed_sdk_agent_attaches_failed_attempt_count_when_usage_is_unavail
 
     failure = sdk_run_failure_metadata(raised.value)
     assert failure["attempt_count"] == 1
-    assert failure["usage"]["requests"] == 1
+    assert failure["usage"]["requests"] is None
     assert failure["usage"]["model_attempts_started"] == 1
-    assert failure["usage"]["provider_request_count_confirmed"] is True
+    assert failure["usage"]["provider_request_count_confirmed"] is False
     assert failure["usage"]["available"] is False
     assert failure["cost"]["available"] is False
     assert failure["execution_telemetry"]["status"] == "failed"
@@ -1297,7 +1776,7 @@ def test_run_typed_sdk_agent_does_not_count_pre_provider_import_failure_as_reque
 
     failure = sdk_run_failure_metadata(raised.value)
     assert failure["attempt_count"] == 1
-    assert failure["usage"]["requests"] == 0
+    assert failure["usage"]["requests"] is None
     assert failure["usage"]["model_attempts_started"] == 1
     assert failure["usage"]["provider_request_count_confirmed"] is False
     assert failure["missing_module"] == "missing_dependency"
@@ -1390,6 +1869,95 @@ def test_run_typed_sdk_agent_preserves_write_receipt_across_structured_retry(
     assert tool.is_enabled is True
 
 
+def test_run_typed_sdk_agent_preserves_read_receipt_on_terminal_structured_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from keystone_agents.receipts.journal import tool_payload_fingerprint
+
+    class ModelBehaviorError(Exception):
+        pass
+
+    async def invoke_read(_context: Any, _tool_input: str) -> str:
+        return json.dumps(
+            {
+                "status": "success",
+                "operation": "read_calendar_window",
+                "item_count": 2,
+                "verification": {"passed": True},
+            }
+        )
+
+    tool = SimpleNamespace(
+        name="read_google_calendar_window",
+        on_invoke_tool=invoke_read,
+        is_enabled=True,
+    )
+
+    class FakeAgent:
+        name = "chief_of_staff"
+        model = "gpt-test"
+        tools = [tool]
+
+    def fake_run_typed_sdk_sync(
+        agent: Any,
+        _prompt: Any,
+        _output_type: Any,
+        **_kwargs: Any,
+    ) -> tuple[dict[str, Any], ChiefOfStaffResult]:
+        asyncio.run(agent.tools[0].on_invoke_tool(None, "{}"))
+        raise ModelBehaviorError("structured output did not match the schema")
+
+    monkeypatch.setattr("keystone_agents.run.run_typed_sdk_sync", fake_run_typed_sdk_sync)
+    monkeypatch.setattr(
+        "keystone_agents.run._sdk_structured_output_max_retries",
+        lambda **_kwargs: 0,
+    )
+
+    with pytest.raises(ModelBehaviorError) as exc_info:
+        run_typed_sdk_agent(
+            agent=FakeAgent(),
+            typed_input={"request": "List the two interviews tomorrow."},
+            output_type=ChiefOfStaffResult,
+            live=True,
+            config=ModelConfig(provider="openai", model="gpt-test", api_key="test-key"),
+        )
+
+    failure = sdk_run_failure_metadata(exc_info.value)
+    assert failure["failure_kind"] == "structured_output_invalid"
+    assert failure["tool_receipts"] == [
+        {
+            "item_count": 2,
+            "operation": "read_calendar_window",
+            "status": "success",
+            "tool_name": "read_google_calendar_window",
+            "verification": {"passed": True},
+        }
+    ]
+    assert failure["request_cache"]["request_tool_scope"]["selected_tool_names"] == [
+        "read_google_calendar_window"
+    ]
+    assert failure["tool_invocations"] == [
+        {
+            "tool_name": "read_google_calendar_window",
+            "invocation_index": 1,
+            "status": "started",
+            "arguments_sha256": tool_payload_fingerprint({}),
+        },
+        {
+            "tool_name": "read_google_calendar_window",
+            "invocation_index": 1,
+            "status": "completed",
+            "output_sha256": tool_payload_fingerprint({
+                "item_count": 2, "operation": "read_calendar_window", "status": "success",
+                "verification": {"passed": True},
+            }),
+        },
+    ]
+    assert failure["tool_execution"]["mode"] == "llm_selected_function_tools_failed"
+    assert failure["tool_execution"]["model_tool_call_count"] == 1
+    assert failure["tool_execution"]["provider_receipt_count"] == 1
+
+
 def test_run_typed_sdk_agent_preserves_explicit_local_pdf_and_image_inputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1424,7 +1992,7 @@ def test_run_typed_sdk_agent_preserves_explicit_local_pdf_and_image_inputs(
 
     result = run_typed_sdk_agent(
         agent=FakeAgent(),
-        typed_input={"request": f"read {pdf_path} and {image_path}"},
+        typed_input={"raw_request": f"read {pdf_path} and {image_path}"},
         output_type=ChiefOfStaffResult,
         live=True,
         config=ModelConfig(provider="openai", model="gpt-test", api_key="test-key"),
@@ -1562,10 +2130,7 @@ def test_run_typed_sdk_agent_records_sdk_run_summary_trace(
             "Opportunity Scout Agent",
             {
                 "search_web",
-                "search_opportunity_sources_placeholder",
                 "score_opportunity",
-                "handoff_to_business_research_analyst_placeholder",
-                "save_opportunity_placeholder",
             },
         ),
         (
@@ -1708,6 +2273,102 @@ def test_typed_specialist_runtime_harness_uses_fake_model_without_openai_key(
     assert model.calls
 
 
+def test_typed_sdk_runner_can_explicitly_disable_environment_session_inheritance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_session_calls: list[bool] = []
+
+    def build_env_session() -> object:
+        env_session_calls.append(True)
+        return object()
+
+    monkeypatch.setattr(
+        "keystone_agents.run.build_sdk_session_from_env",
+        build_env_session,
+    )
+    model = FakeModel(outputs=[[_structured_message(_chief_of_staff_payload())]])
+
+    result = run_typed_sdk_agent(
+        agent=build_chief_of_staff_agent(include_specialist_tools=False),
+        typed_input={"request": "Summarize this supplied internal status."},
+        output_type=ChiefOfStaffResult,
+        run_config=build_local_run_config(FakeProvider(model)),
+        inherit_env_session=False,
+    )
+
+    assert env_session_calls == []
+    assert result.request_cache["session_attached"] is False
+    assert result.request_cache["session_source"] == ""
+
+
+def test_supplied_live_run_config_keeps_live_sdk_execution_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    agent = build_chief_of_staff_agent(include_specialist_tools=False)
+    private_id = "nested-private-provider-id"
+
+    monkeypatch.setattr(
+        "keystone_agents.run.run_typed_sdk_sync",
+        lambda *_args, **_kwargs: (
+            {
+                "new_items": [
+                    {
+                        "type": "tool_call_output_item",
+                        "custom_data": {
+                            "keystone_nested_specialist_execution": {
+                                "route_name": "airtable_context_agent",
+                                "tool_name": "airtable_context_agent_as_specialist_tool",
+                                "tool_call_id": "nested-private-call",
+                                "execution_state": "executed_nested_specialist",
+                                "candidate_universe": [private_id],
+                                "decision_ownership": {
+                                    "decision_owner": "specialist_agent",
+                                    "decision_stage": "airtable_record_selection",
+                                    "attempts": [
+                                        {
+                                            "attempt": 1,
+                                            "candidate_ids": [private_id],
+                                            "selected_candidate_ids": [private_id],
+                                            "validator_outcome": {
+                                                "status": "accepted"
+                                            },
+                                        }
+                                    ],
+                                },
+                            }
+                        },
+                    }
+                ]
+            },
+            ChiefOfStaffResult(mode="llm", summary="Verified live parent run."),
+        ),
+    )
+    monkeypatch.setattr(
+        "keystone_agents.run.enforce_agent_run_budget",
+        lambda **_kwargs: {"status": "ok", "exceeded": False},
+    )
+    monkeypatch.setattr(
+        "keystone_agents.trace_processor.record_sdk_run_summary_trace_event",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    result = run_typed_sdk_agent(
+        agent=agent,
+        typed_input={"request": "Inspect the live provider context."},
+        output_type=ChiefOfStaffResult,
+        run_config=SimpleNamespace(model="gpt-test"),
+        live=True,
+    )
+
+    assert result.live is True
+    assert captured["run_mode"] == "live_sdk"
+    assert captured["live"] is True
+    nested = result.request_cache["nested_specialist_executions"][0]
+    assert nested["origin"] == "sdk_tool_call_output_custom_data"
+    assert private_id not in json.dumps(result.request_cache)
+
+
 def test_direct_specialist_sdk_wrappers_pass_resolved_max_turns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1749,6 +2410,8 @@ def test_direct_specialist_sdk_wrappers_pass_resolved_max_turns(
 
     assert research["max_turns"] == 4
     assert scout["max_turns"] == 4
+    assert scout["tool_correction_max_turns"] == 2
+    assert scout["decision_repair_max_turns"] == 1
     assert gmail["max_turns"] == 4
     assert outreach["max_turns"] == 4
 
@@ -1831,7 +2494,7 @@ def test_direct_research_wrappers_use_canonical_plan_for_turns_and_tools(
 
     assert captured_research["max_turns"] == 4
     assert captured_scout["max_turns"] == 4
-    assert "search_web" not in {
+    assert "search_web" in {
         str(getattr(tool, "name", "")) for tool in captured_research["agent"].tools
     }
     assert "search_web" not in {
@@ -1921,14 +2584,74 @@ def test_business_research_sdk_input_includes_runtime_source_layer_policy(
     assert "vs_private_reference" not in prompt
 
 
-def test_research_sdk_wrappers_infer_deep_retrieval_without_write_tools(
+def test_research_sdk_wrappers_use_canonical_deep_retrieval_without_write_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-    research_model = FakeModel(outputs=[[_structured_message(_company_profile_payload())]])
-    scout_model = FakeModel(outputs=[[_structured_message(_opportunity_scout_payload())]])
+    research_model = FakeModel(
+        outputs=[
+            [
+                _tool_call(
+                    "search_web",
+                    {"query": "OpenAI clinical AI evidence 2026", "num_results": 4},
+                    call_id="research-deep-search",
+                )
+            ],
+            [_structured_message(_company_profile_payload())],
+        ]
+    )
+    scout_model = FakeModel(
+        outputs=[
+            [
+                _tool_call(
+                    "search_web",
+                    {
+                        "query": "behavioral health AI pilot RFP grant opportunities 2026",
+                        "num_results": 4,
+                    },
+                    call_id="scout-deep-search",
+                )
+            ],
+            [
+                _tool_call(
+                    "score_opportunity",
+                    {
+                        "company_name": "NeuroFlow",
+                        "opportunity_type": "behavioral health AI",
+                        "signals": ["payer partnership", "outcomes evidence"],
+                    },
+                    call_id="scout-score",
+                )
+            ],
+            [_structured_message(_opportunity_scout_payload())],
+        ]
+    )
+    research_plan = ManualRequestPlan(
+        source="canonical:test",
+        target_agent="business_research_analyst",
+        intent="company_research",
+        task_objective="entity_research",
+        expected_artifact_type="research_brief",
+        requires_live_search=True,
+        ask_shape=AskShapePolicy(
+            evidence_depth="deep",
+            permission_state="read_only",
+        ),
+    )
+    scout_plan = ManualRequestPlan(
+        source="canonical:test",
+        target_agent="opportunity_scout",
+        intent="opportunity_search",
+        task_objective="opportunity_discovery",
+        expected_artifact_type="opportunity_record",
+        requires_live_search=True,
+        ask_shape=AskShapePolicy(
+            evidence_depth="deep",
+            permission_state="read_only",
+        ),
+    )
 
     run_business_research_analyst_sdk(
         BusinessResearchSDKInput(
@@ -1936,6 +2659,7 @@ def test_research_sdk_wrappers_infer_deep_retrieval_without_write_tools(
             context="Please do a deeper source-backed search and summarize the source data.",
         ),
         live=True,
+        manual_request_plan=research_plan,
         run_config=build_local_run_config(FakeProvider(research_model)),
     )
     run_opportunity_scout_sdk(
@@ -1946,6 +2670,7 @@ def test_research_sdk_wrappers_infer_deep_retrieval_without_write_tools(
             )
         ),
         live=True,
+        manual_request_plan=scout_plan,
         run_config=build_local_run_config(FakeProvider(scout_model)),
     )
 
@@ -1963,7 +2688,7 @@ def test_research_sdk_wrappers_infer_deep_retrieval_without_write_tools(
     assert "airtable_write_record" not in scout_tools
 
 
-def test_gmail_triage_sdk_defaults_to_read_only_unless_draft_requested(
+def test_gmail_triage_sdk_defaults_to_read_only_unless_canonical_draft_requested(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
@@ -1971,6 +2696,19 @@ def test_gmail_triage_sdk_defaults_to_read_only_unless_draft_requested(
 
     read_model = FakeModel(outputs=[[_structured_message(_email_triage_payload())]])
     draft_model = FakeModel(outputs=[[_structured_message(_email_triage_payload())]])
+    draft_plan = ManualRequestPlan(
+        source="canonical:test",
+        target_agent="gmail_triage",
+        intent="gmail_triage",
+        task_objective="gmail_triage",
+        expected_artifact_type="gmail_triage_report",
+        provider_system="gmail",
+        provider_operations=["read", "create"],
+        ask_shape=AskShapePolicy(
+            output_form="draft",
+            permission_state="draft_only",
+        ),
+    )
 
     run_gmail_triage_sdk(
         GmailTriageSDKInput(
@@ -1985,6 +2723,7 @@ def test_gmail_triage_sdk_defaults_to_read_only_unless_draft_requested(
             body="Could Keystone help us evaluate a behavioral health AI workflow?",
             request="Please draft a short reply but do not send it.",
         ),
+        manual_request_plan=draft_plan,
         run_config=build_local_run_config(FakeProvider(draft_model)),
     )
 
@@ -1997,10 +2736,10 @@ def test_gmail_triage_sdk_defaults_to_read_only_unless_draft_requested(
     assert "airtable_write_record" not in read_tools
     assert "create_gmail_draft_reply" in draft_tools
     assert "create_approval_queue_item" in draft_tools
-    assert "search_web" in draft_tools
+    assert "search_web" not in draft_tools
 
 
-def test_orchestrator_sdk_infers_tiered_tools_for_default_and_deep_runs(
+def test_orchestrator_sdk_uses_canonical_tiered_tools_for_deep_runs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
@@ -2008,6 +2747,18 @@ def test_orchestrator_sdk_infers_tiered_tools_for_default_and_deep_runs(
 
     default_model = FakeModel(outputs=[[_structured_message(_orchestrator_payload())]])
     deep_model = FakeModel(outputs=[[_structured_message(_orchestrator_payload())]])
+    deep_plan = ManualRequestPlan(
+        source="canonical:test",
+        target_agent="business_research_analyst",
+        intent="research_brief",
+        task_objective="source_research",
+        expected_artifact_type="research_brief",
+        requires_live_search=True,
+        ask_shape=AskShapePolicy(
+            evidence_depth="deep",
+            permission_state="read_only",
+        ),
+    )
 
     run_orchestrator_sdk(
         "Route Curebase for business research.",
@@ -2016,6 +2767,7 @@ def test_orchestrator_sdk_infers_tiered_tools_for_default_and_deep_runs(
     run_orchestrator_sdk(
         "Run a deeper source-backed web search and summarize the source data.",
         live=True,
+        manual_request_plan=deep_plan,
         run_config=build_local_run_config(FakeProvider(deep_model)),
     )
 
@@ -2038,17 +2790,31 @@ def test_orchestrator_live_sdk_input_includes_runtime_source_layer_policy(
     monkeypatch.setenv("KEYSTONE_ORCHESTRATOR_FILE_SEARCH_VECTOR_STORE_IDS", "vs_router")
     model = FakeModel(outputs=[[_structured_message(_orchestrator_payload())]])
 
+    plan = ManualRequestPlan(
+        source="heuristic",
+        target_agent="google_workspace_context_agent",
+        intent="context_lookup",
+        primary_target="KBA_TEST_DRIVE_FILE_123",
+        target_type="business_system_context",
+        provider_system="google_workspace",
+        provider_operations=["read"],
+    )
     run_orchestrator_sdk(
         "Route this public-company research request.",
         live=True,
+        manual_request_plan=plan,
         run_config=build_local_run_config(FakeProvider(model)),
     )
 
     raw_input = model.calls[0]["input"]
     assert isinstance(raw_input, list)
-    payload = json.loads(raw_input[0]["content"])
+    payload, _end = json.JSONDecoder().raw_decode(raw_input[0]["content"])
     prompt = json.dumps(payload, ensure_ascii=True, sort_keys=True)
     assert payload["request"] == "Route this public-company research request."
+    assert payload["manual_request_plan_authority"] == "routing_advice_only"
+    assert payload["manual_request_plan_routing_advice"]["target_agent"] == (
+        "google_workspace_context_agent"
+    )
     source_layer_policy = payload["runtime_source_layer_policy"]
     layers = {item["layer"]: item for item in source_layer_policy["layers"]}
     assert "hosted_file_search" in layers
@@ -2363,9 +3129,9 @@ def test_gmail_candidate_ranking_sdk_has_selection_only_contract(
         "send_enabled",
         "sent",
     }.isdisjoint(
-        GmailCandidateRankingResult.model_json_schema()["$defs"][
-            "GmailCandidateRankingItem"
-        ]["properties"]
+        GmailCandidateRankingResult.model_json_schema()["$defs"]["GmailCandidateRankingItem"][
+            "properties"
+        ]
     )
     instructions = str(build_gmail_candidate_ranking_agent().instructions)
     assert "selection-only stage" in instructions
@@ -2431,10 +3197,21 @@ def test_retrieved_sdk_synthesis_harness_validates_and_audits(
         "output_tokens": 0,
         "total_tokens": 0,
         "cached_input_tokens": 0,
+        "cache_write_input_tokens": None,
+        "request_usage_entries": [{
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": None,
+            "reasoning_output_tokens": 0,
+        }],
         "reasoning_output_tokens": 0,
         "cache_hit_rate": 0.0,
         "prompt_cache_key_present": False,
         "prompt_cache_key_hash": "",
+        "attempt_count": 1,
+        "complete": True,
     }
     assert outcome.cost["amount_usd"] is None
     assert outcome.cost["source"] == "pricing_table_no_match"
@@ -2442,6 +3219,11 @@ def test_retrieved_sdk_synthesis_harness_validates_and_audits(
     assert outcome.request_cache["repo_instruction_profile"] == "compact-runtime-policy"
     assert outcome.request_cache["session_attached"] is False
     assert outcome.request_cache["tool_count"] > 0
+    assert outcome.request_cache["request_tool_scope"]["agent_name"] == "gmail_triage"
+    assert outcome.request_cache["request_tool_scope"]["selected_tool_count"] == (
+        outcome.request_cache["tool_count"]
+    )
+    assert outcome.request_cache["request_tool_scope"]["selection_fingerprint"]
     assert len(outcome.request_cache["static_prefix_sha256"]) == 64
     assert len(outcome.request_cache["dynamic_prompt_sha256"]) == 64
     assert outcome.storage["agent_run"] == {"status": "saved", "id": 1}
@@ -2522,8 +3304,42 @@ def test_opportunity_scout_compact_sdk_replay_returns_full_verified_result(
         "audit_summary": "One verified opportunity is ready for operator review.",
         "constraint_relaxation_suggestion": "",
         "outreach_generated": False,
+        "decision": {
+            "decision_owner": "specialist_agent",
+            "decision_stage": "opportunity_candidate_selection",
+            "selected_candidate_ids": [record_key],
+            "candidate_assessments": [
+                {
+                    "candidate_id": record_key,
+                    "disposition": "selected",
+                    "rationale": "The verified record satisfies the requested opportunity scope.",
+                }
+            ],
+            "reasoning": "Selected the one verified, decision-ready opportunity.",
+            "limitations": [],
+            "needs_more_context": False,
+        },
     }
-    model = FakeModel(outputs=[[_structured_message(compact_payload)]])
+    invalid_payload = {
+        **compact_payload,
+        "decision": {
+            **compact_payload["decision"],
+            "selected_candidate_ids": ["fabricated-opportunity"],
+            "candidate_assessments": [
+                {
+                    "candidate_id": "fabricated-opportunity",
+                    "disposition": "selected",
+                    "rationale": "Synthetic invalid first attempt.",
+                }
+            ],
+        },
+    }
+    model = FakeModel(
+        outputs=[
+            [_structured_message(invalid_payload)],
+            [_structured_message(compact_payload)],
+        ]
+    )
 
     outcome = run_retrieved_sdk_synthesis(
         agent=build_opportunity_scout_synthesis_agent(max_results=1),
@@ -2537,16 +3353,23 @@ def test_opportunity_scout_compact_sdk_replay_returns_full_verified_result(
         finalize_output=apply_opportunity_scout_synthesis,
         input_summary="compact opportunity replay",
         run_config=build_local_run_config(FakeProvider(model)),
+        decision_contract=lambda raw, _typed_input: (
+            opportunity_scout_synthesis_decision_contract(raw)
+        ),
     )
 
     assert isinstance(outcome.output, OpportunityScoutResult)
     assert len(outcome.output.records) == 1
     assert outcome.output.records[0].sources == record.sources
-    assert outcome.output.records[0].recommended_next_step == compact_payload["decisions"][0][
-        "recommended_next_step"
-    ]
+    assert (
+        outcome.output.records[0].recommended_next_step
+        == compact_payload["decisions"][0]["recommended_next_step"]
+    )
     assert outcome.output.outreach_generated is False
-    assert model.calls
+    assert outcome.output.decision.selected_candidate_ids == [record_key]
+    assert outcome.request_cache["decision_ownership"]["attempt_count"] == 2
+    assert outcome.request_cache["decision_ownership"]["repair_attempted"] is True
+    assert len(model.calls) == 2
 
 
 def test_retrieved_sdk_synthesis_records_prompt_cache_metadata(
@@ -2752,6 +3575,10 @@ def test_retrieved_sdk_synthesis_records_error_for_invalid_model_output(
     assert storage.agent_runs[0]["error"] == "ModelBehaviorError"
     assert storage.agent_runs[0]["output"]["failure"]["kind"] == "schema_or_parse_error"
     assert storage.agent_runs[0]["output"]["send_enabled"] is False
+    failure = storage.agent_runs[0]["output"]["sdk_run_failure"]
+    assert failure["schema"] == "keystone.sdk_run_failure.v1"
+    assert failure["failure_kind"] == "structured_output_invalid"
+    assert failure["request_cache"]["failed_model_attempts"] == 1
 
 
 def test_live_sdk_synthesis_retries_gemini_with_openai_fallback(
@@ -2770,7 +3597,7 @@ def test_live_sdk_synthesis_retries_gemini_with_openai_fallback(
         final_output = _email_triage_payload()
         usage = Usage(requests=1, input_tokens=12, output_tokens=8, total_tokens=20)
 
-    def fake_run_sync(agent: Any, prompt: str, *, run_config: Any) -> RawResult:
+    def fake_run_sync(agent: Any, prompt: str, *, run_config: Any, hooks: Any) -> RawResult:
         calls.append(getattr(run_config, "model", None))
         if len(calls) == 1:
             raise RuntimeError("primary provider unavailable")
@@ -3120,16 +3947,38 @@ def test_outreach_compact_sdk_keeps_approval_objects_deterministic(
             "and warmer without adding facts."
         ),
     )
+    selected_source_ids = ["fixture:curebase_company", "keystone_profile"]
     compact_payload = {
         "company_name": "Curebase",
         "email_subject": "Compare notes",
         "email_body": (
-            "Hi Dr. Example,\n\nWould a brief conversation be useful?\n\n"
-            "Sincerely,\nAnup"
+            "Hi Dr. Example,\n\nWould a brief conversation be useful?\n\nSincerely,\nAnup"
         ),
         "linkedin_note": "",
         "personalization_rationale": "Shortened the approved draft without adding facts.",
-        "source_ids_used": ["fixture:curebase_company", "keystone_profile"],
+        "source_ids_used": selected_source_ids,
+        "decision": {
+            "decision_owner": "specialist_agent",
+            "decision_stage": "outreach_evidence_selection",
+            "selected_candidate_ids": selected_source_ids,
+            "candidate_assessments": [
+                {
+                    "candidate_id": source_id,
+                    "disposition": (
+                        "selected" if source_id in selected_source_ids else "excluded"
+                    ),
+                    "rationale": (
+                        "Supports the company identity or Keystone introduction."
+                        if source_id in selected_source_ids
+                        else "Approved context was available but not used in this revision."
+                    ),
+                }
+                for source_id in approved_context.allowed_source_ids
+            ],
+            "reasoning": "Selected only approved evidence used in the compact draft.",
+            "limitations": ["Draft remains pending approval."],
+            "needs_more_context": False,
+        },
     }
     model = FakeModel(outputs=[[_structured_message(compact_payload)]])
 
@@ -3150,11 +3999,20 @@ def test_outreach_compact_sdk_keeps_approval_objects_deterministic(
     assert result.output.sent is False
     assert result.output.outreach_context.approval_state == "pending"
     assert model.calls[0]["tool_names"] == []
+    input_text = _model_input_text(model.calls[0]["input"])
+    assert "Approved decision context supplied before drafting" in input_text
+    assert "keystone_profile" in input_text
+    pre_model_context = result.request_cache["pre_model_decision_context"]
+    assert pre_model_context["context_complete"] is True
+    assert "keystone_profile" in pre_model_context["candidate_ids"]
+    assert pre_model_context["mandatory_context_ids"] == ["keystone_profile"]
     evidence = json.loads((tmp_path / "outreach-evidence.json").read_text(encoding="utf-8"))
     assert evidence["schema_version"] == "keystone.outreach.constrained_sdk_evidence.v1"
     assert evidence["status"] == "completed"
     assert evidence["compact_output"] == {
         **compact_payload,
+        "supporting_summary": "",
+        "decision": result.output.decision.model_dump(mode="json"),
         "contact_name": "Dr. Example",
         "contact_title": "Clinical Operations Lead",
         "reply_recommended": True,
@@ -3221,17 +4079,94 @@ def test_gmail_sdk_joined_natural_create_executes_verified_provider_draft(
             return dict(self.draft)
 
     draft_text = "Hi Alex, thanks for the note. I will review this and follow up."
+    monkeypatch.setenv("KEYSTONE_ENABLE_LIVE_GMAIL", "true")
+    monkeypatch.setattr(
+        gmail_query_tools.gmail_tool,
+        "search_message_summaries",
+        lambda **_kwargs: [
+            {
+                "id": "message-source-1",
+                "threadId": "thread-source-1",
+                "from": "Alex <alex@example.com>",
+                "sender_name": "Alex",
+                "sender_email": "alex@example.com",
+                "subject": "Project follow-up",
+                "snippet": "Could Keystone send a short response?",
+                "received_at": "2026-08-03T16:00:00Z",
+                "prior_labels": ["INBOX"],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        gmail_query_tools.gmail_tool,
+        "get_thread_with_source_url",
+        lambda _thread_id: {
+            "thread_id": "thread-source-1",
+            "message_count": 1,
+            "subject": "Project follow-up",
+            "summary": "Could Keystone send a short response?",
+            "thread_context": "Could Keystone send a short response?",
+            "latest_received_at": "2026-08-03T16:00:00Z",
+            "participants": ["Alex <alex@example.com>"],
+            "triage_limitations": ["Synthetic provider fixture."],
+            "source_url": (
+                "https://mail.google.com/mail/?authuser=operator%40example.com#all/thread-source-1"
+            ),
+            "messages": [{
+                "id": "message-source-1", "threadId": "thread-source-1",
+                "received_at": "2026-08-03T16:00:00Z", "sender_name": "Alex",
+                "sender_email": "alex@example.com", "subject": "Project follow-up",
+                "snippet": "Could Keystone send a short response?", "prior_labels": ["INBOX"],
+            }],
+        },
+    )
     model = FakeModel(
         outputs=[
+            [
+                _tool_call(
+                    "query_gmail_message_summaries",
+                    {"query": "Example Health", "max_results": 10, "live": True},
+                    call_id="gmail-query-1",
+                )
+            ],
+            [
+                _tool_call(
+                    "read_gmail_context",
+                    {
+                        "resource_type": "thread",
+                        "resource_id": "thread-source-1",
+                        "live": True,
+                    },
+                    call_id="gmail-read-1",
+                )
+            ],
             [
                 _structured_message(
                     _email_triage_payload(
                         message_id="message-source-1",
+                        thread_id="thread-source-1",
                         subject="Project follow-up",
                         draft_reply=draft_text,
+                        decision={
+                            "decision_owner": "specialist_agent",
+                            "decision_stage": "gmail_candidate_selection",
+                            "selected_candidate_ids": ["thread-source-1"],
+                            "candidate_assessments": [
+                                {
+                                    "candidate_id": "thread-source-1",
+                                    "disposition": "selected",
+                                    "rationale": (
+                                        "The bounded thread matches the requested follow-up."
+                                    ),
+                                }
+                            ],
+                            "reasoning": "Selected the only verified matching conversation.",
+                            "limitations": ["Synthetic provider fixture."],
+                            "needs_more_context": False,
+                        },
                     )
                 )
-            ]
+            ],
         ]
     )
     gmail = FakeGmail()
@@ -3269,7 +4204,9 @@ def test_gmail_sdk_joined_natural_create_executes_verified_provider_draft(
     assert payload["side_effects"]["gmail_draft_created"] is True
     assert payload["side_effects"]["email_sent"] is False
     assert payload["side_effects"]["send_enabled"] is False
-    assert model.calls[0]["tool_names"] == []
+    assert "query_gmail_message_summaries" in model.calls[0]["tool_names"]
+    assert "read_gmail_context" in model.calls[0]["tool_names"]
+    assert len(model.calls) == 3
 
 
 def test_gmail_sdk_joined_natural_update_reuses_uniquely_resolved_draft(
@@ -3830,19 +4767,14 @@ def test_high_confidence_manifest_match_resolves_preprints_without_model() -> No
     )
 
     assert resolved is not None
-    assert resolved.command_text == (
-        "/kni-preprints-digest depression digital biomarkers"
-    )
+    assert resolved.command_text == ("/kni-preprints-digest depression digital biomarkers")
     assert resolved.confidence == "high"
 
 
 @pytest.mark.parametrize(
     "request_text",
     [
-        (
-            "move that same KBA_TEST_CALENDAR_COS_0718 event to 3:00-3:30 PM "
-            "and change its note"
-        ),
+        ("move that same KBA_TEST_CALENDAR_COS_0718 event to 3:00-3:30 PM and change its note"),
         "update that same Airtable expense record",
         "create a Google Doc in Drive and verify it",
         "create a Gmail draft to myself and do not send it",
@@ -3883,8 +4815,7 @@ def test_gmail_fake_model_selects_attachment_draft_tool_for_explicit_ask(
                         "subject": "KBA_TEST_DRAFT Clinical AI slide",
                         "body": "KBA_TEST_DRAFT Attached is the requested slide copy.",
                         "attachment_path": (
-                            "artifacts/presentation-derived/"
-                            "KBA_TEST_SLIDE-sdk-preview.png"
+                            "artifacts/presentation-derived/KBA_TEST_SLIDE-sdk-preview.png"
                         ),
                         "expected_account": "operator@example.com",
                         "approval_reference": "operator-command:slide-attachment",
@@ -4024,10 +4955,7 @@ def test_gmail_fake_model_session_followup_preserves_message_and_prior_draft(
     first = _run_with_fake_model(
         agent,
         model,
-        (
-            "Find the selected Example Health email and draft a reply for review. "
-            "Do not send it."
-        ),
+        ("Find the selected Example Health email and draft a reply for review. Do not send it."),
         session=session,
     )
     second = _run_with_fake_model(
@@ -4126,6 +5054,136 @@ def test_context_agent_fake_model_selects_and_executes_typed_history_tool(
     outputs = [item for item in result.new_items if item.type == "tool_call_output_item"]
     assert outputs
     assert title in str(outputs[0].output)
+
+
+@pytest.mark.parametrize(
+    (
+        "builder",
+        "history_tool",
+        "result_type",
+        "feed",
+        "source",
+        "title",
+        "prompt",
+    ),
+    [
+        (
+            build_rss_context_agent,
+            "retrieve_rss_announcement_history",
+            RssContextResult,
+            "rss",
+            "synthetic-rss",
+            "Youth parity and school telehealth update",
+            (
+                "Before I rely on tomorrow's RSS digest, could you confirm whether it "
+                "has a saved checkpoint and any unreviewed items about youth mental-health "
+                "parity or school telehealth? If nothing has been recorded, say that "
+                "plainly. Just inspect; don't prepare or advance a checkpoint or post anything."
+            ),
+        ),
+        (
+            build_preprints_context_agent,
+            "retrieve_preprint_announcement_history",
+            PreprintsContextResult,
+            "preprints",
+            "medRxiv",
+            "Language-model phenotyping from mental-health records",
+            (
+                "Could you confirm whether the preprint watch has a saved checkpoint and "
+                "any unseen work on language-model phenotyping from mental-health records? "
+                "If the history is empty, say so plainly; otherwise show at most two newest "
+                "versions and label them preliminary. Don't run discovery or advance anything."
+            ),
+        ),
+    ],
+)
+def test_deferred_signal_context_ask_calls_history_and_checkpoint_inspection(
+    builder: Any,
+    history_tool: str,
+    result_type: type[Any],
+    feed: str,
+    source: str,
+    title: str,
+    prompt: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / f'{feed}-deferred-sdk.db'}"
+    SQLiteStore(database_url).save_announcement_feed_item(
+        AnnouncementFeedItem(
+            title=title,
+            url=f"https://example.test/{feed}/deferred-item",
+            source=source,
+            feed=feed,
+            tags=["mental health", "preliminary" if feed == "preprints" else "parity"],
+            selected=True,
+            summary="Synthetic bounded evidence for the deferred read-only execution proof.",
+        )
+    )
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    plan = infer_manual_request_plan(prompt, requested_agent=f"{feed}_context_agent")
+    evidence_tool = (
+        "read_preprint_announcement_evidence"
+        if feed == "preprints"
+        else "read_rss_announcement_evidence"
+    )
+    expected_tools = [history_tool, evidence_tool, "inspect_signal_lifecycle"]
+    history_arguments: dict[str, Any] = {
+        "query": (
+            "language-model phenotyping"
+            if feed == "preprints"
+            else "youth mental-health parity school telehealth"
+        ),
+        "selected_only": True,
+        "limit": 2,
+    }
+    if feed == "rss":
+        history_arguments["live"] = False
+    payload = {
+        "mode": "llm",
+        "summary": (
+            f"Found one bounded {feed} history item and no saved lifecycle checkpoint."
+        ),
+        "query": history_arguments["query"],
+        "retrieved_item_ids": [f"synthetic-{feed}-item"],
+        "articles": [],
+        "frontier_summary": (
+            "The saved history can support cautious internal review; no checkpoint was present."
+        ),
+        "blockers": [],
+    }
+    model = FakeModel(
+        outputs=[
+            [_tool_call(history_tool, history_arguments)],
+            [
+                _tool_call(
+                    "inspect_signal_lifecycle",
+                    {"work_item_id": "", "source_kind": feed, "trigger_id": ""},
+                )
+            ],
+            [_structured_message(payload)],
+        ]
+    )
+
+    result = _run_with_fake_model(
+        builder(request_text=prompt, manual_plan=plan),
+        model,
+        prompt,
+    )
+
+    assert isinstance(result.final_output, result_type)
+    assert len(model.calls) == 3
+    assert model.calls[0]["tool_names"] == expected_tools
+    assert model.calls[1]["tool_names"] == expected_tools
+    assert title in _model_input_text(model.calls[1]["input"])
+    assert "no_saved_checkpoint_for_source" in _model_input_text(model.calls[2]["input"])
+    outputs = [item for item in result.new_items if item.type == "tool_call_output_item"]
+    assert len(outputs) == 2
+    assert title in str(outputs[0].output)
+    assert '"status": "no_checkpoint"' in str(outputs[1].output)
+    assert result.final_output.blockers == []
 
 
 @pytest.mark.parametrize(
@@ -4481,9 +5539,7 @@ def test_workspace_context_fake_model_searches_then_reads_local_powerpoint(
             "executed_write_results",
             _airtable_context_payload(
                 summary="Prepared the exact approved Airtable test-record write preview.",
-                executed_write_results=[
-                    {"key": "operation", "value": "create", "note": "dry-run"}
-                ],
+                executed_write_results=[{"key": "operation", "value": "create", "note": "dry-run"}],
             ),
         ),
         (
@@ -4591,6 +5647,39 @@ def test_workspace_context_fake_model_searches_then_reads_local_powerpoint(
                 recommended_target="KNIOps / KBA_TEST_DOC sdk-preview",
                 executed_write_results=[
                     {"key": "operation", "value": "write_doc", "note": "dry-run"}
+                ],
+            ),
+        ),
+        (
+            build_google_workspace_context_agent,
+            "google_doc_test_lifecycle",
+            {
+                "title": "KBA_TEST_DOC Orchard Handoff",
+                "body_text": "Orchard handoff is ready.",
+                "updated_body_text": "Orchard handoff is verified.",
+                "folder_path": "KNIOps",
+                "approval_reference": "approval-sdk-preview",
+                "live": False,
+            },
+            (
+                "I approve one exact synthetic KNIOps document lifecycle titled "
+                "KBA_TEST_DOC Orchard Handoff: create it with the sentence 'Orchard "
+                "handoff is ready.', read it back, replace the sentence with 'Orchard "
+                "handoff is verified.', confirm the same document changed, then move "
+                "it to trash and verify it. Preview the bounded lifecycle for now."
+            ),
+            GoogleWorkspaceContextResult,
+            "KBA_TEST_DOC Orchard Handoff",
+            "executed_write_results",
+            _google_workspace_context_payload(
+                summary="Prepared the bounded marked-document lifecycle preview.",
+                recommended_target="KNIOps / KBA_TEST_DOC Orchard Handoff",
+                executed_write_results=[
+                    {
+                        "key": "operation",
+                        "value": "test_doc_lifecycle",
+                        "note": "dry-run",
+                    }
                 ],
             ),
         ),
@@ -4817,9 +5906,7 @@ def test_structured_context_agent_fake_model_selects_guarded_write_preview_tool(
             _airtable_context_payload(
                 summary="Updated the existing marked-record preview without duplication.",
                 recommended_record_identity="recKBA1",
-                executed_write_results=[
-                    {"key": "operation", "value": "update", "note": "dry-run"}
-                ],
+                executed_write_results=[{"key": "operation", "value": "update", "note": "dry-run"}],
             ),
             "executed_write_results",
         ),
@@ -4933,9 +6020,7 @@ def test_structured_context_agent_fake_model_selects_guarded_write_preview_tool(
             _zotero_context_payload(
                 summary="Updated the existing marked note preview without duplication.",
                 zotero_item_keys=["NOTEKBA1"],
-                executed_note_results=[
-                    {"key": "operation", "value": "update", "note": "dry-run"}
-                ],
+                executed_note_results=[{"key": "operation", "value": "update", "note": "dry-run"}],
             ),
             "executed_note_results",
         ),
@@ -5005,26 +6090,26 @@ def test_structured_context_agent_session_followup_preserves_identity_and_update
             {
                 "source_payloads": [
                     {
-                            "source_id": "source:example-health-primary",
-                            "title": "Example Health official overview",
-                            "url": "https://example.test/company",
-                            "source_type": "company_site",
-                            "snippet": "Example Health provides behavioral health workflow tools.",
-                            "supported_claims": [
-                                "Example Health provides behavioral health workflow tools."
-                            ],
-                            "confidence": 0.8,
+                        "source_id": "source:example-health-primary",
+                        "title": "Example Health official overview",
+                        "url": "https://example.test/company",
+                        "source_type": "company_site",
+                        "snippet": "Example Health provides behavioral health workflow tools.",
+                        "supported_claims": [
+                            "Example Health provides behavioral health workflow tools."
+                        ],
+                        "confidence": 0.8,
                     },
                     {
-                            "source_id": "source:example-health-duplicate",
-                            "title": "Example Health duplicate overview",
-                            "url": "https://example.test/company",
-                            "source_type": "company_site",
-                            "snippet": "Duplicate source that should not be counted twice.",
-                            "supported_claims": [
-                                "Example Health provides behavioral health workflow tools."
-                            ],
-                            "confidence": 0.7,
+                        "source_id": "source:example-health-duplicate",
+                        "title": "Example Health duplicate overview",
+                        "url": "https://example.test/company",
+                        "source_type": "company_site",
+                        "snippet": "Duplicate source that should not be counted twice.",
+                        "supported_claims": [
+                            "Example Health provides behavioral health workflow tools."
+                        ],
+                        "confidence": 0.7,
                     },
                 ],
                 "company_name": "Example Health",
@@ -5042,16 +6127,16 @@ def test_structured_context_agent_session_followup_preserves_identity_and_update
                 website="https://example.test/company",
                 description="Behavioral health workflow tools from the supplied packet.",
                 sources=[
-                        {
-                            "source_id": "source:example-health-primary",
-                            "title": "Example Health official overview",
-                            "url": "https://example.test/company",
-                            "source_type": "company_site",
-                            "supported_claims": [
-                                "Example Health provides behavioral health workflow tools."
-                            ],
-                            "confidence": 0.8,
-                        }
+                    {
+                        "source_id": "source:example-health-primary",
+                        "title": "Example Health official overview",
+                        "url": "https://example.test/company",
+                        "source_type": "company_site",
+                        "supported_claims": [
+                            "Example Health provides behavioral health workflow tools."
+                        ],
+                        "confidence": 0.8,
+                    }
                 ],
                 evidence=["Supplied official overview was retained after deduplication."],
                 missing_information=["Independent corroboration was not supplied."],
@@ -5070,14 +6155,14 @@ def test_structured_context_agent_session_followup_preserves_identity_and_update
                 "for Keystone, and recommend only a next review step."
             ),
             OpportunityScoutResult,
-            "Priority 50/100",
+            "Priority 43/100",
             _opportunity_scout_payload(
                 topic="active behavioral-health grant",
                 records=[
                     {
                         "company_name": "Example Health",
                         "opportunity_type": "grant or collaboration opportunity",
-                        "priority_score": 50,
+                        "priority_score": 43,
                         "why_now_signal": "Active RFP for behavioral health work.",
                         "recommended_next_step": "Verify primary eligibility before action.",
                         "sources": [
@@ -5091,7 +6176,7 @@ def test_structured_context_agent_session_followup_preserves_identity_and_update
                         ],
                         "source_signals": ["active RFP", "behavioral health"],
                         "keystone_fit_reason": "Potential behavioral health advisory fit.",
-                        "outside_consulting_likelihood": 60,
+                        "outside_consulting_likelihood": 47,
                         "handoff_to_business_research_analyst": False,
                         "outreach_draft": None,
                         "approval_required_before_outreach": True,
@@ -5150,7 +6235,39 @@ def test_operating_specialist_fake_model_selects_and_consumes_domain_tool(
         ]
     )
 
-    result = _run_with_fake_model(builder(request_text=prompt), model, prompt)
+    manual_request_plan: ManualRequestPlan | None = None
+    if builder is build_business_research_analyst_agent:
+        manual_request_plan = ManualRequestPlan(
+            source="canonical:test",
+            target_agent="business_research_analyst",
+            intent="company_research",
+            task_objective="entity_research",
+            expected_artifact_type="research_brief",
+            requires_live_search=True,
+            ask_shape=AskShapePolicy(
+                evidence_depth="deep",
+                permission_state="read_only",
+            ),
+        )
+    elif builder is build_opportunity_scout_agent:
+        manual_request_plan = ManualRequestPlan(
+            source="canonical:test",
+            target_agent="opportunity_scout",
+            intent="opportunity_search",
+            task_objective="opportunity_discovery",
+            expected_artifact_type="opportunity_record",
+            requires_live_search=True,
+            ask_shape=AskShapePolicy(
+                evidence_depth="deep",
+                permission_state="read_only",
+            ),
+        )
+
+    result = _run_with_fake_model(
+        builder(request_text=prompt, manual_request_plan=manual_request_plan),
+        model,
+        prompt,
+    )
 
     assert isinstance(result.final_output, result_type)
     assert len(model.calls) == 2
@@ -5259,10 +6376,23 @@ def test_chief_fake_model_cannot_call_receipt_create_tool_directly(
         "chief of staff add a business expense to the airtable business expenses "
         f"based on the receipt details which are: {receipt}"
     )
+    request_plan = ManualRequestPlan(
+        source="canonical:test",
+        target_agent="chief_of_staff",
+        intent="business_system_write",
+        primary_target="Business Expenses",
+        target_type="business_system_context",
+        provider_system="airtable",
+        provider_operations=["read", "create", "attach", "verify"],
+        task_objective="business_system_write",
+        expected_artifact_type="business_system_write_plan",
+        ask_shape=AskShapePolicy(permission_state="approval_required"),
+    )
 
     result = run_chief_of_staff_sdk(
         request,
         live=True,
+        manual_request_plan=request_plan,
         run_config=build_local_run_config(FakeProvider(model)),
     )
 

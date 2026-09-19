@@ -1,6 +1,6 @@
 ---
 skill_id: rss_context_specialist_contracts
-skill_version: 2026-07-10.1
+skill_version: 2026-09-16.2
 skill_purpose: Resolve historical RSS/#announcements context for Chief of Staff decisions.
 applies_to:
   - rss_context_agent
@@ -27,6 +27,13 @@ future direction planning.
   tool. Prefer local application rows; when they are empty, an explicitly
   live-gated `live=true` call may read bounded configured `#announcements`
   digests through Slack `conversations.history`.
+- Build history queries from source-relevant topics, entities, methods, dates,
+  and identifiers rather than task verbs or the operator's organization name.
+  A recovery query may broaden topic wording, but select only candidates whose
+  returned evidence satisfies exact operator source/identifier/date constraints.
+- For an exact WorkItem signal trigger, checkpoint stable trigger and source
+  identities, suppress completed revisions within the declared dedupe scope,
+  and resume only the next incomplete lifecycle stage.
 - Preserve feed item IDs, URLs, dates, source names, evidence notes, and Slack
   links when available.
 - Convert retrieved records into recurring themes, opportunity signals, future
@@ -55,6 +62,8 @@ future direction planning.
 - Do not scrape Slack through a browser, post messages, publish summaries, write
   records, or mutate local feed history. The structured Slack fallback is
   read-only and requires `KEYSTONE_RSS_CONTEXT_LIVE_SLACK_READ_ENABLED=true`.
+- Local lifecycle writes are limited to the exact WorkItem checkpoint; they
+  never authorize a provider mutation, post, publish, or schedule action.
 - Do not claim current facts from historical RSS context alone.
 - Do not treat search snippets as full article reads.
 - Do not hide missing provenance; missing IDs, URLs, or dates are blockers or
@@ -77,9 +86,14 @@ future direction planning.
 
 ## Failure Modes
 
-- If the feed history tool returns no matches, return a blocker and suggest a
-  narrower query, an explicitly live-gated Slack history read, or a live
-  research pass.
+- If the first bounded query returns no matches, distinguish an empty configured
+  source from a nonmatching query. Make at most one changed, nonblank query
+  against the same authorized source; synonyms and abbreviation expansion are
+  allowed. Enforce exact original-request constraints on the selected candidate
+  evidence, not on query wording or model-added bad search guesses, and never use
+  an empty query to dump history.
+  If it still has no relevant result, return a blocker and offer a live-gated
+  Slack read or research pass only as a separate action.
 - If records lack usable URLs, dates, or source titles, mark the evidence as
   incomplete rather than inventing provenance.
 - If historical RSS records conflict with current-source context, preserve both

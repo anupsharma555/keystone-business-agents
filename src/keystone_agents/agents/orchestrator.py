@@ -10,9 +10,28 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from keystone_agents.agent_registry import SPECIALIST_AGENT_SPECS, specialist_handoff_specs
-from keystone_agents.agent_tool_policy import filter_tools_for_tier
-from keystone_agents.authority.semantic import ExecutionIntentAuthority
+from keystone_agents.agent_decision_contracts import orchestrator_decision_contract
+from keystone_agents.agent_registry import (
+    SPECIALIST_AGENT_SPECS,
+    agent_selection_catalog,
+    specialist_handoff_specs,
+)
+from keystone_agents.authority.semantic import (
+    ExecutionIntentAuthority,
+    is_read_only_work_item_inspection_plan,
+)
+from keystone_agents.capabilities.profile import (
+    EffectiveRuntimeRouteScope,
+    active_runtime_route_scope,
+)
+from keystone_agents.capabilities.tool_scope import (
+    ToolScopeMode,
+    attach_tool_scope_receipt,
+    default_tool_tier_for_request,
+    scope_tools_for_request,
+    tool_scope_receipt_for_agent,
+    tool_scope_trace_metadata_for_agent,
+)
 from keystone_agents.feedback import build_operator_feedback_request
 from keystone_agents.file_search import append_configured_file_search_tools
 from keystone_agents.guardrails import (
@@ -20,6 +39,7 @@ from keystone_agents.guardrails import (
     keystone_guardrails,
     keystone_tool_guardrail_kwargs,
 )
+from keystone_agents.instruction_following import output_constraints_from_plan
 from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.orchestrator.routing import (
     OPPORTUNITY_RE as _OPPORTUNITY_RE,
@@ -48,16 +68,25 @@ from keystone_agents.orchestrator.routing import (
 from keystone_agents.orchestrator.routing import (
     payload_text as _payload_text,
 )
+from keystone_agents.outreach_composer.inline_context import (
+    normalize_inline_outreach_request_text,
+    parse_inline_outreach_fact_packet,
+)
 from keystone_agents.planning.compatibility import (
     infer_manual_request_plan,
     positive_capability_text,
 )
 from keystone_agents.planning.composition_admission import (
+    CONTEXT_ONLY_RESPONSE_ROUTES,
     resolve_provider_free_composition_admission,
 )
-from keystone_agents.quality_budget import business_research_quality_budget
 from keystone_agents.retrieval_policy import derive_request_autonomy_hint
-from keystone_agents.run import run_typed_sdk_agent
+from keystone_agents.run import run_typed_sdk_agent, sdk_run_failure_metadata
+from keystone_agents.runtime.decision_validation import AgentDecisionValidationError
+from keystone_agents.runtime.tool_execution import (
+    ToolEvidenceGroup,
+    ToolExecutionContract,
+)
 from keystone_agents.schemas.approval import (
     ApprovalScope,
     ApprovalState,
@@ -73,10 +102,12 @@ from keystone_agents.schemas.orchestrator import (
     HandoffSpec,
     OrchestratorOutputReview,
     OrchestratorOutputReviewScore,
+    OrchestratorPlanningResult,
     OrchestratorResult,
     OrchestratorReviewBaseline,
     OrchestratorReviewChecks,
     OrchestratorReviewCostGuard,
+    OrchestratorWorkflowStateSummary,
     OutputReviewStatus,
     RouteName,
 )
@@ -85,6 +116,7 @@ from keystone_agents.sdk import (
     Agent,
     build_model_settings,
     build_sdk_agent,
+    compose_direct_instructions,
     compose_instructions,
     function_tool,
 )
@@ -119,6 +151,10 @@ from keystone_agents.tools.playwright_tool import render_page
 from keystone_agents.tools.serper_tool import search_web
 from keystone_agents.tools.storage_tool import load_pending_approval_items
 from keystone_agents.tools.web_structuring_tool import structure_web_data_for_schema
+from keystone_agents.tools.work_item_receipt_tool import (
+    inspect_work_item_execution_receipts,
+    inspect_work_item_execution_receipts_impl,
+)
 
 INTENDED_HANDOFFS: tuple[HandoffSpec, ...] = specialist_handoff_specs()
 ORCHESTRATOR_REASONING_EFFORT = "low"
@@ -130,6 +166,7 @@ OPPORTUNITY_SCOUT_TOOL_NAME = ORCHESTRATOR_OPPORTUNITY_SCOUT_TOOL_NAME
 
 
 _HANDOFF_BY_ROUTE = {handoff.route: handoff for handoff in INTENDED_HANDOFFS}
+_LLM_WORKFLOW_ROUTES = frozenset({*_HANDOFF_BY_ROUTE, "chief_of_staff", "clarification"})
 
 
 def _orchestrator_sdk_input(
@@ -395,11 +432,13 @@ def run_orchestrator_preflight(
     *,
     requested_agent: str | None = None,
     live_manual_plan: bool = False,
+    live_orchestrator: bool = False,
     run_config: Any | None = None,
     model: str | None = None,
     session: Any | None = None,
     database_url: str | None = None,
     workflow_state: Mapping[str, Any] | None = None,
+    runtime_scope: EffectiveRuntimeRouteScope | Mapping[str, Any] | None = None,
 ) -> OrchestratorPreflight:
     """Resolve the manual plan as an Orchestrator-owned preflight step.
 
@@ -422,11 +461,25 @@ def run_orchestrator_preflight(
             )
         )
 
+    def record_orchestrator_cost(sdk_result: Any) -> None:
+        sdk_usage_events.append(
+            _preflight_sdk_usage_event_payload(
+                sdk_result,
+                agent_name="orchestrator",
+                run_stage="orchestrator_preflight.route_selection",
+            )
+        )
+
+    planner_text = (
+        normalize_inline_outreach_request_text(text)
+        if parse_inline_outreach_fact_packet(text) is not None
+        else text
+    )
     manual_plan = resolve_manual_request_plan(
-        text,
+        planner_text,
         requested_agent=requested_agent,
         live=live_manual_plan,
-        run_config=run_config,
+        run_config=run_config if live_manual_plan else None,
         model=model,
         session=session,
         workflow_state=workflow_state,
@@ -444,10 +497,101 @@ def run_orchestrator_preflight(
         workflow_state=workflow_state,
         composition_admission=composition_admission,
     )
+    deterministic_block_kind, _ = _preflight_block(route_result)
+    if (
+        not deterministic_block_kind
+        and (run_config is not None or live_orchestrator)
+    ):
+        effective_runtime_scope = _coerce_runtime_route_scope(runtime_scope)
+        try:
+            agent_route = _route_ambiguous_with_llm(
+                text,
+                approved_context_present=route_result.approved_context_present,
+                workflow_state=dict(workflow_state or {}),
+                routing_advice={
+                    "manual_request_plan": manual_plan.model_dump(mode="json"),
+                    "deterministic_route": route_result.route,
+                    "deterministic_rationale": route_result.rationale,
+                },
+                run_config=run_config,
+                live=live_orchestrator,
+                model=model,
+                sdk_callback=record_orchestrator_cost,
+                runtime_scope=effective_runtime_scope,
+            )
+        except AgentDecisionValidationError as exc:
+            advisory_fallback = _explicit_single_owner_advisory_fallback_allowed(
+                manual_plan,
+                deterministic_block_kind=deterministic_block_kind,
+                runtime_scope=effective_runtime_scope,
+            )
+            sdk_usage_events.append(
+                _preflight_sdk_failure_event_payload(
+                    exc,
+                    agent_name="orchestrator",
+                    run_stage="orchestrator_preflight.route_selection",
+                    advisory_fallback_used=advisory_fallback,
+                )
+            )
+            if not advisory_fallback:
+                raise
+            route_result = route_result.model_copy(
+                update={
+                    "audit_notes": [
+                        *route_result.audit_notes,
+                        (
+                            "The Orchestrator model ran first but its route decision did "
+                            "not pass structured validation. Because the operator named "
+                            "one recognized specialist and no deterministic safety blocker "
+                            "was present, the failed route advice remained non-authoritative "
+                            "and execution continued to that bounded specialist."
+                        ),
+                    ]
+                }
+            )
+            agent_route = None
+        if agent_route is not None:
+            route_result = agent_route
+            if not agent_route.refused and agent_route.routing_mode == "llm":
+                # Route/order and output-part bindings are model-owned. Preserve
+                # numeric requirements and all provider/permission fields: a route
+                # decision must not promote a heuristic plan into unvalidated grants.
+                scoped_constraints = manual_plan.ask_shape.output_constraints.model_copy(update={
+                    key: value for key, value in agent_route.output_scopes.model_dump().items()
+                    if value != "unspecified"
+                    and getattr(manual_plan.ask_shape.output_constraints, key) == "unspecified"
+                })
+                manual_plan = manual_plan.model_copy(
+                    update={
+                        "target_agent": agent_route.route,
+                        "ask_shape": manual_plan.ask_shape.model_copy(update={
+                            "output_constraints": scoped_constraints,
+                        }),
+                        "workflow": [
+                            route
+                            for route in agent_route.workflow
+                            if route not in {"orchestrator", "chief_of_staff", "clarification"}
+                        ],
+                    }
+                )
+                if agent_route.context_only_response:
+                    context_plan = _context_only_manual_plan(manual_plan, agent_route, text)
+                    if context_plan is not None:
+                        manual_plan = context_plan
+                composition_admission = resolve_provider_free_composition_admission(
+                    manual_plan,
+                    workflow_state=workflow_state,
+                )
     explicit_agent = manual_plan.requested_agent
     advisory_only = explicit_agent not in {None, "orchestrator"}
     selected_agent = str(route_result.route or manual_plan.target_agent)
     block_kind, block_reason = _preflight_block(route_result)
+    if route_result.context_only_response and not composition_admission.composition_allowed:
+        block_kind = "context_only_response_unavailable"
+        block_reason = (
+            "A context-only response needs one response owner and a completed result "
+            "from this same thread; it cannot authorize a provider action."
+        )
     execution_allowed = not bool(block_kind)
     return OrchestratorPreflight(
         request_text=text,
@@ -465,6 +609,41 @@ def run_orchestrator_preflight(
     )
 
 
+def _context_only_manual_plan(
+    previous: ManualRequestPlan, route: OrchestratorResult, request_text: str,
+) -> ManualRequestPlan | None:
+    """Project only the model's narrow answer mode, never heuristic permissions."""
+    if (
+        not route.context_only_response or route.refused or route.routing_mode != "llm"
+        or route.route not in CONTEXT_ONLY_RESPONSE_ROUTES
+        or set(route.workflow).difference({route.route})
+        or set(previous.provider_operations).difference({"read", "search"})
+        or any(step.operation not in {"read", "search"} for step in previous.provider_action_steps)
+    ):
+        return None
+    return ManualRequestPlan(
+        source="canonical:orchestrator_context_only",
+        requested_agent=previous.requested_agent,
+        target_agent=route.route,
+        intent="route_request",
+        task_objective="route_or_continue",
+        expected_artifact_type="none",
+        objective=request_text,
+        primary_target=previous.primary_target,
+        rationale=route.rationale,
+        side_effect_policy="draft_or_read_only",
+        ask_shape=previous.ask_shape.model_copy(update={
+            "prior_context_dependency": "selected_context",
+            "permission_state": "read_only",
+            "audience_scope": "internal",
+            "output_form": (
+                previous.ask_shape.output_form
+                if previous.ask_shape.output_form != "unspecified" else "brief"
+            ),
+        }),
+    )
+
+
 def _preflight_sdk_usage_event_payload(
     sdk_result: Any,
     *,
@@ -479,10 +658,59 @@ def _preflight_sdk_usage_event_payload(
         "usage": dict(getattr(sdk_result, "usage", None) or {}),
         "cost": dict(getattr(sdk_result, "cost", None) or {}),
         "request_cache": dict(getattr(sdk_result, "request_cache", None) or {}),
-        "execution_telemetry": dict(
-            getattr(sdk_result, "execution_telemetry", None) or {}
-        ),
+        "execution_telemetry": dict(getattr(sdk_result, "execution_telemetry", None) or {}),
     }
+
+
+def _preflight_sdk_failure_event_payload(
+    exc: BaseException,
+    *,
+    agent_name: str,
+    run_stage: str,
+    advisory_fallback_used: bool,
+) -> dict[str, Any]:
+    """Preserve one failed preflight attempt without turning it into route authority."""
+
+    failure = sdk_run_failure_metadata(exc)
+    return {
+        "agent_name": agent_name,
+        "run_stage": run_stage,
+        "status": "failed",
+        "advisory_fallback_used": advisory_fallback_used,
+        "failure_kind": str(failure.get("failure_kind") or type(exc).__name__),
+        "usage": dict(failure.get("usage") or {}),
+        "cost": dict(failure.get("cost") or {}),
+        "request_cache": dict(failure.get("request_cache") or {}),
+        "execution_telemetry": dict(failure.get("execution_telemetry") or {}),
+        "sdk_failure": failure,
+    }
+
+
+def _explicit_single_owner_advisory_fallback_allowed(
+    manual_plan: ManualRequestPlan,
+    *,
+    deterministic_block_kind: str,
+    runtime_scope: EffectiveRuntimeRouteScope | None = None,
+) -> bool:
+    """Allow only a named single owner to survive non-safety route-shape failure."""
+
+    requested = str(manual_plan.requested_agent or "").strip()
+    workflow = [str(route).strip() for route in manual_plan.workflow if str(route).strip()]
+    recognized_single_owners = {
+        "chief_of_staff",
+        *(spec.route_name for spec in SPECIALIST_AGENT_SPECS),
+    }
+    if (
+        runtime_scope is not None
+        and requested not in set(runtime_scope.permitted_routes)
+    ):
+        return False
+    return bool(
+        requested in recognized_single_owners
+        and not deterministic_block_kind
+        and len(workflow) <= 1
+        and (not workflow or workflow == [requested])
+    )
 
 
 def _preflight_block(result: OrchestratorResult) -> tuple[str, str]:
@@ -802,54 +1030,21 @@ def _state_has_approved_context(state: Mapping[str, Any]) -> bool:
 
 
 def _request_has_inline_approved_outreach_context(text: str) -> bool:
-    cleaned = " ".join(str(text or "").split())
+    raw_text = str(text or "").strip()
+    cleaned = " ".join(raw_text.split())
     if not cleaned:
         return False
     if _looks_like_send_side_effect(cleaned):
         return False
-    if not _OUTREACH_RE.search(cleaned) and not _looks_like_email(None, cleaned):
+    if (
+        not _OUTREACH_RE.search(cleaned)
+        and not _looks_like_email(None, cleaned)
+        and not re.search(r"\boutreach\s+composer\b", cleaned, flags=re.I)
+    ):
         return False
     if not re.search(r"\b(?:draft|write|compose|prepare)\b", cleaned, flags=re.I):
         return False
-    context_label = re.search(
-        r"\b(?:"
-        r"(?:these\s+|the\s+following\s+)?approved"
-        r"(?:\s+(?:inline|source|source-backed|source backed))?\s+"
-        r"(?:context|facts|evidence|background|grounding|rationale)"
-        r"|source[-\s]+backed\s+(?:context|facts|evidence|background|grounding)"
-        r"|(?:these\s+|the\s+following\s+)?(?:operator[-\s]+)?"
-        r"(?:supplied|provided)(?:\s+(?:inline|source[-\s]+backed))?\s+"
-        r"(?:context|facts|evidence|background|grounding)"
-        r"|context\s+approved\s+for\s+(?:drafting|draft-only\s+use|draft\s+only\s+use)"
-        r")\s*:",
-        cleaned,
-        flags=re.I,
-    )
-    if context_label is None:
-        bare_context_label = re.search(
-            r"\b(?:facts|context|evidence|background|grounding)\s*:",
-            cleaned,
-            flags=re.I,
-        )
-        supplied_context_authority = re.search(
-            r"\b(?:use|using)\s+only\s+(?:these\s+|the\s+following\s+)?"
-            r"(?:operator[-\s]+)?(?:supplied|provided)\s+"
-            r"(?:facts|context|evidence|background|grounding)\b",
-            cleaned,
-            flags=re.I,
-        )
-        if bare_context_label is None or supplied_context_authority is None:
-            return False
-        context_label = bare_context_label
-    context_block = cleaned[context_label.end() :]
-    context_block = re.split(
-        r"\b(?:return|invite|keep|caveats?|constraints?|instructions?|"
-        r"do\s+not|don't|dont|never)\b",
-        context_block,
-        maxsplit=1,
-        flags=re.I,
-    )[0].strip(" .;,:")
-    if len(re.findall(r"[A-Za-z][A-Za-z'-]*", context_block)) < 5:
+    if parse_inline_outreach_fact_packet(raw_text) is None:
         return False
     return bool(
         re.search(r"\b(?:no send|draft-only|draft only)\b", cleaned, flags=re.I)
@@ -1470,7 +1665,7 @@ def _missing_outreach_context_refusal(
                 "* No search, draft, send, post, CRM write, file write, schedule, "
                 "publish, or external action has been taken.\n\n"
                 "*Reply with:*\n"
-                "\"Target: ...\""
+                '"Target: ..."'
             ),
             approval_scope=ApprovalScope.DRAFTING,
             approval_rationale=(
@@ -1505,7 +1700,7 @@ def _missing_outreach_context_refusal(
             "* Boundary: no email, Gmail draft, Slack post outside this thread, CRM record, "
             "file write, send, schedule, publish, or external action has been taken.\n\n"
             "*Reply with:*\n"
-            "\"Focus: ...; target: ...; use these source-backed facts: ...\""
+            '"Focus: ...; target: ...; use these source-backed facts: ..."'
         ),
         approval_scope=ApprovalScope.DRAFTING,
         approval_rationale=(
@@ -1600,24 +1795,164 @@ def _looks_like_pure_resume_request(text: str) -> bool:
 def _llm_route_prompt(
     request: str | Mapping[str, Any] | None,
     workflow_state: Mapping[str, Any],
+    *,
+    routing_advice: Mapping[str, Any] | None = None,
+    allowed_routes: tuple[str, ...] | None = None,
+    runtime_scope: EffectiveRuntimeRouteScope | None = None,
 ) -> str:
+    route_candidates = (
+        allowed_routes
+        if allowed_routes is not None
+        else tuple(
+            dict.fromkeys(
+                [
+                    *(handoff.route for handoff in INTENDED_HANDOFFS),
+                    "chief_of_staff",
+                    "clarification",
+                ]
+            )
+        )
+    )
+    hard_rules = [
+        "The specialist catalog describes registered capabilities, not attached tools "
+        "or live permission. Select an owner whose tools can acquire the required evidence.",
+        "The complete request is authoritative. Routing advice is non-authoritative evidence.",
+        "Never send email or mark send_enabled true.",
+        "Outreach Composer requires source-backed facts authorized for the requested use.",
+        "Missing evidence that permitted tools can retrieve is an acquisition step, "
+        "not by itself a reason to request more approval.",
+        "Explicitly requested review-thread-only drafting does not grant sending, "
+        "provider-draft creation, or other external-use permission.",
+        "Use clarification for unresolved identity, unavailable evidence, or missing "
+        "permission for the actual requested action.",
+        "For business_research_analyst or opportunity_scout, you may optionally include "
+        "retrieval_hint with precision, structured-enrichment, and search-review "
+        "recommendations.",
+        "Do not choose search providers; shared Python retrieval applies SearXNG plus "
+        "capped Agents hosted web search unless the operator explicitly selected one.",
+        "Return only an OrchestratorResult-compatible structured decision.",
+    ]
     payload = {
         "request": redact_secrets(request),
         "workflow_state": workflow_state,
-        "allowed_routes": [handoff.route for handoff in INTENDED_HANDOFFS] + ["clarification"],
-        "hard_rules": [
-            "Never send email or mark send_enabled true.",
-            "Outreach Composer requires approved company or opportunity context.",
-            "Use clarification for missing approvals, unsafe requests, or insufficient context.",
-            "For business_research_analyst or opportunity_scout, you may optionally include "
-            "retrieval_hint with precision, structured-enrichment, and search-review "
-            "recommendations.",
-            "Do not choose search providers; shared Python retrieval applies SearXNG plus "
-            "capped Agents hosted web search unless the operator explicitly selected one.",
-            "Return only an OrchestratorResult-compatible structured decision.",
-        ],
+        "routing_advice": dict(routing_advice or {}),
+        "allowed_routes": list(route_candidates),
+        "specialist_catalog": agent_selection_catalog(route_candidates),
+        "hard_rules": hard_rules,
     }
+    if runtime_scope is not None:
+        unavailable_requested_owner = _unavailable_requested_owner(
+            routing_advice,
+            runtime_scope,
+        )
+        payload["effective_runtime_scope"] = runtime_scope.prompt_payload(
+            route_candidates=route_candidates,
+            unavailable_requested_owner=unavailable_requested_owner,
+        )
+        hard_rules.insert(
+            0,
+            "effective_runtime_scope is the actual current owner/tool/source ceiling. "
+            "Never select an owner outside it or silently substitute another owner for "
+            "an explicitly requested unavailable owner; use clarification instead.",
+        )
     return json.dumps(payload, ensure_ascii=True, sort_keys=True)
+
+
+def _manual_plan_from_routing_advice(
+    routing_advice: Mapping[str, Any] | None,
+) -> ManualRequestPlan | None:
+    raw_plan = dict(routing_advice or {}).get("manual_request_plan")
+    if not isinstance(raw_plan, Mapping):
+        return None
+    try:
+        return ManualRequestPlan.model_validate(raw_plan)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_runtime_route_scope(
+    runtime_scope: EffectiveRuntimeRouteScope | Mapping[str, Any] | None,
+) -> EffectiveRuntimeRouteScope | None:
+    if runtime_scope is None:
+        return active_runtime_route_scope()
+    if isinstance(runtime_scope, EffectiveRuntimeRouteScope):
+        return runtime_scope
+    return EffectiveRuntimeRouteScope.model_validate(dict(runtime_scope))
+
+
+def _unavailable_requested_owner(
+    routing_advice: Mapping[str, Any] | None,
+    runtime_scope: EffectiveRuntimeRouteScope,
+) -> str:
+    plan = _manual_plan_from_routing_advice(routing_advice)
+    if plan is None:
+        return ""
+    requested = str(plan.requested_agent or "").strip()
+    recognized = {
+        *(spec.route_name for spec in SPECIALIST_AGENT_SPECS),
+        "chief_of_staff",
+    }
+    if requested in recognized and requested not in set(runtime_scope.permitted_routes):
+        return requested
+    return ""
+
+
+def _bounded_orchestrator_route_candidates(
+    routing_advice: Mapping[str, Any] | None,
+    runtime_scope: EffectiveRuntimeRouteScope | None = None,
+) -> tuple[str, ...] | None:
+    """Bound a clear single-owner route without replacing model selection.
+
+    The Orchestrator still returns the decision.  This candidate universe lets
+    the shared validator reject an incompatible owner and give the model one
+    repair turn instead of allowing route advice to silently redirect a named,
+    capability-compatible specialist request.
+    """
+
+    plan = _manual_plan_from_routing_advice(routing_advice)
+    manual_candidates: tuple[str, ...] | None = None
+    if plan is not None:
+        requested = str(plan.requested_agent or "").strip()
+        target = str(plan.target_agent or "").strip()
+        workflow = [
+            str(item or "").strip()
+            for item in plan.workflow
+            if str(item or "").strip()
+        ]
+        # Chief is intentionally excluded: a Chief request may legitimately expand
+        # into a multi-specialist workflow even when compatibility advice initially
+        # describes one manager-owned task.
+        recognized = {spec.route_name for spec in SPECIALIST_AGENT_SPECS}
+        if (
+            requested in recognized
+            and target in recognized
+            and len(workflow) <= 1
+            and (not workflow or workflow == [target])
+        ):
+            manual_candidates = tuple(
+                dict.fromkeys((target, "chief_of_staff", "clarification"))
+            )
+    if runtime_scope is None:
+        return manual_candidates
+    if _unavailable_requested_owner(routing_advice, runtime_scope):
+        return ("clarification",)
+    route_universe = tuple(
+        dict.fromkeys(
+            [
+                *(handoff.route for handoff in INTENDED_HANDOFFS),
+                "chief_of_staff",
+                "clarification",
+            ]
+        )
+    )
+    base_candidates = manual_candidates or route_universe
+    permitted = set(runtime_scope.permitted_routes)
+    bounded = tuple(
+        route
+        for route in base_candidates
+        if route == "clarification" or route in permitted
+    )
+    return bounded or ("clarification",)
 
 
 def _coerce_route_candidate(value: OrchestratorResult | Mapping[str, Any]) -> OrchestratorResult:
@@ -2770,7 +3105,37 @@ def _post_process_llm_route(
     approved_context_present: bool,
     workflow_state: Mapping[str, Any],
 ) -> OrchestratorResult:
-    if candidate.route == "outreach_composer" and not approved_context_present:
+    handoff = _HANDOFF_BY_ROUTE.get(candidate.route)
+    normalized_workflow = [
+        "_".join(str(step or "").strip().lower().replace("-", " ").split())
+        for step in candidate.workflow
+    ]
+    unsupported_workflow = [
+        step
+        for step in normalized_workflow
+        if step not in _LLM_WORKFLOW_ROUTES
+    ]
+    if unsupported_workflow:
+        raise ValueError(
+            "Orchestrator returned unsupported workflow routes: "
+            + ", ".join(dict.fromkeys(unsupported_workflow))
+        )
+    # Some compatible planners express workflow as the stages after `route`.
+    # Never discard the explicitly selected first specialist in that form.
+    # A complete ordered workflow containing the route keeps its exact order.
+    if handoff is not None and candidate.route not in normalized_workflow:
+        normalized_workflow.insert(0, candidate.route)
+    # A planned read is not evidence yet, but it can precede drafting. Keep
+    # actual evidence/approval checks at the specialist execution boundary.
+    before_outreach = (
+        normalized_workflow[:normalized_workflow.index("outreach_composer")]
+        if "outreach_composer" in normalized_workflow else []
+    )
+    acquisition_planned = bool(set(before_outreach) & (
+        _CONTEXT_AGENT_ROUTES | {"gmail_triage", "business_research_analyst"}
+    ))
+    if (candidate.route == "outreach_composer" and not approved_context_present
+            and not acquisition_planned):
         return _missing_outreach_context_refusal(workflow_state=workflow_state).model_copy(
             update={
                 "routing_mode": "llm",
@@ -2782,10 +3147,14 @@ def _post_process_llm_route(
             }
         )
 
-    handoff = _HANDOFF_BY_ROUTE.get(candidate.route)
     candidate.routing_mode = "llm"
-    candidate.target_agent = handoff.agent_name if handoff else None
-    candidate.workflow = [candidate.route] if handoff else []
+    # Preserve the model-owned ordered workflow after the decision validator has
+    # accepted it.  Filling an omitted single-route workflow is a structural
+    # projection of the already-selected route, not a replacement decision.
+    candidate.target_agent = candidate.target_agent or (
+        handoff.agent_name if handoff else None
+    )
+    candidate.workflow = normalized_workflow or ([candidate.route] if handoff else [])
     candidate.requires_human_review = True
     candidate.approval_required = True
     candidate.approved_context_present = approved_context_present
@@ -2799,8 +3168,10 @@ def _post_process_llm_route(
         request_text=request_text,
         current_hint=candidate.retrieval_hint,
     )
-    candidate.state_context_used = not _workflow_state_is_empty(workflow_state)
-    candidate.workflow_state_summary = dict(workflow_state)
+    candidate.state_context_used = bool(
+        not _workflow_state_is_empty(workflow_state) or workflow_state.get("supplied_source_bundle")
+    )
+    candidate.workflow_state_summary = OrchestratorWorkflowStateSummary.model_validate(workflow_state)
     if candidate.route == "outreach_composer":
         candidate.approval_scope = ApprovalScope.EXTERNAL_USE
         candidate.external_use_approval_required = True
@@ -2937,12 +3308,26 @@ def _route_ambiguous_with_llm(
     *,
     approved_context_present: bool,
     workflow_state: Mapping[str, Any],
+    routing_advice: Mapping[str, Any] | None = None,
     llm_router: LLMRouter | None = None,
     run_config: Any | None = None,
     live: bool = False,
     model: str | None = None,
+    sdk_callback: Callable[[Any], None] | None = None,
+    runtime_scope: EffectiveRuntimeRouteScope | Mapping[str, Any] | None = None,
 ) -> OrchestratorResult | None:
-    prompt = _llm_route_prompt(request, workflow_state)
+    effective_runtime_scope = _coerce_runtime_route_scope(runtime_scope)
+    bounded_route_candidates = _bounded_orchestrator_route_candidates(
+        routing_advice,
+        effective_runtime_scope,
+    )
+    prompt = _llm_route_prompt(
+        request,
+        workflow_state,
+        routing_advice=routing_advice,
+        allowed_routes=bounded_route_candidates,
+        runtime_scope=effective_runtime_scope,
+    )
     request_text = _payload_text(request)
     if llm_router is not None:
         candidate = _coerce_route_candidate(llm_router(prompt, workflow_state))
@@ -2955,14 +3340,24 @@ def _route_ambiguous_with_llm(
     if run_config is None and not live:
         return None
     sdk_result = run_typed_sdk_agent(
-        agent=build_orchestrator_agent(model=model, request_text=request_text),
-        typed_input=prompt,
-        output_type=OrchestratorResult,
+        agent=build_orchestrator_agent(
+            model=model,
+            include_handoffs=False,
+            include_tools=False,
+            request_text=request_text,
+            compact_instructions=True,
+            route_only=True,
+        ),
+        typed_input=json.loads(prompt),
+        output_type=OrchestratorPlanningResult,
         run_config=run_config,
         live=live,
         workflow_name="Keystone orchestrator LLM routing",
         trace_metadata={"agent": "orchestrator", "routing_mode": "llm"},
+        decision_contract=orchestrator_decision_contract(bounded_route_candidates),
     )
+    if sdk_callback is not None:
+        sdk_callback(sdk_result)
     candidate = sdk_result.output
     candidate.audit_notes = [*candidate.audit_notes, *_sdk_cost_audit_notes(sdk_result)]
     return _post_process_llm_route(
@@ -3107,8 +3502,7 @@ def _route_from_manual_plan(
         return _with_crm_write_boundary(result, request_text=request_text)
     if (
         not semantic_authority
-        and
-        not approved_context_present
+        and not approved_context_present
         and route == "outreach_composer"
         and _requires_research_before_outreach(request_text)
         and _requested_cross_agent_workflow(
@@ -3128,19 +3522,21 @@ def _route_from_manual_plan(
     ):
         requested_workflow = _requested_cross_agent_workflow(
             request_text,
-            start_route=route if route not in {"orchestrator", "clarification"} else "business_research_analyst",
+            start_route=route
+            if route not in {"orchestrator", "clarification"}
+            else "business_research_analyst",
         )
         has_research_first_path = "outreach_composer" in requested_workflow and any(
             step in requested_workflow[: requested_workflow.index("outreach_composer")]
             for step in ("business_research_analyst", "opportunity_scout", "gmail_triage")
         )
-        if not has_research_first_path and (route != "gmail_triage" or not _gmail_cross_agent_workflow(request_text)):
+        if not has_research_first_path and (
+            route != "gmail_triage" or not _gmail_cross_agent_workflow(request_text)
+        ):
             result = _missing_outreach_context_refusal(
                 workflow_state=workflow_state,
                 owning_route=(
-                    route
-                    if route not in {"orchestrator", "clarification"}
-                    else "outreach_composer"
+                    route if route not in {"orchestrator", "clarification"} else "outreach_composer"
                 ),
             )
             result.audit_notes = [*result.audit_notes, *audit_notes]
@@ -3181,8 +3577,7 @@ def _route_from_manual_plan(
                 ],
             )
         thread_local_draft = bool(
-            not semantic_authority
-            and _looks_like_thread_local_draft_request(request_text)
+            not semantic_authority and _looks_like_thread_local_draft_request(request_text)
         )
         if not approved_context_present and not thread_local_draft:
             result = _missing_outreach_context_refusal(workflow_state=workflow_state)
@@ -3245,11 +3640,7 @@ def _route_from_manual_plan(
         workflow = None
         if not semantic_authority and route == "gmail_triage":
             workflow = _gmail_cross_agent_workflow(request_text) or None
-        elif (
-            not semantic_authority
-            and workflow is None
-            and plan.requested_agent == "orchestrator"
-        ):
+        elif not semantic_authority and workflow is None and plan.requested_agent == "orchestrator":
             workflow = _requested_cross_agent_workflow(request_text, start_route=route) or None
         result = _result(
             route=route,
@@ -3286,13 +3677,17 @@ def _manual_plan_is_read_only_context_lookup(
 ) -> bool:
     if plan is None:
         return False
-    if not (plan.intent == "context_lookup" and plan.target_agent in {
-        "airtable_context_agent",
-        "google_workspace_context_agent",
-        "zotero_context_agent",
-        "rss_context_agent",
-        "preprints_context_agent",
-    }):
+    if not (
+        plan.intent == "context_lookup"
+        and plan.target_agent
+        in {
+            "airtable_context_agent",
+            "google_workspace_context_agent",
+            "zotero_context_agent",
+            "rss_context_agent",
+            "preprints_context_agent",
+        }
+    ):
         return False
     cleaned = _without_negated_context_send_clauses(request_text)
     return not _looks_like_send_side_effect(cleaned)
@@ -3397,9 +3792,9 @@ def route_request(
         else ProviderFreeCompositionAdmission()
     )
     if resolved_composition_admission.composition_allowed:
-        # The authenticated operator selected the completed thread result for
-        # this exact draft-only step. This approves the bounded drafting
-        # context, not external use, provider access, posting, or sending.
+        # The authenticated operator selected a verified bounded context for
+        # this exact draft-only step. This approves the drafting input, not
+        # external use, provider access, posting, or sending.
         approved_context_present = True
     send_side_effect = _looks_like_send_side_effect(text)
     read_only_context_lookup = _manual_plan_is_read_only_context_lookup(
@@ -3451,8 +3846,7 @@ def route_request(
         owning_route=(
             resolved_manual_plan.target_agent
             if resolved_manual_plan is not None
-            and resolved_manual_plan.target_agent
-            not in {"orchestrator", "clarification"}
+            and resolved_manual_plan.target_agent not in {"orchestrator", "clarification"}
             else "clarification"
         ),
     )
@@ -3471,12 +3865,19 @@ def route_request(
     )
     if planned_result is not None:
         if resolved_composition_admission.composition_allowed:
+            admission_note = (
+                "Admitted operator-approved synthetic facts for one provider-free "
+                "composition step; external use remains approval-gated."
+                if resolved_composition_admission.context_kind
+                == "operator_approved_synthetic_facts"
+                else "Admitted completed same-thread selected context for one "
+                "provider-free composition step; external use remains approval-gated."
+            )
             planned_result = planned_result.model_copy(
                 update={
                     "audit_notes": [
                         *planned_result.audit_notes,
-                        "Admitted completed same-thread selected context for one "
-                        "provider-free composition step; external use remains approval-gated.",
+                        admission_note,
                     ]
                 }
             )
@@ -3511,7 +3912,9 @@ def route_request(
             )
         )
 
-    if _OUTREACH_RE.search(route_lower_text) and _request_has_inline_approved_outreach_context(text):
+    if _OUTREACH_RE.search(route_lower_text) and _request_has_inline_approved_outreach_context(
+        text
+    ):
         return finish(
             _result(
                 route="outreach_composer",
@@ -3729,30 +4132,48 @@ def build_orchestrator_agent(
     model: str | None = None,
     *,
     include_handoffs: bool = True,
+    include_tools: bool = True,
     include_specialist_tools: bool | None = None,
     request_text: str = "",
     manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
     context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
+    compact_instructions: bool = False,
+    route_only: bool = False,
     tool_tier: str | int | None = None,
+    tool_scope_mode: ToolScopeMode | str = ToolScopeMode.AUTO,
 ) -> Agent:
     """Build the orchestrator agent with subordinate agent handoffs."""
 
-    instructions = compose_instructions(
-        "keystone_profile.md",
-        "safety_policy.md",
-        "tools.md",
-        "orchestrator.md",
-        skill_files=select_agent_skill_names(
-            "orchestrator",
-            request_text=request_text,
-            context_flags=context_flags,
-            include_all=include_all_skills,
-        ),
+    if route_only:
+        include_tools = False
+        include_handoffs = False
+        include_specialist_tools = False
+
+    skill_files = select_agent_skill_names(
+        "orchestrator",
+        request_text=request_text,
+        context_flags=context_flags,
+        include_all=include_all_skills,
+        compact=compact_instructions,
     )
-    handoffs = [
-        spec.build_agent() for spec in SPECIALIST_AGENT_SPECS if spec.handoff_enabled
-    ] if include_handoffs else []
+    composer = compose_direct_instructions if compact_instructions else compose_instructions
+    prompt_files = (
+        ("keystone_profile.md", "safety_policy.md", "orchestrator.md")
+        if compact_instructions
+        else (
+            "keystone_profile.md",
+            "safety_policy.md",
+            "tools.md",
+            "orchestrator.md",
+        )
+    )
+    instructions = composer(*prompt_files, skill_files=skill_files)
+    handoffs = (
+        [spec.build_agent() for spec in SPECIALIST_AGENT_SPECS if spec.handoff_enabled]
+        if include_handoffs
+        else []
+    )
     specialist_tools = (
         _build_read_only_specialist_tools(
             raw_operator_request=request_text,
@@ -3765,9 +4186,16 @@ def build_orchestrator_agent(
         )
         else []
     )
-    tools = append_configured_file_search_tools(
-        "orchestrator",
-        [
+    exact_work_item_inspection = bool(
+        is_read_only_work_item_inspection_plan(manual_request_plan)
+        and re.search(r"\bwi_[A-Za-z0-9_-]+\b", str(request_text or ""))
+    )
+    tools = (
+        [inspect_work_item_execution_receipts]
+        if exact_work_item_inspection
+        else append_configured_file_search_tools(
+            "orchestrator",
+            [
             list_local_context_sources,
             search_local_context,
             read_local_context_file,
@@ -3784,19 +4212,45 @@ def build_orchestrator_agent(
             summarize_rendered_page_diagnostics,
             route_request_placeholder,
             load_orchestrator_workflow_state,
+            inspect_work_item_execution_receipts,
             load_pending_approval_items,
             extract_research_claims_from_html,
             *specialist_tools,
-            *google_workspace_tools(),
-        ],
+                *google_workspace_tools(),
+            ],
+        )
     )
-    if tool_tier is not None:
-        tools = filter_tools_for_tier("orchestrator", tools, tool_tier)
+    resolved_scope_mode = tool_scope_mode
+    if str(tool_scope_mode) == ToolScopeMode.AUTO.value and (
+        request_text or manual_request_plan is not None or tool_tier is not None
+    ):
+        resolved_scope_mode = ToolScopeMode.REQUEST_SCOPED
+    resolved_tool_tier = tool_tier or ("deep_retrieval" if specialist_tools else None)
+    plan_authority = ExecutionIntentAuthority.from_value(manual_request_plan)
+    retrieval_tools_required = bool(
+        plan_authority.canonical
+        and plan_authority.plan is not None
+        and (
+            plan_authority.plan.requires_live_search
+            or plan_authority.plan.intent in {"company_research", "research_brief", "opportunity_search"}
+        )
+    )
+    attachment = scope_tools_for_request(
+        "orchestrator",
+        tools if include_tools else [],
+        manual_request_plan=manual_request_plan,
+        tool_tier=resolved_tool_tier,
+        mode=resolved_scope_mode,
+        required_tool_names=(
+            *(("search_web", "extract_research_claims_from_html") if retrieval_tools_required else ()),
+            *(str(getattr(tool, "name", "") or "") for tool in specialist_tools),
+        ),
+    )
     agent = build_sdk_agent(
         name="orchestrator",
         instructions=instructions,
-        output_type=OrchestratorResult,
-        tools=tools,
+        output_type=OrchestratorPlanningResult if route_only else OrchestratorResult,
+        tools=list(attachment.tools),
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="orchestrator",
@@ -3810,7 +4264,7 @@ def build_orchestrator_agent(
             "preserving approval gates and no-send policy."
         ),
     )
-    return _attach_handoff_metadata(agent)
+    return _attach_handoff_metadata(attach_tool_scope_receipt(agent, attachment.scope))
 
 
 def build_orchestrator_review_agent(
@@ -3871,36 +4325,240 @@ def run_orchestrator_sdk(
     """Run the orchestrator through the shared typed SDK harness."""
 
     typed_input_for_run = _orchestrator_sdk_input(typed_input, live=live)
+    plan_authority = ExecutionIntentAuthority.from_value(manual_request_plan)
+    if plan_authority.plan is not None:
+        if isinstance(typed_input_for_run, Mapping):
+            typed_input_for_run = dict(typed_input_for_run)
+        else:
+            typed_input_for_run = {"request": str(typed_input_for_run or "")}
+        typed_input_for_run["manual_request_plan_routing_advice"] = (
+            plan_authority.plan.model_dump(mode="json")
+        )
+        typed_input_for_run["manual_request_plan_authority"] = (
+            "canonical_execution_authority"
+            if plan_authority.canonical
+            else "routing_advice_only"
+        )
     resolved_tool_tier = tool_tier or _default_orchestrator_sdk_tool_tier(
-        typed_input,
-        live=live,
+        manual_request_plan,
     )
-    return run_typed_sdk_agent(
-        agent=build_orchestrator_agent(
-            model=model,
-            include_handoffs=False,
-            include_specialist_tools=include_specialist_tools,
-            request_text=skill_request_text(typed_input),
-            manual_request_plan=manual_request_plan,
-            tool_tier=resolved_tool_tier,
-        ),
+    agent = build_orchestrator_agent(
+        model=model,
+        include_handoffs=False,
+        include_specialist_tools=include_specialist_tools,
+        request_text=skill_request_text(typed_input),
+        manual_request_plan=manual_request_plan,
+        tool_tier=resolved_tool_tier,
+    )
+    scope_receipt = tool_scope_receipt_for_agent(agent)
+    result = run_typed_sdk_agent(
+        agent=agent,
         typed_input=typed_input_for_run,
         output_type=OrchestratorResult,
         run_config=run_config,
         live=live,
         session=session,
+        trace_metadata=tool_scope_trace_metadata_for_agent(agent),
+        tool_execution_contract=(
+            ToolExecutionContract.required(
+                ToolEvidenceGroup(
+                    "work_item_receipts",
+                    ("inspect_work_item_execution_receipts",),
+                ),
+                stage="orchestrator_work_item_inspection",
+            )
+            if live
+            and run_config is None
+            and is_read_only_work_item_inspection_plan(manual_request_plan)
+            else None
+        ),
+        decision_contract=orchestrator_decision_contract(),
+    )
+    request_cache = getattr(result, "request_cache", None)
+    if isinstance(request_cache, dict):
+        request_cache["request_tool_scope"] = scope_receipt
+    return result
+
+
+def reconcile_orchestrator_work_item_inspection(
+    result: OrchestratorResult,
+    *,
+    request_text: str,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None,
+    database_url: str | None = None,
+) -> OrchestratorResult:
+    """Render exact read-only WorkItem state without authorizing downstream execution."""
+
+    if not is_read_only_work_item_inspection_plan(manual_request_plan):
+        return result
+    match = re.search(r"\bwi_[A-Za-z0-9_-]+\b", str(request_text or ""))
+    if match is None:
+        return result.model_copy(
+            update={
+                "route": "orchestrator",
+                "target_agent": "orchestrator",
+                "workflow": ["inspect_work_item"],
+                "routing_mode": "deterministic",
+                "rationale": "A read-only WorkItem inspection needs one exact WorkItem id.",
+                "clarification_request": "Provide the exact WorkItem id beginning with wi_.",
+                "stop_reason": "No WorkItem was inspected or mutated.",
+                "approval_required": False,
+                "external_use_approval_required": False,
+                "send_enabled": False,
+                "can_send_email": False,
+                "retrieval_diagnostics": {
+                    **result.retrieval_diagnostics,
+                    "output_authority": "deterministic_receipt_reconciliation",
+                    "model_result_superseded": True,
+                    "work_item_receipt_inspection": {
+                        "inspection_status": "missing_work_item_id",
+                    },
+                },
+            }
+        )
+
+    inspection = json.loads(
+        inspect_work_item_execution_receipts_impl(
+            match.group(0),
+            database_url=database_url,
+        )
+    )
+    if inspection.get("inspection_status") != "ok":
+        summary = f"WorkItem {match.group(0)} was not found in canonical local state."
+        target_agent = "orchestrator"
+    else:
+        stage_receipts = list(inspection.get("stage_receipts") or [])
+        latest_stage = stage_receipts[0] if stage_receipts else {}
+        artifact_ids = [
+            str(item) for item in latest_stage.get("artifact_ids", []) if str(item).strip()
+        ]
+        resume = dict(inspection.get("resume_point") or {})
+        do_not_repeat = [
+            *[str(item) for item in resume.get("do_not_repeat_stages", [])],
+            *[str(item) for item in resume.get("do_not_repeat_tool_names", [])],
+        ]
+        preserved_artifacts = (
+            f" Retain prior artifact ids {', '.join(artifact_ids)} as existing evidence."
+            if artifact_ids
+            else ""
+        )
+        stage_text = (
+            f"{latest_stage.get('route') or inspection.get('current_route') or 'unknown'} / "
+            f"{latest_stage.get('event_type') or latest_stage.get('status') or 'unknown'} "
+            f"({latest_stage.get('status') or inspection.get('work_item_status') or 'unknown'})"
+        )
+        blocker_text = (
+            ", ".join(str(item) for item in inspection.get("open_blocker_codes", []))
+            or "none recorded"
+        )
+        approval_scopes = [
+            str(item)
+            for item in inspection.get("unresolved_approval_scopes", [])
+            if str(item).strip()
+        ]
+        approval_text = (
+            f"pending for {', '.join(approval_scopes)}"
+            if approval_scopes
+            else "none pending"
+        )
+        no_repeat_text = (
+            ", ".join(do_not_repeat) if do_not_repeat else "no verified mutations"
+        )
+        resume_text = str(
+            resume.get("description") or "No exact resume action is available."
+        ).strip()
+        constraints = output_constraints_from_plan(manual_request_plan)
+        exact_three_bullets = bool(
+            constraints.item_count_mode == "exact"
+            and constraints.minimum_items == 3
+            and constraints.maximum_items == 3
+        )
+        if exact_three_bullets:
+            summary = "\n".join(
+                [
+                    (
+                        f"- Verified stage: {stage_text}. Do not repeat: "
+                        f"{no_repeat_text}.{preserved_artifacts}"
+                    ),
+                    f"- Approval: {approval_text}. Current blocker: {blocker_text}.",
+                    (
+                        f"- Safest resume point: {resume_text} "
+                        "This inspection changed no WorkItem or provider state."
+                    ),
+                ]
+            )
+        else:
+            summary = "\n".join(
+                [
+                    "Receipt-backed read-only WorkItem inspection:",
+                    f"Last verified stage: {stage_text}.",
+                    f"Exact blocker: {blocker_text}.",
+                    (
+                        f"Approval state: {approval_text}. Completed operations not to repeat: "
+                        f"{no_repeat_text}.{preserved_artifacts}"
+                    ),
+                    f"Safest single resume action: {resume_text}",
+                    "No WorkItem or provider state was changed.",
+                ]
+            )
+        target_agent = str(inspection.get("current_route") or "orchestrator")
+
+    artifacts = result.artifacts.model_copy(
+        update={
+            "notes": list(
+                dict.fromkeys(
+                    [
+                        *result.artifacts.notes,
+                        "Canonical read-only WorkItem receipt inspection completed.",
+                    ]
+                )
+            )
+        }
+    )
+    return result.model_copy(
+        update={
+            # The route stays with Orchestrator because this is a completed
+            # inspection, not authority to auto-run the specialist named by state.
+            "route": "orchestrator",
+            "target_agent": target_agent,
+            "workflow": ["inspect_work_item"],
+            "routing_mode": "deterministic",
+            "rationale": summary,
+            "clarification_request": None,
+            "stop_reason": "Read-only inspection completed; no resume or mutation executed.",
+            "requires_human_review": False,
+            "approval_required": False,
+            "external_use_approval_required": False,
+            "state_context_used": True,
+            "retrieval_diagnostics": {
+                **result.retrieval_diagnostics,
+                "output_authority": "deterministic_receipt_reconciliation",
+                "model_result_superseded": True,
+                "work_item_receipt_inspection": inspection,
+            },
+            "artifacts": artifacts,
+            "send_enabled": False,
+            "can_send_email": False,
+            "forbidden_actions": list(
+                dict.fromkeys(
+                    [*result.forbidden_actions, "resume_work_item", "mutate_work_item"]
+                )
+            ),
+            "audit_notes": list(
+                dict.fromkeys(
+                    [
+                        *result.audit_notes,
+                        "Read-only inspection route was retained by Orchestrator; downstream autorun was not authorized.",
+                    ]
+                )
+            ),
+        }
     )
 
 
 def _default_orchestrator_sdk_tool_tier(
-    typed_input: str | Mapping[str, Any],
-    *,
-    live: bool,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None,
 ) -> str:
-    """Infer a conservative default tool tier for Orchestrator SDK runs."""
+    """Resolve Orchestrator's tier only from canonical semantic authority."""
 
-    budget = business_research_quality_budget(
-        request_text=skill_request_text(typed_input),
-        live_search=live,
-    )
-    return budget.tool_tier or "core_read"
+    return default_tool_tier_for_request(manual_request_plan)

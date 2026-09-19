@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from pydantic import BaseModel
 
 from keystone_agents.schemas.company_profile import CompanyProfile, CompanyResearchFocusedBrief
 from keystone_agents.schemas.email_triage import EmailTriageResult, GmailPriorityGroupingResult
+from keystone_agents.schemas.gmail_query import GmailReadContextResult
 from keystone_agents.schemas.opportunity import OpportunityScoutResult
 from keystone_agents.schemas.orchestrator import OrchestratorOutputReview
 from keystone_agents.schemas.outreach import OutreachDraft
@@ -943,12 +945,33 @@ def render_operator_dashboard_decision() -> str:
     return "\n".join(lines)
 
 
+def render_gmail_selected_answer(
+    result: EmailTriageResult,
+    *,
+    selected_context: GmailReadContextResult | None = None,
+) -> str:
+    """Render model copy with the source link from its validated provider read."""
+    if result.decision.needs_more_context:
+        return ""
+    lines = [(result.operator_answer or result.summary).strip()]
+    if result.draft_reply:
+        lines.extend(["", "Draft for review:", result.draft_reply.strip()])
+    source_url = selected_context.source_url if selected_context is not None else ""
+    visible_urls = {
+        url.rstrip(").,;]") for url in re.findall(r"https?://[^\s<>]+", "\n".join(lines))
+    }
+    if source_url and source_url not in visible_urls:
+        lines.extend(["", f"Source: {source_url}"])
+    return "\n".join(lines).strip()
+
+
 def render_gmail_triage_report(result: EmailTriageResult | dict[str, Any]) -> str:
     """Render a Gmail triage report."""
 
     data = result.model_dump() if isinstance(result, EmailTriageResult) else result
-    if str(data.get("mode") or "") == "live-gmail-thread-summary" or data.get(
-        "thread_summary_result"
+    if not data.get("operator_answer") and (
+        str(data.get("mode") or "") == "live-gmail-thread-summary"
+        or data.get("thread_summary_result")
     ):
         return render_gmail_thread_summary_report(
             data.get("thread_summary_result") if data.get("thread_summary_result") else data
@@ -969,6 +992,8 @@ def render_gmail_triage_report(result: EmailTriageResult | dict[str, Any]) -> st
         _clean(data.get("summary")),
     ]
     thread_context = _clean(data.get("thread_context") or data.get("thread_summary"))
+    if data.get("operator_answer"):
+        lines.extend(["", "## Answer", "", _clean(data["operator_answer"])])
     if thread_context:
         lines.extend(["", "## Thread Context", "", thread_context])
     if data.get("draft_reply"):

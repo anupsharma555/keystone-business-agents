@@ -8,7 +8,13 @@ from typing import Any
 
 from keystone_agents.agent_tool_policy import filter_tools_for_tier
 from keystone_agents.authority.semantic import ExecutionIntentAuthority
+from keystone_agents.capabilities.tool_scope import (
+    ToolScopeMode,
+    attach_tool_scope_receipt,
+    scope_tools_for_request,
+)
 from keystone_agents.guardrails import keystone_guardrails
+from keystone_agents.planning.compatibility import positive_capability_text
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.operational_context import ZoteroContextResult
 from keystone_agents.sdk import (
@@ -135,6 +141,13 @@ def _canonical_zotero_tool_names(
             )
         return selected
 
+    if (
+        marked_test
+        and {"create", "update", "delete"} <= operations
+        and re.search(r"\bnotes?\b", normalized)
+    ):
+        return {"zotero_test_note_lifecycle"}
+
     # Compatibility for older canonical producers that supplied typed provider
     # operations but not resource-level steps. Target type may narrow the read;
     # otherwise stay within Zotero read-only tools and never infer a write family
@@ -204,10 +217,24 @@ def _zotero_context_tools(
         google_sheet_append_rows,
         google_sheet_update_row,
     ]
-    if tool_tier is None:
-        return tools
-    filtered = filter_tools_for_tier("zotero_context_agent", tools, tool_tier)
     authority = ExecutionIntentAuthority.from_value(manual_plan)
+    if authority.invalid:
+        return []
+    if tool_tier is None and authority.plan is None:
+        return tools
+    zotero_operations = set(authority.effective_provider_operations("zotero"))
+    resolved_tool_tier = (
+        tool_tier
+        if tool_tier is not None
+        else "internal_write"
+        if zotero_operations.intersection({"create", "update", "delete", "attach"})
+        else "core_read"
+    )
+    filtered = filter_tools_for_tier(
+        "zotero_context_agent",
+        tools,
+        resolved_tool_tier,
+    )
     if authority.canonical:
         selected_names = _canonical_zotero_tool_names(
             authority,
@@ -216,10 +243,8 @@ def _zotero_context_tools(
         return [
             tool for tool in filtered if getattr(tool, "name", "") in selected_names
         ]
-    if authority.invalid:
-        return []
-    normalized = " ".join(str(request_text or "").lower().split())
-    tier = str(tool_tier)
+    normalized = " ".join(positive_capability_text(request_text).lower().split())
+    tier = str(resolved_tool_tier)
     if tier not in {"core_read", "internal_write"}:
         return filtered
     selected_names: set[str] = set()
@@ -254,7 +279,11 @@ def _zotero_context_tools(
                 requests_create and requests_update and requests_delete
             )
             if lifecycle:
-                selected_names.add("zotero_test_note_lifecycle")
+                return [
+                    tool
+                    for tool in filtered
+                    if getattr(tool, "name", "") == "zotero_test_note_lifecycle"
+                ]
             elif requests_create or requests_update:
                 selected_names.add("zotero_write_test_note")
             if not lifecycle and requests_delete:
@@ -329,19 +358,31 @@ def build_zotero_context_agent(
             "zotero_context.md",
             skill_files=skill_files,
         )
-    return build_sdk_agent(
+    candidate_tools = (
+        _zotero_context_tools(
+            tool_tier=tool_tier,
+            request_text=request_text,
+            manual_plan=manual_plan,
+        )
+        if attach_tools
+        else []
+    )
+    attachment = scope_tools_for_request(
+        "zotero_context_agent",
+        candidate_tools,
+        manual_request_plan=manual_plan,
+        tool_tier=tool_tier,
+        mode=(
+            ToolScopeMode.REQUEST_SCOPED
+            if manual_plan is not None
+            else ToolScopeMode.FULL
+        ),
+    )
+    agent = build_sdk_agent(
         name="zotero_context_agent",
         instructions=instructions,
         output_type=ZoteroContextResult,
-        tools=(
-            _zotero_context_tools(
-                tool_tier=tool_tier,
-                request_text=request_text,
-                manual_plan=manual_plan,
-            )
-            if attach_tools
-            else []
-        ),
+        tools=list(attachment.tools),
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="zotero_context_agent",
@@ -350,3 +391,4 @@ def build_zotero_context_agent(
             "evidence context, plus direct approved Workspace artifact writes."
         ),
     )
+    return attach_tool_scope_receipt(agent, attachment.scope)

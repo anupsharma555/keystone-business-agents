@@ -3,6 +3,7 @@ from __future__ import annotations
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -95,10 +96,10 @@ def test_sandbox_docs_cover_keystone_use_cases_and_security() -> None:
         assert phrase in text
 
 
-def test_openai_agents_dependency_range_is_0_19() -> None:
+def test_openai_agents_dependency_range_is_0_22() -> None:
     config = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert "openai-agents>=0.19.1,<0.20" in config["project"]["dependencies"]
+    assert "openai-agents>=0.22.2,<0.23" in config["project"]["dependencies"]
 
 
 def test_sandbox_scaffold_is_import_guarded_when_classes_are_missing(
@@ -185,6 +186,69 @@ def test_sandbox_execution_wrapper_uses_injected_local_runner(
     assert result.artifact_review_required is True
     assert calls[0]["agent"] is result.setup.agent
     assert calls[0]["run_config"] is result.setup.run_config
+
+
+def test_unix_local_execution_rejects_legacy_environment_inheritance(monkeypatch) -> None:
+    class LegacyClient:
+        pass
+
+    monkeypatch.setattr(sandboxing, "UnixLocalSandboxClient", LegacyClient)
+    client = sandboxing._build_scoped_unix_local_client()
+    config = SimpleNamespace(sandbox=SimpleNamespace(client=client))
+
+    def unexpected_runner(*_args, **_kwargs):
+        pytest.fail("unsafe Unix-local client must stop before SDK execution")
+
+    monkeypatch.setattr(sandboxing.Runner, "run_sync", unexpected_runner)
+
+    with pytest.raises(sandboxing.SandboxAgentsUnavailable, match="environment isolation"):
+        sandboxing._run_with_sdk_runner(object(), "Inspect synthetic files", config)
+
+
+def test_real_sandbox_execution_rejects_implicit_client() -> None:
+    with pytest.raises(sandboxing.SandboxAgentsUnavailable, match="explicit sandbox client"):
+        sandboxing._validate_unix_local_execution_environment(SimpleNamespace())
+
+
+@pytest.mark.parametrize("unsafe", ["inherit_all", "credential_allowlist"])
+def test_unix_local_execution_rejects_unsafe_supplied_client(monkeypatch, unsafe) -> None:
+    class Client:
+        def __init__(self, *, inherit_host_environment=True, host_environment_allowlist=None):
+            self._host_environment_allowlist = (
+                None if inherit_host_environment else frozenset(host_environment_allowlist)
+            )
+
+    monkeypatch.setattr(sandboxing, "UnixLocalSandboxClient", Client)
+    client = (
+        Client()
+        if unsafe == "inherit_all"
+        else Client(
+            inherit_host_environment=False,
+            host_environment_allowlist={"SYNTHETIC_API_KEY"},
+        )
+    )
+    config = SimpleNamespace(sandbox=SimpleNamespace(client=client))
+
+    with pytest.raises(sandboxing.SandboxAgentsUnavailable, match="environment isolation"):
+        sandboxing._validate_unix_local_execution_environment(config)
+
+
+def test_unix_local_supported_sdk_uses_filtered_environment(monkeypatch) -> None:
+    class Client:
+        def __init__(self, *, inherit_host_environment=True, host_environment_allowlist=None):
+            self._host_environment_allowlist = (
+                None if inherit_host_environment else frozenset(host_environment_allowlist)
+            )
+
+    monkeypatch.setattr(sandboxing, "UnixLocalSandboxClient", Client)
+    client = sandboxing._build_scoped_unix_local_client()
+    config = SimpleNamespace(sandbox=SimpleNamespace(client=client))
+
+    sandboxing._validate_unix_local_execution_environment(config)
+    assert client._host_environment_allowlist is not None
+    assert "PATH" in client._host_environment_allowlist
+    assert "KEYSTONE_OPENAI_API_KEY" not in client._host_environment_allowlist
+    assert "OPENAI_API_KEY" not in client._host_environment_allowlist
 
 
 def test_sandbox_execution_wrapper_rejects_secret_like_prompt(tmp_path: Path) -> None:

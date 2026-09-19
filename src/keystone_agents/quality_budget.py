@@ -10,6 +10,9 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from keystone_agents.authority.semantic import ExecutionIntentAuthority
+from keystone_agents.planning.compatibility import (
+    chief_specialist_execution_forbidden,
+)
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 
 
@@ -110,6 +113,24 @@ def chief_of_staff_quality_budget(
                 "Quality mode inferred as fast for simple deterministic Chief of Staff routing."
             )
     budget = _budget_for_mode(resolved, notes=notes)
+    required_tool_tier = _chief_required_tool_tier(
+        manual_request_plan,
+        request_text=request_text,
+    )
+    if required_tool_tier is not None:
+        budget = budget.model_copy(
+            update={
+                "tool_tier": required_tool_tier,
+                "notes": [
+                    *budget.notes,
+                    (
+                        "The validated provider or specialist workflow raised only the "
+                        f"tool ceiling to {required_tool_tier}; deterministic provider, "
+                        "approval, and specialist gates remain authoritative."
+                    ),
+                ],
+            }
+        )
     if semantic_plan and manual_request_plan is not None:
         if not explicit and _chief_plan_is_provider_free_response(
             manual_request_plan
@@ -173,6 +194,36 @@ def chief_of_staff_quality_budget(
             }
         )
     return budget
+
+
+def _chief_required_tool_tier(
+    plan: ManualRequestPlan | None,
+    *,
+    request_text: str = "",
+) -> str | None:
+    """Return the minimum tier needed by an already-typed Chief plan."""
+
+    authority = ExecutionIntentAuthority.from_value(plan)
+    if authority.plan is None:
+        return None
+    typed_plan = authority.plan
+    operations = set(
+        authority.effective_provider_operations(typed_plan.provider_system)
+    )
+    if (
+        typed_plan.intent == "business_system_write"
+        and typed_plan.provider_system != "unspecified"
+        and typed_plan.ask_shape.permission_state != "read_only"
+        and operations.intersection({"create", "update", "delete", "attach"})
+    ):
+        return "internal_write"
+    if (
+        typed_plan.target_agent == "chief_of_staff"
+        and typed_plan.workflow
+        and not chief_specialist_execution_forbidden(request_text)
+    ):
+        return "deep_retrieval"
+    return None
 
 
 def _chief_quality_mode_from_plan(

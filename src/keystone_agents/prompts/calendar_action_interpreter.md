@@ -132,4 +132,10 @@ Rules:
   the human title without those formatting characters.
 - Record every material uncertainty in `ambiguities`. Do not guess missing
   dates, times, event identity, or write scope.
+- Return a `decision` with `decision_owner=specialist_agent` and
+  `decision_stage=calendar_action_interpretation`. Select the single operation
+  returned in `operation`, explain why the current operator directive supports
+  it, and identify any plausible alternative operation as excluded. If the
+  supplied context is insufficient, choose `operation=none`, select `none`, and
+  explain the missing context; Python will not substitute another operation.
 - Return no prose outside the structured output.

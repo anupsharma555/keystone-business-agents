@@ -225,6 +225,11 @@ def context_file_session_components(
         data = json.loads(Path(context_file_path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    return context_payload_session_components(data)
+
+
+def context_payload_session_components(data: Any) -> tuple[str, tuple[str, ...]] | None:
+    """Derive the same Slack scope from an accepted JSON snapshot without file IO."""
     if not isinstance(data, dict):
         return None
     schema = str(data.get("schema") or data.get("schema_") or "").strip()

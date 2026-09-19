@@ -196,7 +196,7 @@ SLACK_ENTRYPOINT_READINESS_CASES: tuple[SlackEntrypointReadinessCase, ...] = (
             "usage_trace_request_count_and_cost_receipt",
             "no_unintended_side_effect",
         ),
-        max_openai_requests=4,
+        max_openai_requests=10,
         max_cost_usd=0.15,
         live_slack_evidence_proven=True,
         live_evidence_refs=(

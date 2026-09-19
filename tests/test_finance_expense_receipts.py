@@ -101,7 +101,7 @@ def test_image_receipt_ocr_uses_explicit_command_when_launch_path_is_minimal(
     )
     helper.chmod(0o700)
     image = tmp_path / "receipt.png"
-    image.write_bytes(b"synthetic image fixture")
+    image.write_bytes(b"\x89PNG\r\n\x1a\nsynthetic image fixture")
     monkeypatch.setenv("KEYSTONE_TESSERACT_COMMAND", str(helper))
     monkeypatch.setattr(shutil, "which", lambda _name: None)
 
@@ -200,6 +200,27 @@ def test_parse_finance_receipt_text_extracts_example_print_fields() -> None:
     assert parsed["total"] == "76.80"
     assert parsed["currency"] == "USD"
     assert parsed["payment_summary"] == "credit card ending in 0000"
+
+
+def test_parse_booking_confirmation_prefers_merchant_and_document_timestamp() -> None:
+    parsed = parse_finance_receipt_text(
+        """
+        8/5/26, 5:47 PM Your hotel reservation
+        Your reservation is complete!
+        Thank you for booking!
+        Example Harbor Hotel & Spa
+        100 Example Avenue
+        CHECK-IN CHECKOUT
+        Sun, Oct 25, 2026 Tue, Oct 27, 2026
+        Grand Total USD 762.75
+        All data protected by Example Booking Platform, Inc.
+        """
+    )
+
+    assert parsed["vendor"] == "Example Harbor Hotel & Spa"
+    assert parsed["receipt_date"] == "2026-08-05"
+    assert parsed["estimated_tax_periods"] == "3"
+    assert parsed["total"] == "762.75"
 
 
 def test_parse_finance_receipt_text_accepts_amount_paid_total_label() -> None:

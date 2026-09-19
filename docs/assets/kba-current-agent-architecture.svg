@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1280" viewBox="0 0 1800 1280" role="img" aria-labelledby="title desc">
   <title id="title">Keystone Business Agents current architecture</title>
-  <desc id="desc">Generated architecture diagram showing entrypoints, Orchestrator-first preflight and review, WorkItem canonical state, backend graph selection, optional LangGraph execution, Chief of Staff operating synthesis, registered SDK agents, typed context packs, deterministic gates, traces, logs, evals, and renderers.</desc>
+  <desc id="desc">Generated architecture diagram showing entrypoints, agent-owned semantic decisions, Orchestrator-first control, request-scoped tools, bounded validation and recovery, WorkItem canonical state, optional LangGraph execution, cross-provider context, receipts, telemetry, and renderers. Representative handoffs include gmail_triage -> business_research_analyst -> outreach_composer -> approval_checkpoint; chief_of_staff -> airtable/google_workspace context -> approval_checkpoint; and rss/preprints/zotero context -> business research/opportunity specialist.</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#334155"/></marker>
     <marker id="arrow-det" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#d97706"/></marker>
@@ -27,8 +27,8 @@
       .small { font: 400 12px Arial, sans-serif; fill: #475569; }
       .tiny { font: 400 11px Arial, sans-serif; fill: #64748b; }
       .label { font: 700 12px Arial, sans-serif; fill: #334155; }
+      .link { font: 700 12px Arial, sans-serif; fill: #2563eb; text-decoration: underline; }
       .routeLine { stroke: #334155; stroke-width: 2.5; fill: none; marker-end: url(#arrow); }
-      .reviewLine { stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#arrow); stroke-dasharray: 4 4; }
       .detLine { stroke: #d97706; stroke-width: 2.5; fill: none; marker-end: url(#arrow-det); }
       .toolAgentLine { stroke: #0891b2; stroke-width: 2.5; fill: none; marker-end: url(#arrow-tool); }
       .obsLine { stroke: #db2777; stroke-width: 2.5; fill: none; marker-end: url(#arrow-obs); }
@@ -37,8 +37,8 @@
   </defs>
   <rect class="bg" width="1800" height="1280"/>
   <text class="title" x="52" y="56">Keystone Business Agents Architecture</text>
-  <text class="subtitle" x="54" y="84">Generated from the current AgentSpec registry, WorkItem graph runtime contracts, trace processor, and eval database shape.</text>
-  <text class="tiny" x="1510" y="84">Generated 2026-07-11</text>
+  <text class="subtitle" x="54" y="84">Generated from AgentSpec, decision/tool contracts, WorkItem graph runtime, receipts, telemetry, and eval database shape.</text>
+  <text class="tiny" x="1510" y="84">Generated 2026-09-18</text>
   <rect class="frame" x="40" y="115" width="1720" height="1115" rx="18"/>
 <rect class="lane" x="70" y="155" width="310" height="205" rx="14"/>
 <text class="section" x="95" y="190">Entrypoints</text>
@@ -51,20 +51,20 @@
 <rect class="orchestrator" x="450" y="145" width="470" height="225" rx="14"/>
 <text class="section" x="482" y="181">Orchestrator Agent</text>
 <text class="body" x="482" y="215">- First LLM control plane for natural-language asks</text>
-<text class="body" x="482" y="239">- Route advice, blockers, retrieval hints</text>
-<text class="body" x="482" y="263">- Compact preflight context across boundaries</text>
-<text class="body" x="482" y="287">- Deterministic output review before final rendering</text>
+<text class="body" x="482" y="239">- Owns semantic route + ordered workflow choice</text>
+<text class="body" x="482" y="263">- Validated internal decision reaches specialist</text>
+<text class="body" x="482" y="287">- Decision + output review before rendering</text>
 <text class="small" x="482" y="330">Explicit agent mention is routing advice, not authority.</text>
 <text class="small" x="482" y="350">Python gates remain authoritative.</text>
 <rect class="state" x="985" y="145" width="330" height="225" rx="14"/>
 <text class="section" x="1010" y="181">Planning and State Contract</text>
-<text class="body" x="1010" y="215">- ManualRequestPlan</text>
-<text class="body" x="1010" y="239">- OrchestratorResult</text>
-<text class="body" x="1010" y="263">- WorkItems / SQLite canonical state</text>
-<text class="body" x="1010" y="287">- Typed context packs</text>
-<text class="body" x="1010" y="311">- Backend graph selection</text>
-<text class="body" x="1010" y="335">- Approval gates and artifact refs</text>
-<text class="tiny" x="1010" y="350">Schema-light planning; graph-aware typed execution.</text>
+<text class="small" x="1010" y="213">- ManualRequestPlan compatibility envelope</text>
+<text class="small" x="1010" y="235">- OrchestratorResult</text>
+<text class="small" x="1010" y="257">- AgentDecisionRecord + validator outcome</text>
+<text class="small" x="1010" y="279">- WorkItems / SQLite canonical state</text>
+<text class="small" x="1010" y="301">- Typed context packs</text>
+<text class="small" x="1010" y="323">- Backend graph selection</text>
+<text class="tiny" x="1010" y="357">Schema-light planning; graph-aware typed execution.</text>
 <rect class="lane" x="1365" y="145" width="310" height="225" rx="14"/>
 <text class="section" x="1390" y="181">Connection Legend</text>
 <path class="routeLine" d="M1390 215 L1465 215"/>
@@ -75,7 +75,7 @@
 <text class="body" x="1480" y="294">Agents as tools</text>
 <path class="obsLine dash" d="M1390 326 L1465 326"/>
 <text class="body" x="1480" y="331">Traces / logs / evals</text>
-<text class="tiny" x="1390" y="356">Dashed dark arrows show deterministic Orchestrator review feedback.</text>
+<text class="tiny" x="1390" y="356">Lines show ownership, not execution order.</text>
 <rect class="graph" x="985" y="382" width="690" height="42" rx="10"/>
 <text class="cardTitle" x="1010" y="408">Backend graph selector: single specialist step or LangGraph WorkItem graph</text>
 <rect class="chief" x="450" y="430" width="470" height="245" rx="14"/>
@@ -84,111 +84,95 @@
 <text class="body" x="482" y="524">- Plans Slack, workflow, and automation work</text>
 <text class="body" x="482" y="548">- Reads KNI docs, local context, Slack repo context</text>
 <text class="body" x="482" y="572">- May call specialists as advisory tools</text>
-<text class="body" x="482" y="596">- Stages review plans, approvals, and blockers</text>
+<text class="body" x="482" y="596">- Selects typed cross-provider context + handoff</text>
+<text class="body" x="482" y="620">- Stages review plans, approvals, and blockers</text>
 <text class="small" x="482" y="642">Positioning: inside the centralized Orchestrator + WorkItem path,</text>
 <text class="small" x="482" y="662">not a parallel router or alternate communication channel.</text>
-<rect class="specialist" x="985" y="430" width="690" height="245" rx="14"/>
+<rect class="specialist" x="985" y="430" width="690" height="265" rx="14"/>
 <text class="section" x="1010" y="466">Workflow Specialists</text>
 <rect class="specialist" x="1010" y="490" width="150" height="78" rx="10"/>
 <text class="cardTitle" x="1026" y="518">Gmail Triage</text>
 <text class="small" x="1026" y="542">classify / draft</text>
-<text class="small" x="1026" y="560">41 tools</text>
+<text class="small" x="1026" y="560">47 tools</text>
 <rect class="specialist" x="1176" y="490" width="150" height="78" rx="10"/>
 <text class="cardTitle" x="1192" y="512">Business</text>
 <text class="cardTitle" x="1192" y="530">Research</text>
 <text class="small" x="1192" y="548">source briefs</text>
-<text class="small" x="1192" y="564">41 tools</text>
+<text class="small" x="1192" y="564">55 tools</text>
 <rect class="specialist" x="1342" y="490" width="150" height="78" rx="10"/>
 <text class="cardTitle" x="1358" y="512">Opportunity</text>
 <text class="cardTitle" x="1358" y="530">Scout</text>
 <text class="small" x="1358" y="548">score / dedupe</text>
-<text class="small" x="1358" y="564">48 tools</text>
+<text class="small" x="1358" y="564">43 tools</text>
 <rect class="specialist" x="1508" y="490" width="150" height="78" rx="10"/>
 <text class="cardTitle" x="1524" y="512">Outreach</text>
 <text class="cardTitle" x="1524" y="530">Composer</text>
 <text class="small" x="1524" y="548">no-send drafts</text>
-<text class="small" x="1524" y="564">38 tools</text>
-<text class="body" x="1010" y="610">Each run receives raw request + Orchestrator memo + typed context pack.</text>
-<text class="small" x="1010" y="638">Graph-worthy workflows use backend-selected LangGraph nodes; simple runs stay single-step.</text>
-<text class="small" x="1010" y="660">Direct actions (continue, more research, find contact, revise) reuse this selected path.</text>
-<rect class="context" x="70" y="430" width="310" height="285" rx="14"/>
+<text class="small" x="1524" y="564">60 tools</text>
+<text class="body" x="1010" y="610">Each run receives raw request + validated decision + model-visible evidence.</text>
+<text class="small" x="1010" y="630">Model requests are separate from actual SDK tool calls and returned outputs.</text>
+<text class="tiny" x="1010" y="646">Research/Opportunity WorkItems: agent-owned SDK selection + no-reread repair.</text>
+<text class="tiny" x="1010" y="660">RSS/Preprints replay tool-free; A/W/Z have missing-tool + semantic repair.</text>
+<text class="tiny" x="1010" y="674">Chief nested decisions are trace-retained; supplied response is synthesis-only.</text>
+<text class="tiny" x="1010" y="688">Direct actions (continue, more research, find contact, revise) reuse the dispatched path.</text>
+<rect class="context" x="70" y="430" width="310" height="300" rx="14"/>
 <text class="section" x="95" y="466">Read / Context Specialists</text>
-<text class="body" x="95" y="500">- Airtable Context</text>
-<text class="body" x="95" y="522">- Google Workspace</text>
-<text class="body" x="95" y="544">- Zotero Context</text>
-<text class="body" x="95" y="566">- Rss Context Agent</text>
-<text class="body" x="95" y="588">- Preprints Context Agent</text>
-<text class="body" x="95" y="612">Local KNI document evidence</text>
-<text class="body" x="95" y="636">Slack and automation context tools</text>
-<text class="small" x="95" y="670">Context agents stage read-only evidence for graph handoffs.</text>
-<text class="small" x="95" y="690">Provider writes use owning specialists or approved handlers.</text>
+<text class="body" x="95" y="500">- RAG Retrieval</text>
+<text class="body" x="95" y="522">- Airtable Context</text>
+<text class="body" x="95" y="544">- Google Workspace</text>
+<text class="body" x="95" y="566">- Zotero Context</text>
+<text class="body" x="95" y="588">- RSS Context</text>
+<text class="body" x="95" y="610">- Preprints Context</text>
+<text class="body" x="95" y="634">Local KNI document evidence</text>
+<text class="body" x="95" y="658">Slack and automation context tools</text>
+<text class="small" x="95" y="677">Context agents stage read-only</text>
+<text class="small" x="95" y="692">evidence for graph handoffs.</text>
+<text class="small" x="95" y="709">Provider writes stay with owning</text>
+<text class="small" x="95" y="724">specialists or approved handlers.</text>
 <rect class="gate" x="70" y="735" width="760" height="195" rx="14"/>
 <text class="section" x="95" y="771">SDK Guardrails + Deterministic Gates</text>
 <text class="body" x="95" y="805">- SDK guardrails: input/output/tool scans for PHI, secrets, send-like actions, unsafe claims</text>
-<text class="body" x="95" y="830">- Python gates: approvals, source sufficiency, record identity, live flags, provider budgets</text>
-<text class="body" x="95" y="855">- Typed checks: schema reads, arithmetic, deduplication, context-pack readiness</text>
-<text class="body" x="95" y="880">- Tool policy: core reads, web search, deep retrieval, diagnostics, owned writes</text>
+<text class="body" x="95" y="830">- Python gates: request tool scope, approvals, identity, live flags, provider budgets; hard N+1 model ledger</text>
+<text class="body" x="95" y="855">- Typed checks: model-visible candidates, decision coverage, schema, arithmetic, dedupe</text>
+<text class="body" x="95" y="880">- Postconditions: required/optional/forbidden tool evidence; bounded correction/repair</text>
 <text class="body" x="95" y="905">- Negated constraints do not steer routes: &#x27;do not scout opportunities&#x27; blocks that route</text>
 <text class="small" x="95" y="924">Approval checkpoints and no-send/no-write gates remain Python-authoritative after graph steps.</text>
 <rect class="context" x="870" y="735" width="805" height="195" rx="14"/>
 <text class="section" x="895" y="771">Evidence, Retrieval, and Integrations</text>
 <text class="body" x="895" y="805">- Search: dry-run, SearXNG, hosted web search, Exa, Tavily, Firecrawl, explicit Serper</text>
 <text class="body" x="895" y="830">- Extraction: Trafilatura / Firecrawl, HTML review, rendered browser diagnostics</text>
-<text class="body" x="895" y="855">- State: SQLite WorkItems, approvals, memory, artifacts, tool events, automations</text>
-<text class="body" x="895" y="880">- Private context: KNI docs, Slack threads, Gmail, Airtable, Google files, Zotero</text>
+<text class="body" x="895" y="855">- Receipts: attempts, successes, durable proof, read-back, safe retry point</text>
+<text class="body" x="895" y="880">- State/context: SQLite WorkItems, artifacts, KNI docs, Slack, Gmail, Airtable, Workspace, Zotero</text>
 <text class="small" x="895" y="914">Graph-produced sources can satisfy downstream offline evidence gates.</text>
-<text class="tiny" x="1010" y="695">gmail_triage -> business_research_analyst -> outreach_composer -> approval_checkpoint</text>
-<text class="tiny" x="1010" y="713">chief_of_staff -> airtable/google_workspace context -> approval_checkpoint</text>
-<text class="tiny" x="95" y="708">rss/preprints/zotero context -> business research/opportunity specialist</text>
 <rect class="render" x="70" y="980" width="520" height="210" rx="14"/>
 <text class="section" x="95" y="1016">Reviewed Output and Renderers</text>
-<text class="body" x="95" y="1050">- Response synthesis produces operator-facing prose from</text>
-<text class="body" x="95" y="1074">structured outputs</text>
-<text class="body" x="95" y="1098">- No-SDK draft paths ask for model reasoning or exact copy,</text>
-<text class="body" x="95" y="1122">not placeholders</text>
-<text class="body" x="95" y="1146">- Slack / CLI / artifact renderers own final layout</text>
-<text class="body" x="95" y="1170">- Source-backed external facts stay visible in first answer</text>
+<text class="small" x="95" y="1050">- Response synthesis produces operator-facing prose from structured outputs</text>
+<text class="small" x="95" y="1073">- No-SDK draft paths ask for model reasoning or exact copy, not</text>
+<text class="small" x="95" y="1096">placeholders</text>
+<text class="small" x="95" y="1119">- Slack / CLI / artifact renderers own final layout</text>
+<text class="small" x="95" y="1142">- Source-backed external facts stay visible in first answer</text>
 <text class="small" x="95" y="1168">Raw trace noise and internal JSON stay hidden unless debugging was requested.</text>
 <rect class="observability" x="635" y="980" width="1040" height="210" rx="14"/>
 <text class="section" x="660" y="1016">Traces, Logs, Evals, and Feedback Loop</text>
-<text class="body" x="660" y="1050">- SDK summaries: keystone.sdk_run_summary.v1 tracks model, tools, retrieval, cost, session, route, review</text>
-<text class="body" x="660" y="1075">- Structured logs: keystone.structured_log.v1 stores redacted correlation keys only</text>
-<text class="body" x="660" y="1100">- Eval stores: promptfoo_eval_runs, promptfoo_case_results, slack_eval_runs, human_eval_reviews, eval_trace_events,</text>
-<text class="body" x="660" y="1125">benchmark SQLite</text>
-<text class="body" x="660" y="1150">- Optional LLM-as-judge belongs here for quality evals, not as an approval authority</text>
+<text class="small" x="660" y="1050">- keystone.sdk_run_summary.v1 separates model requests, actual SDK tool calls, workflow/pre-acquired/helper origins</text>
+<text class="small" x="660" y="1073">- Request budget: correlation, consumed, remaining, exhaustion; rejected before N+1 model call</text>
+<text class="small" x="660" y="1096">- Semantic stage rows: initial / tool correction / decision repair; transport retries stay ledger-bound</text>
+<text class="small" x="660" y="1119">- Structured logs: keystone.structured_log.v1 stores redacted correlation keys only</text>
+<text class="small" x="660" y="1142">- Correlated traces + eval stores: promptfoo_eval_runs, promptfoo_case_results, slack_eval_runs, human_eval_reviews, eval_trace_events,</text>
+<text class="small" x="660" y="1165">benchmark SQLite</text>
 <text class="small" x="660" y="1178">Promptfoo and Slack #evals exercise the same Orchestrator-first workflow path, then feed dashboards and regression tests.</text>
-  <path class="routeLine" d="M380 250 C410 250 420 250 450 250"/>
-  <text class="label" x="398" y="236">raw request</text>
-  <path class="detLine" d="M920 250 C950 250 955 250 985 250"/>
-  <text class="label" x="938" y="236">state + memo</text>
-  <path class="detLine" d="M1150 370 C1150 376 1150 378 1150 382"/>
-  <text class="label" x="1164" y="379">canonical state</text>
-  <path class="routeLine" d="M1320 424 C1320 426 1320 428 1320 430"/>
-  <text class="label" x="1338" y="424">backend selected</text>
-  <path class="routeLine" d="M685 370 C685 395 685 405 685 430"/>
-  <text class="label" x="700" y="404">broad ops route</text>
-  <path class="toolAgentLine dash" d="M920 552 C950 552 955 552 985 552"/>
-  <text class="label" x="936" y="538">agents as tools</text>
-  <path class="toolAgentLine dash" d="M450 552 C410 552 405 552 380 552"/>
-  <text class="label" x="394" y="538">advisory read-plan</text>
-  <path class="detLine" d="M225 675 C225 705 310 725 390 735"/>
-  <text class="label" x="250" y="715">evidence</text>
-  <path class="detLine" d="M1320 675 C1320 705 1320 710 1320 735"/>
-  <text class="label" x="1335" y="714">verified tool use</text>
-  <path class="detLine" d="M650 675 C630 705 590 715 560 735"/>
-  <text class="label" x="604" y="716">guarded action</text>
-  <path class="detLine" d="M450 930 C425 955 390 965 350 980"/>
-  <text class="label" x="385" y="958">approved structure</text>
-  <path class="obsLine dash" d="M1280 930 C1240 955 1205 965 1160 980"/>
-  <text class="label" x="1200" y="958">diagnostics</text>
-  <path class="detLine" d="M1315 370 C1605 450 1650 650 1535 735"/>
-  <text class="label" x="1570" y="700">state joins</text>
-  <path class="routeLine" d="M790 370 C855 388 930 398 985 403"/>
-  <text class="label" x="870" y="388">routing / graph handoff</text>
-  <path class="reviewLine" d="M985 610 C880 590 860 430 820 370"/>
-  <text class="label" x="830" y="560">deterministic review</text>
-  <path class="reviewLine" d="M610 430 C610 400 620 390 640 370"/>
-  <text class="label" x="522" y="405">review CoS output</text>
-  <path class="obsLine dash" d="M1675 552 C1735 600 1725 925 1675 1065"/>
-  <text class="label" x="1558" y="820">trace / eval linkage</text>
+  <path class="routeLine" d="M380 250 L450 250"/>
+  <path class="detLine" d="M920 250 L985 250"/>
+  <path class="detLine" d="M1150 370 L1150 382"/>
+  <path class="routeLine" d="M1320 424 L1320 430"/>
+  <path class="routeLine" d="M685 370 L685 430"/>
+  <path class="toolAgentLine dash" d="M920 552 L985 552"/>
+  <path class="toolAgentLine dash" d="M450 552 L380 552"/>
+  <path class="detLine" d="M380 700 L405 700 L405 735"/>
+  <path class="detLine" d="M1320 695 L1320 735"/>
+  <path class="detLine" d="M650 675 L560 735"/>
+  <path class="detLine" d="M450 930 L350 980"/>
+  <path class="obsLine dash" d="M1280 930 L1160 980"/>
+  <a href="kba-request-execution-sequence.svg"><text class="link" x="70" y="1218">Numbered request sequence</text></a>
+  <a href="kba-workitem-langgraph-topology.svg"><text class="link" x="255" y="1218">Compiled WorkItem topology</text></a>
 </svg>

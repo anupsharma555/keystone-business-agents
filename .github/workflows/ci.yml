@@ -4,10 +4,18 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Python 3.11
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       KEYSTONE_DRY_RUN: "true"
       KEYSTONE_LIVE_MODE: "false"
@@ -30,13 +38,58 @@ jobs:
       - name: Install dependencies
         run: |
           python -m venv .venv
-          .venv/bin/python -m pip install --upgrade pip
-          .venv/bin/python -m pip install -e ".[dev]"
+          .venv/bin/python -m pip install --upgrade pip setuptools wheel -c constraints/ci.txt
+          .venv/bin/python -m pip install --no-build-isolation -e ".[dev]" -c constraints/ci.txt
+
+      - name: Verify minimal non-graph installation
+        run: |
+          .venv/bin/python -m pip check
+          .venv/bin/python -c 'import importlib.util; assert importlib.util.find_spec("langgraph") is None'
 
       - name: Run ruff
         run: .venv/bin/python -m ruff check .
 
       - name: Run pytest
+        run: .venv/bin/python -m pytest
+
+      - name: Run dependency audit
+        run: .venv/bin/python -m pip_audit --skip-editable --progress-spinner off
+
+  graph:
+    name: Compiled LangGraph (Python 3.13)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      KEYSTONE_DRY_RUN: "true"
+      KEYSTONE_LIVE_MODE: "false"
+      KEYSTONE_ENABLE_LIVE_GMAIL: "false"
+      KEYSTONE_ENABLE_LIVE_RESEARCH: "false"
+      KEYSTONE_ENABLE_LIVE_CRM: "false"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install graph dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip setuptools wheel -c constraints/ci.txt
+          .venv/bin/python -m pip install --no-build-isolation -e ".[dev,orchestration]" -c constraints/ci.txt
+
+      - name: Require compiled graph and SQLite checkpoint support
+        run: |
+          .venv/bin/python -m pip check
+          .venv/bin/python -c 'from keystone_agents.langgraph_workflow import build_work_item_langgraph; from langgraph.checkpoint.sqlite import SqliteSaver; assert build_work_item_langgraph() is not None'
+
+      - name: Run pytest with LangGraph installed
         run: .venv/bin/python -m pytest
 
       - name: Run dependency audit

@@ -8,10 +8,19 @@ from typing import Any
 
 from keystone_agents.agent_tool_policy import filter_tools_for_tier
 from keystone_agents.authority.semantic import ExecutionIntentAuthority
+from keystone_agents.capabilities.tool_scope import (
+    ToolScopeMode,
+    attach_tool_scope_receipt,
+    scope_tools_for_request,
+)
 from keystone_agents.finance_expense_receipts import (
     resolve_finance_expense_receipt_target,
 )
 from keystone_agents.guardrails import keystone_guardrails
+from keystone_agents.planning.compatibility import (
+    looks_like_airtable_schema_request,
+    positive_capability_text,
+)
 from keystone_agents.schemas.operational_context import AirtableContextResult
 from keystone_agents.sdk import (
     Agent,
@@ -27,6 +36,7 @@ from keystone_agents.tools.internal_data_tools import (
     airtable_get_base_schema,
     airtable_link_attachment,
     airtable_read_records,
+    airtable_read_schema_detail,
     airtable_reconcile_duplicate_expense,
     airtable_test_record_lifecycle,
     airtable_upload_attachment,
@@ -42,6 +52,7 @@ def _airtable_context_tools(
 ) -> list[Any]:
     tools: list[Any] = [
         airtable_get_base_schema,
+        airtable_read_schema_detail,
         airtable_read_records,
         airtable_aggregate_records,
         airtable_reconcile_duplicate_expense,
@@ -55,10 +66,13 @@ def _airtable_context_tools(
     if tool_tier is not None:
         tools = filter_tools_for_tier("airtable_context_agent", tools, tool_tier)
     normalized = " ".join(str(request_text or "").lower().split())
+    positive_normalized = " ".join(
+        positive_capability_text(request_text).lower().split()
+    )
     authority = ExecutionIntentAuthority.from_value(manual_plan)
     if authority.invalid:
         return []
-    plan = authority.plan if authority.canonical else None
+    plan = authority.plan
     if plan is not None and plan.provider_system != "airtable":
         return []
     provider_operations = (
@@ -103,6 +117,7 @@ def _airtable_context_tools(
         # create-oriented tool so an in-place correction cannot create a row.
         allowed = {
             "airtable_get_base_schema",
+            "airtable_read_schema_detail",
             "airtable_read_records",
             "airtable_write_record",
             "airtable_reconcile_duplicate_expense",
@@ -113,12 +128,36 @@ def _airtable_context_tools(
             tool
             for tool in tools
             if getattr(tool, "name", "")
-            in {"airtable_get_base_schema", "airtable_read_records"}
+            in {
+                "airtable_get_base_schema",
+                "airtable_read_schema_detail",
+                "airtable_read_records",
+            }
         ]
     if plan is not None:
-        allowed = {"airtable_get_base_schema"}
-        if provider_operations.intersection({"read", "search", "verify"}):
-            allowed.update({"airtable_read_records", "airtable_aggregate_records"})
+        allowed = {"airtable_get_base_schema", "airtable_read_schema_detail"}
+        schema_requested = looks_like_airtable_schema_request(request_text)
+        record_data_requested = bool(
+            re.search(
+                r"\b(?:records?|rows?|entries|record\s+values?|cell\s+values?|"
+                r"most\s+recent|newest|active\s+records?)\b",
+                positive_normalized,
+            )
+        )
+        aggregate_requested = bool(
+            re.search(
+                r"\b(?:aggregate|average|count|group(?:ed)?|how\s+many|sum|total)\b",
+                positive_normalized,
+            )
+        )
+        if provider_operations.intersection({"read", "search", "verify"}) and (
+            record_data_requested or aggregate_requested or not schema_requested
+        ):
+            allowed.add("airtable_read_records")
+            if aggregate_requested:
+                allowed.add("airtable_aggregate_records")
+        if provider_operations.intersection({"create", "update", "attach"}):
+            allowed.add("airtable_read_records")
         if provider_operations.intersection({"create", "update"}):
             allowed.add("airtable_write_record")
         if "attach" in provider_operations:
@@ -159,19 +198,31 @@ def build_airtable_context_agent(
         else ("keystone_profile.md", "safety_policy.md", "tools.md", "airtable_context.md")
     )
     instructions = composer(*prompt_files, skill_files=skill_files)
-    return build_sdk_agent(
+    candidate_tools = (
+        _airtable_context_tools(
+            tool_tier=tool_tier,
+            request_text=request_text,
+            manual_plan=manual_plan,
+        )
+        if attach_tools
+        else []
+    )
+    attachment = scope_tools_for_request(
+        "airtable_context_agent",
+        candidate_tools,
+        manual_request_plan=manual_plan,
+        tool_tier=tool_tier,
+        mode=(
+            ToolScopeMode.REQUEST_SCOPED
+            if manual_plan is not None
+            else ToolScopeMode.FULL
+        ),
+    )
+    agent = build_sdk_agent(
         name="airtable_context_agent",
         instructions=instructions,
         output_type=AirtableContextResult,
-        tools=(
-            _airtable_context_tools(
-                tool_tier=tool_tier,
-                request_text=request_text,
-                manual_plan=manual_plan,
-            )
-            if attach_tools
-            else []
-        ),
+        tools=list(attachment.tools),
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="airtable_context_agent",
@@ -180,3 +231,4 @@ def build_airtable_context_agent(
             "plus direct approved create/update writes when invoked as the selected agent."
         ),
     )
+    return attach_tool_scope_receipt(agent, attachment.scope)

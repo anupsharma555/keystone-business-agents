@@ -5,6 +5,7 @@ skill_purpose: Review final structured output for schema, source, approval, and 
 applies_to:
   - gmail_triage
   - business_research_analyst
+  - rag_retrieval_specialist
   - opportunity_scout
   - outreach_composer
   - airtable_context_agent

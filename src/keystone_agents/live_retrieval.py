@@ -34,7 +34,9 @@ from keystone_agents.retrieval_policy import (
     build_provider_sequence,
     build_provider_use_ladder,
     derive_request_autonomy_hint,
+    filter_company_search_results_for_entity,
     provider_value_summary,
+    resolve_requested_search_provider,
 )
 from keystone_agents.sandboxing import (
     SandboxAgentsUnavailable,
@@ -57,10 +59,14 @@ from keystone_agents.tools.html_review_tool import (
 )
 from keystone_agents.tools.serper_tool import build_search_provider
 from keystone_agents.tools.website_extraction_tool import (
+    MAX_SELECTED_URLS_PER_BUNDLE,
+    MAX_WEB_BUNDLE_RESPONSE_CHARS,
+    MAX_WEB_PREVIEW_TOTAL_CHARS,
     default_company_page_urls,
     discover_company_page_urls,
     extract_website_content,
     extract_website_content_with_fallbacks,
+    project_web_source,
     website_extraction_budget,
     website_extraction_enabled,
     website_extraction_provider_sequence,
@@ -73,7 +79,7 @@ DEFAULT_AGENTS_WEB_SEARCH_MAX_CALLS_PER_RUN = 2
 DEFAULT_EXA_SEARCH_MAX_CALLS_PER_RUN = 10
 DEFAULT_TAVILY_SEARCH_MAX_CALLS_PER_RUN = 2
 DEFAULT_SEARXNG_TRANSIENT_TIMEOUT_SECONDS = 2.0
-
+DEFAULT_SEARXNG_LIFECYCLE_TIMEOUT_SECONDS = 15.0
 
 @dataclass(frozen=True)
 class SharedSearchProviderConfig:
@@ -1225,6 +1231,7 @@ def retrieve_company_profile_live(
         agents_web_search_parallel=agents_web_search_parallel,
         tavily_search_fallback=tavily_search_fallback,
         exa_search_fallback=exa_search_fallback,
+        request_text=request_text,
     )
 
     def build_client() -> HybridSearchProvider:
@@ -1268,6 +1275,7 @@ def retrieve_company_profile_live(
     telemetry_packets: list[dict[str, Any]] = []
     with _maybe_transient_searxng_runtime(
         provider_sequence=search_config.provider_sequence,
+        fallback_provider_sequence=search_config.deepening_provider_sequence,
         settings=settings,
         enabled=search_provider_builder is build_search_provider,
     ) as searxng_runtime:
@@ -1363,10 +1371,16 @@ def retrieve_company_profile_live(
         )
     )
     resolved_company_url = company_url or inferred_company_url or None
+    entity_relevant_search_results = filter_company_search_results_for_entity(
+        search_results,
+        company_name=company,
+        company_url=resolved_company_url,
+        request_text=request_text,
+    )
     profile_search_results = (
         [
             result
-            for result in search_results
+            for result in entity_relevant_search_results
             if resolved_company_url
             and company_source_matches_official_url(
                 str(_jsonable_search_result(result).get("url") or ""),
@@ -1374,7 +1388,7 @@ def retrieve_company_profile_live(
             )
         ]
         if official_company_sources_only
-        else search_results
+        else entity_relevant_search_results
     )
     quality_started_at = clock()
     search_quality = assess_company_search_quality(
@@ -1464,6 +1478,10 @@ def retrieve_company_profile_live(
             "source_triage": source_triage.model_dump(mode="json"),
             "raw_search_result_count": len(search_results),
             "profile_search_result_count": len(profile_search_results),
+            "entity_rejected_search_result_count": max(
+                0,
+                len(search_results) - len(entity_relevant_search_results),
+            ),
             "resolved_company_url": resolved_company_url or "",
             "company_url_inferred": bool(inferred_company_url),
             "max_results": max_results,
@@ -1573,7 +1591,22 @@ def _extract_company_website_inputs(
         )
         base_stats["internal_page_discovery_count"] = len(discovered_urls)
         urls = list(dict.fromkeys([*discovered_urls, *urls]))[:resolved_max_pages]
+    base_stats["deferred_selected_urls"] = urls[
+        MAX_SELECTED_URLS_PER_BUNDLE:MAX_SELECTED_URLS_PER_BUNDLE * 2
+    ]
+    base_stats["additional_unprocessed_url_count"] = max(
+        0, len(urls) - MAX_SELECTED_URLS_PER_BUNDLE * 2
+    )
+    urls = urls[:MAX_SELECTED_URLS_PER_BUNDLE]
     base_stats["pages_considered"] = len(urls)
+    if len(json.dumps([*urls, *base_stats["deferred_selected_urls"]])) > 24000:
+        return [], ["Company URL identifiers exceed the response budget; reduce the page scope."], {
+            **base_stats, "deferred_selected_urls": [], "partial": True,
+            "additional_unprocessed_url_count": (
+                len(urls) + len(base_stats["deferred_selected_urls"])
+                + base_stats["additional_unprocessed_url_count"]
+            ),
+        }
     website_inputs: list[dict[str, Any]] = []
     errors: list[str] = []
     html_review_attempts = 0
@@ -1607,7 +1640,7 @@ def _extract_company_website_inputs(
                 extractor=extract_website_content,
             )
         except Exception as exc:
-            errors.append(f"{url}: {exc}")
+            errors.append(f"{url}: {exc}"[:500])
             continue
         if (
             agent_html_review_enabled()
@@ -1625,9 +1658,9 @@ def _extract_company_website_inputs(
                     live=True,
                 )
             except HtmlReviewError as exc:
-                errors.append(f"{url}: agent HTML review failed: {exc}")
+                errors.append(f"{url}: agent HTML review failed: {exc}"[:500])
             except Exception as exc:
-                errors.append(f"{url}: agent HTML review unavailable: {exc}")
+                errors.append(f"{url}: agent HTML review unavailable: {exc}"[:500])
             else:
                 review_claims = [
                     claim for claim in review.claims if claim and claim not in result.claims
@@ -1644,16 +1677,23 @@ def _extract_company_website_inputs(
                         }
                     )
                     html_review_claim_count += len(review_claims)
-        if not result.claims:
+        if not result.text_or_markdown.strip() and not result.claims:
+            errors.append(f"{url}: extraction returned no readable source text."[:500])
             continue
+        excerpt, access = project_web_source(
+            result, source_id=f"website_extract:{index}", selected_url=url,
+            max_chars=min(6000, MAX_WEB_PREVIEW_TOTAL_CHARS // max(1, len(urls))),
+        )
         website_inputs.append(
             {
                 "source_id": f"website_extract:{index}",
-                "title": result.title or f"{company} website page",
-                "url": result.url,
+                "title": (result.title or f"{company} website page")[:300],
+                "url": url,
                 "source_type": "website",
-                "supported_claims": result.claims,
-                "text_or_markdown": result.text_or_markdown[:6000],
+                "supported_claims": [claim for claim in result.claims if len(claim) <= 280][:10],
+                "text_or_markdown": excerpt,
+                "evidence_excerpt": excerpt,
+                "web_source_access": access.model_dump(mode="json"),
                 "provider": result.provider,
                 "confidence": 0.78 if result.provider == "trafilatura" else 0.82,
             }
@@ -1675,6 +1715,12 @@ def _extract_company_website_inputs(
         "firecrawl_call_cap": extraction_budget.firecrawl_max_calls,
         "firecrawl_calls_attempted": extraction_budget.firecrawl_calls_attempted,
     }
+    while len(json.dumps([website_inputs, errors, stats])) > MAX_WEB_BUNDLE_RESPONSE_CHARS:
+        deferred = website_inputs.pop()
+        stats["deferred_selected_urls"].insert(0, deferred["url"])
+        stats["page_count"] = len(website_inputs)
+        stats["claim_count"] = sum(len(item["supported_claims"]) for item in website_inputs)
+        stats["providers_used"] = list(dict.fromkeys(item["provider"] for item in website_inputs))
     return website_inputs, errors, stats
 
 
@@ -1924,9 +1970,14 @@ def build_shared_search_provider_config(
     exa_search_fallback: bool | None = None,
     exa_search_max_calls: int | None = None,
     serper_enabled: bool = False,
+    request_text: str = "",
 ) -> SharedSearchProviderConfig:
     """Resolve the shared live-search policy for search-heavy Keystone agents."""
 
+    requested_provider = resolve_requested_search_provider(
+        request_text=request_text,
+        requested_provider=requested_provider,
+    )
     provider_sequence = build_provider_sequence(
         requested_provider=requested_provider,
         configured_provider=configured_provider,
@@ -1990,10 +2041,12 @@ def _with_agents_web_search_parallel_lane(
     if not enabled:
         return provider_sequence
     requested = (requested_provider or "").strip().lower()
-    if requested not in {"", "searxng"}:
+    if requested == "agents-web-search":
         return provider_sequence
-    if "searxng" not in provider_sequence or "agents-web-search" in provider_sequence:
+    if "agents-web-search" in provider_sequence:
         return provider_sequence
+    if "searxng" not in provider_sequence:
+        return (*provider_sequence, "agents-web-search")
     expanded: list[str] = []
     for provider_name in provider_sequence:
         expanded.append(provider_name)
@@ -2110,6 +2163,7 @@ def _tavily_search_max_calls() -> int:
 def _maybe_transient_searxng_runtime(
     *,
     provider_sequence: tuple[str, ...],
+    fallback_provider_sequence: tuple[str, ...] = (),
     settings: Any,
     enabled: bool = True,
 ) -> Any:
@@ -2119,6 +2173,7 @@ def _maybe_transient_searxng_runtime(
         "enabled": False,
         "started": False,
         "stopped": False,
+        "start_attempted": False,
         "reason": "not_needed",
     }
     base_url = str(getattr(settings, "searxng_base_url", "") or "")
@@ -2144,7 +2199,29 @@ def _maybe_transient_searxng_runtime(
         return
 
     metadata["reason"] = "started_for_run"
-    _run_searxng_lifecycle_command("start")
+    metadata["start_attempted"] = True
+    try:
+        _run_searxng_lifecycle_command("start")
+    except RuntimeError as exc:
+        fallback_providers = tuple(
+            dict.fromkeys(
+                provider_name
+                for provider_name in (*provider_sequence, *fallback_provider_sequence)
+                if provider_name != "searxng"
+            )
+        )
+        if not fallback_providers:
+            raise
+        metadata.update(
+            {
+                "reason": "start_failed_fallback_available",
+                "startup_error_type": type(exc).__name__,
+                "startup_error": "SearXNG transient startup did not become ready.",
+                "fallback_providers": list(fallback_providers),
+            }
+        )
+        yield metadata
+        return
     metadata["started"] = True
     try:
         yield metadata
@@ -2176,12 +2253,32 @@ def _run_searxng_lifecycle_command(command: str, *, check: bool = True) -> None:
         if check:
             raise RuntimeError(f"SearXNG lifecycle script not found: {script}")
         return
-    completed = subprocess.run(
-        [str(script), command],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    raw_timeout = os.getenv("KEYSTONE_SEARXNG_LIFECYCLE_TIMEOUT_SECONDS", "").strip()
+    try:
+        timeout_seconds = (
+            float(raw_timeout)
+            if raw_timeout
+            else DEFAULT_SEARXNG_LIFECYCLE_TIMEOUT_SECONDS
+        )
+    except ValueError:
+        timeout_seconds = DEFAULT_SEARXNG_LIFECYCLE_TIMEOUT_SECONDS
+    timeout_seconds = max(1.0, min(60.0, timeout_seconds))
+    try:
+        completed = subprocess.run(
+            [str(script), command],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        if check:
+            raise RuntimeError(
+                "SearXNG transient "
+                f"{command} exceeded its {timeout_seconds:.1f}s startup budget; "
+                "continue with configured fallback providers."
+            ) from exc
+        return
     if check and completed.returncode != 0:
         details = "\n".join(
             part.strip() for part in (completed.stdout, completed.stderr) if part and part.strip()
@@ -2424,6 +2521,7 @@ def build_opportunity_search_provider(
         agents_web_search_max_calls=agents_web_search_max_calls,
         agents_web_search_parallel=agents_web_search_parallel,
         tavily_search_fallback=tavily_search_fallback,
+        request_text=request_text,
     )
     provider = HybridSearchProvider(
         provider_sequence=search_config.provider_sequence,
@@ -2613,6 +2711,9 @@ def run_opportunity_scout_live(
     provider_sequence = tuple(getattr(provider, "provider_sequence", ()) or ())
     with _maybe_transient_searxng_runtime(
         provider_sequence=provider_sequence,
+        fallback_provider_sequence=tuple(
+            getattr(provider, "deepening_provider_sequence", ()) or ()
+        ),
         settings=settings,
         enabled=(effective_provider_builder is build_search_provider and bool(provider_sequence)),
     ) as searxng_runtime:

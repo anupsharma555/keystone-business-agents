@@ -75,15 +75,21 @@ planner target to OpenAI `gpt-5.4-mini`, so the former
 was a configuration fact, not an invariant: a future target-agent provider
 override would have become the first planner attempt.
 
-New live natural-language asks now default to a dedicated OpenAI
-`gpt-5.4-mini` planner profile. Target-agent provider overrides continue to
-control specialist execution, while `target` and
-`target_with_openai_fallback` remain explicit experiment modes. This creates a
-stable audited interpretation layer without changing execution authority: the
-planner remains tool-free, emits `ManualRequestPlan`, and Python reconciliation
-still owns structural repair and safety gates. Offline, planner-disabled, and
-provider-failure paths continue to use the deterministic fallback and identify
-that provenance rather than claiming an LLM planner call.
+As of the 2026-08-02 reliability pass, live natural-language asks no longer add
+the dedicated manual planner as a mandatory model hop. Explicitly named agents
+receive a deterministic, schema-light preflight and then interpret the original
+request while selecting from a bounded agent-owned toolbox. Unnamed or genuinely
+ambiguous live asks use the Orchestrator as the first model control plane. Python
+reconciliation still owns structural repair, provider-operation ceilings,
+approval gates, exact object identity, and side-effect blocking.
+
+The tool-free manual planner remains available through `--live-manual-plan` for
+counterfactual evaluation and controlled parser/provider experiments. In that
+mode it emits `ManualRequestPlan`; `openai`, `target`, and
+`target_with_openai_fallback` continue to select its provider policy. Planner
+advice cannot erase a read-only WorkItem inspection contract or enlarge provider
+authority. Planner-disabled and provider-failure paths identify deterministic
+provenance rather than claiming an LLM planner call.
 
 The current Chief-to-specialist design remains the right SDK pattern. Chief of
 Staff owns the combined operator answer, so specialists are exposed as typed
@@ -93,6 +99,59 @@ planning memo, selected target, coordination context, and provider context into
 the specialist's model-visible input. This is important because SDK
 `RunContextWrapper.context` is local application state and is not automatically
 visible to the model.
+
+The same model-visible-input rule is the contract for every agent-owned semantic
+decision. Where the shared wrapper is wired, pre-acquired evidence is normalized and serialized before the specialist
+turn, and declared candidate identities are checked against the actual model input
+before any request is made. Candidates discovered through function tools must be
+returned into the same model loop before selection. Post-model Python remains a
+validator and permission boundary: it may reject a fabricated or contradictory
+selection and request bounded repair, but it may not add missing evidence or silently
+substitute a different choice.
+
+Tool attachment and tool execution are now separate observable facts. The
+shared runtime records the request-scoped attached toolbox, actual model-called
+tools, workflow-called tools, deterministic workflow helpers, pre-acquired
+context tools, provider request attempts/successes, and retained provider
+receipts in distinct fields. This avoids claiming ReAct-style tool use when a
+workflow acquired evidence outside the model loop, while still preserving that
+evidence for the downstream agent and validator.
+
+Required tool stages use explicit postconditions where the active call site
+uses the shared wrapper. A missing required result or invalid decision may enter bounded correction/repair with verified evidence and
+prior receipts preserved; an already completed mutation is disabled before any
+correction turn. If the evidence cannot support a safe correction, the run fails
+closed rather than returning successful-looking synthesis. Exact retry ordering
+and per-agent default execution shape should be read from the current wrapper,
+call sites, and trace evidence rather than inferred from the registry alone.
+
+The current integration has multiple shapes. `cli_impl.py` owns direct live
+Airtable, Workspace, and Zotero execution that `WorkflowRunner` does not
+dispatch; RSS and Preprints use the signal runtime; Chief context specialists
+use validated child wrappers over agent tools. Those distinct routes must not
+be described as one identical corrective envelope merely because the registry
+or trace harness knows their names. Direct Airtable, Workspace,
+and Zotero retain semantic-decision repair plus one bounded
+missing-required-tool correction that runs first. It preserves completed read
+evidence, disables completed tools, never repeats mutations, and fails closed
+when evidence replay or the corrected postcondition is unavailable. RSS and
+Preprints now reuse the first verified candidate universe for a tool-free
+semantic repair without repeating the history read.
+
+Live Business Research and Opportunity WorkItems now use the same semantic
+ownership rule: the SDK specialist calls retrieval tools, sees stable provider
+candidate IDs, selects and ranks candidates, and owns the typed handoff. One
+tool-free repair replays the complete bounded universe without another provider
+read. Python validates identity, bounds, and formal gates; it does not replace
+the selection or override a validated handoff.
+
+The generic provider-free `DirectAgentResponse` lane is admitted only for
+positively evidenced supplied-text or attachment synthesis. It cannot intercept
+provider actions, candidate selection, continuations, delegation, or specialist
+schemas. That is a useful synthesis path, not specialist decision proof.
+Likewise, a model request or compatibility `tool_mode=model_called`
+event is not an SDK tool call unless the run contains the actual tool-call item
+and returned tool output.
 
 Keystone-owned Gmail, Calendar, Airtable, and Workspace integrations should
 remain bounded function tools. A separate MCP server for every provider would
@@ -154,8 +213,9 @@ work the operator actually requested without dictating the substantive answer.
 That completeness rule must not be generalized by pretending every context
 helper is already an executable graph stage. Gmail Triage is currently a
 first-class WorkItem route, so a typed `Gmail read -> Outreach draft` sequence
-can advance directly. Airtable, Google Workspace, Zotero, and some Calendar
-context paths still pass through Chief-owned tools or route aliases. Before
+can advance directly. Airtable, Google Workspace, and Zotero instead have
+direct CLI paths, while Chief may call their validated child wrappers for nested
+context; `WorkflowRunner` does not dispatch those routes. Before
 compiling those providers into equivalent multi-stage graphs, define one
 execution-stage contract. Each context owner must either become a first-class
 WorkItem route or use an adapter that emits the same typed evidence artifact,

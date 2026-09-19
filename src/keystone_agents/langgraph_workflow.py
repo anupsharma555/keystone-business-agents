@@ -53,6 +53,8 @@ from keystone_agents.schemas.work_item import (
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
 from keystone_agents.tools.announcement_context_tools import (
+    read_preprint_announcement_evidence_impl,
+    read_rss_announcement_evidence_impl,
     retrieve_preprint_announcement_history_impl,
     retrieve_rss_announcement_history_impl,
 )
@@ -98,6 +100,7 @@ class WorkItemGraphState(TypedDict, total=False):
     max_manager_steps: int
     terminal: bool
     graph_stop_reason: str
+    business_state: dict[str, Any]
 
 
 class LangGraphWorkflowOutcome(BaseModel):
@@ -113,6 +116,9 @@ class LangGraphWorkflowOutcome(BaseModel):
     node_path: list[str] = Field(default_factory=list)
     improvements: list[str] = Field(default_factory=list)
     checkpoint_key: str = ""
+    execution_id: str = ""
+    durable: bool = False
+    interrupted: bool = False
 
 
 def langgraph_available() -> bool:
@@ -375,6 +381,7 @@ def build_work_item_langgraph(*, checkpointer: Any | None = None) -> Any:
     builder.add_node("stage_airtable_context", _stage_airtable_context_node)
     builder.add_node("stage_google_workspace_context", _stage_google_workspace_context_node)
     builder.add_node("run_business_research", _run_business_research_node)
+    builder.add_node("run_rag_retrieval", _run_rag_retrieval_node)
     builder.add_node("run_opportunity_scout", _run_opportunity_scout_node)
     builder.add_node("run_gmail_triage", _run_gmail_triage_node)
     builder.add_node("run_outreach_composer", _run_outreach_composer_node)
@@ -404,6 +411,7 @@ def build_work_item_langgraph(*, checkpointer: Any | None = None) -> Any:
             "stage_airtable_context": "stage_airtable_context",
             "stage_google_workspace_context": "stage_google_workspace_context",
             "run_business_research": "run_business_research",
+            "run_rag_retrieval": "run_rag_retrieval",
             "run_opportunity_scout": "run_opportunity_scout",
             "run_gmail_triage": "run_gmail_triage",
             "run_outreach_composer": "run_outreach_composer",
@@ -420,6 +428,7 @@ def build_work_item_langgraph(*, checkpointer: Any | None = None) -> Any:
             "stage_airtable_context": "stage_airtable_context",
             "stage_google_workspace_context": "stage_google_workspace_context",
             "run_business_research": "run_business_research",
+            "run_rag_retrieval": "run_rag_retrieval",
             "run_opportunity_scout": "run_opportunity_scout",
             "run_gmail_triage": "run_gmail_triage",
             "run_outreach_composer": "run_outreach_composer",
@@ -436,6 +445,7 @@ def build_work_item_langgraph(*, checkpointer: Any | None = None) -> Any:
             "stage_airtable_context": "stage_airtable_context",
             "stage_google_workspace_context": "stage_google_workspace_context",
             "run_business_research": "run_business_research",
+            "run_rag_retrieval": "run_rag_retrieval",
             "run_opportunity_scout": "run_opportunity_scout",
             "run_gmail_triage": "run_gmail_triage",
             "run_outreach_composer": "run_outreach_composer",
@@ -453,6 +463,7 @@ def build_work_item_langgraph(*, checkpointer: Any | None = None) -> Any:
             "stage_airtable_context": "stage_airtable_context",
             "stage_google_workspace_context": "stage_google_workspace_context",
             "run_business_research": "run_business_research",
+            "run_rag_retrieval": "run_rag_retrieval",
             "run_opportunity_scout": "run_opportunity_scout",
             "run_gmail_triage": "run_gmail_triage",
             "run_outreach_composer": "run_outreach_composer",
@@ -470,6 +481,7 @@ def build_work_item_langgraph(*, checkpointer: Any | None = None) -> Any:
             "stage_airtable_context": "stage_airtable_context",
             "stage_google_workspace_context": "stage_google_workspace_context",
             "run_business_research": "run_business_research",
+            "run_rag_retrieval": "run_rag_retrieval",
             "run_opportunity_scout": "run_opportunity_scout",
             "run_gmail_triage": "run_gmail_triage",
             "run_outreach_composer": "run_outreach_composer",
@@ -479,6 +491,7 @@ def build_work_item_langgraph(*, checkpointer: Any | None = None) -> Any:
     )
     for node_name in (
         "run_business_research",
+        "run_rag_retrieval",
         "run_opportunity_scout",
         "run_gmail_triage",
         "run_outreach_composer",
@@ -511,14 +524,27 @@ def run_work_item_langgraph(
     *,
     checkpointer: Any | None = None,
     thread_id: str | None = None,
+    native_thread_id: str | None = None,
     require_langgraph: bool = False,
-    enable_interrupts: bool = False,
+    enable_interrupts: bool = True,
     manager_loop: bool = False,
     max_manager_steps: int = 3,
     feedback_callback: Any | None = None,
 ) -> LangGraphWorkflowOutcome:
     """Advance a WorkItem through the optional LangGraph orchestration layer."""
 
+    from keystone_agents.orchestration.checkpoints import GRAPH_INPUT, run_durable_graph
+
+    if request.save and checkpointer is None and langgraph_available():
+        return run_durable_graph(
+            request, thread_id=thread_id, require_langgraph=require_langgraph,
+            enable_interrupts=enable_interrupts, manager_loop=manager_loop,
+            max_manager_steps=max_manager_steps, feedback_callback=feedback_callback,
+        )
+
+    from keystone_agents.runtime.context_snapshot import freeze_workflow_context
+
+    request = freeze_workflow_context(request)
     bounded_max_steps = max(1, min(5, int(max_manager_steps or 3)))
     initial_state: WorkItemGraphState = {
         "request": request.model_dump(mode="json"),
@@ -545,9 +571,14 @@ def run_work_item_langgraph(
         )
     if langgraph_available():
         graph = build_work_item_langgraph(checkpointer=checkpointer)
+        resuming, resume_input = GRAPH_INPUT.get()
         final_state = graph.invoke(
-            initial_state,
-            config={"configurable": {"thread_id": checkpoint_key}},
+            resume_input if resuming else initial_state,
+            config={
+                "configurable": {"thread_id": native_thread_id or checkpoint_key},
+                "recursion_limit": 100,
+            },
+            **({"durability": "sync"} if checkpointer is not None else {}),
         )
         runtime: Literal["langgraph", "dependency_free_fallback"] = "langgraph"
     else:
@@ -559,6 +590,9 @@ def run_work_item_langgraph(
         final_state = _run_dependency_free_graph(initial_state)
         runtime = "dependency_free_fallback"
 
+    interrupted = bool(final_state.get("__interrupt__"))
+    if interrupted and "approval_checkpoint" not in final_state.get("node_path", [])[-1:]:
+        final_state["node_path"] = [*final_state.get("node_path", []), "approval_checkpoint"]
     result = WorkflowRunResult.model_validate(final_state["result"])
     checkpoint_required = bool(final_state.get("checkpoint_required", False))
     checkpoint_reason = str(final_state.get("checkpoint_reason") or "")
@@ -590,10 +624,25 @@ def run_work_item_langgraph(
             result=result,
             graph_completion_review=graph_completion_review,
         )
-        result = synthesize_terminal_work_item_response(
-            result,
-            request=request,
+        from keystone_agents.runtime.durable_execution import current_execution
+
+        execution = current_execution()
+        terminal_input = {
+            "result": result.model_dump(mode="json"), "request": request.model_dump(mode="json"),
+        }
+        saved_terminal = (
+            execution.store.stage_result(execution.execution_id, "terminal_output", terminal_input)
+            if execution else None
         )
+        if saved_terminal is not None:
+            result = WorkflowRunResult.model_validate(saved_terminal)
+        else:
+            result = synthesize_terminal_work_item_response(result, request=request)
+            if execution:
+                execution.store.save_stage(
+                    execution.execution_id, "terminal_output", terminal_input,
+                    result.model_dump(mode="json"),
+                )
         audit_note_set = set(result.audit_notes)
         llm_review_used = bool(
             "Live user-facing response synthesis executed." in audit_note_set
@@ -660,6 +709,7 @@ def run_work_item_langgraph(
             final_state.get("improvements") or langgraph_functionality_improvements()
         ),
         checkpoint_key=checkpoint_key,
+        interrupted=interrupted,
     )
 
 
@@ -755,6 +805,18 @@ def _emit_langgraph_feedback(
 
 
 def _run_dependency_free_graph(state: WorkItemGraphState) -> WorkItemGraphState:
+    from keystone_agents.runtime.work_item_lock import work_item_execution_lock
+
+    request = WorkflowRunRequest.from_checkpoint(state.get("request") or {})
+    with work_item_execution_lock(
+        request.database_url,
+        request.work_item_id if request.save else "",
+        owner=request.execution_id,
+    ):
+        return _run_dependency_free_graph_steps(state)
+
+
+def _run_dependency_free_graph_steps(state: WorkItemGraphState) -> WorkItemGraphState:
     state = _normalize_request_node(state)
     state = _orchestrator_preflight_node(state)
     state = _state_followup_node(state)
@@ -768,6 +830,7 @@ def _run_dependency_free_graph(state: WorkItemGraphState) -> WorkItemGraphState:
     route_node = _route_to_specialist_node(state)
     specialist_nodes = {
         "run_business_research": _run_business_research_node,
+        "run_rag_retrieval": _run_rag_retrieval_node,
         "run_opportunity_scout": _run_opportunity_scout_node,
         "run_gmail_triage": _run_gmail_triage_node,
         "run_outreach_composer": _run_outreach_composer_node,
@@ -948,6 +1011,14 @@ def _enhance_graph_terminal_summary(
                 ],
             }
         )
+    if (
+        outreach is not None
+        and outreach.metadata.get("thread_local_slack_draft") is True
+        and outreach.metadata.get("canonical_draft_copy") is True
+    ):
+        # The specialist's reviewed copy already answers the private draft request.
+        # Do not infer a reply recommendation from the presence of a draft.
+        return result
     if not re.search(
         r"\b(?:visible result|recommendation|strongest evidence|main uncertainty|"
         r"next step|decision|data\s*source|facts?|inference|limitations?|unknowns?|"
@@ -1364,6 +1435,7 @@ def _graph_requested_stage_review(
     typed_workflow = set(typed_plan.workflow) if typed_plan is not None else set()
     downstream_artifact_owners = {
         WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        WorkItemRoute.RAG_RETRIEVAL_SPECIALIST.value,
         WorkItemRoute.OPPORTUNITY_SCOUT.value,
         WorkItemRoute.OUTREACH_COMPOSER.value,
     }
@@ -1595,7 +1667,7 @@ def _manager_loop_stop_reason(state: WorkItemGraphState) -> str:
         }
         if result.next_action.agent.value in previous_routes:
             return "stopped before repeating a specialist already used in this graph loop"
-        original_request = WorkflowRunRequest.model_validate(
+        original_request = WorkflowRunRequest.from_checkpoint(
             state.get("original_request") or state.get("request") or {}
         )
         if not (
@@ -1611,7 +1683,7 @@ def _manager_loop_stop_reason(state: WorkItemGraphState) -> str:
 
 def _manager_loop_continue_node(state: WorkItemGraphState) -> WorkItemGraphState:
     result = WorkflowRunResult.model_validate(state["result"])
-    original_request = WorkflowRunRequest.model_validate(
+    original_request = WorkflowRunRequest.from_checkpoint(
         state.get("original_request") or state.get("request") or {}
     )
     manual_request_plan = dict(original_request.manual_request_plan or {})
@@ -1634,7 +1706,7 @@ def _manager_loop_continue_node(state: WorkItemGraphState) -> WorkItemGraphState
 
 def _manager_loop_finalize_node(state: WorkItemGraphState) -> WorkItemGraphState:
     result = WorkflowRunResult.model_validate(state["result"])
-    original_request = WorkflowRunRequest.model_validate(
+    original_request = WorkflowRunRequest.from_checkpoint(
         state.get("original_request") or state.get("request") or {}
     )
     stop_reason = str(
@@ -1706,7 +1778,7 @@ def _run_legacy_single_pass_tail(state: WorkItemGraphState) -> WorkItemGraphStat
 
 
 def _normalize_request_node(state: WorkItemGraphState) -> WorkItemGraphState:
-    request = WorkflowRunRequest.model_validate(state.get("request") or {})
+    request = WorkflowRunRequest.from_checkpoint(state.get("request") or {})
     normalized = normalize_workflow_request_for_graph(request)
     return {
         **state,
@@ -1717,7 +1789,7 @@ def _normalize_request_node(state: WorkItemGraphState) -> WorkItemGraphState:
 
 
 def _orchestrator_preflight_node(state: WorkItemGraphState) -> WorkItemGraphState:
-    request = WorkflowRunRequest.model_validate(state.get("request") or {})
+    request = WorkflowRunRequest.from_checkpoint(state.get("request") or {})
     preflight = (
         request.orchestrator_preflight if isinstance(request.orchestrator_preflight, dict) else {}
     )
@@ -1735,7 +1807,7 @@ def _orchestrator_preflight_node(state: WorkItemGraphState) -> WorkItemGraphStat
 
 
 def _state_followup_node(state: WorkItemGraphState) -> WorkItemGraphState:
-    request = WorkflowRunRequest.model_validate(state.get("request") or {})
+    request = WorkflowRunRequest.from_checkpoint(state.get("request") or {})
     result = answer_work_item_state_followup(request)
     if result is None:
         return {
@@ -1755,8 +1827,15 @@ def _state_followup_node(state: WorkItemGraphState) -> WorkItemGraphState:
 
 
 def _prepare_work_item_node(state: WorkItemGraphState) -> WorkItemGraphState:
-    request = WorkflowRunRequest.model_validate(state.get("request") or {})
+    request = WorkflowRunRequest.from_checkpoint(state.get("request") or {})
     prepared = prepare_work_item_step(request)
+    from keystone_agents.runtime.durable_execution import current_execution
+
+    execution = current_execution()
+    if execution is not None:
+        execution.store.update(
+            execution.execution_id, status="running", work_item_id=prepared.work_item.id,
+        )
     return {
         **state,
         "request": prepared.request.model_dump(mode="json"),
@@ -1776,6 +1855,11 @@ def _stage_feed_context_node(state: WorkItemGraphState) -> WorkItemGraphState:
     retrieval = _retrieve_feed_context_history(
         kind=kind,
         request_text=request_text,
+        database_url=prepared.request.database_url,
+    )
+    retrieval = _stage_feed_context_saved_evidence(
+        kind=kind,
+        retrieval=retrieval,
         database_url=prepared.request.database_url,
     )
     source_refs = _feed_context_source_refs(
@@ -2505,6 +2589,10 @@ def _run_business_research_node(state: WorkItemGraphState) -> WorkItemGraphState
     return _run_specialist_node(state, "run_business_research")
 
 
+def _run_rag_retrieval_node(state: WorkItemGraphState) -> WorkItemGraphState:
+    return _run_specialist_node(state, "run_rag_retrieval")
+
+
 def _run_opportunity_scout_node(state: WorkItemGraphState) -> WorkItemGraphState:
     return _run_specialist_node(state, "run_opportunity_scout")
 
@@ -2550,7 +2638,7 @@ def _finalize_step_node(state: WorkItemGraphState) -> WorkItemGraphState:
     loop_steps = list(state.get("loop_steps") or [])
     if manager_loop:
         loop_steps.append(_graph_step_summary(result, len(loop_steps) + 1))
-        original_request = WorkflowRunRequest.model_validate(
+        original_request = WorkflowRunRequest.from_checkpoint(
             state.get("original_request") or state.get("request") or {}
         )
         store = (
@@ -2597,6 +2685,18 @@ def _approval_checkpoint_node(state: WorkItemGraphState) -> WorkItemGraphState:
             interrupt = None
         if interrupt is not None:
             human_decision = interrupt(payload)
+            from keystone_agents.orchestration.checkpoints import _refresh_work_item_state
+
+            request = WorkflowRunRequest.from_checkpoint(state["request"])
+            state = _refresh_work_item_state(dict(state), request, approval=True)
+            result = WorkflowRunResult.model_validate(state["result"])
+            followup = answer_work_item_state_followup(request.model_copy(update={
+                "request_text": "continue", "work_item_id": result.work_item.id,
+            }))
+            if followup is not None:
+                state = _state_with_result(state, followup)
+                state["checkpoint_required"] = False
+                state["checkpoint_reason"] = ""
     return {
         **state,
         "node_path": [*state.get("node_path", []), "approval_checkpoint"],
@@ -2619,6 +2719,7 @@ def _route_after_prepare_work_item(
     "stage_airtable_context",
     "stage_google_workspace_context",
     "run_business_research",
+    "run_rag_retrieval",
     "run_opportunity_scout",
     "run_gmail_triage",
     "run_outreach_composer",
@@ -2692,6 +2793,7 @@ def _chief_coordination_should_run_before_context_edges(
         specialist_routes = {
             "gmail_triage",
             "business_research_analyst",
+            "rag_retrieval_specialist",
             "opportunity_scout",
             "outreach_composer",
             "rss_context_agent",
@@ -2757,6 +2859,7 @@ def _route_after_context_staging(
     "stage_airtable_context",
     "stage_google_workspace_context",
     "run_business_research",
+    "run_rag_retrieval",
     "run_opportunity_scout",
     "run_gmail_triage",
     "run_outreach_composer",
@@ -2775,6 +2878,7 @@ def _route_after_airtable_context_staging(
     "stage_airtable_context",
     "stage_google_workspace_context",
     "run_business_research",
+    "run_rag_retrieval",
     "run_opportunity_scout",
     "run_gmail_triage",
     "run_outreach_composer",
@@ -2795,6 +2899,7 @@ def _route_after_google_workspace_context_staging(
     "stage_airtable_context",
     "stage_google_workspace_context",
     "run_business_research",
+    "run_rag_retrieval",
     "run_opportunity_scout",
     "run_gmail_triage",
     "run_outreach_composer",
@@ -2810,6 +2915,7 @@ def _route_to_specialist_node(
     state: WorkItemGraphState,
 ) -> Literal[
     "run_business_research",
+    "run_rag_retrieval",
     "run_opportunity_scout",
     "run_gmail_triage",
     "run_outreach_composer",
@@ -2819,6 +2925,8 @@ def _route_to_specialist_node(
     route = str(state.get("route") or "")
     if route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value:
         return "run_business_research"
+    if route == WorkItemRoute.RAG_RETRIEVAL_SPECIALIST.value:
+        return "run_rag_retrieval"
     if route == WorkItemRoute.OPPORTUNITY_SCOUT.value:
         return "run_opportunity_scout"
     if route == WorkItemRoute.GMAIL_TRIAGE.value:
@@ -2834,7 +2942,7 @@ def _context_edge_request_text(
     state: WorkItemGraphState,
     prepared: PreparedWorkItemStep,
 ) -> str:
-    original = WorkflowRunRequest.model_validate(
+    original = WorkflowRunRequest.from_checkpoint(
         state.get("original_request") or state.get("request") or {}
     )
     return " ".join(
@@ -2929,6 +3037,7 @@ def _semantic_context_handoff(
             index = normalized.index(agent)
             executable = {
                 WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+                WorkItemRoute.RAG_RETRIEVAL_SPECIALIST.value,
                 WorkItemRoute.OPPORTUNITY_SCOUT.value,
                 WorkItemRoute.GMAIL_TRIAGE.value,
                 WorkItemRoute.OUTREACH_COMPOSER.value,
@@ -2979,6 +3088,7 @@ def _semantic_route_after_context(
     executable_routes = {
         WorkItemRoute.GMAIL_TRIAGE.value,
         WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        WorkItemRoute.RAG_RETRIEVAL_SPECIALIST.value,
         WorkItemRoute.OPPORTUNITY_SCOUT.value,
         WorkItemRoute.OUTREACH_COMPOSER.value,
         WorkItemRoute.CHIEF_OF_STAFF.value,
@@ -3016,6 +3126,7 @@ def _typed_context_stage_follows_route(
     executable_routes = {
         WorkItemRoute.GMAIL_TRIAGE.value,
         WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        WorkItemRoute.RAG_RETRIEVAL_SPECIALIST.value,
         WorkItemRoute.OPPORTUNITY_SCOUT.value,
         WorkItemRoute.OUTREACH_COMPOSER.value,
         WorkItemRoute.CHIEF_OF_STAFF.value,
@@ -3709,6 +3820,174 @@ def _retrieve_feed_context_history(
     )
 
 
+def _stage_feed_context_saved_evidence(
+    *,
+    kind: Literal["rss", "preprints"],
+    retrieval: Mapping[str, Any],
+    database_url: str | None,
+) -> dict[str, Any]:
+    """Stage bounded saved evidence without selecting substantive facts in Python."""
+
+    reader = (
+        read_preprint_announcement_evidence_impl
+        if kind == "preprints"
+        else read_rss_announcement_evidence_impl
+    )
+    max_total_chars = 12_000
+    max_records = 12
+    page_chars = 1_000
+    remaining_chars = max_total_chars
+    evidence_reads: list[dict[str, Any]] = []
+    indexed_record_count = 0
+    staged_record_ids: set[tuple[str, str]] = set()
+    limitations: list[str] = []
+    index_continuation_incomplete = False
+    read_continuation_incomplete = False
+
+    for raw_item in list(retrieval.get("items") or [])[:5]:
+        if not isinstance(raw_item, Mapping):
+            continue
+        feed_item_id = str(raw_item.get("feed_item_id") or "").strip()
+        if not feed_item_id or not raw_item.get("selected_evidence_read_required"):
+            continue
+        index_entries = [
+            dict(entry)
+            for entry in list(raw_item.get("evidence_index") or [])
+            if isinstance(entry, Mapping)
+        ]
+        coverage = raw_item.get("evidence_index_coverage")
+        next_index_request = (
+            dict(coverage.get("next_request") or {})
+            if isinstance(coverage, Mapping) and coverage.get("has_more")
+            else None
+        )
+        while next_index_request and len(index_entries) < max_records:
+            index_page = reader(
+                database_url=database_url,
+                **next_index_request,
+            )
+            if index_page.get("status") != "success":
+                limitations.extend(
+                    str(item) for item in list(index_page.get("limitations") or [])[:3]
+                )
+                next_index_request = None
+                break
+            new_entries = [
+                dict(entry)
+                for entry in list(index_page.get("evidence_index") or [])
+                if isinstance(entry, Mapping)
+            ]
+            if not new_entries:
+                limitations.append(
+                    "A saved evidence-index continuation made no progress and was stopped."
+                )
+                next_index_request = None
+                break
+            index_entries.extend(new_entries)
+            next_coverage = index_page.get("evidence_index_coverage")
+            next_index_request = (
+                dict(next_coverage.get("next_request") or {})
+                if isinstance(next_coverage, Mapping) and next_coverage.get("has_more")
+                else None
+            )
+        if next_index_request:
+            index_continuation_incomplete = True
+        indexed_record_count += len(index_entries)
+
+        for entry in index_entries:
+            evidence_id = str(entry.get("evidence_id") or "").strip()
+            record_key = (feed_item_id, evidence_id)
+            if (
+                not evidence_id
+                or record_key in staged_record_ids
+                or len(staged_record_ids) >= max_records
+                or remaining_chars < page_chars
+            ):
+                continue
+            request: dict[str, Any] = {
+                "feed_item_id": feed_item_id,
+                "evidence_id": evidence_id,
+                "max_chars": page_chars,
+            }
+            page_number = 0
+            next_request: dict[str, Any] | None = request
+            while remaining_chars >= page_chars:
+                page = reader(database_url=database_url, **request)
+                page_number += 1
+                text = str(page.get("text") or "")
+                metadata_text = str(page.get("metadata_text") or "")
+                consumed = len(text) + len(metadata_text)
+                evidence_reads.append(
+                    {
+                        "feed_item_id": feed_item_id,
+                        "evidence_id": evidence_id,
+                        "evidence_position": entry.get("position"),
+                        "evidence_kind": str(entry.get("kind") or ""),
+                        "status": str(page.get("status") or ""),
+                        "content_status": str(page.get("content_status") or ""),
+                        "saved_content_scope": str(
+                            page.get("saved_content_scope") or ""
+                        ),
+                        "article_full_text_verified": bool(
+                            page.get("article_full_text_verified")
+                        ),
+                        "page_number": page_number,
+                        "text": text,
+                        "metadata_text": metadata_text,
+                        "read_window": dict(page.get("read_window") or {}),
+                        "metadata_window": dict(page.get("metadata_window") or {}),
+                        "source_snapshot": dict(page.get("source_snapshot") or {}),
+                        "limitations": [
+                            str(item)
+                            for item in list(page.get("limitations") or [])[:5]
+                        ],
+                    }
+                )
+                remaining_chars -= consumed
+                continuation = page.get("continuation")
+                next_request = (
+                    dict(continuation.get("next_request") or {})
+                    if isinstance(continuation, Mapping)
+                    and continuation.get("available")
+                    else None
+                )
+                if not next_request:
+                    if page.get("status") != "success":
+                        read_continuation_incomplete = True
+                    break
+                if consumed <= 0:
+                    limitations.append(
+                        "A saved evidence continuation made no progress and was stopped."
+                    )
+                    read_continuation_incomplete = True
+                    break
+                request = next_request
+            if next_request and remaining_chars < page_chars:
+                read_continuation_incomplete = True
+            staged_record_ids.add(record_key)
+
+    incomplete = bool(
+        index_continuation_incomplete
+        or read_continuation_incomplete
+        or indexed_record_count > len(staged_record_ids)
+        or remaining_chars < page_chars
+    )
+    return {
+        **dict(retrieval),
+        "selected_evidence_reads": evidence_reads,
+        "selected_evidence_coverage": {
+            "policy": "source_order_without_substantive_python_selection",
+            "max_total_chars": max_total_chars,
+            "max_records": max_records,
+            "indexed_record_count": indexed_record_count,
+            "staged_record_count": len(staged_record_ids),
+            "staged_char_count": max_total_chars - remaining_chars,
+            "complete": not incomplete,
+            "limitations": limitations,
+        },
+    }
+
+
 def _feed_context_source_refs(
     *,
     work_item_id: str,
@@ -3718,12 +3997,30 @@ def _feed_context_source_refs(
 ) -> list[WorkItemSourceRef]:
     agent_name = _feed_context_agent_name(kind)
     refs: list[WorkItemSourceRef] = []
+    evidence_by_item: dict[str, list[Mapping[str, Any]]] = {}
+    for read in list(retrieval.get("selected_evidence_reads") or []):
+        if not isinstance(read, Mapping):
+            continue
+        evidence_by_item.setdefault(str(read.get("feed_item_id") or ""), []).append(
+            read
+        )
     for index, item in enumerate(list(retrieval.get("items") or [])[:5], start=1):
         if not isinstance(item, Mapping):
             continue
         source_id = str(item.get("feed_item_id") or item.get("url") or f"{work_item_id}:{index}")
+        selected_evidence = evidence_by_item.get(source_id, [])
+        saved_evidence_text = " ".join(
+            str(read.get("text") or "").strip()
+            for read in selected_evidence
+            if str(read.get("text") or "").strip()
+        )
         evidence_notes = [str(note) for note in item.get("evidence_notes") or [] if str(note)]
         key_facts = [
+            (
+                f"Saved evidence staged: {saved_evidence_text[:1200]}"
+                if saved_evidence_text
+                else ""
+            ),
             str(item.get("selection_reason") or "").strip(),
             str(item.get("summary") or "").strip(),
             str(item.get("source_basis") or "").strip(),
@@ -3743,7 +4040,7 @@ def _feed_context_source_refs(
                 extraction_status=str(item.get("evidence_status") or "historical_context"),
                 source_quality="historical_context",
                 key_facts=[fact for fact in key_facts if fact][:5],
-                evidence_excerpt=" | ".join(evidence_notes)[:700],
+                evidence_excerpt=(saved_evidence_text or " | ".join(evidence_notes))[:700],
             )
         )
     if refs:
@@ -3817,6 +4114,14 @@ def _feed_context_artifact(
                 str(blocker) for blocker in list(retrieval.get("blockers") or [])[:5]
             ],
             "item_count": item_count,
+            "selected_evidence_reads": [
+                dict(item)
+                for item in list(retrieval.get("selected_evidence_reads") or [])
+                if isinstance(item, Mapping)
+            ],
+            "selected_evidence_coverage": dict(
+                retrieval.get("selected_evidence_coverage") or {}
+            ),
             "recommended_downstream_route": route.value,
             "recommended_artifact_plan": [
                 "Use the context as historical signal for specialist planning.",
@@ -4255,9 +4560,15 @@ def _prepared_step_from_state(state: WorkItemGraphState) -> PreparedWorkItemStep
     payload = state.get("prepared_step")
     if not isinstance(payload, dict):
         raise ValueError("LangGraph WorkItem state is missing prepared_step.")
+    request = WorkflowRunRequest.from_checkpoint(payload.get("request") or {})
+    work_item = WorkItem.model_validate(payload.get("work_item") or {})
+    from keystone_agents.orchestration.checkpoints import GRAPH_INPUT
+
+    if GRAPH_INPUT.get()[0] and request.save:
+        work_item = SQLiteStore(request.database_url).get_work_item(work_item.id) or work_item
     return PreparedWorkItemStep(
-        request=WorkflowRunRequest.model_validate(payload.get("request") or {}),
-        work_item=WorkItem.model_validate(payload.get("work_item") or {}),
+        request=request,
+        work_item=work_item,
         route=WorkItemRoute(str(payload.get("route") or WorkItemRoute.ORCHESTRATOR.value)),
         input_text=str(payload.get("input_text") or ""),
         context_pack=dict(payload.get("context_pack") or {}),
@@ -4268,8 +4579,17 @@ def _state_with_result(
     state: WorkItemGraphState,
     result: WorkflowRunResult,
 ) -> WorkItemGraphState:
+    business_state = {}
+    from keystone_agents.runtime.durable_execution import current_execution
+
+    execution = current_execution()
+    if execution is not None:
+        request = WorkflowRunRequest.from_checkpoint(state.get("request") or {})
+        stored = SQLiteStore(request.database_url).get_work_item(result.work_item.id)
+        business_state = stored.model_dump(mode="json") if stored else {}
     return {
         **state,
+        **({"business_state": business_state} if business_state else {}),
         "result": result.model_dump(mode="json"),
         "route": result.route.value,
         "status": result.status.value,
@@ -4329,6 +4649,10 @@ def _approval_checkpoint_payload(
                 "provider": source.provider,
                 "source_quality": source.source_quality,
                 "supported_claim": source.supported_claim,
+                "evidence_access": (source.evidence_access.model_dump(mode="json")
+                                    if source.evidence_access else None),
+                "web_source_access": (source.web_source_access.model_dump(mode="json")
+                                      if source.web_source_access else None),
             }
             for source in result.work_item.sources[:12]
         ],
@@ -4367,6 +4691,9 @@ def _record_langgraph_checkpoint_event(
     checkpoint_payload: dict[str, Any] | None = None,
     graph_completion_review: dict[str, Any] | None = None,
 ) -> None:
+    from keystone_agents.runtime.durable_execution import current_execution
+
+    execution = current_execution()
     if not request.save:
         return
     store = SQLiteStore(request.database_url or database_url_from_env())
@@ -4383,6 +4710,7 @@ def _record_langgraph_checkpoint_event(
             "checkpoint_required": checkpoint_required,
             "checkpoint_reason": checkpoint_reason,
             "checkpoint_key": checkpoint_key,
+            "execution_id": execution.execution_id if execution else "",
             "node_path": node_path,
             "checkpoint_payload": checkpoint_payload,
             "graph_completion_review": graph_completion_review,

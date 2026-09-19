@@ -56,6 +56,7 @@ from keystone_agents.agents.outreach_composer import (
 from keystone_agents.agents.preprints_context import build_preprints_context_agent
 from keystone_agents.agents.rss_context import build_rss_context_agent
 from keystone_agents.agents.web_query_planner import build_web_query_planner_agent
+from keystone_agents.runtime import signal_context as signal_context_runtime
 
 __all__ = [
     "build_business_research_analyst_agent",
@@ -94,4 +95,5 @@ __all__ = [
     "run_outreach_composer_sdk",
     "resolve_manual_request_plan",
     "plan_chief_of_staff_request",
+    "signal_context_runtime",
 ]

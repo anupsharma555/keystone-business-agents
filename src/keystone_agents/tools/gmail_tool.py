@@ -7,6 +7,7 @@ test-draft send path. Ordinary agent email sending remains unavailable.
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import html
 import json
@@ -21,32 +22,46 @@ from email.utils import parseaddr, parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 
 from keystone_agents.context_env import context_env_value
 from keystone_agents.guardrails import (
+    enforce_public_source_output_guardrails,
     enforce_tool_input_guardrails,
     enforce_tool_output_guardrails,
     keystone_tool_guardrail_kwargs,
+    redact_secret_like_text,
 )
 from keystone_agents.provider_read import (
     ProviderReadContextError,
     current_provider_read_context,
     record_provider_read_result,
 )
+from keystone_agents.receipts.journal import durable_provider_tool, record_provider_observation
 from keystone_agents.schemas.email_triage import (
     GMAIL_MANAGED_LABELS,
     GMAIL_PRIMARY_LABEL_SET,
     GmailAttachmentMetadata,
+    GmailBodyEvidence,
     GmailLinkRecord,
     GmailMessageEnvelope,
+    GmailQuotationEvidence,
     normalize_managed_gmail_labels,
 )
 from keystone_agents.sdk import ToolGuardrailViolation, function_tool
 
 GMAIL_API_BASE_URL = "https://gmail.googleapis.com/gmail/v1/users/me"
+
+
+def _record_gmail_draft_observation(draft_id: str, operation: str) -> None:
+    if draft_id:
+        record_provider_observation({
+            "status": "observed", "provider": "gmail", "operation": operation,
+            "draft_id": draft_id, "provider_write": True,
+            "verification": {"passed": False, "status": "pending_readback"},
+        })
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 DEFAULT_TIMEOUT_SECONDS = 10.0
 DEFAULT_GOOGLE_CREDENTIALS_FILE = "credentials.json"
@@ -107,6 +122,18 @@ GMAIL_SYSTEM_LABEL_IDS = {
 URL_RE = re.compile(r"\b(?:https?://|www\.)[^\s<>'\"`]+", re.IGNORECASE)
 HTML_TAG_RE = re.compile(r"<[a-zA-Z][^>]*>")
 HTML_BLOCKQUOTE_RE = re.compile(r"<blockquote\b", re.IGNORECASE)
+HTML_REPLY_CLASS_MARKERS = (
+    "gmail_quote",
+    "gmail_attr",
+    "moz-cite-prefix",
+    "protonmail_quote",
+    "yahoo_quoted",
+)
+PLAIN_RENDERING_STUB_RE = re.compile(
+    r"(?:\b(?:view|read|open|display)\b.{0,100}\b(?:html|browser|online|web|rich[- ]text|"
+    r"compatible)\b|\b(?:html|rich[- ]text)\b.{0,80}\b(?:version|reader|view)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
 QUOTE_DELIMITER_RE = re.compile(
     r"^(?:On .+ wrote:|From:\s.+|-----Original Message-----|Begin forwarded message:|"
     r"_{6,})$",
@@ -159,6 +186,9 @@ SHORTENER_DOMAINS = {
     "buff.ly",
     "rebrand.ly",
 }
+GMAIL_BODY_EVIDENCE_MAX_PARTS = 8
+GMAIL_BODY_EVIDENCE_MAX_CHARS = 12_000
+GMAIL_BODY_PART_MAX_CHARS = 6_000
 RISKY_ATTACHMENT_EXTENSIONS = {
     ".exe",
     ".js",
@@ -190,12 +220,53 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=True, sort_keys=True)
 
 
-def _decode_base64_url(data: str | None) -> str:
+def _decode_base64_url_bytes(data: str | None) -> bytes | None:
     if not data:
-        return ""
+        return b""
     padded = data + "=" * (-len(data) % 4)
-    decoded = base64.urlsafe_b64decode(padded.encode("utf-8"))
+    try:
+        return base64.urlsafe_b64decode(padded.encode("utf-8"))
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _decode_base64_url(data: str | None) -> str:
+    decoded = _decode_base64_url_bytes(data)
+    if decoded is None:
+        return ""
     return decoded.decode("utf-8", errors="replace")
+
+
+def _text_part_charset(part: Mapping[str, Any]) -> str:
+    headers = part.get("headers") if isinstance(part.get("headers"), list) else []
+    content_type = _header(headers, "Content-Type")
+    match = re.search(r"charset\s*=\s*[\"']?([^;\s\"']+)", content_type, re.I)
+    return match.group(1).strip() if match else "utf-8"
+
+
+def _decode_text_part(
+    part: Mapping[str, Any],
+    data: str | None,
+) -> tuple[str, bool, str]:
+    raw = _decode_base64_url_bytes(data)
+    if raw is None:
+        return "", False, "The MIME body was not valid base64url data."
+    charset = _text_part_charset(part)
+    try:
+        return raw.decode(charset, errors="strict"), True, ""
+    except LookupError:
+        return (
+            raw.decode("utf-8", errors="replace"),
+            False,
+            f"Declared charset {charset!r} is unsupported; UTF-8 replacement decoding was used.",
+        )
+    except UnicodeDecodeError:
+        return (
+            raw.decode(charset, errors="replace"),
+            False,
+            f"MIME bytes were invalid for declared charset {charset!r}; replacement "
+            "decoding was used.",
+        )
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -244,6 +315,248 @@ class _HTMLLinkExtractor(HTMLParser):
         href = dict(attrs).get("href")
         if href:
             self.links.append(href)
+
+
+class _HTMLSourceExtractor(HTMLParser):
+    """Preserve bounded HTML structure and quotation provenance without rendering."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.events: list[tuple[str, str]] = []
+        self.frames: list[dict[str, str]] = []
+        self.tables: list[dict[str, int]] = []
+        self.table_count = 0
+        self.structure_annotations = False
+        self.content_complete = True
+        self.limitations: list[str] = []
+        self.unread_media_count = 0
+        self._skip_depth = 0
+
+    def _quote_kind(self) -> str:
+        for frame in reversed(self.frames):
+            if frame.get("quote_kind"):
+                return frame["quote_kind"]
+        return "direct"
+
+    def _append(self, value: str) -> None:
+        if value and not self._skip_depth:
+            self.events.append((self._quote_kind(), value))
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag_lower = tag.lower()
+        values = {str(key).lower(): str(value or "") for key, value in attrs}
+        if tag_lower in {"script", "style"}:
+            self._skip_depth += 1
+            self.frames.append({"tag": tag_lower, "skip": "true"})
+            return
+        if self._skip_depth:
+            self.frames.append({"tag": tag_lower})
+            return
+
+        marker_text = " ".join(
+            [values.get("class", ""), values.get("id", "")]
+        ).lower()
+        reply_marker = any(marker in marker_text for marker in HTML_REPLY_CLASS_MARKERS)
+        ancestor_quote_kind = self._quote_kind()
+        quote_kind = ""
+        if tag_lower == "blockquote":
+            quote_kind = (
+                "reply_history"
+                if ancestor_quote_kind == "reply_history"
+                or reply_marker
+                or values.get("type", "").lower() == "cite"
+                else "editorial_source"
+            )
+        elif reply_marker and tag_lower in {"div", "section"}:
+            quote_kind = "reply_history"
+        frame = {
+            "tag": tag_lower,
+            "quote_kind": quote_kind,
+            "href": values.get("href", "") if tag_lower == "a" else "",
+        }
+        self.frames.append(frame)
+
+        if tag_lower in {
+            "br",
+            "p",
+            "div",
+            "li",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "blockquote",
+        }:
+            self._append("\n")
+        if tag_lower in {"img", "video", "audio", "object", "svg", "canvas"}:
+            self._append("\n[[inline visual or media content not read]]\n")
+            self.content_complete = False
+            self.unread_media_count += 1
+        if tag_lower == "table":
+            self.table_count += 1
+            self.tables.append({"index": self.table_count, "row": 0, "cell": 0})
+            self.structure_annotations = True
+            self._append(f"\n[[table {self.table_count} start]]\n")
+        elif tag_lower == "tr" and self.tables:
+            table = self.tables[-1]
+            table["row"] += 1
+            table["cell"] = 0
+            self._append(f"\n[[table {table['index']} row {table['row']}]]\n")
+        elif tag_lower in {"th", "td"} and self.tables:
+            table = self.tables[-1]
+            table["cell"] += 1
+            row_span = values.get("rowspan", "1") or "1"
+            column_span = values.get("colspan", "1") or "1"
+            self._append(
+                "\n"
+                f"[[table {table['index']} cell row={table['row']} "
+                f"cell_index={table['cell']} header={str(tag_lower == 'th').lower()} "
+                f"row_span={row_span} column_span={column_span}]]\n"
+            )
+            frame["cell_content_start"] = str(len(self.events))
+
+    def handle_startendtag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag_lower = tag.lower()
+        frame_index = next(
+            (
+                index
+                for index in range(len(self.frames) - 1, -1, -1)
+                if self.frames[index].get("tag") == tag_lower
+            ),
+            None,
+        )
+        frame = self.frames[frame_index] if frame_index is not None else {}
+        if frame.get("skip") == "true":
+            self._skip_depth = max(0, self._skip_depth - 1)
+        if not self._skip_depth:
+            if tag_lower in {"th", "td"} and frame.get("cell_content_start"):
+                content_start = int(frame["cell_content_start"])
+                content = _compact_source_text(
+                    "".join(value for _kind, value in self.events[content_start:])
+                )
+                if not content:
+                    self._append("[[blank table cell]]")
+            if tag_lower == "a" and frame.get("href"):
+                self._append(f" [[link: {frame['href']}]]")
+            if tag_lower in {
+                "p",
+                "div",
+                "li",
+                "h1",
+                "h2",
+                "h3",
+                "h4",
+                "h5",
+                "h6",
+                "blockquote",
+            }:
+                self._append("\n")
+            if tag_lower == "table" and self.tables:
+                table = self.tables.pop()
+                self._append(f"\n[[table {table['index']} end]]\n")
+        if frame_index is not None:
+            del self.frames[frame_index:]
+
+    def handle_data(self, data: str) -> None:
+        self._append(data)
+
+
+@dataclass(frozen=True)
+class _GmailPayloadExtraction:
+    normalized_body: str
+    body_evidence: list[GmailBodyEvidence]
+    links: list[GmailLinkRecord]
+    attachments: list[GmailAttachmentMetadata]
+    quote_stripped: bool
+    body_content_status: Literal["complete", "partial", "conflicting", "empty"]
+    body_content_complete: bool
+    limitations: list[str]
+
+
+def _compact_source_text(value: str) -> str:
+    lines = [" ".join(line.split()) for line in value.replace("\r", "").splitlines()]
+    return "\n".join(line for line in lines if line).strip().replace("\u2014", "-")
+
+
+def _bounded_source_text(value: str, *, limit: int) -> tuple[str, bool]:
+    text = _compact_source_text(value)
+    if len(text) <= limit:
+        return text, False
+    marker = "\n[[truncated: bounded Gmail source evidence]]"
+    if limit <= 0:
+        return "", bool(text)
+    if limit <= len(marker):
+        return marker[:limit], True
+    return text[: limit - len(marker)].rstrip() + marker, True
+
+
+def _quoted_segments_from_events(
+    events: list[tuple[str, str]],
+) -> list[GmailQuotationEvidence]:
+    grouped: list[tuple[str, str]] = []
+    for kind, value in events:
+        if kind == "direct":
+            continue
+        if grouped and grouped[-1][0] == kind:
+            grouped[-1] = (kind, grouped[-1][1] + value)
+        else:
+            grouped.append((kind, value))
+    output: list[GmailQuotationEvidence] = []
+    for kind, value in grouped:
+        text, truncated = _bounded_source_text(value, limit=4_000)
+        if not text:
+            continue
+        attribution = ""
+        attribution_status: Literal[
+            "not_applicable", "explicit", "inferred_reply_marker", "unknown"
+        ]
+        if kind == "reply_history":
+            first_line = text.splitlines()[0]
+            if QUOTE_DELIMITER_RE.match(first_line):
+                attribution = first_line
+                attribution_status = "explicit"
+            else:
+                attribution_status = "inferred_reply_marker"
+        elif kind == "editorial_source":
+            attribution_status = "not_applicable"
+        else:
+            attribution_status = "unknown"
+        output.append(
+            GmailQuotationEvidence(
+                quote_kind=kind,
+                text=text,
+                attribution=attribution,
+                attribution_status=attribution_status,
+                truncated=truncated,
+            )
+        )
+    return output[:20]
+
+
+def _source_text_from_events(events: list[tuple[str, str]]) -> str:
+    parts: list[str] = []
+    active_kind = "direct"
+    for kind, value in events:
+        if kind != active_kind:
+            if active_kind != "direct":
+                parts.append(f"\n[[end {active_kind.replace('_', ' ')}]]\n")
+            if kind != "direct":
+                parts.append(f"\n[[{kind.replace('_', ' ')}]]\n")
+            active_kind = kind
+        parts.append(value)
+    if active_kind != "direct":
+        parts.append(f"\n[[end {active_kind.replace('_', ' ')}]]\n")
+    return "".join(parts)
 
 
 def _html_to_text(value: str) -> str:
@@ -430,6 +743,443 @@ def _normalize_body(text: str) -> tuple[str, bool]:
     return normalized.replace("\u2014", "-"), quote_stripped
 
 
+def _plain_source_events(value: str) -> list[tuple[str, str]]:
+    events: list[tuple[str, str]] = []
+    reply_history = False
+    for raw_line in value.replace("\r\n", "\n").replace("\r", "\n").splitlines():
+        line = raw_line.strip()
+        if not reply_history and QUOTE_DELIMITER_RE.match(line):
+            reply_history = True
+            events.append(("reply_history", line + "\n"))
+            continue
+        if reply_history:
+            events.append(("reply_history", line.lstrip("> ") + "\n"))
+        elif line.startswith(">"):
+            events.append(("ambiguous", line.lstrip("> ") + "\n"))
+        else:
+            events.append(("direct", raw_line + "\n"))
+    return events
+
+
+def _body_evidence_from_events(
+    *,
+    part_path: str,
+    mime_type: str,
+    container_mime_type: str = "",
+    alternative_group: str = "",
+    representation: Literal["plain", "html", "other_text"],
+    events: list[tuple[str, str]],
+    structure_annotations: bool = False,
+    content_complete: bool = True,
+    limitations: list[str] | None = None,
+) -> GmailBodyEvidence:
+    direct_text, direct_truncated = _bounded_source_text(
+        "".join(value for kind, value in events if kind == "direct"),
+        limit=GMAIL_BODY_PART_MAX_CHARS,
+    )
+    triage_text, triage_truncated = _bounded_source_text(
+        "".join(
+            value
+            for kind, value in events
+            if kind in {"direct", "editorial_source"}
+        ),
+        limit=GMAIL_BODY_PART_MAX_CHARS,
+    )
+    source_text, source_truncated = _bounded_source_text(
+        _source_text_from_events(events),
+        limit=GMAIL_BODY_PART_MAX_CHARS,
+    )
+    truncated = direct_truncated or triage_truncated or source_truncated
+    evidence_limitations = list(limitations or [])
+    if truncated:
+        evidence_limitations.append(
+            f"This MIME representation was truncated to {GMAIL_BODY_PART_MAX_CHARS} characters."
+        )
+    return GmailBodyEvidence(
+        part_path=part_path,
+        mime_type=mime_type,
+        container_mime_type=container_mime_type,
+        alternative_group=alternative_group,
+        representation=representation,
+        role="single_representation",
+        direct_text=direct_text,
+        triage_text=triage_text,
+        source_text=source_text,
+        quotations=_quoted_segments_from_events(events),
+        structure_annotations=structure_annotations,
+        content_complete=content_complete and not truncated,
+        truncated=truncated,
+        limitations=list(dict.fromkeys(evidence_limitations))[:10],
+    )
+
+
+def _plain_body_evidence(
+    part_path: str,
+    mime_type: str,
+    value: str,
+    *,
+    container_mime_type: str = "",
+    alternative_group: str = "",
+    content_complete: bool = True,
+    limitations: list[str] | None = None,
+) -> GmailBodyEvidence:
+    return _body_evidence_from_events(
+        part_path=part_path,
+        mime_type=mime_type,
+        container_mime_type=container_mime_type,
+        alternative_group=alternative_group,
+        representation="plain" if mime_type == "text/plain" else "other_text",
+        events=_plain_source_events(value),
+        content_complete=content_complete,
+        limitations=limitations,
+    )
+
+
+def _html_body_evidence(
+    part_path: str,
+    value: str,
+    *,
+    container_mime_type: str = "",
+    alternative_group: str = "",
+    decoded_complete: bool = True,
+    decoding_limitations: list[str] | None = None,
+) -> GmailBodyEvidence:
+    parser = _HTMLSourceExtractor()
+    limitations: list[str] = list(decoding_limitations or [])
+    try:
+        parser.feed(value)
+        parser.close()
+        events = parser.events
+        content_complete = parser.content_complete and decoded_complete
+        limitations.extend(parser.limitations)
+        if parser.unread_media_count:
+            limitations.append(
+                f"{parser.unread_media_count} inline visual or media element(s) are "
+                "present but were not interpreted."
+            )
+        structure_annotations = parser.structure_annotations
+    except Exception:
+        events = [("direct", _html_to_text(value))]
+        content_complete = False
+        structure_annotations = False
+        limitations.append(
+            "Malformed HTML required a plain-text fallback; quotation and table "
+            "structure may be incomplete."
+        )
+    return _body_evidence_from_events(
+        part_path=part_path,
+        mime_type="text/html",
+        container_mime_type=container_mime_type,
+        alternative_group=alternative_group,
+        representation="html",
+        events=events,
+        structure_annotations=structure_annotations,
+        content_complete=content_complete,
+        limitations=limitations,
+    )
+
+
+def _walk_payload_parts_with_paths(
+    part: dict[str, Any],
+    path: str = "0",
+    *,
+    container_mime_type: str = "",
+    alternative_group: str = "",
+) -> list[tuple[str, dict[str, Any], str, str]]:
+    parts = [(path, part, container_mime_type, alternative_group)]
+    mime_type = str(part.get("mimeType") or "").lower()
+    child_alternative_group = path if mime_type == "multipart/alternative" else alternative_group
+    for index, child in enumerate(part.get("parts", []) or [], start=1):
+        if isinstance(child, dict):
+            parts.extend(
+                _walk_payload_parts_with_paths(
+                    child,
+                    f"{path}.{index}",
+                    container_mime_type=mime_type,
+                    alternative_group=child_alternative_group,
+                )
+            )
+    return parts
+
+
+def _comparison_tokens(value: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+|\$-?\d+(?:\.\d+)?", value.lower()))
+
+
+def _critical_tokens(value: str) -> set[str]:
+    return set(
+        re.findall(
+            r"\$?-?\d+(?:\.\d+)?|\b(?:not|no|never|only|unless|if|before|after)\b",
+            value.lower(),
+        )
+    )
+
+
+def _select_body_evidence(
+    evidence: list[GmailBodyEvidence],
+) -> tuple[list[GmailBodyEvidence], list[int], bool, list[str]]:
+    candidates = [index for index, item in enumerate(evidence) if item.triage_text]
+    if not candidates:
+        return evidence, [], False, []
+    updated = list(evidence)
+    selected_indices: list[int] = []
+    conflict = False
+    limitations: list[str] = []
+    alternative_groups: dict[str, list[int]] = {}
+    for index in candidates:
+        group = evidence[index].alternative_group
+        if group:
+            alternative_groups.setdefault(group, []).append(index)
+
+    grouped_indices = {
+        index for indices in alternative_groups.values() for index in indices
+    }
+    for _group, indices in alternative_groups.items():
+        selected = indices[0]
+        plain_index = next(
+            (index for index in indices if evidence[index].representation == "plain"),
+            None,
+        )
+        html_index = next(
+            (index for index in indices if evidence[index].representation == "html"),
+            None,
+        )
+        if plain_index is not None and html_index is not None:
+            plain = evidence[plain_index].triage_text
+            html_text = evidence[html_index].triage_text
+            plain_tokens = _comparison_tokens(plain)
+            html_tokens = _comparison_tokens(html_text)
+            token_union = plain_tokens | html_tokens
+            similarity = (
+                len(plain_tokens & html_tokens) / len(token_union) if token_union else 1.0
+            )
+            critical_mismatch = _critical_tokens(plain) != _critical_tokens(html_text)
+            html_materially_richer = bool(
+                plain_tokens
+                and plain_tokens <= html_tokens
+                and len(html_text) > max(len(plain) + 40, int(len(plain) * 1.25))
+            )
+            plain_is_stub = bool(
+                PLAIN_RENDERING_STUB_RE.search(plain)
+                and len(html_text) > len(plain)
+            )
+            if plain_is_stub or html_materially_richer:
+                selected = html_index
+                limitations.append(
+                    "The plain and HTML alternatives differed; the materially richer HTML "
+                    "representation was selected for the triage view and both were retained."
+                )
+            elif similarity < 0.65 or critical_mismatch:
+                selected = plain_index
+                conflict = True
+                limitations.append(
+                    "The plain and HTML alternatives contain potentially conflicting "
+                    "content; the plain representation remains the triage view and both "
+                    "are retained without reconciliation."
+                )
+            else:
+                selected = plain_index
+        for index in indices:
+            role = (
+                "selected_triage_view"
+                if index == selected
+                else "alternate_representation"
+            )
+            updated[index] = updated[index].model_copy(update={"role": role})
+        selected_indices.append(selected)
+
+    coexisting = [index for index in candidates if index not in grouped_indices]
+    if len(coexisting) == 1 and not alternative_groups:
+        index = coexisting[0]
+        updated[index] = updated[index].model_copy(update={"role": "single_representation"})
+        selected_indices.append(index)
+    else:
+        for index in coexisting:
+            updated[index] = updated[index].model_copy(update={"role": "coexisting_section"})
+            selected_indices.append(index)
+
+    return updated, sorted(selected_indices), conflict, limitations
+
+
+def _extract_payload_content(payload: dict[str, Any] | None) -> _GmailPayloadExtraction:
+    if not payload:
+        return _GmailPayloadExtraction(
+            normalized_body="",
+            body_evidence=[],
+            links=[],
+            attachments=[],
+            quote_stripped=False,
+            body_content_status="empty",
+            body_content_complete=False,
+            limitations=["The Gmail payload did not contain a readable message body."],
+        )
+
+    evidence: list[GmailBodyEvidence] = []
+    html_links: list[str] = []
+    attachments: list[GmailAttachmentMetadata] = []
+    limitations: list[str] = []
+    omitted_parts = 0
+    for (
+        part_path,
+        part,
+        container_mime_type,
+        alternative_group,
+    ) in _walk_payload_parts_with_paths(payload):
+        attachment = _attachment_metadata(part)
+        if attachment is not None:
+            attachments.append(attachment)
+
+        mime_type = str(part.get("mimeType") or "").lower()
+        body = part.get("body", {}) if isinstance(part.get("body"), dict) else {}
+        body_data = body.get("data")
+        filename = str(part.get("filename") or "").strip()
+        if filename or body.get("attachmentId"):
+            continue
+        if mime_type.startswith(("image/", "audio/", "video/")):
+            if len(evidence) < GMAIL_BODY_EVIDENCE_MAX_PARTS:
+                evidence.append(
+                    GmailBodyEvidence(
+                        part_path=part_path,
+                        mime_type=mime_type or "application/octet-stream",
+                        container_mime_type=container_mime_type,
+                        alternative_group=alternative_group,
+                        representation="other_text",
+                        role="single_representation",
+                        source_text=f"[[{mime_type or 'inline media'} content not read]]",
+                        content_complete=False,
+                        limitations=[
+                            "Inline visual or media content is present but was not interpreted."
+                        ],
+                    )
+                )
+            else:
+                omitted_parts += 1
+            continue
+        if not body_data:
+            continue
+        decoded, decoded_complete, decoding_limitation = _decode_text_part(
+            part,
+            str(body_data),
+        )
+        if not decoded:
+            if mime_type.startswith("text/"):
+                limitations.append(
+                    decoding_limitation
+                    or f"Text MIME part {part_path} could not be decoded or was empty."
+                )
+            continue
+        if len(evidence) >= GMAIL_BODY_EVIDENCE_MAX_PARTS:
+            omitted_parts += 1
+            continue
+        if mime_type == "text/html":
+            evidence.append(
+                _html_body_evidence(
+                    part_path,
+                    decoded,
+                    container_mime_type=container_mime_type,
+                    alternative_group=alternative_group,
+                    decoded_complete=decoded_complete,
+                    decoding_limitations=(
+                        [decoding_limitation] if decoding_limitation else []
+                    ),
+                )
+            )
+            html_links.extend(_links_from_html(decoded))
+        elif mime_type == "text/plain" or (
+            not part.get("parts") and mime_type.startswith("text/")
+        ):
+            evidence.append(
+                _plain_body_evidence(
+                    part_path,
+                    mime_type,
+                    decoded,
+                    container_mime_type=container_mime_type,
+                    alternative_group=alternative_group,
+                    content_complete=decoded_complete,
+                    limitations=[decoding_limitation] if decoding_limitation else [],
+                )
+            )
+
+    if omitted_parts:
+        limitations.append(
+            f"{omitted_parts} additional MIME part(s) exceeded the "
+            f"{GMAIL_BODY_EVIDENCE_MAX_PARTS}-part evidence limit."
+        )
+    if attachments:
+        limitations.append(
+            "Attachment bodies were not ingested; only bounded attachment metadata is available."
+        )
+    evidence, selected_indices, conflict, selection_limitations = _select_body_evidence(
+        evidence
+    )
+    limitations.extend(selection_limitations)
+
+    total_chars = 0
+    bounded_evidence: list[GmailBodyEvidence] = []
+    for item in evidence:
+        remaining = max(0, GMAIL_BODY_EVIDENCE_MAX_CHARS - total_chars)
+        source_text, total_truncated = _bounded_source_text(
+            item.source_text,
+            limit=min(GMAIL_BODY_PART_MAX_CHARS, remaining),
+        ) if remaining else ("", bool(item.source_text))
+        total_chars += len(source_text)
+        if total_truncated:
+            limitations.append(
+                f"MIME part {item.part_path} exceeded the total bounded source-evidence limit."
+            )
+        bounded_evidence.append(
+            item.model_copy(
+                update={
+                    "source_text": source_text,
+                    "truncated": item.truncated or total_truncated,
+                    "content_complete": item.content_complete and not total_truncated,
+                }
+            )
+        )
+    evidence = bounded_evidence
+
+    selected = [
+        evidence[index] for index in selected_indices if index < len(evidence)
+    ]
+    normalized = "\n".join(item.triage_text for item in selected if item.triage_text)
+    quote_stripped = bool(
+        selected
+        and any(
+            quote.quote_kind in {"reply_history", "ambiguous"}
+            for item in selected
+            for quote in item.quotations
+        )
+    )
+    incomplete = bool(
+        omitted_parts
+        or limitations
+        or any(not item.content_complete for item in evidence)
+    )
+    if not evidence or not any(item.source_text for item in evidence):
+        status: Literal["complete", "partial", "conflicting", "empty"] = "empty"
+        limitations.append("No readable text representation was available in the Gmail payload.")
+    elif conflict:
+        status = "conflicting"
+    elif incomplete:
+        status = "partial"
+    else:
+        status = "complete"
+    links = _extract_links(
+        *(item.source_text for item in evidence),
+        *html_links,
+    )
+    return _GmailPayloadExtraction(
+        normalized_body=normalized,
+        body_evidence=evidence,
+        links=links,
+        attachments=attachments,
+        quote_stripped=quote_stripped,
+        body_content_status=status,
+        body_content_complete=status == "complete",
+        limitations=list(dict.fromkeys(item for item in limitations if item)),
+    )
+
+
 def _payload_raw_text(payload: dict[str, Any] | None) -> str:
     if not payload:
         return ""
@@ -441,7 +1191,8 @@ def _payload_raw_text(payload: dict[str, Any] | None) -> str:
         body_data = body.get("data")
         if not body_data:
             continue
-        decoded = _decode_base64_url(str(body_data)).strip()
+        decoded, _complete, _limitation = _decode_text_part(part, str(body_data))
+        decoded = decoded.strip()
         if not decoded:
             continue
         if mime_type == "text/plain":
@@ -506,42 +1257,13 @@ def _thread_prior_context(raw_messages: list[Mapping[str, Any]]) -> list[str]:
 def _payload_text_links_and_attachments(
     payload: dict[str, Any] | None,
 ) -> tuple[str, list[GmailLinkRecord], list[GmailAttachmentMetadata], bool]:
-    if not payload:
-        return "", [], [], False
-
-    plain_parts: list[str] = []
-    html_parts: list[str] = []
-    html_links: list[str] = []
-    attachments: list[GmailAttachmentMetadata] = []
-
-    for part in _walk_payload_parts(payload):
-        attachment = _attachment_metadata(part)
-        if attachment is not None:
-            attachments.append(attachment)
-
-        mime_type = str(part.get("mimeType") or "").lower()
-        body = part.get("body", {}) if isinstance(part.get("body"), dict) else {}
-        body_data = body.get("data")
-        if not body_data:
-            continue
-        decoded = _decode_base64_url(str(body_data)).strip()
-        if not decoded:
-            continue
-        if mime_type == "text/plain":
-            plain_parts.append(decoded)
-        elif mime_type == "text/html":
-            html_parts.append(decoded)
-            html_links.extend(_links_from_html(decoded))
-        elif not part.get("parts") and mime_type.startswith("text/"):
-            plain_parts.append(decoded)
-
-    raw_text = "\n".join(plain_parts).strip()
-    if not raw_text and html_parts:
-        raw_text = "\n".join(_html_to_text(part) for part in html_parts).strip()
-    normalized, quote_stripped = _normalize_body(raw_text)
-    quote_stripped = quote_stripped or any(HTML_BLOCKQUOTE_RE.search(part) for part in html_parts)
-    links = _extract_links(normalized, *html_links)
-    return normalized, links, attachments, quote_stripped
+    extraction = _extract_payload_content(payload)
+    return (
+        extraction.normalized_body,
+        extraction.links,
+        extraction.attachments,
+        extraction.quote_stripped,
+    )
 
 
 def _extract_text_from_payload(payload: dict[str, Any] | None) -> str:
@@ -698,15 +1420,23 @@ def _thread_level_limitations(envelopes: list[GmailMessageEnvelope]) -> list[str
     if any(envelope.attachment_metadata for envelope in envelopes):
         limitations.append("Attachments were not ingested; metadata only was screened.")
     if any(
-        "Quoted prior replies were stripped before triage." in envelope.triage_limitations
+        any(
+            "retained separately as labeled source evidence" in limitation
+            for limitation in envelope.triage_limitations
+        )
         for envelope in envelopes
     ):
-        limitations.append("Quoted prior replies were stripped before summary extraction.")
+        limitations.append(
+            "Quoted content excluded from latest-sender summary extraction remains "
+            "available as labeled per-message source evidence."
+        )
     return limitations
 
 
 def _thread_overview(
     envelopes: list[GmailMessageEnvelope],
+    *,
+    chronology_available: bool = True,
 ) -> tuple[str, list[str], list[str], list[str], list[str]]:
     if not envelopes:
         return (
@@ -720,14 +1450,43 @@ def _thread_overview(
     action_items = _thread_action_items(envelopes)
     deadlines = _thread_deadlines(envelopes)
     open_questions = _thread_open_questions(envelopes)
-    if _latest_message_closes_exchange(envelopes):
+    exchange_closed = chronology_available and _latest_message_closes_exchange(envelopes)
+    if exchange_closed:
         action_items = []
         open_questions = []
-    latest = envelopes[-1]
-    subject = latest.subject or next((item.subject for item in envelopes if item.subject), "")
+    latest = envelopes[-1] if chronology_available else None
+    subject = (
+        latest.subject
+        if latest is not None and latest.subject
+        else next((item.subject for item in envelopes if item.subject), "")
+    )
+    if not chronology_available:
+        fragments = [
+            "Thread chronology unavailable because one or more provider message dates "
+            "were missing or invalid; no entry was labeled latest or initial."
+        ]
+        if subject:
+            fragments.append(f"Thread about {subject}.")
+        if participants:
+            fragments.append(f"Participants: {', '.join(participants[:3])}.")
+        return (
+            _thread_summary("", " ".join(fragments)),
+            participants,
+            action_items,
+            deadlines,
+            open_questions,
+        )
+    assert latest is not None
+    latest_points = _thread_sentences(latest.normalized_body, latest.snippet)
+    initial_points = _thread_sentences(
+        envelopes[0].normalized_body,
+        envelopes[0].snippet,
+    )
     recent_points = _unique_nonempty(
-        _thread_sentences(latest.normalized_body, latest.snippet)
-        + _thread_sentences(envelopes[0].normalized_body, envelopes[0].snippet),
+        [
+            *(latest_points[:1]),
+            *([] if exchange_closed else initial_points[:1]),
+        ],
         limit=2,
     )
     fragments: list[str] = []
@@ -765,7 +1524,10 @@ def gmail_message_envelope_from_api(data: Mapping[str, Any]) -> GmailMessageEnve
 
     payload = data.get("payload", {}) if isinstance(data.get("payload"), dict) else {}
     headers = payload.get("headers", []) if isinstance(payload.get("headers"), list) else []
-    body, links, attachments, quote_stripped = _payload_text_links_and_attachments(payload)
+    extraction = _extract_payload_content(payload)
+    body = extraction.normalized_body
+    links = extraction.links
+    attachments = extraction.attachments
     from_header = _header(headers, "From")
     sender_name, sender_email = parseaddr(from_header)
     snippet = str(data.get("snippet") or "")
@@ -775,8 +1537,30 @@ def gmail_message_envelope_from_api(data: Mapping[str, Any]) -> GmailMessageEnve
     ]
     if attachments:
         limitations.append("Attachments were not ingested; metadata only was screened.")
-    if quote_stripped:
+    selected_evidence = [
+        item
+        for item in extraction.body_evidence
+        if item.role
+        in {"selected_triage_view", "single_representation", "coexisting_section"}
+    ]
+    quote_kinds = {
+        quote.quote_kind
+        for item in selected_evidence
+        for quote in item.quotations
+    }
+    if "reply_history" in quote_kinds:
         limitations.append("Quoted prior replies were stripped before triage.")
+    if "ambiguous" in quote_kinds:
+        limitations.append(
+            "Attribution-uncertain quoted lines were excluded from the latest-sender "
+            "triage view."
+        )
+    if extraction.quote_stripped:
+        limitations.append(
+            "Quoted or attribution-uncertain content was retained separately as labeled "
+            "source evidence."
+        )
+    limitations.extend(extraction.limitations)
     return GmailMessageEnvelope(
         message_id=str(data.get("id") or ""),
         thread_id=str(data.get("threadId") or ""),
@@ -788,6 +1572,9 @@ def gmail_message_envelope_from_api(data: Mapping[str, Any]) -> GmailMessageEnve
         snippet=snippet,
         prior_labels=[str(label) for label in data.get("labelIds", []) or []],
         normalized_body=body,
+        body_evidence=extraction.body_evidence,
+        body_content_status=extraction.body_content_status,
+        body_content_complete=extraction.body_content_complete,
         extracted_links=links,
         attachment_metadata=attachments,
         thread_summary=thread_summary,
@@ -832,15 +1619,48 @@ def gmail_message_envelope_from_dict(message: Mapping[str, Any]) -> GmailMessage
         return GmailMessageEnvelope.model_validate(message["envelope"])
     sender_name, sender_email = parseaddr(str(message.get("from") or ""))
     body = str(message.get("normalized_body") or message.get("body") or "")
-    body_text, html_links, html_quote_stripped = _text_for_normalization(body)
-    normalized, quote_stripped = _normalize_body(body_text)
-    quote_stripped = quote_stripped or html_quote_stripped
-    links = _extract_links(normalized, *html_links)
     attachments = [
         GmailAttachmentMetadata.model_validate(item)
         for item in (message.get("attachment_metadata") or message.get("attachments") or [])
         if isinstance(item, Mapping)
     ]
+    body_evidence = [
+        GmailBodyEvidence.model_validate(item)
+        for item in message.get("body_evidence", []) or []
+        if isinstance(item, Mapping)
+    ]
+    html_links: list[str] = []
+    if not body_evidence and body:
+        if HTML_TAG_RE.search(body):
+            body_evidence = [_html_body_evidence("legacy.body", body)]
+            html_links = _links_from_html(body)
+        else:
+            body_evidence = [_plain_body_evidence("legacy.body", "text/plain", body)]
+    selected = [
+        item
+        for item in body_evidence
+        if item.role
+        in {"selected_triage_view", "single_representation", "coexisting_section"}
+    ]
+    if not selected and body_evidence:
+        selected = [body_evidence[0]]
+    normalized = (
+        "\n".join(item.triage_text for item in selected if item.triage_text)
+        if any(item.triage_text for item in selected)
+        else _normalize_body(body)[0]
+    )
+    quote_stripped = bool(
+        selected
+        and any(
+            quote.quote_kind in {"reply_history", "ambiguous"}
+            for item in selected
+            for quote in item.quotations
+        )
+    )
+    links = _extract_links(
+        *(item.source_text for item in body_evidence),
+        *html_links,
+    )
     snippet = str(message.get("snippet") or "")
     supplied_summary = str(message.get("thread_summary") or "")
     supplied_context = str(message.get("thread_context") or "")
@@ -848,8 +1668,21 @@ def gmail_message_envelope_from_dict(message: Mapping[str, Any]) -> GmailMessage
     thread_context_text, _ = _normalize_body(_text_for_normalization(supplied_context)[0])
     thread_summary = thread_summary_text or _thread_summary(snippet, normalized)
     limitations = [str(item) for item in message.get("triage_limitations", []) if str(item).strip()]
-    if quote_stripped:
+    quote_kinds = {
+        quote.quote_kind for item in selected for quote in item.quotations
+    }
+    if "reply_history" in quote_kinds:
         limitations.append("Quoted prior replies were stripped before triage.")
+    if "ambiguous" in quote_kinds:
+        limitations.append(
+            "Attribution-uncertain quoted lines were excluded from the latest-sender "
+            "triage view."
+        )
+    if quote_stripped:
+        limitations.append(
+            "Quoted or attribution-uncertain content was retained separately as labeled "
+            "source evidence."
+        )
     if attachments:
         limitations.append("Attachments were not ingested; metadata only was screened.")
     return GmailMessageEnvelope(
@@ -867,6 +1700,23 @@ def gmail_message_envelope_from_dict(message: Mapping[str, Any]) -> GmailMessage
             if str(label).strip()
         ],
         normalized_body=normalized,
+        body_evidence=body_evidence,
+        body_content_status=str(
+            message.get("body_content_status")
+            or (
+                "empty"
+                if not body_evidence
+                else "partial"
+                if any(not item.content_complete for item in body_evidence)
+                else "complete"
+            )
+        ),
+        body_content_complete=bool(
+            message.get(
+                "body_content_complete",
+                bool(body_evidence) and all(item.content_complete for item in body_evidence),
+            )
+        ),
         extracted_links=links,
         attachment_metadata=attachments,
         thread_summary=thread_summary,
@@ -875,6 +1725,188 @@ def gmail_message_envelope_from_dict(message: Mapping[str, Any]) -> GmailMessage
         suspicious_signals=_envelope_suspicious_signals(links, attachments),
         triage_limitations=limitations,
     )
+
+
+def _body_evidence_projection(
+    evidence: list[GmailBodyEvidence],
+    *,
+    max_chars: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Return bounded sanitized source evidence without raw MIME bytes."""
+
+    output: list[dict[str, Any]] = []
+    remaining = max_chars
+    truncated = False
+    for item in evidence[:GMAIL_BODY_EVIDENCE_MAX_PARTS]:
+        source_text, item_truncated = _bounded_source_text(
+            item.source_text,
+            limit=remaining,
+        )
+        remaining = max(0, remaining - len(source_text))
+        truncated = truncated or item_truncated
+        output.append(
+            {
+                "part_path": item.part_path,
+                "mime_type": item.mime_type,
+                "container_mime_type": item.container_mime_type,
+                "alternative_group": item.alternative_group,
+                "representation": item.representation,
+                "role": item.role,
+                "source_text": source_text,
+                "quotations": [
+                    {
+                        "quote_kind": quote.quote_kind,
+                        "text": "",
+                        "attribution": quote.attribution,
+                        "attribution_status": quote.attribution_status,
+                        "truncated": quote.truncated,
+                    }
+                    for quote in item.quotations
+                ],
+                "structure_annotations": item.structure_annotations,
+                "content_complete": item.content_complete and not item_truncated,
+                "truncated": item.truncated or item_truncated,
+                "limitations": list(item.limitations),
+            }
+        )
+    if len(evidence) > GMAIL_BODY_EVIDENCE_MAX_PARTS:
+        truncated = True
+    return output, truncated
+
+
+def _full_sanitized_body_source_records(
+    payload: dict[str, Any] | None,
+    evidence: list[GmailBodyEvidence],
+) -> list[dict[str, Any]]:
+    """Rebuild complete inline text representations before redaction and paging."""
+
+    if not payload:
+        return []
+    parts_by_path = {
+        path: (part, container_mime_type, alternative_group)
+        for path, part, container_mime_type, alternative_group in (
+            _walk_payload_parts_with_paths(payload)
+        )
+    }
+    records: list[dict[str, Any]] = []
+    for item in evidence[:GMAIL_BODY_EVIDENCE_MAX_PARTS]:
+        source_text = item.source_text
+        full_content_complete = item.content_complete and not item.truncated
+        limitations = [
+            limitation
+            for limitation in item.limitations
+            if "truncated to" not in limitation.lower()
+        ]
+        raw_part = parts_by_path.get(item.part_path)
+        if raw_part is not None:
+            part, _container_mime_type, _alternative_group = raw_part
+            body = part.get("body", {}) if isinstance(part.get("body"), dict) else {}
+            body_data = body.get("data")
+            filename = str(part.get("filename") or "").strip()
+            if body_data and not filename and not body.get("attachmentId"):
+                decoded, decoded_complete, decoding_limitation = _decode_text_part(
+                    part,
+                    str(body_data),
+                )
+                if decoding_limitation:
+                    limitations.append(decoding_limitation)
+                mime_type = str(part.get("mimeType") or "").lower()
+                if mime_type == "text/html":
+                    parser = _HTMLSourceExtractor()
+                    try:
+                        parser.feed(decoded)
+                        parser.close()
+                        source_text = _compact_source_text(
+                            _source_text_from_events(parser.events)
+                        )
+                        full_content_complete = (
+                            decoded_complete and parser.content_complete
+                        )
+                        limitations.extend(parser.limitations)
+                        if parser.unread_media_count:
+                            limitations.append(
+                                f"{parser.unread_media_count} inline visual or media "
+                                "element(s) are present but were not interpreted."
+                            )
+                    except Exception:
+                        source_text = _compact_source_text(_html_to_text(decoded))
+                        full_content_complete = False
+                        limitations.append(
+                            "Malformed HTML required a plain-text fallback; quotation "
+                            "and table structure may be incomplete."
+                        )
+                elif mime_type.startswith("text/"):
+                    source_text = _compact_source_text(
+                        _source_text_from_events(_plain_source_events(decoded))
+                    )
+                    full_content_complete = decoded_complete
+        sanitized_text = redact_secret_like_text(source_text)
+        enforce_public_source_output_guardrails(
+            "gmail_get_message_context_projection_full_source",
+            {"source_text": sanitized_text},
+        )
+        records.append(
+            {
+                "part_path": item.part_path,
+                "mime_type": item.mime_type,
+                "container_mime_type": item.container_mime_type,
+                "alternative_group": item.alternative_group,
+                "representation": item.representation,
+                "role": item.role,
+                "source_text": sanitized_text,
+                "quotations": [
+                    {
+                        "quote_kind": quote_item.quote_kind,
+                        "text": "",
+                        "attribution": redact_secret_like_text(
+                            quote_item.attribution
+                        ),
+                        "attribution_status": quote_item.attribution_status,
+                        "truncated": quote_item.truncated,
+                    }
+                    for quote_item in item.quotations
+                ],
+                "structure_annotations": item.structure_annotations,
+                "full_content_complete": full_content_complete,
+                "limitations": list(
+                    dict.fromkeys(value for value in limitations if value)
+                )[:10],
+                "redaction_applied": sanitized_text != source_text,
+            }
+        )
+    return records
+
+
+def _gmail_source_snapshot_sha256(
+    *,
+    message_id: str,
+    thread_id: str,
+    history_id: str,
+    internal_date: str,
+    records: list[dict[str, Any]],
+) -> str:
+    snapshot = {
+        "message_id": message_id,
+        "thread_id": thread_id,
+        "history_id": history_id,
+        "internal_date": internal_date,
+        "records": [
+            {
+                key: value
+                for key, value in record.items()
+                if key != "redaction_applied"
+            }
+            for record in records
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(
+            snapshot,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _load_json_file(path: Path, *, description: str) -> dict[str, Any]:
@@ -1183,6 +2215,11 @@ class GmailTool:
         if not self.live:
             raise GmailConfigurationError("Live Gmail mode is disabled.")
 
+        if (os.environ.get("KEYSTONE_CANARY_GMAIL_READ_ONLY") == "true"
+            or os.environ.get("KEYSTONE_CANARY_ACCEPTANCE_PROFILE")):
+            from keystone_agents.canary_acceptance import gmail_read_guard
+
+            gmail_read_guard(method, self._token_path(), self.api_base_url)
         headers = dict(kwargs.pop("headers", {}) or {})
         headers["Authorization"] = f"Bearer {self._access_token()}"
         headers.setdefault("Accept", "application/json")
@@ -1623,6 +2660,11 @@ class GmailTool:
             "snippet": envelope.snippet,
             "body": envelope.normalized_body,
             "normalized_body": envelope.normalized_body,
+            "body_evidence": [
+                item.model_dump(mode="json") for item in envelope.body_evidence
+            ],
+            "body_content_status": envelope.body_content_status,
+            "body_content_complete": envelope.body_content_complete,
             "received_at": envelope.received_at,
             "prior_labels": envelope.prior_labels,
             "labelIds": envelope.prior_labels,
@@ -1637,6 +2679,327 @@ class GmailTool:
             "envelope": envelope.model_dump(mode="json"),
         }
         return enforce_tool_output_guardrails("gmail_get_message", output)
+
+    def get_message_context_projection(
+        self,
+        message_id: str,
+        *,
+        body_part_path: str = "",
+        body_start_char: int = 0,
+        max_body_chars: int = 3_000,
+        expected_thread_id: str = "",
+        expected_account_identity_sha256: str = "",
+        expected_source_snapshot_sha256: str = "",
+    ) -> dict[str, Any]:
+        """Read one message and immediately return a redacted bounded projection.
+
+        Unlike ``get_message``, this returns at most 6000 characters of sanitized
+        selected-message text and a source link, rather than a raw body/MIME field.
+        The raw provider response stays inside this adapter boundary.
+        """
+
+        enforce_tool_input_guardrails(
+            "gmail_get_message_context_projection",
+            {
+                "message_id": message_id,
+                "body_part_path": body_part_path,
+                "body_start_char": body_start_char,
+                "max_body_chars": max_body_chars,
+                "expected_thread_id": expected_thread_id,
+                "expected_account_identity_sha256": expected_account_identity_sha256,
+                "expected_source_snapshot_sha256": expected_source_snapshot_sha256,
+            },
+        )
+        clean_part_path = str(body_part_path or "").strip()
+        bounded_start = max(int(body_start_char or 0), 0)
+        bounded_chars = min(max(int(max_body_chars or 1), 1), 3_000)
+        if bounded_start and not clean_part_path:
+            raise ValueError("body_part_path is required when body_start_char is nonzero.")
+        if not self.live:
+            return enforce_tool_output_guardrails(
+                "gmail_get_message_context_projection",
+                {
+                    "status": "dry-run",
+                    "id": message_id,
+                    "threadId": "",
+                    "triage_limitations": [
+                        "Live Gmail message retrieval is disabled in dry-run mode."
+                    ],
+                },
+            )
+
+        data = self._request(
+            "GET",
+            f"messages/{message_id}",
+            operation="get bounded message context",
+            params={"format": "full"},
+        )
+        envelope = gmail_message_envelope_from_api(data)
+        redaction_applied = False
+
+        def safe_text(value: object) -> str:
+            nonlocal redaction_applied
+            original = str(value or "")
+            redacted = redact_secret_like_text(original)
+            redaction_applied = redaction_applied or redacted != original
+            return redacted
+
+        def safe_list(values: list[str]) -> list[str]:
+            return [safe_text(value) for value in values]
+
+        sender_name = safe_text(envelope.sender_name)
+        sender_email = safe_text(envelope.sender_email)
+        subject = safe_text(envelope.subject)
+        snippet = safe_text(envelope.snippet)
+        thread_summary = safe_text(envelope.thread_summary)
+        context_text = safe_text(envelope.normalized_body or envelope.thread_context)
+        # Newsletter padding must not consume the excerpt budget. Preserve isolated
+        # joining characters in ordinary words and emoji rather than stripping all.
+        context_text = re.sub(r"(?:[\u200b\u200c\u200d\ufeff]\s*){4,}", "\n", context_text)
+        thread_context = context_text[:6000]
+        suspicious_signals = safe_list(list(envelope.suspicious_signals))
+        limitations = safe_list(list(envelope.triage_limitations))
+        if len(context_text) > 6000:
+            limitations.append("Selected message text was truncated to 6000 characters.")
+        account_email = self.current_account_email()
+        account_identity_sha256 = hashlib.sha256(
+            account_email.strip().lower().encode("utf-8")
+        ).hexdigest()
+        history_id = str(data.get("historyId") or "")
+        full_records = _full_sanitized_body_source_records(
+            data.get("payload") if isinstance(data.get("payload"), dict) else {},
+            envelope.body_evidence,
+        )
+        redaction_applied = redaction_applied or any(
+            record.get("redaction_applied") is True for record in full_records
+        )
+        source_snapshot_sha256 = _gmail_source_snapshot_sha256(
+            message_id=envelope.message_id,
+            thread_id=envelope.thread_id,
+            history_id=history_id,
+            internal_date=str(data.get("internalDate") or ""),
+            records=full_records,
+        )
+        source_url = (
+            "https://mail.google.com/mail/?authuser=" + quote(account_email, safe="")
+            + "#all/" + quote(envelope.thread_id or envelope.message_id, safe="")
+        )
+        extracted_links = []
+        for link in envelope.extracted_links[:10]:
+            safe_url = safe_text(link.url)
+            if safe_url != link.url:
+                continue
+            extracted_links.append({
+                "url": safe_url, "suspicious": link.suspicious,
+                "reasons": safe_list(list(link.reasons[:10])),
+            })
+        source_changed = bool(
+            (expected_thread_id and expected_thread_id != envelope.thread_id)
+            or (
+                expected_account_identity_sha256
+                and expected_account_identity_sha256 != account_identity_sha256
+            )
+            or (
+                expected_source_snapshot_sha256
+                and expected_source_snapshot_sha256 != source_snapshot_sha256
+            )
+        )
+        identity_output = {
+            "id": envelope.message_id,
+            "threadId": envelope.thread_id,
+            "account_identity_sha256": account_identity_sha256,
+            "provider_history_id": history_id,
+            "source_snapshot_sha256": source_snapshot_sha256,
+            "source_url": source_url,
+        }
+        if source_changed:
+            return enforce_tool_output_guardrails(
+                "gmail_get_message_context_projection",
+                {
+                    "status": "source_changed",
+                    **identity_output,
+                    "body_evidence": [],
+                    "body_content_status": "partial",
+                    "body_content_complete": False,
+                    "source_restart_required": True,
+                    "triage_limitations": [
+                        "The selected Gmail account, thread, or sanitized source snapshot "
+                        "changed after the prior window. Restart from the first window; "
+                        "do not combine source versions."
+                    ],
+                    "provider_read": True,
+                    "send_enabled": False,
+                    "raw_message_bodies_returned": False,
+                },
+            )
+        selected_records = (
+            [
+                record
+                for record in full_records
+                if record.get("part_path") == clean_part_path
+            ]
+            if clean_part_path
+            else full_records
+        )
+        if clean_part_path and not selected_records:
+            return enforce_tool_output_guardrails(
+                "gmail_get_message_context_projection",
+                {
+                    "status": "source_inaccessible",
+                    **identity_output,
+                    "body_evidence": [],
+                    "body_content_status": "partial",
+                    "body_content_complete": False,
+                    "source_restart_required": False,
+                    "triage_limitations": [
+                        "The requested sanitized MIME part is unavailable. Raw MIME, "
+                        "attachment bodies, and image content were not substituted."
+                    ],
+                    "provider_read": True,
+                    "send_enabled": False,
+                    "raw_message_bodies_returned": False,
+                },
+            )
+        if clean_part_path and selected_records:
+            full_count = len(str(selected_records[0].get("source_text") or ""))
+            if bounded_start >= full_count and full_count:
+                return enforce_tool_output_guardrails(
+                    "gmail_get_message_context_projection",
+                    {
+                        "status": "out_of_range",
+                        **identity_output,
+                        "body_evidence": [],
+                        "body_content_status": "partial",
+                        "body_content_complete": False,
+                        "source_restart_required": False,
+                        "triage_limitations": [
+                            "body_start_char is outside the selected sanitized MIME part."
+                        ],
+                        "provider_read": True,
+                        "send_enabled": False,
+                        "raw_message_bodies_returned": False,
+                    },
+                )
+        safe_evidence: list[dict[str, Any]] = []
+        remaining_initial_chars = 6_000
+        for record in selected_records:
+            source_text = str(record.get("source_text") or "")
+            start = bounded_start if clean_part_path else 0
+            available_chars = (
+                bounded_chars
+                if clean_part_path
+                else min(bounded_chars, remaining_initial_chars)
+            )
+            end = min(len(source_text), start + available_chars)
+            has_more = end < len(source_text)
+            coverage = {
+                "start_char": start,
+                "end_char": end,
+                "full_char_count": len(source_text),
+                "complete": not has_more,
+                "has_more": has_more,
+            }
+            next_request = (
+                {
+                    "resource_type": "message",
+                    "resource_id": envelope.message_id,
+                    "body_part_path": str(record.get("part_path") or ""),
+                    "body_start_char": end,
+                    "max_body_chars": bounded_chars,
+                    "expected_thread_id": envelope.thread_id,
+                    "expected_account_identity_sha256": account_identity_sha256,
+                    "expected_source_snapshot_sha256": source_snapshot_sha256,
+                }
+                if has_more and len(source_text) > 0
+                else None
+            )
+            item_limitations = safe_list(list(record.get("limitations") or []))
+            if has_more:
+                item_limitations.append(
+                    "This sanitized MIME representation has later text; use the exact "
+                    "snapshot-pinned next_request to continue."
+                )
+            safe_evidence.append(
+                {
+                    "part_path": record.get("part_path"),
+                    "mime_type": record.get("mime_type"),
+                    "container_mime_type": record.get("container_mime_type"),
+                    "alternative_group": record.get("alternative_group"),
+                    "representation": record.get("representation"),
+                    "role": record.get("role"),
+                    "source_text": source_text[start:end],
+                    "quotations": record.get("quotations", []),
+                    "structure_annotations": record.get("structure_annotations") is True,
+                    "content_complete": (
+                        record.get("full_content_complete") is True and not has_more
+                    ),
+                    "truncated": (
+                        record.get("full_content_complete") is not True or has_more
+                    ),
+                    "coverage": coverage,
+                    "next_request": next_request,
+                    "limitations": list(dict.fromkeys(item_limitations))[:10],
+                }
+            )
+            if not clean_part_path:
+                remaining_initial_chars = max(
+                    0,
+                    remaining_initial_chars - (end - start),
+                )
+        evidence_truncated = any(
+            item.get("coverage", {}).get("has_more") is True
+            for item in safe_evidence
+        )
+        if evidence_truncated:
+            limitations.append(
+                "Bounded source evidence was truncated to 6000 characters for model use."
+            )
+        projected_content_status = envelope.body_content_status
+        if redaction_applied and projected_content_status == "complete":
+            projected_content_status = "partial"
+        output = {
+            "status": "read",
+            **identity_output,
+            "received_at": envelope.received_at,
+            "sender_name": sender_name,
+            "sender_email": sender_email,
+            "subject": subject,
+            "snippet": snippet,
+            "prior_labels": list(envelope.prior_labels),
+            "attachment_metadata": [
+                attachment.model_dump(mode="json")
+                for attachment in envelope.attachment_metadata
+            ],
+            "thread_summary": thread_summary,
+            "thread_context": thread_context,
+            "body_evidence": safe_evidence,
+            "body_content_status": (
+                "partial" if evidence_truncated else projected_content_status
+            ),
+            "body_content_complete": (
+                bool(safe_evidence)
+                and all(item.get("content_complete") is True for item in safe_evidence)
+                and not evidence_truncated
+                and not redaction_applied
+            ),
+            "extracted_links": extracted_links,
+            "suspicious_signals": suspicious_signals,
+            "triage_limitations": [],
+            "provider_read": True,
+            "send_enabled": False,
+            "raw_message_bodies_returned": False,
+            "source_restart_required": False,
+        }
+        if redaction_applied:
+            limitations.append(
+                "One or more credential-shaped values were redacted from the bounded "
+                "message projection before model use."
+            )
+        output["triage_limitations"] = list(dict.fromkeys(limitations))
+        return enforce_tool_output_guardrails(
+            "gmail_get_message_context_projection",
+            output,
+        )
 
     def get_thread(self, thread_id: str) -> dict[str, Any]:
         """Read and normalize a complete Gmail thread without modifying Gmail.
@@ -1674,29 +3037,84 @@ class GmailTool:
             params={"format": "full"},
         )
         raw_messages = [item for item in data.get("messages", []) if isinstance(item, Mapping)]
-        envelopes = [gmail_message_envelope_from_api(message) for message in raw_messages]
+        message_pairs = [
+            (message, gmail_message_envelope_from_api(message))
+            for message in raw_messages
+        ]
+        chronology_available = bool(message_pairs) and all(
+            envelope.received_at for _message, envelope in message_pairs
+        )
+        if chronology_available:
+            try:
+                message_pairs.sort(
+                    key=lambda pair: datetime.fromisoformat(
+                        pair[1].received_at.replace("Z", "+00:00")
+                    )
+                )
+            except (TypeError, ValueError):
+                chronology_available = False
+        raw_messages = [message for message, _envelope in message_pairs]
+        envelopes = [envelope for _message, envelope in message_pairs]
         message_count = len(envelopes)
-        summary, participants, action_items, deadlines, open_questions = _thread_overview(envelopes)
+        summary, participants, action_items, deadlines, open_questions = _thread_overview(
+            envelopes,
+            chronology_available=chronology_available,
+        )
         prior_context = _thread_prior_context(raw_messages)
-        newest_first = list(reversed(envelopes))
+        newest_first = list(reversed(envelopes)) if chronology_available else envelopes
         thread_context = _thread_summary(
             " ".join(envelope.snippet for envelope in newest_first),
             " ".join(envelope.thread_summary for envelope in newest_first),
         )
         triage_limitations = _thread_level_limitations(envelopes)
-        latest_received_at = envelopes[-1].received_at if envelopes else ""
+        if not chronology_available and envelopes:
+            triage_limitations.append(
+                "One or more provider message dates were missing or invalid; message "
+                "chronology, latest status, and latest_received_at are unavailable."
+            )
+        latest_received_at = (
+            envelopes[-1].received_at if envelopes and chronology_available else ""
+        )
         subject = (
             envelopes[-1].subject
-            if envelopes and envelopes[-1].subject
+            if envelopes and chronology_available and envelopes[-1].subject
             else next((item.subject for item in envelopes if item.subject), "")
         )
+        thread_evidence_budget = GMAIL_BODY_EVIDENCE_MAX_CHARS
+        evidence_by_message: dict[str, tuple[list[dict[str, Any]], bool]] = {}
+        evidence_priority = (
+            list(reversed(envelopes)) if chronology_available else envelopes
+        )
+        for envelope in evidence_priority:
+            if thread_evidence_budget <= 0:
+                evidence_by_message[envelope.message_id] = ([], bool(envelope.body_evidence))
+                continue
+            projection, truncated = _body_evidence_projection(
+                envelope.body_evidence,
+                max_chars=min(3000, thread_evidence_budget),
+            )
+            thread_evidence_budget -= sum(
+                len(str(item.get("source_text") or "")) for item in projection
+            )
+            evidence_by_message[envelope.message_id] = (projection, truncated)
         messages = []
         for envelope in envelopes:
+            body_evidence, body_evidence_truncated = evidence_by_message.get(
+                envelope.message_id,
+                ([], bool(envelope.body_evidence)),
+            )
+            message_limitations = list(
+                dict.fromkeys([*envelope.triage_limitations, *triage_limitations])
+            )
+            if body_evidence_truncated:
+                message_limitations.append(
+                    "This message's source evidence was truncated by the bounded thread budget."
+                )
             normalized = envelope.model_copy(
                 update={
                     "thread_message_count": message_count,
                     "thread_context": thread_context,
-                    "triage_limitations": triage_limitations,
+                    "triage_limitations": message_limitations,
                 }
             )
             messages.append(
@@ -1714,6 +3132,11 @@ class GmailTool:
                     "labelIds": normalized.prior_labels,
                     "body": normalized.normalized_body,
                     "normalized_body": normalized.normalized_body,
+                    "body_evidence": body_evidence,
+                    "body_content_status": normalized.body_content_status,
+                    "body_content_complete": (
+                        normalized.body_content_complete and not body_evidence_truncated
+                    ),
                     "extracted_links": [
                         link.model_dump(mode="json") for link in normalized.extracted_links
                     ],
@@ -1725,7 +3148,13 @@ class GmailTool:
                     "thread_context": normalized.thread_context,
                     "suspicious_signals": normalized.suspicious_signals,
                     "triage_limitations": normalized.triage_limitations,
-                    "envelope": normalized.model_dump(mode="json"),
+                    "envelope": {
+                        **normalized.model_dump(mode="json"),
+                        "body_evidence": body_evidence,
+                        "body_content_complete": (
+                            normalized.body_content_complete and not body_evidence_truncated
+                        ),
+                    },
                 }
             )
         return {
@@ -2050,6 +3479,7 @@ class GmailTool:
         self._label_name_to_id[cleaned] = label_id
         return label_id
 
+    @durable_provider_tool("create_gmail_draft_reply")
     def create_draft_reply(
         self, message_id: str, body: str, **legacy_fields: str
     ) -> dict[str, Any]:
@@ -2100,6 +3530,7 @@ class GmailTool:
                 }
             },
         )
+        _record_gmail_draft_observation(str(data.get("id") or ""), "create_draft_reply")
         output = {
             "status": "draft_created",
             "message_id": message_id,
@@ -2120,6 +3551,7 @@ class GmailTool:
             raise GmailAPIError("Gmail API profile response did not include emailAddress.")
         return email_address
 
+    @durable_provider_tool("create_gmail_draft")
     def create_draft(
         self,
         to: str,
@@ -2179,6 +3611,7 @@ class GmailTool:
             operation="create draft",
             json={"message": {"raw": encoded_message}},
         )
+        _record_gmail_draft_observation(str(data.get("id") or ""), "create_draft")
         created_message = data.get("message", {})
         if not isinstance(created_message, Mapping):
             created_message = {}
@@ -2195,6 +3628,7 @@ class GmailTool:
         }
         return enforce_tool_output_guardrails("gmail_create_draft", output)
 
+    @durable_provider_tool("create_gmail_draft_with_attachment")
     def create_draft_with_attachment(
         self,
         to: str,
@@ -2215,6 +3649,7 @@ class GmailTool:
             expected_account=expected_account,
         )
 
+    @durable_provider_tool("update_gmail_draft_with_attachment")
     def update_draft_with_attachment(
         self,
         draft_id: str,
@@ -2298,6 +3733,10 @@ class GmailTool:
                 else "create Gmail draft with attachment"
             ),
             json=request_payload,
+        )
+        _record_gmail_draft_observation(
+            str(data.get("id") or clean_draft_id),
+            "update_draft_attachment" if clean_draft_id else "create_draft_attachment",
         )
         created_message = data.get("message", {})
         if not isinstance(created_message, Mapping):
@@ -2432,6 +3871,7 @@ class GmailTool:
             drafts.append(self.get_draft(draft_id))
         return drafts
 
+    @durable_provider_tool("update_gmail_draft")
     def update_draft(
         self,
         draft_id: str,
@@ -2482,6 +3922,7 @@ class GmailTool:
             operation="update Gmail draft",
             json={"id": clean_draft_id, "message": {"raw": encoded_message}},
         )
+        _record_gmail_draft_observation(str(data.get("id") or clean_draft_id), "update_draft")
         created_message = data.get("message", {})
         if not isinstance(created_message, Mapping):
             created_message = {}
@@ -2497,6 +3938,7 @@ class GmailTool:
             "approval_required": True,
         }
 
+    @durable_provider_tool("delete_gmail_test_draft")
     def delete_draft(
         self,
         draft_id: str,
@@ -2529,6 +3971,7 @@ class GmailTool:
             f"drafts/{clean_draft_id}",
             operation="delete Gmail test draft",
         )
+        _record_gmail_draft_observation(clean_draft_id, "delete_test_draft")
         return {
             "status": "draft_deleted",
             "draft_id": clean_draft_id,
@@ -2713,9 +4156,47 @@ def get_message(message_id: str) -> dict[str, Any]:
     return result
 
 
+def get_message_context_projection(
+    message_id: str,
+    *,
+    body_part_path: str = "",
+    body_start_char: int = 0,
+    max_body_chars: int = 3_000,
+    expected_thread_id: str = "",
+    expected_account_identity_sha256: str = "",
+    expected_source_snapshot_sha256: str = "",
+) -> dict[str, Any]:
+    result = _gmail_read_tool().get_message_context_projection(
+        message_id=message_id,
+        body_part_path=body_part_path,
+        body_start_char=body_start_char,
+        max_body_chars=max_body_chars,
+        expected_thread_id=expected_thread_id,
+        expected_account_identity_sha256=expected_account_identity_sha256,
+        expected_source_snapshot_sha256=expected_source_snapshot_sha256,
+    )
+    record_provider_read_result("gmail_get_message_context_projection", result)
+    return result
+
+
 def get_thread(thread_id: str) -> dict[str, Any]:
     result = _gmail_read_tool().get_thread(thread_id=thread_id)
     record_provider_read_result("gmail_get_thread", result)
+    return result
+
+
+def get_thread_with_source_url(thread_id: str) -> dict[str, Any]:
+    """Read a thread and attach its authenticated mailbox link before projection."""
+    tool = _gmail_read_tool()
+    result = tool.get_thread(thread_id=thread_id)
+    returned_id = str(result.get("thread_id") or result.get("id") or "")
+    if result.get("status") == "read" and returned_id == thread_id:
+        result["source_url"] = (
+            "https://mail.google.com/mail/?authuser="
+            + quote(tool.current_account_email(), safe="")
+            + "#all/" + quote(returned_id, safe="")
+        )
+    record_provider_read_result("gmail_get_thread_with_source_url", result)
     return result
 
 

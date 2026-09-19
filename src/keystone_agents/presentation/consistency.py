@@ -12,6 +12,7 @@ _TERMINAL_NON_SUCCESS_STATES = {
     "blocked",
     "canceled",
     "failed",
+    "needs_approval",
     "needs_input",
     "partial",
 }

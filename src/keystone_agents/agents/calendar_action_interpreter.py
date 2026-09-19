@@ -9,7 +9,13 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from typing import Any, Literal
 
-from keystone_agents.authority.semantic import ExecutionIntentAuthority
+from keystone_agents.agent_decision_contracts import (
+    calendar_action_interpreter_decision_contract,
+)
+from keystone_agents.authority.semantic import (
+    ExecutionIntentAuthority,
+    is_bounded_provider_read_plan,
+)
 from keystone_agents.calendar_actions import (
     MONTHS,
     CalendarActionPlan,
@@ -49,6 +55,7 @@ class CalendarActionResolution:
     interpreter_used: bool = False
     openai_requests: int = 0
     warnings: tuple[str, ...] = ()
+    decision_telemetry: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +65,7 @@ class CalendarLookupSynthesisResolution:
     synthesis: CalendarLookupSynthesis | None
     openai_requests: int = 0
     warnings: tuple[str, ...] = ()
+    decision_telemetry: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -75,6 +83,7 @@ class CalendarLookupAnswerResolution:
     related_event_groups: tuple[tuple[int, ...], ...] = ()
     openai_requests: int = 0
     warnings: tuple[str, ...] = ()
+    decision_telemetry: dict[str, Any] | None = None
 
 
 def build_calendar_action_interpreter_agent(model: str | None = None) -> Agent:
@@ -168,15 +177,16 @@ def resolve_calendar_lookup_synthesis(
     ]
     if not bounded_events or (not live and run_config is None):
         return CalendarLookupSynthesisResolution(synthesis=None)
+    typed_input = CalendarLookupSynthesisInput(
+        request_text=request_text,
+        lookup_target=lookup_target,
+        response_scope=response_scope,
+        events=bounded_events,
+    )
     try:
         result = run_typed_sdk_agent(
             agent=build_calendar_lookup_synthesizer_agent(model=model),
-            typed_input=CalendarLookupSynthesisInput(
-                request_text=request_text,
-                lookup_target=lookup_target,
-                response_scope=response_scope,
-                events=bounded_events,
-            ),
+            typed_input=typed_input,
             output_type=CalendarLookupSynthesis,
             run_config=run_config,
             live=live,
@@ -195,23 +205,76 @@ def resolve_calendar_lookup_synthesis(
             ),
         )
     synthesis = result.output
-    valid_indexes = [
-        index
-        for index in synthesis.selected_event_indexes
-        if 0 <= index < len(bounded_events)
-    ]
-    if valid_indexes != synthesis.selected_event_indexes:
-        return CalendarLookupSynthesisResolution(
-            synthesis=None,
-            openai_requests=1,
-            warnings=("Calendar lookup synthesis selected an invalid event index.",),
+    initial_synthesis = synthesis
+    validation_error = _calendar_lookup_validation_error(
+        synthesis,
+        candidate_count=len(bounded_events),
+    )
+    openai_requests = 1
+    if validation_error:
+        repair_input = CalendarLookupSynthesisInput(
+            request_text=(
+                request_text
+                + "\n\nDeterministic selection validation rejected the first "
+                "semantic choice. Correct only the Calendar event selection using "
+                "the same provider-verified candidate events below. Do not invent "
+                "an index and do not call tools. Validator feedback: "
+                + validation_error
+            ),
+            lookup_target=lookup_target,
+            response_scope=response_scope,
+            events=bounded_events,
         )
-    if synthesis.status == "matched" and not valid_indexes:
-        return CalendarLookupSynthesisResolution(
-            synthesis=None,
-            openai_requests=1,
-            warnings=("Calendar lookup synthesis returned a match without an event.",),
+        try:
+            repair_result = run_typed_sdk_agent(
+                agent=build_calendar_lookup_synthesizer_agent(model=model),
+                typed_input=repair_input,
+                output_type=CalendarLookupSynthesis,
+                run_config=run_config,
+                live=live,
+                workflow_name="Keystone Calendar lookup synthesis repair",
+                tracing_disabled=True,
+                max_turns=1,
+            )
+        except Exception as exc:
+            warning_detail = " ".join(str(exc).split())[:240]
+            return CalendarLookupSynthesisResolution(
+                synthesis=None,
+                openai_requests=2,
+                warnings=(
+                    "Calendar lookup synthesis repair unavailable: "
+                    f"{type(exc).__name__}"
+                    + (f": {warning_detail}" if warning_detail else ""),
+                ),
+                decision_telemetry=_calendar_lookup_decision_telemetry(
+                    (initial_synthesis,),
+                    candidate_count=len(bounded_events),
+                    validation_errors=(validation_error,),
+                    terminal_status="rejected",
+                ),
+            )
+        openai_requests = 2
+        synthesis = repair_result.output
+        repaired_error = _calendar_lookup_validation_error(
+            synthesis,
+            candidate_count=len(bounded_events),
         )
+        if repaired_error:
+            return CalendarLookupSynthesisResolution(
+                synthesis=None,
+                openai_requests=openai_requests,
+                warnings=(
+                    "Calendar lookup synthesis remained invalid after one "
+                    f"evidence-preserving repair: {repaired_error}",
+                ),
+                decision_telemetry=_calendar_lookup_decision_telemetry(
+                    (initial_synthesis, synthesis),
+                    candidate_count=len(bounded_events),
+                    validation_errors=(validation_error, repaired_error),
+                    terminal_status="rejected",
+                ),
+            )
+    valid_indexes = list(synthesis.selected_event_indexes)
     selected_index_set = set(valid_indexes)
     related_event_groups: list[list[int]] = []
     grouped_indexes: set[int] = set()
@@ -242,9 +305,85 @@ def resolve_calendar_lookup_synthesis(
         )
     return CalendarLookupSynthesisResolution(
         synthesis=synthesis,
-        openai_requests=1,
+        openai_requests=openai_requests,
         warnings=tuple(group_warnings),
+        decision_telemetry=_calendar_lookup_decision_telemetry(
+            (
+                (initial_synthesis, synthesis)
+                if openai_requests == 2
+                else (synthesis,)
+            ),
+            candidate_count=len(bounded_events),
+            validation_errors=(validation_error,) if validation_error else (),
+            terminal_status="accepted",
+        ),
     )
+
+
+def _calendar_lookup_validation_error(
+    synthesis: CalendarLookupSynthesis,
+    *,
+    candidate_count: int,
+) -> str:
+    """Validate one model-owned Calendar choice without substituting an event."""
+
+    indexes = list(synthesis.selected_event_indexes)
+    invalid_indexes = [
+        index for index in indexes if index < 0 or index >= candidate_count
+    ]
+    if invalid_indexes:
+        return (
+            "selected_event_indexes contains indexes outside the verified candidate "
+            f"range 0..{candidate_count - 1}: {invalid_indexes}"
+        )
+    if synthesis.status in {"matched", "ambiguous"} and not indexes:
+        return f"status={synthesis.status} requires at least one selected event index"
+    if synthesis.status == "no_match" and indexes:
+        return "status=no_match cannot also select an event index"
+    return ""
+
+
+def _calendar_lookup_decision_telemetry(
+    attempts: tuple[CalendarLookupSynthesis, ...],
+    *,
+    candidate_count: int,
+    validation_errors: tuple[str, ...],
+    terminal_status: Literal["accepted", "rejected"],
+) -> dict[str, Any]:
+    """Preserve Calendar selection attempts without provider/private event data."""
+
+    return {
+        "schema": "keystone.calendar_lookup_decision.v1",
+        "decision_owner": "calendar_lookup_synthesizer",
+        "decision_stage": "calendar_verified_event_selection",
+        "candidate_count": candidate_count,
+        "attempt_count": len(attempts),
+        "repair_attempted": len(attempts) > 1,
+        "provider_calls_during_repair": 0,
+        "model_tool_call_count": 0,
+        "attempts": [
+            {
+                "attempt": index,
+                "status": attempt.status,
+                "selected_event_indexes": list(attempt.selected_event_indexes),
+                "selection_reason": attempt.selection_reason,
+                "validator_status": (
+                    "repair_required"
+                    if index <= len(validation_errors)
+                    and validation_errors[index - 1]
+                    else "accepted"
+                ),
+                "validator_feedback": (
+                    validation_errors[index - 1]
+                    if index <= len(validation_errors)
+                    else ""
+                ),
+                "tool_mode": "tool_free",
+            }
+            for index, attempt in enumerate(attempts, start=1)
+        ],
+        "terminal_status": terminal_status,
+    }
 
 
 def resolve_calendar_action_plan(
@@ -272,7 +411,27 @@ def resolve_calendar_action_plan(
                 "fall back to request keywords.",
             ),
         )
-    if authority.canonical:
+    if is_bounded_provider_read_plan(
+        manual_plan,
+        provider_system="google_calendar",
+        allowed_agents={"chief_of_staff"},
+        allowed_intents={"context_lookup"},
+    ):
+        assert authority.plan is not None
+        allowed_operations = frozenset({"read"})
+        canonical_read_scope = authority.plan.provider_read_scope
+        fallback = _calendar_fallback_for_authorized_operations(
+            fallback,
+            allowed_operations=allowed_operations,
+        )
+        typed_read_plan = canonical_calendar_read_plan(
+            request_text,
+            manual_plan=authority.plan,
+            today=today,
+        )
+        if typed_read_plan is not None:
+            return CalendarActionResolution(plan=typed_read_plan)
+    elif authority.canonical:
         assert authority.plan is not None
         if not authority.authorizes_provider(
             "google_calendar",
@@ -377,6 +536,9 @@ def resolve_calendar_action_plan(
             workflow_name="Keystone Calendar action interpretation",
             tracing_disabled=True,
             max_turns=1,
+            decision_contract=calendar_action_interpreter_decision_contract(
+                allowed_operations or ()
+            ),
         )
     except Exception as exc:
         warning_detail = " ".join(str(exc).split())[:240]
@@ -494,6 +656,26 @@ def resolve_calendar_action_plan(
         interpreter_used=True,
         openai_requests=1,
         warnings=tuple((*warnings, *semantic_warnings)),
+        decision_telemetry=(
+            {
+                "schema": "keystone.calendar_action_model_stage.v1",
+                "agent_name": str(
+                    getattr(result, "agent_name", "")
+                    or "calendar_action_interpreter"
+                ),
+                "decision_ownership": dict(
+                    result.request_cache.get("decision_ownership") or {}
+                ),
+                "pre_model_decision_context": dict(
+                    result.request_cache.get("pre_model_decision_context") or {}
+                ),
+                "tool_execution": dict(
+                    result.request_cache.get("tool_execution") or {}
+                ),
+            }
+            if isinstance(getattr(result, "request_cache", None), dict)
+            else None
+        ),
     )
 
 
@@ -503,7 +685,7 @@ def canonical_calendar_read_plan(
     manual_plan: ManualRequestPlan | dict[str, object] | None,
     today: date | None = None,
 ) -> CalendarActionPlan | None:
-    """Reuse a complete canonical read plan without a second model interpretation.
+    """Reuse a complete typed read plan without a second model interpretation.
 
     This deliberately handles only a read-only, bounded collection whose
     semantic planner output already specifies an item result and read-only
@@ -512,12 +694,13 @@ def canonical_calendar_read_plan(
     """
 
     authority = ExecutionIntentAuthority.from_value(manual_plan)
-    if not authority.canonical or authority.plan is None:
+    if authority.plan is None:
         return None
     plan = authority.plan
     if not (
-        authority.authorizes_provider(
-            "google_calendar",
+        is_bounded_provider_read_plan(
+            plan,
+            provider_system="google_calendar",
             allowed_agents={"chief_of_staff"},
             allowed_intents={"context_lookup"},
         )
@@ -570,6 +753,7 @@ def canonical_calendar_read_plan(
             ).strip()
             or DEFAULT_CALENDAR_TIMEZONE
         ),
+        target_count=plan.desired_count if plan.desired_count_explicit else 1,
         all_day=False,
         complete=True,
     )
@@ -728,6 +912,7 @@ def _canonical_calendar_query(lookup_target: str) -> str:
     clean = _clean_source_value(lookup_target)
     if not clean:
         return ""
+    clean = re.sub(r"\b(?:today|tomorrow)'s\b", " ", clean, flags=re.I)
     clean = re.sub(r"\b20\d{2}-\d{2}-\d{2}\b", " ", clean)
     clean = re.sub(r"\b\d{1,2}/\d{1,2}/20\d{2}\b", " ", clean)
     month_names = "|".join(MONTHS)
@@ -743,8 +928,11 @@ def _canonical_calendar_query(lookup_target: str) -> str:
         "all",
         "an",
         "any",
+        "are",
         "calendar",
         "calendars",
+        "could",
+        "do",
         "earliest",
         "event",
         "events",
@@ -752,19 +940,50 @@ def _canonical_calendar_query(lookup_target: str) -> str:
         "for",
         "from",
         "google",
+        "have",
+        "i",
         "in",
         "last",
         "latest",
+        "list",
+        "look",
+        "me",
         "my",
         "next",
+        "only",
         "on",
         "our",
+        "read",
+        "read-only",
+        "readonly",
+        "review",
+        "show",
         "the",
+        "tell",
         "today",
         "tomorrow",
+        "what",
+        "when",
+        "which",
+        "would",
+        "you",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
     }
     tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9'_-]*", clean)
-    query = " ".join(token for token in tokens if token.lower() not in generic)
+    query = " ".join(
+        token
+        for token in tokens
+        if token.lower() not in generic and not token.isdigit()
+    )
     return query if _calendar_query_is_discriminating(query) else ""
 
 
@@ -866,6 +1085,7 @@ def resolve_calendar_lookup_answer(
             status="fallback",
             openai_requests=resolution.openai_requests,
             warnings=resolution.warnings,
+            decision_telemetry=resolution.decision_telemetry,
         )
 
     selected_pairs = [
@@ -897,6 +1117,7 @@ def resolve_calendar_lookup_answer(
             related_event_groups=related_event_groups,
             openai_requests=resolution.openai_requests,
             warnings=resolution.warnings,
+            decision_telemetry=resolution.decision_telemetry,
         )
     if related_event_groups:
         grouped_indexes = set(related_event_groups[0])
@@ -941,6 +1162,7 @@ def resolve_calendar_lookup_answer(
             related_event_groups=related_event_groups,
             openai_requests=resolution.openai_requests,
             warnings=resolution.warnings,
+            decision_telemetry=resolution.decision_telemetry,
         )
     if synthesis.status in {"matched", "ambiguous"} and selected:
         lines = [
@@ -967,6 +1189,7 @@ def resolve_calendar_lookup_answer(
             related_event_groups=related_event_groups,
             openai_requests=resolution.openai_requests,
             warnings=resolution.warnings,
+            decision_telemetry=resolution.decision_telemetry,
         )
 
     no_match_text = "I could not identify a matching Calendar event."
@@ -978,6 +1201,7 @@ def resolve_calendar_lookup_answer(
         status="no_match",
         openai_requests=resolution.openai_requests,
         warnings=resolution.warnings,
+        decision_telemetry=resolution.decision_telemetry,
     )
 
 
@@ -2800,7 +3024,15 @@ def _field_matches_deterministic_parse(
     operation: str,
     today: date | None,
 ) -> bool:
-    if _normalize_source_text(evidence) not in _normalize_source_text(request_text):
+    evidence_is_current = (
+        _normalize_source_text(evidence) in _normalize_source_text(request_text)
+    )
+    if not evidence_is_current:
+        evidence_is_current = bool(
+            field in {"start_time", "end_time"}
+            and _clock_evidence_tokens_are_current(request_text, evidence)
+        )
+    if not evidence_is_current:
         return False
     if field in {"start_date", "end_date"}:
         dates = infer_calendar_action_plan(
@@ -2830,3 +3062,32 @@ def _field_matches_deterministic_parse(
         today=today,
     )
     return probe is not None and str(getattr(probe, field, "")) == expected
+
+
+def _clock_evidence_tokens_are_current(request_text: str, evidence: str) -> bool:
+    """Allow a compact model range assembled from explicit request clock spans.
+
+    The Calendar schema has one ``time_source_text`` field for both start and
+    end times. A model may therefore normalize two separately labeled spans
+    such as ``Time: 2:35 PM`` and ``End time: 3:05 PM`` into
+    ``2:35 PM to 3:05 PM``. Every clock token must still occur verbatim in the
+    current request; Python validates the normalized values separately.
+    """
+
+    clock_pattern = re.compile(
+        r"\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\b",
+        re.IGNORECASE,
+    )
+
+    def normalized_clocks(value: str) -> list[str]:
+        return [
+            re.sub(r"[.\s]", "", match.group(0).lower())
+            for match in clock_pattern.finditer(value)
+        ]
+
+    evidence_clocks = normalized_clocks(evidence)
+    request_clocks = normalized_clocks(request_text)
+    return bool(
+        evidence_clocks
+        and all(clock in request_clocks for clock in evidence_clocks)
+    )

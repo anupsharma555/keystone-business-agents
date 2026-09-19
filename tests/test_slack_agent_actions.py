@@ -87,6 +87,21 @@ def _modal_submission(private_metadata: str, task: str = "research Acme Health")
     }
 
 
+def _offline_orchestrator_preflight(request_text: str, **kwargs: object):
+    """Keep downstream live-SDK unit tests offline at the new preflight boundary."""
+
+    from keystone_agents.agents.orchestrator import run_orchestrator_preflight
+
+    return run_orchestrator_preflight(
+        request_text,
+        requested_agent=kwargs.get("requested_agent"),
+        live_manual_plan=False,
+        live_orchestrator=False,
+        database_url=kwargs.get("database_url"),
+        workflow_state=kwargs.get("workflow_state"),
+    )
+
+
 def test_slack_message_shortcut_manifest_uses_run_agent_callback() -> None:
     patch = slack_message_action_manifest_patch()
 
@@ -513,7 +528,14 @@ def test_orchestrator_workflow_state_retains_verified_airtable_aggregate_scope(
                     "year": 2026,
                     "date_field": "Date of Expense",
                     "total": "3041.53",
-                    "currency": "USD",
+                    "display_total": "£3041.53",
+                    "currency": "",
+                    "unit": {
+                        "kind": "currency_symbol",
+                        "symbol": "£",
+                        "precision": 2,
+                        "source": "airtable_field_options",
+                    },
                     "matching_records": 4,
                     "truncated": False,
                     "verification": {
@@ -542,6 +564,12 @@ def test_orchestrator_workflow_state_retains_verified_airtable_aggregate_scope(
     assert scope["airtable_estimated_period"] == 3
     assert scope["airtable_year"] == 2026
     assert scope["aggregate_total"] == "3041.53"
+    assert scope["aggregate_display_total"] == "£3041.53"
+    assert scope["aggregate_currency"] == ""
+    assert scope["aggregate_unit_kind"] == "currency_symbol"
+    assert scope["aggregate_unit_symbol"] == "£"
+    assert scope["aggregate_unit_precision"] == 2
+    assert scope["aggregate_unit_source"] == "airtable_field_options"
     assert scope["item_count"] == 4
     assert scope["complete"] is True
     assert scope["verified"] is True
@@ -2449,6 +2477,11 @@ def test_slack_thread_follow_up_can_reach_chief_of_staff_live_sdk(
         "keystone_agents.workflow_runner.run_chief_of_staff_sdk",
         fake_run_chief_of_staff_sdk,
     )
+    monkeypatch.setattr(
+        slack_actions_module,
+        "run_orchestrator_preflight",
+        _offline_orchestrator_preflight,
+    )
     modal_result = handle_run_agent_interaction(
         _message_action_payload(),
         context_dir=tmp_path / "contexts",
@@ -2515,6 +2548,11 @@ def test_slack_chief_of_staff_cross_agent_ask_enables_specialist_tools(
         "keystone_agents.workflow_runner.run_chief_of_staff_sdk",
         fake_run_chief_of_staff_sdk,
     )
+    monkeypatch.setattr(
+        slack_actions_module,
+        "run_orchestrator_preflight",
+        _offline_orchestrator_preflight,
+    )
     payload = _message_action_payload()
     payload["channel"] = {"id": "CWORKFLOW", "name": "ai-agents-workflow"}
     modal_result = handle_run_agent_interaction(
@@ -2576,6 +2614,11 @@ def test_slack_chief_of_staff_negated_context_mentions_do_not_enable_specialist_
     monkeypatch.setattr(
         "keystone_agents.workflow_runner.run_chief_of_staff_sdk",
         fake_run_chief_of_staff_sdk,
+    )
+    monkeypatch.setattr(
+        slack_actions_module,
+        "run_orchestrator_preflight",
+        _offline_orchestrator_preflight,
     )
     payload = _message_action_payload()
     payload["channel"] = {"id": "CWORKFLOW", "name": "ai-agents-workflow"}
@@ -2671,6 +2714,11 @@ def test_slack_chief_of_staff_local_kni_followup_gets_evidence_packet(
     monkeypatch.setattr(
         "keystone_agents.workflow_runner.run_chief_of_staff_sdk",
         fake_run_chief_of_staff_sdk,
+    )
+    monkeypatch.setattr(
+        slack_actions_module,
+        "run_orchestrator_preflight",
+        _offline_orchestrator_preflight,
     )
     monkeypatch.setattr(
         "keystone_agents.workflow_runner.plan_chief_of_staff_request",

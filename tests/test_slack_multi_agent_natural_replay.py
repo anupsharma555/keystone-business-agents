@@ -38,7 +38,11 @@ OPPORTUNITY_FIXTURE_PATH = Path(
 def test_natural_chief_preprints_zotero_replay_uses_real_graph(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_research_fake_sdk,
 ) -> None:
+    supplied_research_fake_sdk.source_predicate = lambda source: (
+        source["source_type"].endswith("_historical_context")
+    )
     fixture = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
     database_path = tmp_path / "chief-context-graph.db"
     database_url = f"sqlite:///{database_path}"
@@ -172,6 +176,12 @@ def test_natural_chief_preprints_zotero_replay_uses_real_graph(
         assert connection.execute("SELECT COUNT(*) FROM tool_events").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM approval_queue").fetchone()[0] == 0
 
+
+    assert len(supplied_research_fake_sdk) == 1
+    research_input = supplied_research_fake_sdk[0]["model_input"]
+    assert preprint["summary"] in research_input
+    assert "preprints_context_summary" in research_input
+    assert "zotero_context_summary" in research_input
 
 def test_quick_opportunity_airtable_outreach_replay_uses_full_review_only_graph(
     tmp_path: Path,

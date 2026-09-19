@@ -43,6 +43,7 @@ WORKFLOW_ROUTES = {
     "outreach_composer",
 }
 AGENT_DISPLAY_LABELS = {
+    "rag_retrieval_specialist": ("RAG Retrieval", "saved corpus evidence"),
     "gmail_triage": ("Gmail Triage", "classify / draft"),
     "business_research_analyst": ("Business Research", "source briefs"),
     "opportunity_scout": ("Opportunity Scout", "score / dedupe"),
@@ -50,6 +51,8 @@ AGENT_DISPLAY_LABELS = {
     "airtable_context_agent": ("Airtable Context", "schema / records"),
     "google_workspace_context_agent": ("Google Workspace", "Drive / Docs / Sheets"),
     "zotero_context_agent": ("Zotero Context", "library evidence"),
+    "rss_context_agent": ("RSS Context", "feed evidence"),
+    "preprints_context_agent": ("Preprints Context", "preprint evidence"),
 }
 
 
@@ -142,7 +145,7 @@ def render_svg(*, generated_date: str) -> str:
     lines: list[str] = [
         '<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1280" viewBox="0 0 1800 1280" role="img" aria-labelledby="title desc">',
         '  <title id="title">Keystone Business Agents current architecture</title>',
-        '  <desc id="desc">Generated architecture diagram showing entrypoints, Orchestrator-first preflight and review, WorkItem canonical state, backend graph selection, optional LangGraph execution, Chief of Staff operating synthesis, registered SDK agents, typed context packs, deterministic gates, traces, logs, evals, and renderers.</desc>',
+        '  <desc id="desc">Generated architecture diagram showing entrypoints, agent-owned semantic decisions, Orchestrator-first control, request-scoped tools, bounded validation and recovery, WorkItem canonical state, optional LangGraph execution, cross-provider context, receipts, telemetry, and renderers. Representative handoffs include gmail_triage -> business_research_analyst -> outreach_composer -> approval_checkpoint; chief_of_staff -> airtable/google_workspace context -> approval_checkpoint; and rss/preprints/zotero context -> business research/opportunity specialist.</desc>',
         "  <defs>",
         '    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#334155"/></marker>',
         '    <marker id="arrow-det" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#d97706"/></marker>',
@@ -169,8 +172,8 @@ def render_svg(*, generated_date: str) -> str:
         "      .small { font: 400 12px Arial, sans-serif; fill: #475569; }",
         "      .tiny { font: 400 11px Arial, sans-serif; fill: #64748b; }",
         "      .label { font: 700 12px Arial, sans-serif; fill: #334155; }",
+        "      .link { font: 700 12px Arial, sans-serif; fill: #2563eb; text-decoration: underline; }",
         "      .routeLine { stroke: #334155; stroke-width: 2.5; fill: none; marker-end: url(#arrow); }",
-        "      .reviewLine { stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#arrow); stroke-dasharray: 4 4; }",
         "      .detLine { stroke: #d97706; stroke-width: 2.5; fill: none; marker-end: url(#arrow-det); }",
         "      .toolAgentLine { stroke: #0891b2; stroke-width: 2.5; fill: none; marker-end: url(#arrow-tool); }",
         "      .obsLine { stroke: #db2777; stroke-width: 2.5; fill: none; marker-end: url(#arrow-obs); }",
@@ -179,7 +182,7 @@ def render_svg(*, generated_date: str) -> str:
         "  </defs>",
         '  <rect class="bg" width="1800" height="1280"/>',
         '  <text class="title" x="52" y="56">Keystone Business Agents Architecture</text>',
-        '  <text class="subtitle" x="54" y="84">Generated from the current AgentSpec registry, WorkItem graph runtime contracts, trace processor, and eval database shape.</text>',
+        '  <text class="subtitle" x="54" y="84">Generated from AgentSpec, decision/tool contracts, WorkItem graph runtime, receipts, telemetry, and eval database shape.</text>',
         f'  <text class="tiny" x="1510" y="84">Generated {generated_date}</text>',
         '  <rect class="frame" x="40" y="115" width="1720" height="1115" rx="18"/>',
     ]
@@ -207,9 +210,9 @@ def render_svg(*, generated_date: str) -> str:
         lines,
         (
             "First LLM control plane for natural-language asks",
-            "Route advice, blockers, retrieval hints",
-            "Compact preflight context across boundaries",
-            "Deterministic output review before final rendering",
+            "Owns semantic route + ordered workflow choice",
+            "Validated internal decision reaches specialist",
+            "Decision + output review before rendering",
         ),
         x=482,
         y=215,
@@ -223,18 +226,20 @@ def render_svg(*, generated_date: str) -> str:
     _bullet_list(
         lines,
         (
-            "ManualRequestPlan",
+            "ManualRequestPlan compatibility envelope",
             "OrchestratorResult",
+            "AgentDecisionRecord + validator outcome",
             "WorkItems / SQLite canonical state",
             "Typed context packs",
             "Backend graph selection",
-            "Approval gates and artifact refs",
         ),
         x=1010,
-        y=215,
-        max_chars=36,
+        y=213,
+        cls="small",
+        max_chars=44,
+        line_height=22,
     )
-    lines.append('<text class="tiny" x="1010" y="350">Schema-light planning; graph-aware typed execution.</text>')
+    lines.append('<text class="tiny" x="1010" y="357">Schema-light planning; graph-aware typed execution.</text>')
 
     _rect(lines, "lane", 1365, 145, 310, 225)
     lines.append('<text class="section" x="1390" y="181">Connection Legend</text>')
@@ -246,7 +251,7 @@ def render_svg(*, generated_date: str) -> str:
     lines.append('<text class="body" x="1480" y="294">Agents as tools</text>')
     lines.append('<path class="obsLine dash" d="M1390 326 L1465 326"/>')
     lines.append('<text class="body" x="1480" y="331">Traces / logs / evals</text>')
-    lines.append('<text class="tiny" x="1390" y="356">Dashed dark arrows show deterministic Orchestrator review feedback.</text>')
+    lines.append('<text class="tiny" x="1390" y="356">Lines show ownership, not execution order.</text>')
 
     _rect(lines, "graph", 985, 382, 690, 42, rx=10)
     lines.append('<text class="cardTitle" x="1010" y="408">Backend graph selector: single specialist step or LangGraph WorkItem graph</text>')
@@ -260,6 +265,7 @@ def render_svg(*, generated_date: str) -> str:
             "Plans Slack, workflow, and automation work",
             "Reads KNI docs, local context, Slack repo context",
             "May call specialists as advisory tools",
+            "Selects typed cross-provider context + handoff",
             "Stages review plans, approvals, and blockers",
         ),
         x=482,
@@ -269,7 +275,7 @@ def render_svg(*, generated_date: str) -> str:
     lines.append('<text class="small" x="482" y="642">Positioning: inside the centralized Orchestrator + WorkItem path,</text>')
     lines.append('<text class="small" x="482" y="662">not a parallel router or alternate communication channel.</text>')
 
-    _rect(lines, "specialist", 985, 430, 690, 245)
+    _rect(lines, "specialist", 985, 430, 690, 265)
     lines.append('<text class="section" x="1010" y="466">Workflow Specialists</text>')
     card_x = 1010
     for spec in workflow_specs:
@@ -292,11 +298,14 @@ def render_svg(*, generated_date: str) -> str:
         lines.append(f'<text class="small" x="{card_x + 16}" y="{role_y}">{_esc(_agent_role(spec.route_name))}</text>')
         lines.append(f'<text class="small" x="{card_x + 16}" y="{tools_y}">{len(spec.tools)} tools</text>')
         card_x += 166
-    lines.append('<text class="body" x="1010" y="610">Each run receives raw request + Orchestrator memo + typed context pack.</text>')
-    lines.append('<text class="small" x="1010" y="638">Graph-worthy workflows use backend-selected LangGraph nodes; simple runs stay single-step.</text>')
-    lines.append('<text class="small" x="1010" y="660">Direct actions (continue, more research, find contact, revise) reuse this selected path.</text>')
+    lines.append('<text class="body" x="1010" y="610">Each run receives raw request + validated decision + model-visible evidence.</text>')
+    lines.append('<text class="small" x="1010" y="630">Model requests are separate from actual SDK tool calls and returned outputs.</text>')
+    lines.append('<text class="tiny" x="1010" y="646">Research/Opportunity WorkItems: agent-owned SDK selection + no-reread repair.</text>')
+    lines.append('<text class="tiny" x="1010" y="660">RSS/Preprints replay tool-free; A/W/Z have missing-tool + semantic repair.</text>')
+    lines.append('<text class="tiny" x="1010" y="674">Chief nested decisions are trace-retained; supplied response is synthesis-only.</text>')
+    lines.append('<text class="tiny" x="1010" y="688">Direct actions (continue, more research, find contact, revise) reuse the dispatched path.</text>')
 
-    _rect(lines, "context", 70, 430, 310, 285)
+    _rect(lines, "context", 70, 430, 310, 300)
     lines.append('<text class="section" x="95" y="466">Read / Context Specialists</text>')
     context_y = _bullet_list(
         lines,
@@ -308,8 +317,24 @@ def render_svg(*, generated_date: str) -> str:
     )
     lines.append(f'<text class="body" x="95" y="{context_y + 2}">Local KNI document evidence</text>')
     lines.append(f'<text class="body" x="95" y="{context_y + 26}">Slack and automation context tools</text>')
-    lines.append(f'<text class="small" x="95" y="{context_y + 60}">Context agents stage read-only evidence for graph handoffs.</text>')
-    lines.append(f'<text class="small" x="95" y="{context_y + 80}">Provider writes use owning specialists or approved handlers.</text>')
+    note_y = _text(
+        lines,
+        "Context agents stage read-only evidence for graph handoffs.",
+        x=95,
+        y=context_y + 45,
+        cls="small",
+        max_chars=34,
+        line_height=15,
+    )
+    _text(
+        lines,
+        "Provider writes stay with owning specialists or approved handlers.",
+        x=95,
+        y=note_y + 17,
+        cls="small",
+        max_chars=34,
+        line_height=15,
+    )
 
     _rect(lines, "gate", 70, 735, 760, 195)
     lines.append('<text class="section" x="95" y="771">SDK Guardrails + Deterministic Gates</text>')
@@ -317,9 +342,9 @@ def render_svg(*, generated_date: str) -> str:
         lines,
         (
             "SDK guardrails: input/output/tool scans for PHI, secrets, send-like actions, unsafe claims",
-            "Python gates: approvals, source sufficiency, record identity, live flags, provider budgets",
-            "Typed checks: schema reads, arithmetic, deduplication, context-pack readiness",
-            "Tool policy: core reads, web search, deep retrieval, diagnostics, owned writes",
+            "Python gates: request tool scope, approvals, identity, live flags, provider budgets; hard N+1 model ledger",
+            "Typed checks: model-visible candidates, decision coverage, schema, arithmetic, dedupe",
+            "Postconditions: required/optional/forbidden tool evidence; bounded correction/repair",
             "Negated constraints do not steer routes: 'do not scout opportunities' blocks that route",
         ),
         x=95,
@@ -336,8 +361,8 @@ def render_svg(*, generated_date: str) -> str:
         (
             "Search: dry-run, SearXNG, hosted web search, Exa, Tavily, Firecrawl, explicit Serper",
             "Extraction: Trafilatura / Firecrawl, HTML review, rendered browser diagnostics",
-            "State: SQLite WorkItems, approvals, memory, artifacts, tool events, automations",
-            "Private context: KNI docs, Slack threads, Gmail, Airtable, Google files, Zotero",
+            "Receipts: attempts, successes, durable proof, read-back, safe retry point",
+            "State/context: SQLite WorkItems, artifacts, KNI docs, Slack, Gmail, Airtable, Workspace, Zotero",
         ),
         x=895,
         y=805,
@@ -345,10 +370,6 @@ def render_svg(*, generated_date: str) -> str:
         line_height=25,
     )
     lines.append('<text class="small" x="895" y="914">Graph-produced sources can satisfy downstream offline evidence gates.</text>')
-
-    lines.append('<text class="tiny" x="1010" y="695">gmail_triage -> business_research_analyst -> outreach_composer -> approval_checkpoint</text>')
-    lines.append('<text class="tiny" x="1010" y="713">chief_of_staff -> airtable/google_workspace context -> approval_checkpoint</text>')
-    lines.append('<text class="tiny" x="95" y="708">rss/preprints/zotero context -> business research/opportunity specialist</text>')
 
     _rect(lines, "render", 70, 980, 520, 210)
     lines.append('<text class="section" x="95" y="1016">Reviewed Output and Renderers</text>')
@@ -362,7 +383,9 @@ def render_svg(*, generated_date: str) -> str:
         ),
         x=95,
         y=1050,
-        max_chars=60,
+        cls="small",
+        max_chars=75,
+        line_height=23,
     )
     lines.append('<text class="small" x="95" y="1168">Raw trace noise and internal JSON stay hidden unless debugging was requested.</text>')
 
@@ -371,54 +394,36 @@ def render_svg(*, generated_date: str) -> str:
     _bullet_list(
         lines,
         (
-            "SDK summaries: keystone.sdk_run_summary.v1 tracks model, tools, retrieval, cost, session, route, review",
+            "keystone.sdk_run_summary.v1 separates model requests, actual SDK tool calls, workflow/pre-acquired/helper origins",
+            "Request budget: correlation, consumed, remaining, exhaustion; rejected before N+1 model call",
+            "Semantic stage rows: initial / tool correction / decision repair; transport retries stay ledger-bound",
             "Structured logs: keystone.structured_log.v1 stores redacted correlation keys only",
-            f"Eval stores: {', '.join(_eval_table_names())}, benchmark SQLite",
-            "Optional LLM-as-judge belongs here for quality evals, not as an approval authority",
+            f"Correlated traces + eval stores: {', '.join(_eval_table_names())}, benchmark SQLite",
         ),
         x=660,
         y=1050,
-        max_chars=118,
-        line_height=25,
+        cls="small",
+        max_chars=135,
+        line_height=23,
     )
     lines.append('<text class="small" x="660" y="1178">Promptfoo and Slack #evals exercise the same Orchestrator-first workflow path, then feed dashboards and regression tests.</text>')
 
     lines.extend(
         [
-            '  <path class="routeLine" d="M380 250 C410 250 420 250 450 250"/>',
-            '  <text class="label" x="398" y="236">raw request</text>',
-            '  <path class="detLine" d="M920 250 C950 250 955 250 985 250"/>',
-            '  <text class="label" x="938" y="236">state + memo</text>',
-            '  <path class="detLine" d="M1150 370 C1150 376 1150 378 1150 382"/>',
-            '  <text class="label" x="1164" y="379">canonical state</text>',
-            '  <path class="routeLine" d="M1320 424 C1320 426 1320 428 1320 430"/>',
-            '  <text class="label" x="1338" y="424">backend selected</text>',
-            '  <path class="routeLine" d="M685 370 C685 395 685 405 685 430"/>',
-            '  <text class="label" x="700" y="404">broad ops route</text>',
-            '  <path class="toolAgentLine dash" d="M920 552 C950 552 955 552 985 552"/>',
-            '  <text class="label" x="936" y="538">agents as tools</text>',
-            '  <path class="toolAgentLine dash" d="M450 552 C410 552 405 552 380 552"/>',
-            '  <text class="label" x="394" y="538">advisory read-plan</text>',
-            '  <path class="detLine" d="M225 675 C225 705 310 725 390 735"/>',
-            '  <text class="label" x="250" y="715">evidence</text>',
-            '  <path class="detLine" d="M1320 675 C1320 705 1320 710 1320 735"/>',
-            '  <text class="label" x="1335" y="714">verified tool use</text>',
-            '  <path class="detLine" d="M650 675 C630 705 590 715 560 735"/>',
-            '  <text class="label" x="604" y="716">guarded action</text>',
-            '  <path class="detLine" d="M450 930 C425 955 390 965 350 980"/>',
-            '  <text class="label" x="385" y="958">approved structure</text>',
-            '  <path class="obsLine dash" d="M1280 930 C1240 955 1205 965 1160 980"/>',
-            '  <text class="label" x="1200" y="958">diagnostics</text>',
-            '  <path class="detLine" d="M1315 370 C1605 450 1650 650 1535 735"/>',
-            '  <text class="label" x="1570" y="700">state joins</text>',
-            '  <path class="routeLine" d="M790 370 C855 388 930 398 985 403"/>',
-            '  <text class="label" x="870" y="388">routing / graph handoff</text>',
-            '  <path class="reviewLine" d="M985 610 C880 590 860 430 820 370"/>',
-            '  <text class="label" x="830" y="560">deterministic review</text>',
-            '  <path class="reviewLine" d="M610 430 C610 400 620 390 640 370"/>',
-            '  <text class="label" x="522" y="405">review CoS output</text>',
-            '  <path class="obsLine dash" d="M1675 552 C1735 600 1725 925 1675 1065"/>',
-            '  <text class="label" x="1558" y="820">trace / eval linkage</text>',
+            '  <path class="routeLine" d="M380 250 L450 250"/>',
+            '  <path class="detLine" d="M920 250 L985 250"/>',
+            '  <path class="detLine" d="M1150 370 L1150 382"/>',
+            '  <path class="routeLine" d="M1320 424 L1320 430"/>',
+            '  <path class="routeLine" d="M685 370 L685 430"/>',
+            '  <path class="toolAgentLine dash" d="M920 552 L985 552"/>',
+            '  <path class="toolAgentLine dash" d="M450 552 L380 552"/>',
+            '  <path class="detLine" d="M380 700 L405 700 L405 735"/>',
+            '  <path class="detLine" d="M1320 695 L1320 735"/>',
+            '  <path class="detLine" d="M650 675 L560 735"/>',
+            '  <path class="detLine" d="M450 930 L350 980"/>',
+            '  <path class="obsLine dash" d="M1280 930 L1160 980"/>',
+            '  <a href="kba-request-execution-sequence.svg"><text class="link" x="70" y="1218">Numbered request sequence</text></a>',
+            '  <a href="kba-workitem-langgraph-topology.svg"><text class="link" x="255" y="1218">Compiled WorkItem topology</text></a>',
             "</svg>",
         ]
     )

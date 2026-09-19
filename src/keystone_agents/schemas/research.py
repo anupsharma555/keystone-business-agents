@@ -6,6 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from keystone_agents.schemas.decision_ownership import AgentDecisionRecord
 from keystone_agents.schemas.request_coverage import RequestCoverage
 
 ResearchTargetType = Literal[
@@ -106,6 +107,12 @@ class ResearchBrief(BaseModel):
     raw_source_content_included: bool = False
     send_enabled: bool = False
     request_coverage: RequestCoverage = Field(default_factory=RequestCoverage)
+    decision: AgentDecisionRecord = Field(
+        default_factory=lambda: AgentDecisionRecord(
+            decision_stage="research_source_selection",
+            needs_more_context=True,
+        )
+    )
 
     @field_validator("target_name", "research_goal", "summary", mode="before")
     @classmethod

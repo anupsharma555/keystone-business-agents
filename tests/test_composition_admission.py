@@ -65,6 +65,53 @@ def test_completed_same_thread_evidence_admits_provider_free_composition(
     assert admission.source_run_id == "run-1"
 
 
+def test_operator_approved_synthetic_facts_admit_show_only_composition() -> None:
+    plan = _draft_plan(
+        ask_shape=AskShapePolicy(
+            output_form="draft",
+            prior_context_dependency="selected_context",
+            permission_state="draft_only",
+            audience_scope="external",
+            source_type_preference=["approved_synthetic"],
+        )
+    )
+
+    admission = resolve_provider_free_composition_admission(
+        plan,
+        workflow_state=None,
+    )
+
+    assert admission.composition_allowed is True
+    assert admission.context_kind == "operator_approved_synthetic_facts"
+    assert admission.reason == "admitted_approved_synthetic_context"
+    assert admission.external_use_approval_required is True
+    assert admission.provider_action_allowed is False
+    assert admission.same_thread_verified is False
+
+
+@pytest.mark.parametrize("source_type", ["synthetic", "approved", "provided"])
+def test_incomplete_synthetic_approval_marker_does_not_admit_composition(
+    source_type: str,
+) -> None:
+    plan = _draft_plan(
+        ask_shape=AskShapePolicy(
+            output_form="draft",
+            prior_context_dependency="selected_context",
+            permission_state="draft_only",
+            source_type_preference=[source_type],
+        )
+    )
+
+    admission = resolve_provider_free_composition_admission(
+        plan,
+        workflow_state=None,
+    )
+
+    assert admission.composition_allowed is False
+    assert admission.reason == "selected_context_missing"
+    assert admission.provider_action_allowed is False
+
+
 @pytest.mark.parametrize(
     ("prior_run", "reason"),
     [

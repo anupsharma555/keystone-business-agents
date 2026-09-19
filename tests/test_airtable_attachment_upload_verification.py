@@ -99,7 +99,7 @@ def test_live_airtable_attachment_upload_fails_closed_without_matching_readback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     attachment = tmp_path / "KBA_TEST_SLIDE-example.png"
-    attachment.write_bytes(b"png")
+    attachment.write_bytes(b"\x89PNG\r\n\x1a\nsynthetic image fixture")
     monkeypatch.setenv("AIRTABLE_BASE_ID", "app_test")
     monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
     monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")

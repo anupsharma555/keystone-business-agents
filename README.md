@@ -32,13 +32,16 @@ For operator modes, runtime versions, live flags, and troubleshooting, use
 
 ## System Shape
 
-The runtime has four main layers:
+The runtime has five main layers:
 
 1. **Orchestrator and Chief of Staff**
    The Orchestrator is the first control plane for natural-language `@KNI`,
    Slack, WorkItem, scheduled automation, and named-agent requests. It reads the
-   raw request and compact context, produces route advice, blockers, retrieval
-   hints, and review notes, then passes a memo to the selected specialist.
+   raw request and compact context, owns the semantic route/workflow decision,
+   records blockers and retrieval needs, and passes the validated internal
+   decision plus the original request to the selected specialist. Deterministic
+   code may reject an invalid decision, but it must not silently invent a
+   different business decision.
    Chief of Staff handles broad operational synthesis, context-agent
    coordination, and structured handoffs when a downstream specialist should own
    the next WorkItem step.
@@ -47,7 +50,11 @@ The runtime has four main layers:
    Each specialist is an OpenAI Agents SDK `Agent` with markdown prompts,
    Pydantic structured output, explicit tool wrappers, and registry metadata.
    The stable specialist routes are Gmail Triage, Business Research Analyst,
-   Opportunity Scout, and Outreach Composer.
+   Opportunity Scout, and Outreach Composer. A request-scoped capability layer
+   admits the safe toolbox for the run. Depending on the execution path,
+   evidence may come from model-called tools, workflow-called tools/helpers, or
+   verified context acquired before the model turn; runtime telemetry keeps
+   those origins distinct.
 
 3. **WorkItems, Context Packs, And Gates**
    WorkItems in local SQLite are the canonical workflow state. Context packs
@@ -64,13 +71,69 @@ The runtime has four main layers:
    replace SDK agents, WorkItems, context packs, or Python safety gates.
    Details live in `docs/LANGGRAPH_OPTION.md`.
 
+5. **Decision Validation, Recovery, And Observability**
+   Where the shared decision wrapper is wired, agent decisions use typed records
+   checked against the candidate identities and provider evidence visible to
+   that agent. Required tool-use postconditions and bounded correction/repair
+   complement provider receipts and safe retry points; completed writes must
+   never be repeated merely to repair model output. Execution summaries distinguish
+   attached tools from actual model calls, workflow calls, pre-acquired context,
+   deterministic helpers, provider attempts/successes, retained receipts, and
+   `performed` / `not_performed` / `unknown` external-write state.
+
+These are shared architecture primitives, not one uniform call path. In the
+current snapshot, Airtable, Google Workspace, and Zotero have direct live CLI
+paths that `WorkflowRunner` does not dispatch; RSS and Preprints use the signal
+runtime; Chief-of-Staff context specialists use validated child wrappers over
+their agent tools. The shared direct corrective turn is therefore not evidence
+of universal coverage. Read exact per-agent execution and recovery behavior
+from current call sites and traces.
+
+Direct Airtable, Workspace, and Zotero now bind decisions to provider-authoritative
+candidates, retain cumulative telemetry, and preserve mutation-safe evidence
+across one semantic repair. Their direct CLI path first permits one bounded
+missing-required-tool correction, then applies semantic decision
+validation/repair. Completed read evidence is replayed with completed tools
+disabled; mutations are never repeated, and unavailable replay or a failed
+corrected postcondition fails closed. These routes remain outside first-class
+`WorkflowRunner` specialist dispatch.
+
+Live Business Research and Opportunity WorkItems now keep retrieval, selection,
+ranking, and handoff judgment inside the owning SDK specialist. The model and
+validator share stable provider candidate IDs; one semantic repair replays the
+same bounded universe without another provider read. Python validates identity,
+bounds, and formal gates but does not choose a replacement candidate or handoff.
+
+Chief nested context children enforce live reads on isolated tool copies, keep
+mutation tools absent, and persist validated child decisions through SDK custom
+data into the unified privacy-safe trace. A live parent-supplied `run_config` is
+labeled `live_sdk`; private child identities stay out of model-visible and
+public envelopes.
+
+A model request is not itself a model-called tool. That label is reserved for
+an observed SDK tool invocation and its returned output in the same run.
+Likewise, the generic provider-free `DirectAgentResponse` lane is restricted to
+positively evidenced supplied-text or attachment synthesis. It cannot intercept
+provider actions, candidate selection, continuations, delegation, or specialist
+schemas, and must not be cited as proof that a named specialist executed its
+decision contract.
+
+When a model-request limit is configured, one request-local hard ledger covers
+the parent run, nested agent calls, reserved child-process work, and sandbox SDK
+execution. Each actual model turn is admitted and counted before provider
+dispatch; the next turn after the configured limit is rejected before the model
+call. Request estimates expose semantic stage rows for the initial loop and any
+conditional tool correction or decision repair. Transport and structured-output
+retries are not duplicated as semantic stages, but every model request they
+actually start remains ledger-bounded and observable.
+
 Generated architecture visual:
 `docs/assets/kba-current-agent-architecture.svg`
 
 Integrated architecture and ordered execution visual:
 `docs/assets/kba-integrated-agent-architecture.svg`
 
-Regenerate it after agent, workflow, trace, or eval-structure changes:
+Regenerate them after agent, workflow, trace, or eval-structure changes:
 
 ```bash
 .venv/bin/python scripts/render_agent_architecture_diagram.py
@@ -98,6 +161,15 @@ Read-only or write-planning context agents:
   metadata for artifact-placement and context decisions.
 - **Zotero Context Agent** reads library, collection, item, importer, and
   evidence context; mutation remains limited to guarded importer paths.
+- **RSS Context Agent** evaluates bounded announcement history and remains
+  read-only.
+- **Preprints Context Agent** evaluates bounded preprint evidence and remains
+  read-only.
+
+The Calendar Action Interpreter is a supporting typed SDK agent rather than a
+registry route. It interprets one bounded Calendar action; deterministic code
+still owns identity resolution, approval/live gates, provider execution, and
+read-back verification.
 
 The canonical registry is `src/keystone_agents/agent_registry.py`. It is the
 source of truth for agent builders, schemas, prompt files, tools, live flags,
@@ -114,6 +186,11 @@ validation paths, handoff descriptions, and safety notes.
   WorkItem actions, and human-summary-first rendering.
 - Local SQLite audit storage for WorkItems, events, approvals, drafts, sources,
   tool calls, and benchmark/eval records.
+- Typed agent-decision validation, bounded recovery, and path-specific
+  tool/provider/receipt telemetry. SDK summaries carry the strongest current
+  evidence. The production compiler now hydrates nested attempts, linked
+  manager/specialist run IDs, actual tool/context/provider origins, and CLI
+  multi-run linkage while preserving privacy-safe unknown evidence.
 - Repo-local `SKILL.md` bundles that encode reusable reasoning contracts such as
   source triage, evidence handling, tool-result resilience, handoff packaging,
   action boundaries, and output review.
@@ -124,12 +201,13 @@ Python 3.11 or newer is required.
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -e ".[dev]"
+.venv/bin/python -m pip install --upgrade pip setuptools wheel -c constraints/ci.txt
+.venv/bin/python -m pip install --no-build-isolation -e ".[dev]" -c constraints/ci.txt
 ```
 
-The authoritative Agents SDK range is `openai-agents>=0.19.1,<0.20`; version
-`0.19.1` is the currently validated minimum. Confirm the installed version with:
+The V2 dependency baseline is `openai-agents>=0.22.2,<0.23` with
+`openai>=3.12,<4`. Use the tested [dependency constraints](constraints/README.md)
+for reproducible development and CI installs. Confirm the installed version with:
 
 ```bash
 .venv/bin/python -c 'from importlib.metadata import version; print(version("openai-agents"))'
@@ -138,8 +216,14 @@ The authoritative Agents SDK range is `openai-agents>=0.19.1,<0.20`; version
 Optional LangGraph runtime:
 
 ```bash
-.venv/bin/python -m pip install -e ".[orchestration]"
+.venv/bin/python -m pip install --no-build-isolation -e ".[orchestration]" -c constraints/ci.txt
 ```
+
+The orchestration extra includes LangGraph 1.2.11 or newer and the SQLite
+checkpointer. Saved graph runs use native checkpoints; direct execution retains
+the shared local operation journal. See the [V2 implementation report](docs/KBA_V2_IMPLEMENTATION.md)
+for inspection/resume commands and proof boundaries, and the
+[V2 experiment guide](docs/KBA_V2_EXPERIMENTS.md) for controlled comparisons.
 
 Initialize local SQLite state:
 

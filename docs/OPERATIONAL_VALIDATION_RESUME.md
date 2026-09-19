@@ -1,6 +1,6 @@
 # Operational Validation Resume Context
 
-Updated: 2026-07-10
+Updated: 2026-08-05
 
 ## Objective
 
@@ -9,6 +9,48 @@ direct single-agent and LangGraph execution. Keep Promptfoo deferred. Run live
 model checks one at a time, fix between runs, preserve no-send/no-post and
 approval boundaries, and record meaningful milestones rather than every
 intermediate step in Linear.
+
+## 2026-08-05 Airtable Receipt Resume Boundary
+
+One real Business Expenses receipt lifecycle now passes through the direct
+Airtable Context Agent path. The exact provider record is independently verified
+with Date of Expense `2026-08-05`, Estimated Tax Periods `3`, Amount `618.00`,
+Total Expenses `762.75`, and one exact 159,066-byte PDF attachment. The initial
+`Q3` value was corrected in place on the same record; there was never a duplicate
+expense. Refreshed Airtable UI shows the record in the existing `3` group, no
+`Q3` group, and 22 total expenses. Stop receipt-create testing here; another
+create would be a duplicate rather than additional acceptance evidence.
+
+The shared fixes are uncommitted in the current dirty checkout. They preserve a
+prefix-stripped receipt request as an Airtable `business_system_write` with
+`create`, `attach`, and `verify`, correct booking-confirmation vendor/date
+fallback extraction, normalize estimated-period labels to numeric base values,
+and inspect existing provider values before an expense write. ATC and CoS share
+that tool boundary. The correction run's schema/read/write calls succeeded, but
+its Slack card falsely failed because three turns did not leave room for final
+synthesis; generic direct business writes now reserve four turns. Provider and
+UI correctness are proven; the final-synthesis budget is offline-proven only.
+The remaining receipt-specific work is output compaction and latency measurement.
+
+## 2026-08-05 Current Gmail Resume Boundary
+
+The current checkout repairs the shared Gmail decision contract and preserves
+the complete raw request, provider-returned identity mapping, bounded read
+evidence, selection and exclusion decision, validator feedback, repair attempt,
+tool and receipt metadata, usage, request budget, and latency. Repair is
+tool-free and cannot repeat the query or completed reads. It also removes a
+stale forced tool choice before a provider-free repair turn; that mismatch had
+produced repeated provider HTTP 400 responses even though the repair turn had
+no attached tools.
+
+Two post-fix read-only Slack runs completed without a Gmail mutation. The first
+selected the human MassChallenge thread and returned a reply, proving the prior
+tool-choice failure was removed, but its advice was temporally imperfect because
+it suggested scheduling a meeting that had already occurred. The second
+correctly summarized the topic of the latest sent email, although the answer was
+less detailed than ideal. Treat Gmail execution as live-capable but semantic
+quality and latency as still partial; a future run should use a novel decision
+shape and be inspected before the next live submission.
 
 ## Current Gmail Evidence
 

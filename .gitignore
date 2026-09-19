@@ -1,6 +1,7 @@
 .DS_Store
 .coverage
 .venv/
+.venv
 node_modules/
 .env
 .env.*
@@ -36,3 +37,6 @@ keystone_agents.db
 *.sqlite
 *.sqlite3
 DB
+
+# Per-execution SQLite locks remain local runtime state.
+*.db.execution.sqlite3.*.lock

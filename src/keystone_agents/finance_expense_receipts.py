@@ -571,9 +571,31 @@ def _resolve_local_executable(
 
 
 def _vendor_from_text(text: str) -> str:
+    lines = [" ".join(line.split()).strip() for line in text.splitlines()]
+    for index, line in enumerate(lines):
+        if not re.search(
+            r"\b(?:thank\s+you\s+for\s+booking|booking\s+confirmed)\b",
+            line,
+            re.I,
+        ):
+            continue
+        for candidate in lines[index + 1 : index + 5]:
+            if candidate and not re.search(
+                r"\b(?:address|check[- ]?in|check[- ]?out|confirmation|reservation)\b",
+                candidate,
+                re.I,
+            ):
+                return candidate[:120]
     for line in text.splitlines():
         clean = " ".join(line.split()).strip()
         if not clean:
+            continue
+        if re.search(
+            r"\b(?:all\s+data\s+protected|no\s+unauthorized\s+use|"
+            r"copyright|privacy\s+policy|terms\s+of\s+use)\b",
+            clean,
+            re.I,
+        ):
             continue
         suffix = r"(?:Inc\.|Inc|LLC|Ltd\.|Ltd|Corporation|Corp\.|Corp|Company)"
         match = re.search(rf"\b([A-Z][A-Za-z0-9 &'.,-]{{1,80}}?\b{suffix})(?:\s|$)", clean)
@@ -589,6 +611,19 @@ def _vendor_from_text(text: str) -> str:
 
 
 def _receipt_date_from_text(text: str) -> str:
+    timestamp_match = re.search(
+        r"^\s*(\d{1,2}/\d{1,2}/(?:\d{2}|\d{4}))\s*,?\s+"
+        r"\d{1,2}:\d{2}\s*(?:AM|PM)\b",
+        text,
+        flags=re.I | re.M,
+    )
+    if timestamp_match:
+        raw_timestamp_date = timestamp_match.group(1)
+        for fmt in ("%m/%d/%y", "%m/%d/%Y"):
+            try:
+                return datetime.strptime(raw_timestamp_date, fmt).date().isoformat()
+            except ValueError:
+                continue
     match = re.search(
         r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+"
         r"\d{1,2},\s+\d{4}\b",

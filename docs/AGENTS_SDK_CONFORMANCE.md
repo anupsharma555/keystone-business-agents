@@ -19,11 +19,15 @@ concept in an explicit local boundary.
 | Semantic execution authority | `src/keystone_agents/authority/semantic.py`; public facade: `src/keystone_agents/semantic_execution.py` |
 | Bounded compatibility planning | `src/keystone_agents/planning/compatibility.py`; public facade: `src/keystone_agents/manual_request.py` |
 | Capability admission | `src/keystone_agents/capabilities/profile.py`; public facade: `src/keystone_agents/capability_profile.py` |
+| Agent-owned decision policy and evidence binding | `src/keystone_agents/agent_decision_policy.py`, `src/keystone_agents/agent_decision_contracts.py`, `src/keystone_agents/runtime/decision_validation.py` |
+| Tool-use postconditions and origin accounting | `src/keystone_agents/runtime/tool_execution.py` |
+| Cross-provider context selection and handoff | `src/keystone_agents/runtime/provider_context.py` |
 | Mutation receipts, idempotency, and provider recovery | `src/keystone_agents/receipts/`; public facades: `src/keystone_agents/provider_recovery.py`, `src/keystone_agents/tool_receipt_journal.py` |
 | Request-scoped runtime composition | `src/keystone_agents/runtime/request.py` |
 | Handoffs and orchestration | `src/keystone_agents/agents/orchestrator.py` |
 | Public executable-stage boundary | `src/keystone_agents/orchestration/stages.py`; execution kernel: `src/keystone_agents/workflow_runner.py` |
 | Results, local state, and audit storage | `src/keystone_agents/run.py`, `src/keystone_agents/storage/` |
+| Execution attempts, telemetry, and trace-safe decision evidence | `src/keystone_agents/runtime/execution_attempt.py`, `src/keystone_agents/execution_telemetry.py`, `src/keystone_agents/runtime/decision_trace_harness.py`, `src/keystone_agents/trace_processor.py` |
 | Public-result assembly and rendering | `src/keystone_agents/presentation/`; public facades: `src/keystone_agents/reporting.py`, `src/keystone_agents/terminal_result_consistency.py` |
 | CLI entrypoint | Public facade: `src/keystone_agents/cli.py`; implementation: `src/keystone_agents/entrypoints/cli_impl.py` |
 | Optional LangGraph WorkItem orchestration | `src/keystone_agents/langgraph_workflow.py`, `docs/LANGGRAPH_OPTION.md` |
@@ -54,8 +58,32 @@ concept in an explicit local boundary.
   packages listed above.
 - Orchestrator preflight is the first model control-plane step for
   natural-language Slack, CLI, WorkItem, scheduled-automation, and explicit
-  named-agent paths. Specialists still receive the raw request plus compact
-  Orchestrator memo/context.
+  named-agent paths. Its validated internal semantic decision and the raw
+  request must reach the specialist; the public preflight may remain compact.
+- Model-owned selections must be bound to evidence that was actually visible
+  in the same model loop. Python may normalize before the turn and validate or
+  request bounded repair afterward, but it may not add missing substantive
+  evidence or silently substitute a different selection.
+- Tool attachment is capability, not proof of execution. Runtime summaries keep
+  model requests, attached tools, actual SDK model tool calls and outputs,
+  workflow-called tools, deterministic helpers, pre-acquired context, provider
+  attempts, successes, and receipts as separate fields. Compatibility
+  `tool_mode=model_called` decision events do not establish a tool call alone.
+- A missing required tool result or invalid decision fails closed or, where the
+  shared wrapper is wired, enters bounded recovery. Completed provider
+  mutations are never repeated merely to repair output or decision shape.
+- Runtime integration is not uniform across the registry. Current direct CLI
+  paths own Airtable, Workspace, and Zotero execution outside
+  `WorkflowRunner`, including bounded missing-tool correction and semantic
+  repair; RSS and Preprints use the signal runtime; nested Chief context
+  specialists use validated child wrappers over agent tools rather than the
+  direct wrapper. Registry or trace-harness presence alone does not prove one
+  identical validation/repair envelope.
+- Live Business Research and Opportunity WorkItems use agent-owned SDK
+  retrieval, selection, ranking, and handoff over model-visible stable provider
+  candidate IDs. Their one semantic repair replays the same evidence tool-free;
+  Python validates identity, bounds, and formal gates rather than selecting a
+  replacement.
 - LangGraph is an optional graph runtime around WorkItems. It must call existing
   typed workflow utilities, carry Orchestrator preflight context, and preserve
   SDK specialists as the behavior boundary.

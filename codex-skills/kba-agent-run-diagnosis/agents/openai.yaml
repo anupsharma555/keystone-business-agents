@@ -1,0 +1,4 @@
+interface:
+  display_name: "KBA Agent Run Diagnosis"
+  short_description: "Diagnose recorded KBA run evidence and failures"
+  default_prompt: "Use $kba-agent-run-diagnosis to reconstruct this KBA run's evidence, identify the first failed layer, and state what remains unproven."

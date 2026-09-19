@@ -2,14 +2,34 @@
 
 from __future__ import annotations
 
+import json
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from email.utils import parseaddr
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
-from keystone_agents.agent_tool_policy import filter_tools_for_tier
+from keystone_agents.capabilities.tool_scope import (
+    ToolScopeMode,
+    attach_tool_scope_receipt,
+    default_tool_tier_for_request,
+    scope_tools_for_request,
+    tool_scope_receipt_for_agent,
+    tool_scope_trace_metadata_for_agent,
+)
+from keystone_agents.gmail_triage.decision_ownership import (
+    decision_record_from_gmail_result,
+    gmail_claimed_output_fields,
+    gmail_decision_evidence,
+    gmail_decision_telemetry,
+    normalize_empty_gmail_abstention,
+    validate_gmail_agent_decision,
+    validate_verified_gmail_continuation_decision,
+)
+from keystone_agents.gmail_triage.handoff_context import selected_provider_context
 from keystone_agents.gmail_triage.text import (
     clean_text as _clean_text,
 )
@@ -33,6 +53,7 @@ from keystone_agents.guardrails import (
     assess_text_guardrails,
     keystone_guardrails,
 )
+from keystone_agents.model_provider import gmail_selection_reasoning_effort
 from keystone_agents.models import (
     GmailCandidateRankingSDKInput,
     GmailContactLookupSDKInput,
@@ -41,6 +62,13 @@ from keystone_agents.models import (
     TypedAgentRunResult,
 )
 from keystone_agents.run import run_typed_sdk_agent
+from keystone_agents.runtime.request_budget import current_model_request_capacity
+from keystone_agents.runtime.tool_execution import (
+    ToolEvidenceGroup,
+    ToolExecutionContract,
+    ToolExecutionMode,
+)
+from keystone_agents.schemas.decision_ownership import AgentDecisionRecord
 from keystone_agents.schemas.email_style import EmailStyleProfile
 from keystone_agents.schemas.email_triage import (
     EmailTriageResult,
@@ -48,12 +76,18 @@ from keystone_agents.schemas.email_triage import (
     GmailContactLookupResult,
     GmailMailboxActionPlan,
     GmailMessageEnvelope,
+    GmailNeedsMoreContextRepair,
     GmailPriorityGroupedMessage,
     GmailPriorityGroupingResult,
+    GmailSelectedSelectionRepair,
+    GmailSelectionRepairResult,
     managed_gmail_labels,
 )
+from keystone_agents.schemas.gmail_query import GmailReadContextResult
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.sdk import (
     Agent,
+    build_model_settings,
     build_sdk_agent,
     compose_direct_instructions,
     compose_instructions,
@@ -62,6 +96,10 @@ from keystone_agents.sdk_run_policy import resolve_sdk_turn_policy
 from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
 from keystone_agents.tools.approval_tool import create_approval_queue_item
 from keystone_agents.tools.email_style_tool import load_email_style_profile
+from keystone_agents.tools.gmail_query_tools import (
+    gmail_model_read_evidence_snapshot,
+    gmail_model_read_tools,
+)
 from keystone_agents.tools.gmail_tool import (
     apply_gmail_labels,
     create_gmail_draft_reply,
@@ -522,34 +560,691 @@ def run_gmail_triage_sdk(
     max_turns: int | None = None,
     attach_tools: bool = True,
     compact_instructions: bool = False,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
+    provider_selection_required: bool | None = None,
+    provider_context_read_required: bool | None = None,
+    repair_invalid_selection: bool = True,
+    prepared_agent: Agent | None = None,
+    selected_context_callback: Callable[[GmailReadContextResult], None] | None = None,
 ) -> TypedAgentRunResult[EmailTriageResult]:
-    """Run Gmail triage through the typed SDK harness."""
+    """Run Gmail triage, optionally retaining a host-admitted nested toolbox."""
 
-    if isinstance(typed_input, GmailMessageEnvelope):
+    if isinstance(typed_input, str):
+        typed_input = GmailTriageSDKInput(
+            subject="",
+            body="",
+            request=typed_input,
+        )
+    elif isinstance(typed_input, GmailMessageEnvelope):
         typed_input = GmailTriageSDKInput.from_envelope(typed_input)
-    resolved_tool_tier = tool_tier or _default_gmail_triage_sdk_tool_tier(typed_input)
-    agent = build_gmail_triage_agent(
+    if not typed_input.request_evaluated_at.strip():
+        typed_input = replace(
+            typed_input,
+            request_evaluated_at=(
+                datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            ),
+        )
+    if typed_input.model_request_capacity is None:
+        model_request_capacity = current_model_request_capacity()
+        if model_request_capacity is not None:
+            typed_input = replace(
+                typed_input,
+                model_request_capacity=model_request_capacity,
+            )
+    selection_required = (
+        _gmail_provider_selection_required(typed_input)
+        if provider_selection_required is None
+        else bool(provider_selection_required)
+    )
+    context_read_required = (
+        _gmail_verified_context_read_required(typed_input)
+        if provider_context_read_required is None
+        else bool(provider_context_read_required)
+    )
+    resolved_tool_tier = tool_tier or _default_gmail_triage_sdk_tool_tier(manual_request_plan)
+    # Select procedures from the task, not dataclass field names, style examples,
+    # or the host's advisory memo. Those remain visible in to_prompt().
+    task_text = typed_input.request.strip() or "\n".join(
+        value for value in (typed_input.subject, typed_input.body) if value
+    )
+    agent = prepared_agent or build_gmail_triage_agent(
         model=model,
         include_tools=attach_tools,
-        request_text=skill_request_text(typed_input),
+        provider_tools_live=live,
+        provider_selection_mode=selection_required,
+        request_text=task_text,
         context_flags=context_flags,
         tool_tier=resolved_tool_tier,
         compact_instructions=compact_instructions,
+        manual_request_plan=manual_request_plan,
+        tool_scope_mode=ToolScopeMode.REQUEST_SCOPED,
     )
     turn_policy = resolve_sdk_turn_policy(
         "gmail_triage",
-        request_text=skill_request_text(typed_input),
+        request_text=task_text,
         explicit_max_turns=max_turns,
     )
-    return run_typed_sdk_agent(
+    scope_receipt = tool_scope_receipt_for_agent(agent)
+    tool_execution_contract = (
+        ToolExecutionContract.required(
+            ToolEvidenceGroup(
+                name="gmail_query",
+                any_of_tool_names=("query_gmail_message_summaries",),
+            ),
+            stage="gmail_agent_owned_selection",
+        )
+        if selection_required
+        else ToolExecutionContract.required(
+            ToolEvidenceGroup(
+                name="gmail_verified_context_read",
+                any_of_tool_names=("read_gmail_context",),
+            ),
+            stage="gmail_verified_continuation_read",
+        )
+        if context_read_required
+        else None
+    )
+    result = run_typed_sdk_agent(
         agent=agent,
         typed_input=typed_input,
         output_type=EmailTriageResult,
         run_config=run_config,
         live=live,
         session=session,
-        max_turns=turn_policy.max_turns,
+        max_turns=max(turn_policy.max_turns, 7) if selection_required else turn_policy.max_turns,
+        trace_metadata=tool_scope_trace_metadata_for_agent(agent),
+        tool_execution_contract=tool_execution_contract,
+        structured_retry_evidence_provider=(
+            lambda: gmail_model_read_evidence_snapshot(agent.tools)
+            if selection_required
+            else ()
+        ),
     )
+    if selection_required:
+        result = _validate_and_repair_gmail_selection(
+            result,
+            typed_input=typed_input,
+            run_config=run_config,
+            live=live,
+            model=model,
+            session=session,
+            compact_instructions=compact_instructions,
+            repair_invalid_selection=repair_invalid_selection,
+            cumulative_tool_evidence=gmail_model_read_evidence_snapshot(agent.tools),
+        )
+    elif context_read_required:
+        result = _validate_and_repair_verified_gmail_continuation(
+            result,
+            typed_input=typed_input,
+            run_config=run_config,
+            live=live,
+            model=model,
+            session=session,
+            compact_instructions=compact_instructions,
+            repair_invalid_selection=repair_invalid_selection,
+        )
+    request_cache = getattr(result, "request_cache", None)
+    if isinstance(request_cache, dict):
+        request_cache["request_tool_scope"] = scope_receipt
+    if selected_context_callback is not None and (selection_required or context_read_required):
+        context = selected_provider_context(
+            result.output, gmail_model_read_evidence_snapshot(agent.tools),
+        )
+        if context is not None:
+            selected_context_callback(context)
+    return result
+
+
+class GmailAgentDecisionError(RuntimeError):
+    """The Gmail model did not produce a valid choice after bounded repair."""
+
+    def __init__(
+        self,
+        telemetry: Mapping[str, Any],
+        *,
+        result: TypedAgentRunResult[EmailTriageResult] | None = None,
+    ) -> None:
+        self.telemetry = dict(telemetry)
+        self.result = result
+        outcome = self.telemetry.get("validator_outcome")
+        reason = outcome.get("reason_code") if isinstance(outcome, Mapping) else ""
+        super().__init__(
+            "Gmail Triage could not bind its selected message/thread to the bounded "
+            f"provider evidence after one repair attempt. reason_code={reason or 'unknown'}"
+        )
+
+
+def _build_gmail_selection_repair_agent(*, model: str | None) -> Agent:
+    """Build an isolated, tool-free repair stage with a mutually exclusive schema."""
+
+    return build_sdk_agent(
+        name="gmail_triage_selection_repair",
+        instructions=compose_direct_instructions(
+            "safety_policy.md",
+            "gmail_triage.md",
+        ),
+        output_type=GmailSelectionRepairResult,
+        tools=[],
+        guardrails=keystone_guardrails(),
+        model=model,
+        policy_agent_name="gmail_triage",
+        handoff_description=(
+            "Use only for one bounded validator repair over already-read Gmail evidence."
+        ),
+    )
+
+
+def _unresolved_gmail_repair_result(
+    initial: EmailTriageResult,
+    repair: GmailNeedsMoreContextRepair,
+) -> EmailTriageResult:
+    """Render the agent's explicit abstention without selecting or retaining evidence."""
+
+    requested_context = list(repair.requested_context)
+    action = (
+        "Provide the missing context requested by Gmail Triage: " + "; ".join(requested_context)
+        if requested_context
+        else "Provide additional context so Gmail Triage can select without guessing."
+    )
+    return initial.model_copy(
+        update={
+            "message_id": "",
+            "thread_id": "",
+            "received_at": "",
+            "subject": "",
+            "sender_name": "",
+            "sender_email": "",
+            "category": "unrelated",
+            "confidence": 0.0,
+            "priority": "normal",
+            "summary": "Gmail Triage needs more context before selecting a conversation.",
+            "operator_answer": "",
+            "thread_summary": "",
+            "thread_context": "",
+            "reasoning": repair.reasoning,
+            "needs_reply": False,
+            "recommended_labels": [],
+            "risk_flags": [],
+            "suspicious_signals": [],
+            "recommended_next_agent": "human_review",
+            "triage_limitations": list(repair.limitations),
+            "prior_labels": [],
+            "snippet": "",
+            "normalized_body": "",
+            "retrieval_diagnostics": {},
+            "extracted_links": [],
+            "attachment_metadata": [],
+            "recommended_action": action,
+            "draft_reply": None,
+            "draft_created": False,
+            "style_profile_used": False,
+            "style_profile_id": "",
+            "approval_required": False,
+            "requires_human_review": True,
+            "decision": AgentDecisionRecord(
+                decision_owner="specialist_agent",
+                decision_stage="gmail_candidate_selection",
+                reasoning=repair.reasoning,
+                limitations=list(repair.limitations),
+                needs_more_context=True,
+            ),
+        }
+    )
+
+
+def _gmail_provider_selection_required(typed_input: GmailTriageSDKInput) -> bool:
+    """Require the model tool loop only when no exact provider object was supplied."""
+
+    return bool(
+        typed_input.request.strip()
+        and not (typed_input.message_id.strip() or typed_input.thread_id.strip())
+        and not (
+            typed_input.subject.strip()
+            or typed_input.body.strip()
+            or typed_input.snippet.strip()
+            or typed_input.thread_context.strip()
+        )
+    )
+
+
+def _gmail_verified_context_read_required(typed_input: GmailTriageSDKInput) -> bool:
+    return bool(
+        typed_input.request.strip()
+        and (typed_input.message_id.strip() or typed_input.thread_id.strip())
+        and not (
+            typed_input.subject.strip()
+            or typed_input.body.strip()
+            or typed_input.snippet.strip()
+            or typed_input.thread_context.strip()
+        )
+    )
+
+
+def _validate_and_repair_gmail_selection(
+    result: TypedAgentRunResult[EmailTriageResult],
+    *,
+    typed_input: GmailTriageSDKInput,
+    run_config: Any | None,
+    live: bool,
+    model: str | None,
+    session: Any | None,
+    compact_instructions: bool,
+    repair_invalid_selection: bool,
+    cumulative_tool_evidence: tuple[dict[str, Any], ...] = (),
+) -> TypedAgentRunResult[EmailTriageResult]:
+    evidence = gmail_decision_evidence(
+        result.raw_result,
+        cumulative_tool_evidence=cumulative_tool_evidence,
+    )
+    normalized_output = result.final_output.model_copy(
+        update={"decision": decision_record_from_gmail_result(result.final_output)}
+    )
+    validator = validate_gmail_agent_decision(
+        normalized_output,
+        evidence,
+        original_request=typed_input.request,
+        require_live_provider=live,
+    )
+    normalization_metadata = []
+    if validator.reason_code == "needs_more_context_with_claimed_gmail_output":
+        normalized_output, cleared_fields = normalize_empty_gmail_abstention(
+            normalized_output, evidence,
+        )
+        if cleared_fields:
+            normalization_metadata = [{
+                "kind": "verified_empty_search_context_discarded", "fields": list(cleared_fields),
+            }]
+            validator = validate_gmail_agent_decision(
+                normalized_output, evidence, original_request=typed_input.request,
+                require_live_provider=live,
+            )
+    normalized_result = replace(result, output=normalized_output)
+    if validator.status == "accepted":
+        telemetry = gmail_decision_telemetry(normalized_output, validator, evidence)
+        if normalization_metadata:
+            telemetry["repair_metadata_normalizations"] = normalization_metadata
+        return _attach_gmail_decision_telemetry(
+            normalized_result, telemetry,
+        )
+    if validator.reason_code in {
+        "gmail_live_query_evidence_missing",
+        "gmail_live_context_evidence_missing",
+    }:
+        telemetry = gmail_decision_telemetry(normalized_output, validator, evidence)
+        raise GmailAgentDecisionError(telemetry, result=normalized_result)
+    if not repair_invalid_selection:
+        telemetry = gmail_decision_telemetry(normalized_output, validator, evidence)
+        raise GmailAgentDecisionError(telemetry, result=normalized_result)
+
+    repair_request = (
+        typed_input.request + "\n\nDeterministic selection validation rejected the first decision. "
+        "Correct only the candidate selection and final triage using the verified, "
+        "already-read evidence below. Do not invent an identity and do not call tools. "
+        "Return exactly one of these mutually exclusive shapes:\n"
+        "RESOLVED: decision.needs_more_context=false; select exactly one identity "
+        "from decision_candidate_ids; return only matching message/thread fields; "
+        "assess every successfully read decision candidate; and produce reply output "
+        "only when supported by that selected context. Explicitly return "
+        "decision.decision_owner=specialist_agent and "
+        "decision.decision_stage=gmail_candidate_selection; do not rely on defaults.\n"
+        "When the rejected result selected a verified thread but paired it with a "
+        "message_id from another returned record, preserve the agent's semantic thread "
+        "choice, set thread_id and decision.selected_candidate_id to that exact returned "
+        "thread_id, and leave message_id blank. A unique returned message-to-thread "
+        "mapping is verified evidence, not missing context. You still choose whether the "
+        "selected conversation is semantically supported.\n"
+        "UNRESOLVED: decision.needs_more_context=true; clear message_id, thread_id, "
+        "received_at, subject, sender fields, thread fields, snippet, normalized_body, "
+        "draft_reply, selected_candidate_id, selected_candidate_ids, candidate_assessments, "
+        "labels, risk flags, links, attachments, and every provider-specific claim. "
+        "Do not preserve desired reply copy merely because the original request asked for it.\n"
+        + json.dumps(
+            {
+                "validator_feedback": validator.model_dump(mode="json"),
+                "conflicting_output_fields": list(gmail_claimed_output_fields(normalized_output)),
+                "permitted_resolutions": ["selected", "needs_more_context"],
+                "verified_candidate_evidence": evidence.repair_context(),
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+    )
+    repair_input = replace(
+        typed_input,
+        request=repair_request,
+        subject="",
+        body="",
+        sender_name="",
+        sender_email="",
+        message_id="",
+        thread_id="",
+        received_at="",
+        snippet="",
+        prior_labels=[],
+        extracted_links=[],
+        attachment_metadata=[],
+        thread_summary="",
+        thread_context="",
+        suspicious_signals=[],
+        triage_limitations=[
+            "Validator repair used the already-read bounded Gmail candidate evidence; "
+            "no provider query was repeated."
+        ],
+    )
+    repair_agent = _build_gmail_selection_repair_agent(model=model)
+    repair_result = run_typed_sdk_agent(
+        agent=repair_agent,
+        typed_input=repair_input,
+        output_type=GmailSelectionRepairResult,
+        run_config=run_config,
+        live=live,
+        session=None,
+        inherit_env_session=False,
+        max_turns=2,
+        tool_execution_contract=ToolExecutionContract(
+            mode=ToolExecutionMode.FORBIDDEN,
+            stage="gmail_validator_repair",
+        ),
+    )
+    repair_branch = repair_result.final_output.repair
+    repair_metadata_normalizations: list[dict[str, Any]] = []
+    if isinstance(repair_branch, GmailSelectedSelectionRepair):
+        repair_decision = repair_branch.triage_result.decision
+        if "decision" in repair_branch.triage_result.model_fields_set:
+            # The repair agent owns the selected identity, assessments, reasoning,
+            # limitations, and reply judgment. The stage name is fixed runtime
+            # provenance, not a semantic choice; stamp it at this boundary so an
+            # omitted string literal cannot discard an otherwise valid repair.
+            if repair_decision.decision_stage != "gmail_candidate_selection":
+                repair_metadata_normalizations.append(
+                    {
+                        "field": "decision_stage",
+                        "reported_value": repair_decision.decision_stage,
+                        "canonical_value": "gmail_candidate_selection",
+                        "semantic_selection_changed": False,
+                    }
+                )
+            repair_decision = repair_decision.model_copy(
+                update={"decision_stage": "gmail_candidate_selection"}
+            )
+        repaired_output = repair_branch.triage_result.model_copy(
+            update={"decision": repair_decision}
+        )
+    else:
+        repaired_output = _unresolved_gmail_repair_result(
+            normalized_output,
+            repair_branch,
+        )
+    repaired_validator = validate_gmail_agent_decision(
+        repaired_output,
+        evidence,
+        original_request=typed_input.request,
+        repair_attempted=True,
+        require_live_provider=live,
+    )
+    telemetry = gmail_decision_telemetry(repaired_output, repaired_validator, evidence)
+    telemetry["repair_metadata_normalizations"] = repair_metadata_normalizations
+    telemetry["model_stages"] = [
+        {
+            "stage": "gmail_agent_owned_selection",
+            "tool_mode": "model_called",
+            "validator_status": validator.status,
+            "reason_code": validator.reason_code,
+        },
+        {
+            "stage": "gmail_validator_repair",
+            "tool_mode": "verified_context_tool_free",
+            "validator_status": repaired_validator.status,
+            "reason_code": repaired_validator.reason_code,
+        },
+    ]
+    terminal_events = list(telemetry.get("events") or [])
+    telemetry["events"] = [
+        {
+            "event_type": "proposed",
+            "decision_owner": normalized_output.decision.decision_owner,
+            "decision_stage": "gmail_candidate_selection",
+            "attempt": 1,
+            "candidate_ids": list(evidence.decision_candidate_ids),
+            "selected_candidate_ids": list(normalized_output.decision.selected_candidate_ids),
+            "excluded_candidate_ids": [
+                item.candidate_id
+                for item in normalized_output.decision.candidate_assessments
+                if item.disposition == "excluded"
+            ],
+            "validator_status": "not_evaluated",
+            "reason_code": "",
+            "tool_mode": "model_called",
+        },
+        {
+            "event_type": "validator_result",
+            "decision_owner": normalized_output.decision.decision_owner,
+            "decision_stage": "gmail_candidate_selection",
+            "attempt": 1,
+            "candidate_ids": list(evidence.decision_candidate_ids),
+            "selected_candidate_ids": list(normalized_output.decision.selected_candidate_ids),
+            "excluded_candidate_ids": [
+                item.candidate_id
+                for item in normalized_output.decision.candidate_assessments
+                if item.disposition == "excluded"
+            ],
+            "validator_status": validator.status,
+            "reason_code": validator.reason_code,
+            "tool_mode": "model_called",
+        },
+        {
+            "event_type": "repair_proposed",
+            "decision_owner": repaired_output.decision.decision_owner,
+            "decision_stage": "gmail_candidate_selection",
+            "attempt": 2,
+            "candidate_ids": list(evidence.decision_candidate_ids),
+            "selected_candidate_ids": list(repaired_output.decision.selected_candidate_ids),
+            "excluded_candidate_ids": [
+                item.candidate_id
+                for item in repaired_output.decision.candidate_assessments
+                if item.disposition == "excluded"
+            ],
+            "validator_status": "not_evaluated",
+            "reason_code": validator.reason_code,
+            "tool_mode": "verified_context_tool_free",
+        },
+        *[
+            event
+            for event in terminal_events
+            if event.get("event_type") in {"validator_result", "terminal"}
+        ],
+    ]
+    combined_result = _combine_gmail_model_results(
+        normalized_result,
+        replace(repair_result, output=repaired_output),
+        telemetry=telemetry,
+    )
+    if repaired_validator.status != "accepted":
+        raise GmailAgentDecisionError(telemetry, result=combined_result)
+    return combined_result
+
+
+def _validate_and_repair_verified_gmail_continuation(
+    result: TypedAgentRunResult[EmailTriageResult],
+    *,
+    typed_input: GmailTriageSDKInput,
+    run_config: Any | None,
+    live: bool,
+    model: str | None,
+    session: Any | None,
+    compact_instructions: bool,
+    repair_invalid_selection: bool,
+) -> TypedAgentRunResult[EmailTriageResult]:
+    """Repair one invalid continuation choice without another Gmail read."""
+
+    output = result.final_output.model_copy(
+        update={"decision": decision_record_from_gmail_result(result.final_output)}
+    )
+    normalized_result = replace(result, output=output)
+    validator = validate_verified_gmail_continuation_decision(
+        output,
+        result.raw_result,
+        expected_message_id=typed_input.message_id,
+        expected_thread_id=typed_input.thread_id,
+    )
+    evidence = gmail_decision_evidence(result.raw_result)
+    telemetry = gmail_decision_telemetry(output, validator, evidence)
+    telemetry["context_source"] = "verified_continuation_object"
+    if validator.status == "accepted":
+        return _attach_gmail_decision_telemetry(normalized_result, telemetry)
+    if not repair_invalid_selection:
+        raise GmailAgentDecisionError(telemetry, result=normalized_result)
+
+    repair_request = (
+        typed_input.request
+        + "\n\nDeterministic continuation validation rejected the first semantic "
+        "choice. Correct only the reply/message/thread identity against the exact "
+        "verified continuation context below. Do not query Gmail, do not read Gmail "
+        "again, and do not reinterpret phrases such as 'same thread'.\n"
+        + json.dumps(
+            {
+                "validator_feedback": validator.model_dump(mode="json"),
+                "expected_message_id": typed_input.message_id,
+                "expected_thread_id": typed_input.thread_id,
+                "verified_continuation_context": evidence.repair_context(),
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+    )
+    repair_input = replace(typed_input, request=repair_request)
+    repair_agent = build_gmail_triage_agent(
+        model=model,
+        include_tools=False,
+        request_text=typed_input.request,
+        compact_instructions=compact_instructions,
+        tool_scope_mode=ToolScopeMode.REQUEST_SCOPED,
+    )
+    repair_result = run_typed_sdk_agent(
+        agent=repair_agent,
+        typed_input=repair_input,
+        output_type=EmailTriageResult,
+        run_config=run_config,
+        live=live,
+        session=session,
+        max_turns=2,
+        tool_execution_contract=ToolExecutionContract(
+            mode=ToolExecutionMode.FORBIDDEN,
+            stage="gmail_verified_continuation_repair",
+        ),
+    )
+    repaired_output = repair_result.final_output.model_copy(
+        update={"decision": decision_record_from_gmail_result(repair_result.final_output)}
+    )
+    repaired_validator = validate_verified_gmail_continuation_decision(
+        repaired_output,
+        result.raw_result,
+        expected_message_id=typed_input.message_id,
+        expected_thread_id=typed_input.thread_id,
+        repair_attempted=True,
+    )
+    repaired_telemetry = gmail_decision_telemetry(
+        repaired_output,
+        repaired_validator,
+        evidence,
+    )
+    repaired_telemetry.update(
+        {
+            "context_source": "verified_continuation_object",
+            "model_stages": [
+                {
+                    "stage": "gmail_verified_continuation",
+                    "tool_mode": "model_called",
+                    "validator_status": validator.status,
+                    "reason_code": validator.reason_code,
+                },
+                {
+                    "stage": "gmail_verified_continuation_repair",
+                    "tool_mode": "verified_context_tool_free",
+                    "validator_status": repaired_validator.status,
+                    "reason_code": repaired_validator.reason_code,
+                },
+            ],
+        }
+    )
+    combined_result = _combine_gmail_model_results(
+        normalized_result,
+        replace(repair_result, output=repaired_output),
+        telemetry=repaired_telemetry,
+    )
+    if repaired_validator.status != "accepted":
+        raise GmailAgentDecisionError(repaired_telemetry, result=combined_result)
+    return combined_result
+
+
+def _attach_gmail_decision_telemetry(
+    result: TypedAgentRunResult[EmailTriageResult],
+    telemetry: Mapping[str, Any],
+) -> TypedAgentRunResult[EmailTriageResult]:
+    request_cache = dict(result.request_cache or {})
+    request_cache["decision_ownership"] = dict(telemetry)
+    repeated_queries = int(telemetry.get("repeated_query_call_count") or 0)
+    if repeated_queries:
+        request_cache["tool_corrections"] = max(
+            int(request_cache.get("tool_corrections") or 0),
+            min(repeated_queries, 1),
+        )
+    return replace(result, request_cache=request_cache)
+
+
+def _combine_gmail_model_results(
+    initial: TypedAgentRunResult[EmailTriageResult],
+    repaired: TypedAgentRunResult[EmailTriageResult],
+    *,
+    telemetry: Mapping[str, Any],
+) -> TypedAgentRunResult[EmailTriageResult]:
+    initial_items = list(getattr(initial.raw_result, "new_items", []) or [])
+    repair_items = list(getattr(repaired.raw_result, "new_items", []) or [])
+    request_cache = dict(initial.request_cache or {})
+    request_cache["decision_ownership"] = dict(telemetry)
+    request_cache["repair_stage_request_cache"] = dict(repaired.request_cache or {})
+    request_cache["decision_repairs"] = int(
+        request_cache.get("decision_repairs") or 0
+    ) + 1
+    return TypedAgentRunResult(
+        agent_name=repaired.agent_name,
+        output=repaired.final_output,
+        raw_result=SimpleNamespace(new_items=[*initial_items, *repair_items]),
+        live=repaired.live,
+        usage=_sum_numeric_mappings(initial.usage, repaired.usage),
+        cost=_sum_numeric_mappings(initial.cost, repaired.cost),
+        budget_guard=dict(repaired.budget_guard or initial.budget_guard or {}),
+        request_cache=request_cache,
+        execution_telemetry={
+            "schema": "keystone.gmail.multi_stage_execution.v1",
+            "initial": dict(initial.execution_telemetry or {}),
+            "repair": dict(repaired.execution_telemetry or {}),
+        },
+        tool_receipts=[*initial.tool_receipts, *repaired.tool_receipts],
+    )
+
+
+def _sum_numeric_mappings(
+    first: Mapping[str, Any] | None,
+    second: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    output: dict[str, Any] = dict(first or {})
+    for key, value in (second or {}).items():
+        prior = output.get(key)
+        if key == "available":
+            output[key] = prior is True and value is True
+        elif isinstance(prior, bool) and isinstance(value, bool):
+            output[key] = prior or value
+        elif (
+            isinstance(prior, int | float)
+            and not isinstance(prior, bool)
+            and isinstance(value, int | float)
+            and not isinstance(value, bool)
+        ):
+            output[key] = prior + value
+        elif key not in output:
+            output[key] = value
+    return output
 
 
 def run_gmail_priority_grouping_sdk(
@@ -672,11 +1367,15 @@ def build_gmail_triage_agent(
     model: str | None = None,
     *,
     include_tools: bool = True,
+    provider_tools_live: bool = False,
+    provider_selection_mode: bool = False,
     request_text: str = "",
     context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
     compact_instructions: bool = False,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
+    tool_scope_mode: ToolScopeMode | str = ToolScopeMode.AUTO,
 ) -> Agent:
     """Build the Gmail triage agent."""
 
@@ -694,8 +1393,16 @@ def build_gmail_triage_agent(
         else ("keystone_profile.md", "safety_policy.md", "tools.md", "gmail_triage.md")
     )
     instructions = composer(*prompt_files, skill_files=skill_files)
+    (
+        inspect_gmail_mailbox_schema,
+        query_gmail_message_summaries,
+        read_gmail_context,
+    ) = gmail_model_read_tools(live=provider_tools_live)
     tools = (
         [
+            inspect_gmail_mailbox_schema,
+            query_gmail_message_summaries,
+            read_gmail_context,
             get_gmail_message,
             apply_gmail_labels,
             modify_gmail_message_state,
@@ -722,21 +1429,47 @@ def build_gmail_triage_agent(
     )
     if include_tools and _marked_test_draft_lifecycle_request(request_text):
         tools = [gmail_test_draft_lifecycle]
-    if tool_tier is not None:
-        tools = filter_tools_for_tier("gmail_triage", tools, tool_tier)
-    return build_sdk_agent(
+    elif include_tools and is_gmail_schema_only_request(request_text):
+        tools = [inspect_gmail_mailbox_schema]
+    elif include_tools and provider_selection_mode:
+        tools = [query_gmail_message_summaries, read_gmail_context]
+    resolved_scope_mode = tool_scope_mode
+    if str(tool_scope_mode) == ToolScopeMode.AUTO.value and (
+        request_text or manual_request_plan is not None or tool_tier is not None
+    ):
+        resolved_scope_mode = ToolScopeMode.REQUEST_SCOPED
+    if _marked_test_draft_lifecycle_request(request_text):
+        required_tool_names = ("gmail_test_draft_lifecycle",)
+    else:
+        required_tool_names = ()
+    attachment = scope_tools_for_request(
+        "gmail_triage",
+        tools,
+        manual_request_plan=manual_request_plan,
+        tool_tier=tool_tier,
+        mode=resolved_scope_mode,
+        required_tool_names=required_tool_names,
+    )
+    agent = build_sdk_agent(
         name="gmail_triage",
         instructions=instructions,
         output_type=EmailTriageResult,
-        tools=tools,
+        tools=list(attachment.tools),
         guardrails=keystone_guardrails(),
         model=model,
+        model_settings=build_model_settings(
+            reasoning_effort=(
+                gmail_selection_reasoning_effort(model) if provider_selection_mode else None
+            ),
+            tool_choice=("query_gmail_message_summaries" if provider_selection_mode else None)
+        ),
         policy_agent_name="gmail_triage",
         handoff_description=(
             "Use for inbound email classification, label planning, suspicious message review, "
             "and draft-only reply preparation."
         ),
     )
+    return attach_tool_scope_receipt(agent, attachment.scope)
 
 
 def _marked_test_draft_lifecycle_request(request_text: str) -> bool:
@@ -749,6 +1482,37 @@ def _marked_test_draft_lifecycle_request(request_text: str) -> bool:
         and re.search(r"\b(?:update|change|modify|revise|edit)\b", normalized)
         and re.search(r"\b(?:delete|remove|clean\s*up)\b", normalized)
     )
+
+
+def is_gmail_schema_only_request(request_text: str) -> bool:
+    """Recognize a metadata-only connector question that forbids mailbox reads."""
+
+    normalized = " ".join(
+        str(request_text or "")
+        .lower()
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .split()
+    )
+    asks_for_schema = bool(
+        re.search(
+            r"\b(?:schema|available\s+(?:gmail\s+)?fields?|field\s+names?|"
+            r"field\s+types?)\b",
+            normalized,
+        )
+    )
+    forbids_message_data = bool(
+        re.search(
+            r"\b(?:do\s+not|don't|dont|without)\b[^.;]{0,100}"
+            r"\b(?:query|search|read|return|include|expose)\b[^.;]{0,80}"
+            r"\b(?:inbox|mail|messages?|mailbox(?:-derived)?\s+data|senders?|subjects?|"
+            r"snippets?|body|content)\b",
+            normalized,
+        )
+    )
+    return asks_for_schema and forbids_message_data
 
 
 def build_gmail_mailbox_action_agent(model: str | None = None) -> Agent:
@@ -772,19 +1536,11 @@ def build_gmail_mailbox_action_agent(model: str | None = None) -> Agent:
 
 
 def _default_gmail_triage_sdk_tool_tier(
-    typed_input: GmailTriageSDKInput | str,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None,
 ) -> str:
-    """Infer the default Gmail SDK tool tier from the operator request."""
+    """Resolve Gmail's tier only from canonical semantic authority."""
 
-    request_text = (
-        typed_input if isinstance(typed_input, str) else getattr(typed_input, "request", "")
-    )
-    request_text = str(request_text or "").lower()
-    if any(marker in request_text for marker in ("draft", "reply", "label", "archive")):
-        return "internal_write"
-    if any(marker in request_text for marker in ("search web", "source", "research", "look up")):
-        return "web_search"
-    return "core_read"
+    return default_tool_tier_for_request(manual_request_plan)
 
 
 def build_gmail_priority_grouping_agent(

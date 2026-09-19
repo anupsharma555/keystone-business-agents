@@ -5,6 +5,7 @@ skill_purpose: Decide which retrieved web sources should be retained, reviewed, 
 applies_to:
   - gmail_triage
   - business_research_analyst
+  - rag_retrieval_specialist
   - opportunity_scout
   - outreach_composer
   - zotero_context_agent

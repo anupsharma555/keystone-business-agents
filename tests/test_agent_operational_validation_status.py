@@ -8,10 +8,17 @@ STATUS_DOC = Path("docs/AGENT_OPERATIONAL_VALIDATION_STATUS.md")
 LINEAR_BACKLOG = Path("LINEAR_BACKLOG.MD")
 
 
-def _normalized_document_text(path: Path) -> str:
-    """Compare prose evidence without making Markdown wrapping authoritative."""
+def _current_matrix_cells(path: Path, agent_family: str) -> list[str]:
+    """Return one agent row from the canonical current operational matrix."""
 
-    return " ".join(path.read_text().split())
+    prefix = f"| {agent_family} |"
+    matches = [line for line in path.read_text().splitlines() if line.startswith(prefix)]
+
+    assert len(matches) == 1
+    cells = [cell.strip() for cell in matches[0].strip("|").split("|")]
+    assert len(cells) == 7
+    assert cells[0] == agent_family
+    return cells
 
 
 def test_operational_status_covers_every_registered_agent_family() -> None:
@@ -21,6 +28,7 @@ def test_operational_status_covers_every_registered_agent_family() -> None:
         "chief_of_staff": "Chief of Staff",
         "gmail_triage": "Gmail Triage",
         "business_research_analyst": "Business Research Analyst",
+        "rag_retrieval_specialist": "RAG Retrieval Specialist",
         "opportunity_scout": "Opportunity Scout",
         "outreach_composer": "Outreach Composer",
         "airtable_context_agent": "Airtable Context",
@@ -52,30 +60,52 @@ def test_operational_status_preserves_evidence_dimensions_and_eval_boundary() ->
         assert phrase in text
 
 
-def test_airtable_backlog_matches_current_attachment_evidence_boundary(
+def test_canonical_airtable_status_preserves_live_and_blocked_boundaries(
     require_local_evidence,
 ) -> None:
-    backlog = _normalized_document_text(require_local_evidence(LINEAR_BACKLOG))
-
-    assert "private-PNG lifecycle also passed" in backlog
-    assert "Fake-model SDK execution now distinguishes HTTPS URLs" in backlog
-    assert "do not claim a joined natural attachment pass" in backlog
-    assert (
-        "Structural base/table/field/view creation is a separate ANU-211 boundary"
-        in backlog
+    cells = _current_matrix_cells(
+        require_local_evidence(STATUS_DOC), "Airtable Context"
     )
-    assert "local-file local-file receipt upload" not in backlog
+    interpretation, tool, _, lifecycle, safety, boundary = cells[1:]
+
+    assert "Proven live" in interpretation
+    assert "both attachment modes" in interpretation
+    assert "provider-backed synthesis" in interpretation
+    assert "separate no-tool synthesis mode" in tool
+    assert "HTTPS link attachment" in lifecycle
+    assert "private local upload" in lifecycle
+    assert "no raw record, send, or post persisted" in safety
+    assert "ANU-211" in boundary
+    assert "resource-scope blocked" in boundary
 
 
-def test_workspace_backlog_matches_current_live_and_structural_evidence(
+def test_canonical_workspace_status_preserves_live_and_fixture_boundaries(
     require_local_evidence,
 ) -> None:
-    backlog = _normalized_document_text(require_local_evidence(LINEAR_BACKLOG))
+    cells = _current_matrix_cells(
+        require_local_evidence(STATUS_DOC), "Google Workspace Context"
+    )
+    interpretation, tool, reasoning, lifecycle, safety, boundary = cells[1:]
 
-    assert "natural selected-file read/synthesis, a natural marked-Sheet lifecycle" in backlog
-    assert "separate folder/Doc lifecycles, exact identity/read-back/cleanup" in backlog
-    assert "selected-file pass consumed all 1,096" in backlog
-    assert "characters from the exact `README.doc`" in backlog
-    assert "two provider reads succeeded" in backlog
-    assert "no Workspace mutation" in backlog
-    assert "join the layers in one approved live-model run" not in backlog
+    assert "live selected-document synthesis" in interpretation
+    assert "joined research-to-Doc execution" in interpretation
+    assert "Proven live" in tool
+    assert "exact `README.doc`" in tool
+    assert "fake-model execution" in tool
+    assert "Proven live for selected-file reasoning" in reasoning
+    assert "research-to-Doc lifecycles pass" in lifecycle
+    assert "no search/send/share occurred" in safety
+    assert "inline-image insertion still requires a publicly accessible URI" in safety
+    assert "True Google Doc image embed remains blocked" in boundary
+
+
+def test_linear_backlog_links_to_canonical_operational_status(
+    require_local_evidence,
+) -> None:
+    backlog = require_local_evidence(LINEAR_BACKLOG).read_text()
+    require_local_evidence(STATUS_DOC)
+
+    assert (
+        "[Agent Operational Validation Status]"
+        "(docs/AGENT_OPERATIONAL_VALIDATION_STATUS.md)" in backlog
+    )

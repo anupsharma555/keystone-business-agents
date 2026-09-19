@@ -42,3 +42,15 @@ def test_staged_publish_guard_normalizes_dot_prefix_and_deduplicates() -> None:
             "   ",
         )
     ) == ("output/page.png",)
+
+
+def test_staged_publish_guard_blocks_runtime_state_and_environment_symlink() -> None:
+    paths = (
+        ".venv",
+        ".venv/bin/python",
+        ".env",
+        ".keystone/private-evidence.json",
+        "keystone_agents.db.execution.sqlite3.example.lock",
+    )
+    assert blocked_staged_paths(paths) == tuple(sorted(paths))
+    assert blocked_staged_paths((".env.example",)) == ()

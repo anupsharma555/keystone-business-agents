@@ -27,6 +27,10 @@ from keystone_agents.agents.chief_of_staff import (
 from keystone_agents.agents.manual_request_planner import resolve_manual_request_plan
 from keystone_agents.agents.orchestrator import review_specialist_output, run_orchestrator_preflight
 from keystone_agents.agents.web_query_planner import resolve_web_query_plan
+from keystone_agents.authority.semantic import (
+    is_bounded_provider_read_plan,
+    is_read_only_work_item_inspection_plan,
+)
 from keystone_agents.calendar_actions import infer_calendar_action_plan
 from keystone_agents.cli import execute_direct_calendar_action
 from keystone_agents.cli_sdk import add_sdk_session_arguments, sdk_session_from_args
@@ -61,13 +65,16 @@ from keystone_agents.orchestrator.preflight_context import (
     compact_orchestrator_preflight_payload,
     load_manual_request_plan_from_env,
     load_orchestrator_preflight_from_env,
+    load_orchestrator_route_result_from_env,
     load_specialist_execution_context_from_env,
 )
 from keystone_agents.provider_side_effect_policy import (
     semantic_provider_side_effect_policy,
 )
 from keystone_agents.quality_budget import AgentQualityBudget, chief_of_staff_quality_budget
+from keystone_agents.receipts.recovery import verified_provider_write_summary
 from keystone_agents.run import sdk_run_failure_metadata
+from keystone_agents.runtime.tool_execution import build_tool_execution_summary
 from keystone_agents.schemas.chief_of_staff import (
     ChiefOfStaffResult,
     ChiefOfStaffRouteRecommendation,
@@ -552,6 +559,7 @@ def _request_forbids_live_web_research(input_text: str) -> bool:
 def _chief_of_staff_should_attach_tools(
     input_text: str,
     manual_plan: object | None = None,
+    orchestrator_route_result: object | None = None,
 ) -> bool:
     """Attach the narrow tool set selected by the semantic plan.
 
@@ -561,8 +569,11 @@ def _chief_of_staff_should_attach_tools(
     """
 
     del input_text
+    route_tool_advice = _orchestrator_route_requests_tool_attachment(
+        orchestrator_route_result
+    )
     if manual_plan is None:
-        return False
+        return route_tool_advice
     tool_backed_intents = {
         "company_research",
         "research_brief",
@@ -576,13 +587,57 @@ def _chief_of_staff_should_attach_tools(
         "context_lookup",
     }
     return bool(
-        getattr(manual_plan, "requires_live_search", False)
+        route_tool_advice
+        or
+        is_read_only_work_item_inspection_plan(manual_plan)
+        or getattr(manual_plan, "requires_live_search", False)
         or str(getattr(manual_plan, "provider_system", "") or "")
         != "unspecified"
         or list(getattr(manual_plan, "provider_operations", []) or [])
         or str(getattr(manual_plan, "intent", "") or "") in tool_backed_intents
         or str(getattr(manual_plan, "task_objective", "") or "") in tool_backed_intents
         or list(getattr(manual_plan, "workflow", []) or [])
+    )
+
+
+def _orchestrator_route_requests_tool_attachment(route_result: object | None) -> bool:
+    """Use validated manager decisions as attachment advice, never write authority."""
+
+    if not isinstance(route_result, dict) or route_result.get("refused") is True:
+        return False
+    route = str(
+        route_result.get("target_agent") or route_result.get("route") or ""
+    ).strip()
+    if route != "chief_of_staff":
+        return False
+    decision = route_result.get("decision")
+    if not isinstance(decision, dict):
+        return False
+    if str(decision.get("decision_owner") or "").strip() != "orchestrator":
+        return False
+    if str(decision.get("decision_stage") or "").strip() != "orchestrator_route_selection":
+        return False
+    if decision.get("needs_more_context") is True:
+        return False
+    selected = decision.get("selected_candidate_ids") or decision.get(
+        "selected_candidate_id"
+    )
+    selected_values = selected if isinstance(selected, list) else [selected]
+    if "chief_of_staff" not in {
+        str(value or "").strip() for value in selected_values
+    }:
+        return False
+    provider_decisions = route_result.get("provider_context_decisions")
+    return any(
+        isinstance(item, dict)
+        and item.get("needs_more_context") is not True
+        and bool(
+            item.get("selected_candidate_ids")
+            or item.get("selected_candidate_id")
+        )
+        for item in (
+            provider_decisions if isinstance(provider_decisions, list) else []
+        )
     )
 
 
@@ -667,6 +722,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Run through live SDK model execution. Slack posts still require channel policy; "
             "external writes remain gated."
+        ),
+    )
+    parser.add_argument(
+        "--live-manual-plan",
+        action="store_true",
+        help=(
+            "Run the standalone SDK manual-request planner as an explicit comparison "
+            "step. Disabled by default; Chief interprets the request in its own model run."
         ),
     )
     parser.add_argument("--model", default=None, help="Optional model override.")
@@ -1273,6 +1336,44 @@ def _nonnegative_int(value: object) -> int:
         return 0
 
 
+def _tool_execution_summary_from_request_cache(
+    request_cache: object,
+    *,
+    tool_receipts: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Promote exact SDK tool-call proof into the shared trace shape."""
+
+    if not isinstance(request_cache, dict):
+        return {}
+    scope = request_cache.get("request_tool_scope")
+    postcondition = request_cache.get("tool_execution_postcondition")
+    if not isinstance(scope, dict) or not isinstance(postcondition, dict):
+        return {}
+    selected = [
+        str(name)
+        for name in scope.get("selected_tool_names") or []
+        if str(name).strip()
+    ]
+    completed = [
+        str(name)
+        for name in postcondition.get("completed_tool_names") or []
+        if str(name).strip()
+    ]
+    return build_tool_execution_summary(
+        mode=(
+            "llm_selected_function_tools"
+            if completed
+            else "model_tools_attached_no_call"
+            if selected
+            else "tool_free"
+        ),
+        selected_tool_names=selected,
+        model_called_tool_names=completed,
+        provider_receipt_count=len(tool_receipts or []),
+        postcondition=postcondition,
+    )
+
+
 def _payload(
     *,
     mode: str,
@@ -1334,6 +1435,21 @@ def _payload(
         payload["cost"] = aggregate_cost
     if request_cache is not None:
         payload["request_cache"] = request_cache
+        recorded_tool_execution = (
+            request_cache.get("tool_execution")
+            if isinstance(request_cache, dict)
+            else None
+        )
+        tool_execution = (
+            dict(recorded_tool_execution)
+            if isinstance(recorded_tool_execution, dict) and recorded_tool_execution
+            else _tool_execution_summary_from_request_cache(
+                request_cache,
+                tool_receipts=receipts,
+            )
+        )
+        if tool_execution:
+            payload["tool_execution"] = tool_execution
     if web_query_plan is not None:
         payload["web_query_plan"] = (
             web_query_plan.model_dump(mode="json")
@@ -1377,6 +1493,7 @@ def _payload(
             )
         )
         payload["status"] = "done" if verified else "blocked"
+        payload["completion_confirmed"] = verified
         payload["side_effects"] = {
             "calendar_write_performed": bool(
                 intent == "business_system_write" and verified
@@ -1518,6 +1635,55 @@ def _payload(
     return payload
 
 
+def _reconcile_verified_write_after_sdk_failure(
+    payload: dict[str, object],
+    *,
+    tool_receipts: list[dict[str, object]],
+    sdk_failure: dict[str, object],
+) -> None:
+    """Keep provider truth visible when Chief narration fails after a verified write."""
+
+    if not sdk_failure:
+        return
+    write_summary = verified_provider_write_summary(tool_receipts)
+    if not write_summary:
+        return
+    request_cache = payload.get("request_cache")
+    request_cache = dict(request_cache) if isinstance(request_cache, dict) else {}
+    request_cache["post_side_effect_reconciliation"] = {
+        "schema": "keystone.post_side_effect_reconciliation.v1",
+        "provider_write_verified": True,
+        "model_synthesis_completed": False,
+        "retry_mutation": False,
+    }
+    side_effects = payload.get("side_effects")
+    side_effects = dict(side_effects) if isinstance(side_effects, dict) else {}
+    side_effects.update(
+        {
+            "external_write_performed": True,
+            "evidence_complete": True,
+        }
+    )
+    recovery_summary = (
+        f"{write_summary} The provider change is complete and verified, but the "
+        "final Chief of Staff explanation did not finish. Do not repeat the write."
+    )
+    payload.update(
+        {
+            "status": "partial",
+            "completion_confirmed": False,
+            "block_kind": "verified_provider_write_synthesis_incomplete",
+            "human_summary": recovery_summary,
+            "slack_display_text": recovery_summary,
+            "display_text": recovery_summary,
+            "request_cache": request_cache,
+            "side_effects": side_effects,
+        }
+    )
+    payload.pop("public_result", None)
+    attach_execution_public_result(payload)
+
+
 def _sdk_tool_receipts(raw_result: object) -> list[dict[str, object]]:
     """Extract bounded provider receipts from one SDK run for verification."""
 
@@ -1626,6 +1792,7 @@ def _maybe_execute_recommended_work_item_handoff(
             live_search=False,
             live_sdk=bool(live_sdk and not inline_only),
             max_results=3,
+            max_results_explicit=False,
             requested_route=delegated_route,
             manual_request_plan=(
                 manual_request_plan.model_dump(mode="json")
@@ -2053,6 +2220,7 @@ def main(argv: list[str] | None = None) -> int:
     cost_directive = parse_cost_tracking_directive(raw_input_text)
     input_text = (cost_directive.cleaned_text or raw_input_text).strip()
     orchestrator_preflight = load_orchestrator_preflight_from_env()
+    orchestrator_route_result = load_orchestrator_route_result_from_env()
     parent_manual_plan = load_manual_request_plan_from_env()
     specialist_execution_context = load_specialist_execution_context_from_env()
     local_kni_lookup = False
@@ -2070,13 +2238,14 @@ def main(argv: list[str] | None = None) -> int:
             preflight = run_orchestrator_preflight(
                 input_text,
                 requested_agent="chief_of_staff",
-                live_manual_plan=True,
+                live_manual_plan=bool(args.live_manual_plan),
                 model=args.model,
                 session=sdk_session,
                 database_url=args.database_url,
             )
             manual_plan = preflight.manual_request_plan
             orchestrator_preflight = compact_orchestrator_preflight_payload(preflight)
+            orchestrator_route_result = preflight.route_result.model_dump(mode="json")
         local_kni_lookup = _manual_plan_requests_local_kni_evidence(
             manual_plan,
             input_text=input_text,
@@ -2087,10 +2256,19 @@ def main(argv: list[str] | None = None) -> int:
             live_sdk=True,
             manual_request_plan=manual_plan,
         )
+        calendar_authority = ExecutionIntentAuthority.from_value(manual_plan)
         if (
-            ExecutionIntentAuthority.from_value(manual_plan).canonical
-            and manual_plan.provider_system == "google_calendar"
-            and manual_plan.intent in {"context_lookup", "business_system_write"}
+            is_bounded_provider_read_plan(
+                manual_plan,
+                provider_system="google_calendar",
+                allowed_agents={"chief_of_staff"},
+                allowed_intents={"context_lookup"},
+            )
+            or (
+                calendar_authority.canonical
+                and manual_plan.provider_system == "google_calendar"
+                and manual_plan.intent in {"context_lookup", "business_system_write"}
+            )
         ):
             calendar_resolution = resolve_calendar_action_plan(
                 input_text,
@@ -2193,6 +2371,7 @@ def main(argv: list[str] | None = None) -> int:
                 "attach_tools": _chief_of_staff_should_attach_tools(
                     input_text,
                     manual_plan,
+                    orchestrator_route_result,
                 ),
                 "include_specialist_tools": chief_of_staff_should_use_specialist_tools(
                     input_text,
@@ -2200,6 +2379,12 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 "manual_request_plan": manual_plan.model_dump(mode="json"),
                 "orchestrator_preflight": orchestrator_preflight,
+                "orchestrator_route_result": orchestrator_route_result,
+                "orchestrator_route_result_instruction": (
+                    "Treat this validated Orchestrator decision as model-visible routing "
+                    "and provider-capability context. It does not grant provider-write "
+                    "authority or override deterministic admission, approval, or exact-scope gates."
+                ),
                 "runtime_source_layer_policy": runtime_source_layer_policy_context(
                     "chief_of_staff"
                 ),
@@ -2338,6 +2523,10 @@ def main(argv: list[str] | None = None) -> int:
             if not _should_fallback_after_live_sdk_exception(exc):
                 raise
             failed_sdk_metadata = sdk_run_failure_metadata(exc)
+            tool_receipts = _merge_tool_receipts(
+                tool_receipts,
+                list(failed_sdk_metadata.get("tool_receipts") or []),
+            )
             result = _fallback_after_live_sdk_exception(
                 input_text=input_text,
                 slack_repo_path=args.slack_repo_path,
@@ -2408,10 +2597,16 @@ def main(argv: list[str] | None = None) -> int:
                     "attempt_count",
                     "usage",
                     "cost",
+                    "tool_execution_postcondition",
                     "execution_telemetry",
                 )
                 if failed_sdk_metadata.get(key) is not None
             }
+            _reconcile_verified_write_after_sdk_failure(
+                payload,
+                tool_receipts=tool_receipts,
+                sdk_failure=failed_sdk_metadata,
+            )
     else:
         if args.mode != RunMode.DRY_RUN.value:
             raise SystemExit("Only dry-run planning and --live-sdk model planning are supported.")

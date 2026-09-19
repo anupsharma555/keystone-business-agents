@@ -1,45 +1,37 @@
 digraph kba_request_execution_sequence {
-  graph [rankdir=TB, bgcolor="#f8fafc", pad="0.35", nodesep="0.38", ranksep="0.62", splines=polyline, fontname="Arial", fontsize=22, labelloc=t, label="Keystone @KNI request execution sequence\nGenerated 2026-07-20 • semantic interpretation first; deterministic gates remain authoritative"];
-  node [shape=box, style="rounded,filled", color="#94a3b8", fillcolor="#ffffff", fontname="Arial", fontsize=12, margin="0.16,0.10"];
-  edge [color="#475569", fontcolor="#334155", fontname="Arial", fontsize=10, penwidth=1.5, arrowsize=0.75];
+  graph [rankdir=LR, bgcolor="#f8fafc", pad="0.30", nodesep="0.30", ranksep="0.52", splines=ortho, newrank=true, fontname="Arial", fontsize=20, labelloc=t, label="Keystone @KNI request execution sequence\nGenerated 2026-09-18 • read left to right • semantic ownership and execution shape are separate"];
+  node [shape=box, style="rounded,filled", color="#94a3b8", fillcolor="#ffffff", fontname="Arial", fontsize=10, margin="0.15,0.10", width=2.20];
+  edge [color="#475569", fontname="Arial", penwidth=1.45, arrowsize=0.70];
 
-  entry [label="Operator entry\n@KNI CoS • direct agent ask • Slack action • automation", fillcolor="#f1f5f9", color="#64748b"];
-  interpret [label="Orchestrator Agent preflight\nInterpret the goal, preserve wording, and treat an agent mention as routing advice", fillcolor="#fff7ed", color="#ea580c", penwidth=2.0];
-  uncertainty [label="Resolve uncertainty intelligently\nInfer safe defaults → retrieve bounded context → clarify only material ambiguity", fillcolor="#fff7ed", color="#ea580c"];
-  gates [label="Deterministic policy gates\nApproval • record identity • live flags • exact write scope • source sufficiency", fillcolor="#fffbeb", color="#d97706"];
-  backend [shape=diamond, label="Execution shape?\nBounded single owner or stateful / multi-owner", fillcolor="#eef2ff", color="#4f46e5", width=2.9, height=1.0];
+  entry [label="1  Preserve the operator request\nSlack • CLI • schedule\nraw ask + bounded context", fillcolor="#f1f5f9", color="#64748b"];
+  interpret [label="2  Orchestrator Agent\ninterpret meaning • uncertainty\nowner • constraints • safe defaults\nagent mention = routing advice", fillcolor="#fff7ed", color="#ea580c", penwidth=2.0];
+  gates [label="3  Python validates the envelope\nsafety • exact identity • approval\nprovider scope • source sufficiency\nN+1 model call blocked before dispatch", fillcolor="#fffbeb", color="#d97706"];
+  backend [shape=diamond, label="4  Choose execution shape\nbounded single owner\nor resumable / approval-dependent\nambiguous / multi-owner", fillcolor="#eef2ff", color="#4f46e5", width=2.55, height=1.18];
 
   subgraph cluster_direct {
-    label="DIRECT / SINGLE-OWNER PATH"; color="#86efac"; fontcolor="#166534"; style="rounded,dashed";
-    direct_owner [label="Owning SDK specialist\nor Chief of Staff delegates one bounded task (KNI Chief of Staff Agent)", fillcolor="#ecfdf5", color="#16a34a"];
-    direct_tool [label="Typed provider helper\nRead / query / scoped write / modify / marked test cleanup", fillcolor="#ecfdf5", color="#16a34a"];
+    label="A — DIRECT / SINGLE OWNER"; color="#86efac"; fontcolor="#166534"; style="rounded,dashed";
+    direct_owner [label="5A  Optional bounded context\n6A  Owning specialist reasons\nKNI Chief of Staff Agent may delegate\none selected owner", fillcolor="#ecfdf5", color="#16a34a", width=2.55];
   }
 
   subgraph cluster_stateful {
-    label="WORKITEM / LANGGRAPH PATH"; color="#a5b4fc"; fontcolor="#3730a3"; style="rounded,dashed";
-    workitem [label="Canonical WorkItem\nSQLite state + selected backend + typed context packs", fillcolor="#f5f3ff", color="#7c3aed"];
-    context [label="Read-only context staging\nAirtable Context Agent • Google Workspace Context Agent • Zotero Context Agent • RSS Context Agent • Preprints Context Agent", fillcolor="#f0f9ff", color="#0284c7"];
-    specialists [label="Specialist / Chief manager loop\nGmail Inbound Triage Agent • Business Research Analyst • Opportunity Scout Agent • Outreach Composer Agent", fillcolor="#ecfdf5", color="#16a34a"];
-    checkpoint [label="Approval checkpoint when required\nPause, block, or resume the exact next action", fillcolor="#fffbeb", color="#d97706"];
+    label="B — WORKITEM / OPTIONAL LANGGRAPH"; color="#a5b4fc"; fontcolor="#3730a3"; style="rounded,dashed";
+    graph_owner [label="5B  Canonical WorkItem + context pack\nSQLite business state ≠ graph checkpoint proof\n6B  Chief / manager + owning specialist\nloop or approval checkpoint when required", fillcolor="#f5f3ff", color="#7c3aed", width=3.05];
   }
 
-  receipt [label="Verified provider or workflow receipt\nRead-back and exact outcome override speculative completion prose", fillcolor="#eff6ff", color="#2563eb"];
-  review [label="Orchestrator / deterministic output review\nCheck request coverage, blockers, safety, and receipt truth", fillcolor="#fff7ed", color="#ea580c"];
-  render [label="Operator-facing result\nSlack / CLI / artifact renderer shows what happened and what remains", fillcolor="#eff6ff", color="#2563eb"];
+  context_catalog [shape=note, label="5  Context specialists stage typed evidence only when needed in A or B\nRAG Retrieval Specialist • Airtable Context Agent • Google Workspace Context Agent • Zotero Context Agent • RSS Context Agent • Preprints Context Agent\nmodel-visible evidence • no inherited write authority", fillcolor="#f0f9ff", color="#0284c7", width=3.2];
+  specialist_catalog [shape=note, label="Registered workflow owners used by A or B\nGmail Inbound Triage Agent • Business Research Analyst • Opportunity Scout Agent • Outreach Composer Agent", fillcolor="#ecfdf5", color="#16a34a", width=3.0];
+  provider [label="7  Provider / tool result\nexact admitted permission + read-back\nmodel call • SDK tool call • helper\npre-acquired context stay distinct", fillcolor="#eff6ff", color="#2563eb", width=2.75];
+  review [label="8  Reconcile decision + receipt\nOrchestrator / deterministic review\nperformed • not performed • unknown", fillcolor="#fff7ed", color="#ea580c", width=2.50];
+  render [label="9  Render one answer\nSlack • CLI • artifact\nresult first; metadata secondary", fillcolor="#eff6ff", color="#2563eb", width=2.25];
 
-  entry -> interpret [label="1  raw request + bounded context"];
-  interpret -> uncertainty [label="2  semantic plan + assumptions"];
-  uncertainty -> gates [label="3  resolved context or targeted blocker"];
-  gates -> backend [label="4  safe execution envelope"];
-  backend -> direct_owner [label="5A  bounded single owner", color="#16a34a"];
-  direct_owner -> direct_tool [label="6A  exact operation", color="#16a34a"];
-  direct_tool -> receipt [label="7A  read-back", color="#16a34a"];
-  backend -> workitem [label="5B  stateful / multi-owner", color="#4f46e5"];
-  workitem -> context [label="6B  stage only relevant context", color="#0284c7"];
-  context -> specialists [label="7B  evidence handoff", color="#0284c7"];
-  specialists -> checkpoint [label="8B  if next action is gated", color="#d97706"];
-  specialists -> receipt [label="8B  completed safe step", color="#16a34a"];
-  checkpoint -> receipt [label="9B  approved, blocked, or paused", color="#d97706"];
-  receipt -> review [label="8A / 10B  structured result"];
-  review -> render [label="9A / 11B  one reviewed answer"];
+  entry -> interpret;
+  interpret -> gates;
+  gates -> backend;
+  backend -> direct_owner [color="#16a34a"];
+  backend -> graph_owner [color="#4f46e5"];
+  direct_owner -> provider [color="#16a34a"];
+  graph_owner -> provider [color="#4f46e5"];
+  provider -> review;
+  review -> render;
+  { rank=same; direct_owner; graph_owner; context_catalog; specialist_catalog; }
 }

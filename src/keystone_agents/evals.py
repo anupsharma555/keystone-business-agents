@@ -492,6 +492,54 @@ def _score_company(observed: Mapping[str, Any], expected: Mapping[str, Any]) -> 
     return checks
 
 
+def _scout_strategic_fit_check(
+    top: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> EvalCheck:
+    specification = _mapping(expected.get("strategic_fit"))
+    if not specification:
+        return _contains_terms_check(
+            "strategic_fit",
+            str(top.get("keystone_fit_reason", "")),
+            expected.get("strategic_fit_terms", []),
+        )
+
+    expected_types = {
+        str(value).strip().casefold()
+        for value in _list(specification.get("opportunity_types"))
+        if str(value).strip()
+    }
+    required_signals = {
+        str(value).strip().casefold()
+        for value in _list(specification.get("required_signals"))
+        if str(value).strip()
+    }
+    observed_type = str(top.get("opportunity_type") or "").strip().casefold()
+    observed_signals = {
+        str(value).strip().casefold()
+        for value in _list(top.get("source_signals"))
+        if str(value).strip()
+    }
+    rationale = str(top.get("keystone_fit_reason") or "").strip()
+    source_confidence = int(
+        _mapping(top.get("source_quality_summary")).get("overall_score") or 0
+    )
+    minimum_confidence = specification.get("source_confidence_min")
+    missing_signals = sorted(required_signals - observed_signals)
+    failures: list[str] = []
+    if not rationale:
+        failures.append("empty fit rationale")
+    if expected_types and observed_type not in expected_types:
+        failures.append(f"unexpected opportunity type: {observed_type or 'missing'}")
+    if missing_signals:
+        failures.append(f"missing supported signals: {missing_signals!r}")
+    if minimum_confidence is not None and source_confidence < int(minimum_confidence):
+        failures.append(
+            f"source confidence {source_confidence} below {int(minimum_confidence)}"
+        )
+    return _check("strategic_fit", not failures, "; ".join(failures))
+
+
 def _score_scout(observed: Mapping[str, Any], expected: Mapping[str, Any]) -> list[EvalCheck]:
     records = _list_of_mappings(observed.get("records"))
     top = records[0] if records else {}
@@ -501,11 +549,7 @@ def _score_scout(observed: Mapping[str, Any], expected: Mapping[str, Any]) -> li
     top_bundle_categories = [str(bundle.get("source_category", "")) for bundle in top_bundles]
     checks = [
         _exact("top_company", top.get("company_name"), expected.get("top_company")),
-        _contains_terms_check(
-            "strategic_fit",
-            str(top.get("keystone_fit_reason", "")),
-            expected.get("strategic_fit_terms", []),
-        ),
+        _scout_strategic_fit_check(top, expected),
         _contains_terms_check(
             "why_now_signal_quality",
             str(top.get("why_now_signal", "")),

@@ -4,17 +4,21 @@ import ast
 import base64
 import json
 import sys
+from datetime import datetime
 from email import message_from_bytes
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from keystone_agents.agents.gmail_triage import (
     EmailFixture,
+    GmailAgentDecisionError,
     build_gmail_contact_lookup_agent,
     build_gmail_triage_agent,
     group_gmail_envelopes_fixture,
+    is_gmail_schema_only_request,
     run_gmail_triage_fixture,
     triage_email_fixture,
     triage_gmail_message_envelope,
@@ -25,11 +29,18 @@ from keystone_agents.gmail_triage.contact_lookup import (
     gmail_contact_lookup_human_summary,
     gmail_contact_lookup_receipt,
 )
-from keystone_agents.gmail_triage.execution_plan import resolve_gmail_execution_plan
+from keystone_agents.gmail_triage.execution_plan import (
+    infer_gmail_execution_plan,
+    resolve_gmail_execution_plan,
+)
 from keystone_agents.gmail_triage.priority_grouping import (
     gmail_priority_grouping_human_summary,
     rank_gmail_candidates_for_request,
     run_gmail_priority_grouping_workflow,
+)
+from keystone_agents.gmail_triage.relationship_query import (
+    associated_gmail_query,
+    extract_gmail_association_entity,
 )
 from keystone_agents.manual_request import infer_manual_request_plan
 from keystone_agents.models import (
@@ -70,6 +81,70 @@ from keystone_agents.tools.gmail_tool import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_email_triage_result_normalizes_em_dash_without_discarding_result() -> None:
+    result = EmailTriageResult(
+        category="collaboration_opportunity",
+        confidence=0.9,
+        reasoning="Relevant interview thread — bounded Gmail evidence.",
+        recommended_action="Review reply copy — do not send.",
+        normalized_body="Operator said Slack copy only — no Gmail draft.",
+    )
+
+    assert "—" not in result.reasoning
+    assert "—" not in result.recommended_action
+    assert "—" not in result.normalized_body
+
+
+def test_live_sdk_main_preserves_structured_failure_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import scripts.run_gmail_triage as cli
+
+    failure = RuntimeError(
+        "Tool execution postcondition failed for gmail_agent_owned_selection: "
+        "missing evidence groups: gmail_query"
+    )
+    failure.keystone_sdk_run_failure = {  # type: ignore[attr-defined]
+        "schema": "keystone.sdk_run_failure.v1",
+        "failure_kind": "required_tool_execution_missing",
+        "run_mode": "live_sdk",
+        "usage": {"requests": 2, "complete": True},
+        "cost": {"estimated_usd": 0.001, "complete": True},
+        "request_cache": {
+            "request_budget": {
+                "schema": "keystone.model_request_budget.v1",
+                "limit": 7,
+                "consumed": 2,
+                "remaining": 5,
+            },
+            "decision_ownership": {"decision_stage": "gmail_selection"},
+        },
+        "tool_execution": {"model_tool_call_count": 0},
+        "tool_receipts": [],
+        "execution_telemetry": {"status": "failed"},
+    }
+
+    monkeypatch.setattr(cli, "sdk_execution_requested", lambda _args: True)
+    monkeypatch.setattr(
+        cli,
+        "_run_sdk_synthesis",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+    monkeypatch.setattr(sys, "argv", ["run_gmail_triage.py", "--json"])
+
+    assert cli.main() == 1
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["status"] == "failed"
+    assert payload["sdk_failure"]["failure_kind"] == "required_tool_execution_missing"
+    assert payload["usage"]["requests"] == 2
+    assert payload["request_budget"]["consumed"] == 2
+    assert payload["decision_ownership"]["decision_stage"] == "gmail_selection"
+    assert payload["tool_execution"]["model_tool_call_count"] == 0
+    assert "missing evidence groups: gmail_query" in payload["output"]["failure"]["reason"]
 FIXTURES = PROJECT_ROOT / "tests" / "fixtures"
 
 
@@ -834,6 +909,70 @@ def test_stored_read_only_gmail_plan_cannot_replay_draft_write_operations() -> N
     assert execution.side_effect_policy == "read_only_or_draft_only"
 
 
+def test_curly_coordinated_no_send_boundary_blocks_provider_draft_write() -> None:
+    plan = infer_gmail_execution_plan(
+        "Find the associated email and write a short reply here. Please don’t send "
+        "it or create a Gmail draft—just give me copy in this thread."
+    )
+
+    assert plan.operation == "draft_reply"
+    assert plan.create_gmail_drafts is False
+    assert plan.draft_replies_in_output is True
+    assert plan.read_scope == "collection"
+    assert plan.max_messages == 4
+    assert plan.candidate_helpers == [
+        "query_gmail_message_summaries",
+        "read_gmail_context",
+        "gmail_triage_sdk",
+    ]
+    assert plan.artifact_policy == "draft_text_in_output"
+
+
+@pytest.mark.parametrize(
+    ("request_text", "entity"),
+    [
+        (
+            "Use the G2i interview on my calendar to identify the related email "
+            "conversation.",
+            "G2i",
+        ),
+        (
+            "Find the email thread associated with the Acme Health meeting.",
+            "Acme Health",
+        ),
+        (
+            "Using my Northstar call from Calendar, locate the matching email.",
+            "Northstar",
+        ),
+        (
+            "Could you use tomorrow’s G2i interview as the clue to find the "
+            "matching Gmail conversation?",
+            "G2i",
+        ),
+        (
+            "Find the Gmail conversation connected to tomorrow's 10:30 AM G2i "
+            "interview and put a brief response here.",
+            "G2i",
+        ),
+    ],
+)
+def test_gmail_association_query_extracts_bounded_event_anchor(
+    request_text: str,
+    entity: str,
+) -> None:
+    assert extract_gmail_association_entity(request_text) == entity
+    assert associated_gmail_query(request_text) == f'"{entity}"'
+
+
+def test_known_contact_query_takes_precedence_over_broad_account_association() -> None:
+    plan = infer_gmail_execution_plan(
+        "Who at Acme Compute helped set up my startup account, and what email "
+        "address did they use? Check Gmail."
+    )
+
+    assert plan.gmail_query == '"Acme Compute"'
+
+
 def test_contact_lookup_objective_survives_inconsistent_lower_level_target_shape() -> None:
     request = "What is the email address of the person who set up my account?"
     manual_plan = infer_manual_request_plan(
@@ -912,6 +1051,61 @@ def test_gmail_collection_triage_variations_use_one_read_only_contract(
     assert execution.read_scope == "collection"
     assert execution.side_effect_policy == "read_only"
     assert execution.create_gmail_drafts is False
+
+
+def test_single_outcome_gmail_wording_uses_agent_owned_candidate_selection() -> None:
+    request = (
+        "I just wrapped up today's G2i interview. Look through recent G2i mail, "
+        "distinguish the active conversation from cancellations and transcript shares, "
+        "and give me a two-sentence note I can paste here. Leave Gmail untouched."
+    )
+
+    execution = infer_gmail_execution_plan(request)
+
+    assert execution.operation == "candidate_selection"
+    assert execution.read_scope == "collection"
+    assert execution.max_messages == 4
+    assert execution.candidate_helpers == [
+        "query_gmail_message_summaries",
+        "read_gmail_context",
+        "gmail_triage_sdk",
+    ]
+    assert execution.create_gmail_drafts is False
+    assert execution.side_effect_policy == "read_only_or_draft_only"
+
+
+def test_semantic_gmail_plan_preserves_single_outcome_shape_from_full_request() -> None:
+    request = (
+        "I just wrapped up today's G2i interview. Look through recent G2i mail, "
+        "distinguish the active conversation from cancellations and transcript shares, "
+        "and give me a two-sentence note I can paste here. Leave Gmail untouched."
+    )
+    plan = ManualRequestPlan(
+        source="llm",
+        target_agent="gmail_triage",
+        intent="gmail_triage",
+        target_type="gmail_message_collection",
+        provider_system="gmail",
+        provider_operations=["search", "read"],
+        provider_read_scope="bounded_collection",
+        provider_result_mode="items",
+        task_objective="gmail_triage",
+        expected_artifact_type="gmail_triage_report",
+        desired_count=1,
+        desired_count_explicit=False,
+        draft_policy="no_drafts_requested",
+    )
+
+    execution = resolve_gmail_execution_plan(request, manual_plan=plan)
+
+    assert execution.operation == "candidate_selection"
+    assert execution.read_scope == "collection"
+    assert execution.max_messages == 4
+    assert execution.candidate_helpers == [
+        "query_gmail_message_summaries",
+        "read_gmail_context",
+        "gmail_triage_sdk",
+    ]
 
 
 def test_gmail_collection_honors_an_explicit_one_message_limit() -> None:
@@ -1288,7 +1482,8 @@ def test_gmail_api_envelope_uses_html_fallback_and_attachment_metadata() -> None
     html_body = base64.urlsafe_b64encode(
         b"<html><body><p>Could we discuss a clinical operations workflow?</p>"
         b"<a href='http://bit.ly/login-reset'>review details</a>"
-        b"<blockquote>Older quoted reply should be ignored.</blockquote></body></html>"
+        b"<blockquote class='gmail_quote'>Older quoted reply should be ignored."
+        b"</blockquote></body></html>"
     ).decode()
     envelope = gmail_message_envelope_from_api(
         {
@@ -1507,6 +1702,25 @@ def test_build_gmail_triage_agent_returns_sdk_agent_like_object() -> None:
         "create_gmail_draft_reply",
         "create_gmail_draft_with_attachment",
     } <= tool_names
+
+
+@pytest.mark.parametrize(
+    "prompt_text",
+    [
+        (
+            "Inspect the Gmail schema only. Don't query or read messages or return "
+            "mailbox-derived data."
+        ),
+        (
+            "Could you explain the available Gmail fields? Don\u2019t search the inbox "
+            "or include message content."
+        ),
+    ],
+)
+def test_gmail_schema_only_request_accepts_natural_apostrophes(prompt_text: str) -> None:
+    assert is_gmail_schema_only_request(prompt_text) is True
+    agent = build_gmail_triage_agent(request_text=prompt_text, compact_instructions=True)
+    assert [tool.name for tool in agent.tools] == ["inspect_gmail_mailbox_schema"]
 
 
 def test_build_gmail_triage_agent_can_disable_tools_for_llm_only_synthesis() -> None:
@@ -2124,7 +2338,7 @@ def test_gmail_get_thread_does_not_promote_onboarding_ctas_to_action_items() -> 
                                 "labelIds": ["INBOX", "CATEGORY_PROMOTIONS"],
                                 "payload": {
                                     "headers": [
-                                        {"name": "From", "value": "Anna <anna@halo.science>"},
+                                        {"name": "From", "value": "Anna <anna@halo.example>"},
                                         {"name": "To", "value": "Anup <operator@example.com>"},
                                         {"name": "Subject", "value": "Welcome to Halo!"},
                                     ],
@@ -2723,6 +2937,143 @@ def test_live_sdk_message_resolution_deduplicates_relaxed_matches_by_thread() ->
     assert refs == [{"id": "message-new", "threadId": "thread-1"}]
     assert len(calls) == 3
     assert diagnostics["attempts"][-1]["scope"] == "all_mail_relaxed_subject"
+
+
+def test_live_sdk_message_resolution_ranks_multiple_threads_before_blocking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.run_gmail_triage as cli
+
+    class FakeGmail:
+        def list_recent_messages(self, **_kwargs: object) -> list[dict[str, str]]:
+            return [
+                {"id": "message-news", "threadId": "thread-news"},
+                {"id": "message-interview", "threadId": "thread-interview"},
+            ]
+
+        def get_thread(self, thread_id: str) -> dict[str, object]:
+            subject = (
+                "G2i newsletter"
+                if thread_id == "thread-news"
+                else "Interview with G2i Inc."
+            )
+            return {
+                "thread_id": thread_id,
+                "subject": subject,
+                "summary": subject,
+                "thread_context": subject,
+                "message_count": 1,
+                "latest_received_at": "2026-08-03T12:00:00-04:00",
+                "participants": [],
+                "action_items": [],
+                "deadlines": [],
+                "open_questions": [],
+                "triage_limitations": [],
+                "messages": [
+                    {
+                        "id": f"message-{thread_id.removeprefix('thread-')}",
+                        "sender_name": "G2i",
+                        "sender_email": "coordinator@example.test",
+                        "subject": subject,
+                        "snippet": subject,
+                        "prior_labels": ["INBOX"],
+                    }
+                ],
+            }
+
+    def fake_rank(**kwargs: object) -> SimpleNamespace:
+        summaries = kwargs["summaries"]
+        assert len(summaries) == 2
+        return SimpleNamespace(
+            result=GmailCandidateRankingResult(
+                request_summary=str(kwargs["operator_request"]),
+                source_message_count=2,
+                candidates=[
+                    GmailCandidateRankingItem(
+                        message_id="message-news",
+                        disposition="exclude",
+                        relevance_score=0.1,
+                        needs_reply=False,
+                        reasoning="Newsletter is not the selected interview.",
+                    ),
+                    GmailCandidateRankingItem(
+                        message_id="message-interview",
+                        disposition="candidate",
+                        relevance_score=0.98,
+                        needs_reply=True,
+                        reasoning="Exact interview thread requested by the operator.",
+                    ),
+                ],
+            ),
+            ranked_thread_ids=("thread-interview",),
+            candidate_payloads=(
+                {"id": "message-news", "threadId": "thread-news"},
+                {"id": "message-interview", "threadId": "thread-interview"},
+            ),
+        )
+
+    monkeypatch.setattr(cli, "rank_gmail_candidates_for_request", fake_rank)
+    refs, diagnostics = cli._resolve_live_sdk_message_refs(
+        FakeGmail(),
+        request_text=(
+            "Find the Gmail thread associated with tomorrow's G2i interview and "
+            "write reply copy here without creating a Gmail draft."
+        ),
+        label="INBOX",
+        query='"G2i"',
+        max_results=1,
+    )
+
+    assert refs == [{"id": "message-interview", "threadId": "thread-interview"}]
+    assert diagnostics["candidate_ranking_used"] is True
+    assert diagnostics["selected_count"] == 1
+    assert diagnostics["provider_read"] is True
+    assert diagnostics["provider_write"] is False
+
+
+def test_calendar_associated_gmail_resolution_normalizes_timezone_and_lifecycle() -> None:
+    import scripts.run_gmail_triage as cli
+
+    summaries = [
+        GmailThreadSummaryResult(
+            thread_id="thread-current",
+            source_label="INBOX",
+            query='"G2i"',
+            subject=(
+                "Invitation: Interview with G2i Inc. @ Tue Aug 4, 2026 "
+                "7:30am - 8am (PDT)"
+            ),
+            summary="Current invitation.",
+        ),
+        GmailThreadSummaryResult(
+            thread_id="thread-canceled",
+            source_label="INBOX",
+            query='"G2i"',
+            subject=(
+                "Canceled event: Interview with G2i Inc. @ Tue Aug 4, 2026 "
+                "7:30am - 8am (PDT)"
+            ),
+            summary="Canceled invitation.",
+        ),
+        GmailThreadSummaryResult(
+            thread_id="thread-obsolete",
+            source_label="INBOX",
+            query='"G2i"',
+            subject=(
+                "Updated video conference: Interview with G2i Inc. @ Tue Aug 4, "
+                "2026 9am - 9:30am (EDT)"
+            ),
+            summary="Different time.",
+        ),
+    ]
+
+    selected = cli._exact_schedule_thread_id(
+        "Find the Gmail thread for tomorrow's 10:30 AM G2i interview.",
+        summaries,
+        now=datetime(2026, 8, 3, 15, 0, tzinfo=ZoneInfo("America/New_York")),
+    )
+
+    assert selected == "thread-current"
 
 
 def test_live_sdk_message_resolution_returns_safe_no_match_blocker() -> None:
@@ -3722,8 +4073,212 @@ def test_live_cli_requires_label_filter_unless_allow_inbox(monkeypatch: pytest.M
         cli.main()
 
 
+def test_gmail_uncaught_sdk_failure_emits_structured_audit_evidence(capsys) -> None:
+    import scripts.run_gmail_triage as cli
+
+    exc = RuntimeError("model request budget exhausted")
+    exc.keystone_sdk_run_failure = {
+        "schema": "keystone.sdk_run_failure.v1",
+        "failure_kind": "modelrequestbudgetexhausted",
+        "attempt_count": 2,
+        "usage": {"requests": 2},
+        "cost": {"estimated_usd": 0.01},
+        "request_cache": {
+            "decision_ownership": {
+                "validator_outcome": {"status": "repair_required"}
+            },
+            "model_request_budget": {
+                "schema": "keystone.model_request_budget.v1",
+                "limit": 2,
+                "consumed": 2,
+                "exhausted": True,
+            },
+        },
+        "tool_execution": {
+            "model_called_tool_names": ["query_gmail_message_summaries"]
+        },
+        "tool_receipts": [{"tool_name": "query_gmail_message_summaries"}],
+        "execution_telemetry": {"status": "failed"},
+    }
+
+    exit_code = cli._handle_uncaught_exception(exc, ["--json"])
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_code == 1
+    assert payload["status"] == "failed"
+    assert payload["sdk_failure"]["attempt_count"] == 2
+    assert payload["usage"]["requests"] == 2
+    assert payload["tool_execution"]["model_called_tool_names"] == [
+        "query_gmail_message_summaries"
+    ]
+    assert payload["decision_ownership"]["validator_outcome"]["status"] == (
+        "repair_required"
+    )
+    assert payload["request_budget"]["exhausted"] is True
+    assert payload["send_enabled"] is False
+    assert "model request budget exhausted" in captured.err
+
+
+def test_gmail_decision_block_preserves_completed_tool_and_usage_evidence() -> None:
+    import scripts.run_gmail_triage as cli
+
+    result = SimpleNamespace(
+        usage={"requests": 4},
+        cost={"estimated_usd": 0.03},
+        budget_guard={"status": "within_budget"},
+        request_cache={
+            "tool_execution": {
+                "model_called_tool_names": [
+                    "query_gmail_message_summaries",
+                    "read_gmail_context",
+                ],
+                "model_tool_call_count": 5,
+            },
+            "model_request_budget": {
+                "schema": "keystone.model_request_budget.v1",
+                "limit": 8,
+                "consumed": 4,
+                "remaining": 4,
+            },
+        },
+        tool_receipts=[{"tool_name": "query_gmail_message_summaries"}],
+        execution_telemetry={"status": "completed"},
+    )
+    exc = GmailAgentDecisionError(
+        {
+            "decision_stage": "gmail_candidate_selection",
+            "validator_outcome": {
+                "status": "rejected",
+                "reason_code": "candidate_assessments_incomplete",
+            },
+        },
+        result=result,
+    )
+    payload: dict[str, object] = {"status": "blocked"}
+
+    cli._attach_gmail_decision_block_evidence(payload, exc)
+
+    assert payload["usage"] == {"requests": 4}
+    assert payload["tool_execution"]["model_tool_call_count"] == 5
+    assert payload["request_budget"]["consumed"] == 4
+    assert payload["request_cache"]["decision_ownership"] == exc.telemetry
+    assert payload["tool_receipts"] == [
+        {"tool_name": "query_gmail_message_summaries"}
+    ]
+
+
 def test_send_email_raises_not_implemented() -> None:
     with pytest.raises(NotImplementedError):
         GmailTool().send_email("person@example.com", "Subject", "Body")
     with pytest.raises(NotImplementedError):
         gmail_tool.send_email("person@example.com", "Subject", "Body")
+
+
+@pytest.mark.parametrize(
+    "telemetry,empty_search",
+    [
+        ({"candidate_count": 0, "query_provider_read_performed": True,
+          "query_output_count": 2}, True),
+        ({"candidate_count": 2, "query_provider_read_performed": True,
+          "query_output_count": 1}, False),
+        ({"candidate_count": 0, "query_provider_read_performed": False,
+          "query_output_count": 1}, False),
+        ({"candidate_count": 0, "query_provider_read_performed": True,
+          "query_output_count": 0}, False),
+        ({}, False),
+    ],
+)
+def test_direct_gmail_abstention_distinguishes_verified_empty_search(
+    monkeypatch, telemetry, empty_search,
+):
+    import scripts.run_gmail_triage as cli
+
+    output = EmailTriageResult(
+        subject="", sender_email="", category="unrelated", confidence=0,
+        summary="No conversation selected.", reasoning="The available evidence is insufficient.",
+        recommended_action="Review the identifying clues.",
+        decision={
+            "decision_owner": "specialist_agent", "decision_stage": "gmail_candidate_selection",
+            "needs_more_context": True, "reasoning": "No verified selection.",
+        },
+    )
+    sdk_result = TypedAgentRunResult(
+        agent_name="gmail_triage", output=output, live=False,
+        raw_result=SimpleNamespace(new_items=[]),
+        request_cache={"decision_ownership": telemetry},
+    )
+    monkeypatch.setattr(cli, "run_gmail_triage_sdk", lambda *_a, **_k: sdk_result)
+    monkeypatch.setattr(cli, "load_specialist_execution_context_from_env", lambda: {})
+    args = cli.build_parser().parse_args(["--request", "Find the planning email.", "--json"])
+    payload = cli._run_agent_owned_live_gmail_synthesis(
+        args, run_config=SimpleNamespace(model="synthetic"), live=False,
+        style_context="", founder_context="", preflight_context="",
+    )
+    assert payload["status"] == "needs_input"
+    assert payload["block_kind"] == (
+        "gmail_search_no_matches" if empty_search else "gmail_agent_requested_more_context"
+    )
+    assert ("Gmail returned no messages" in payload["human_summary"]) is empty_search
+    assert ("has not been read" in payload["human_summary"]) is empty_search
+    assert "reviewed the bounded candidates" not in payload["human_summary"]
+    assert "selected the conversation" not in " ".join(payload.get("audit_notes", []))
+    assert payload["public_result"]["completion_confirmed"] is False
+    assert payload["public_result"]["status"] == "needs_input"
+
+
+def test_agent_owned_gmail_persistence_uses_canonical_terminal_status_and_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.run_gmail_triage as cli
+
+    captured: dict[str, object] = {}
+
+    class FakeStorage:
+        def __init__(self, database_url: str) -> None:
+            captured["database_url"] = database_url
+
+        def save_agent_run(self, **kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return {"status": "saved", "table": "agent_runs", "id": 17}
+
+    monkeypatch.setattr(cli, "StorageTool", FakeStorage)
+    args = SimpleNamespace(
+        database_url="sqlite:///test.db",
+        request="Find the email associated with tomorrow's interview.",
+        gmail_query="interview",
+    )
+    payload = {
+        "status": "needs_input",
+        "decision_ownership": {
+            "validator_outcome": {
+                "status": "accepted",
+                "reason_code": "agent_requested_more_context",
+            }
+        },
+        "public_result": {
+            "status": "needs_input",
+            "failure_summary": "The agent declined to guess among two plausible threads.",
+        },
+        "storage": {"must_not_recurse": True},
+    }
+
+    result = cli._save_agent_owned_gmail_run(
+        args,
+        payload=payload,
+        model_provider="openai",
+        model_name="gpt-test-mini",
+        live=True,
+    )
+
+    assert result["id"] == 17
+    assert captured["status"] == "needs_input"
+    assert captured["model"] == "openai:gpt-test-mini"
+    assert captured["dry_run"] is False
+    assert captured["error"] == (
+        "The agent declined to guess among two plausible threads."
+    )
+    stored_output = captured["output"]
+    assert isinstance(stored_output, dict)
+    assert "storage" not in stored_output
+    assert stored_output["decision_ownership"] == payload["decision_ownership"]

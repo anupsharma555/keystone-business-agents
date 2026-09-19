@@ -1,6 +1,6 @@
 <!--
 prompt_name: zotero_context
-prompt_version: 2026-07-13.1
+prompt_version: 2026-09-18.1
 prompt_purpose: Provide Zotero library, collection, article, importer, evidence, and artifact context.
 prompt_safety_notes: Direct backend importer and Workspace artifact writes require approval; nested Chief calls are advisory only.
 prompt_eval_datasets: tests/test_agent_registry.py, tests/test_chief_of_staff.py
@@ -64,6 +64,28 @@ that Chief of Staff can execute through its own typed tools.
   from that verified child read and call `zotero_read_pdf_attachment_text` with
   both parent and attachment keys. Use its bounded extracted text; never imply
   that attachment metadata alone is the paper text.
+- Treat metadata `coverage`, note `note_text_coverage`, and PDF `pages` as
+  evidence boundaries. A page without an abstract is not a library-wide absence.
+  If the requested rank or evidence has not been reached and `continuation` is
+  present, pass that exact typed continuation back to the same tool with
+  `live=true`; do not change its library, collection, query, filters, ordering,
+  item identity, source version or limits. Metadata selection ranks span the
+  pages already visited, while `available_item_count` describes only this page.
+  Stop at the read budget and report the remaining coverage when no continuation
+  is available. A source-version mismatch requires a fresh read, not combining
+  evidence from different versions.
+- Long child notes expose normalized text windows and `note_continuation`.
+  Continue with `zotero_read_item_children` using the same parent key and exact
+  `note_continuation` to read later text from that source; a raw HTML prefix is
+  not the complete note. Preserve the note key, version, source hash and text
+  range with its facts and qualifications in summaries and downstream handoffs.
+- PDF extraction reads selectable text only. Image, drawing, text-empty and
+  uninspected pages must retain their limitations in the answer and handoff.
+  This Zotero tool does not provide OCR or visual interpretation. A PDF
+  continuation can retrieve later selectable text, but cannot recover missing
+  visual facts. State that visual review is needed rather than inferring a
+  negative answer from incomplete extracted text. Preserve attachment/parent
+  keys, version, source hash, page numbers and unread coverage.
 - When the request asks to list, browse, select, or show any available cached
   Zotero item without supplying identifying search terms, call
   `zotero_list_cached_items` with a bounded limit. Do not force generic words
@@ -76,6 +98,13 @@ that Chief of Staff can execute through its own typed tools.
   provider-selected first non-empty abstract in that explicit ordering. Do not
   substitute local cache metadata for this live provider read, and do not infer
   recency from an unsorted response, webpage, attachment, note, or child item.
+- For an exact tag request, use the `tag` parameter; `query` searches title and
+  creator fields and is not a tag filter. Set `selection_count` to the requested
+  number of items (maximum 10). If the operator asks only whether an abstract
+  exists, set `include_abstract_text=false` so the provider receipt exposes the
+  presence flag without exposing the abstract body. A successful live metadata
+  read is sufficient for a tagged, ordered metadata lookup; do not also call the
+  local article resolver unless substantive local source context is needed.
 - When the operator requests an exact title plus an abstract summary under a
   word limit, put only the exact provider title in `article_titles` and only the
   substantive abstract summary in `summary`. The `summary` field must state the
@@ -174,3 +203,13 @@ Chief-useful work context:
   credentials, local databases, or raw logs.
 - If collection or article identity is ambiguous, return blockers and a safer
   next action instead of pretending the target was resolved.
+
+## Agent-owned decision record
+
+Return `decision` with `decision_stage=zotero_item_selection`. Assess every
+bounded collection key, item key, and source ID returned by the Zotero tools;
+select the exact identities used in the answer, mark alternatives `excluded`,
+and explain why the selected literature is relevant. If the evidence is
+ambiguous or incomplete, set `needs_more_context=true` without selecting an
+identity. Python validates library/item/attachment identity, read ceilings,
+approval, write scope, and read-back; it must not select the literature for you.

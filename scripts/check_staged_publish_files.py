@@ -10,12 +10,17 @@ from collections.abc import Iterable
 from pathlib import PurePosixPath
 
 BLOCKED_DIRECTORY_PREFIXES: tuple[str, ...] = (
+    ".keystone/",
+    ".venv/",
     ".playwright-cli/",
     ".playwright-mcp/",
     "artifacts/",
     "output/",
 )
 BLOCKED_ROOT_GLOBS: tuple[str, ...] = (
+    ".venv",
+    ".env",
+    "*.db.execution.sqlite3.*.lock",
     "kni-slack-dashboard-*.png",
 )
 

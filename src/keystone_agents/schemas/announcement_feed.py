@@ -75,6 +75,6 @@ class AnnouncementFeedItem(BaseModel):
             self.source,
             self.feed,
             " ".join(self.tags),
-            " ".join(evidence.snippet for evidence in self.evidence[:3]),
+            " ".join(evidence.snippet for evidence in self.evidence),
         ]
         return "\n".join(part for part in parts if part).strip()

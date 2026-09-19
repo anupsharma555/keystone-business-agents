@@ -5,6 +5,7 @@ skill_purpose: Package compact but loss-aware context for specialist and multi-a
 applies_to:
   - gmail_triage
   - business_research_analyst
+  - rag_retrieval_specialist
   - opportunity_scout
   - outreach_composer
   - orchestrator

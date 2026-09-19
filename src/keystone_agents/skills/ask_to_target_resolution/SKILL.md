@@ -10,6 +10,7 @@ applies_to:
   - outreach_composer
   - opportunity_scout
   - business_research_analyst
+  - rag_retrieval_specialist
   - orchestrator
 eval_datasets:
   - evals/local/skill_contracts.jsonl

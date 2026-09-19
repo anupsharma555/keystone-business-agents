@@ -16,6 +16,7 @@ from keystone_agents.retrieval_policy import (
     ProviderRequestBudget,
     assess_company_search_quality,
     derive_request_autonomy_hint,
+    resolve_requested_search_provider,
 )
 from keystone_agents.sdk import function_tool
 from keystone_agents.tools.search_provider import (
@@ -100,9 +101,21 @@ def sdk_search_diagnostics_from_telemetry(
     used: list[str] = []
     queries: list[str] = []
     errors: list[dict[str, Any]] = []
+    provider_error_fallback_used = False
+    quality_fallback_used = False
+    deepening_search_used = False
     provider_usage: dict[str, dict[str, Any]] = {}
     provider_result_samples: dict[str, list[dict[str, str]]] = {}
     for packet in telemetry_packets:
+        provider_error_fallback_used = bool(
+            provider_error_fallback_used or packet.get("provider_error_fallback_used")
+        )
+        quality_fallback_used = bool(
+            quality_fallback_used or packet.get("search_provider_fallback_used")
+        )
+        deepening_search_used = bool(
+            deepening_search_used or packet.get("deepening_search_used")
+        )
         provider_sequence.extend(_string_items(packet.get("search_provider_sequence")))
         deepening_sequence.extend(_string_items(packet.get("search_deepening_provider_sequence")))
         queries.extend(_string_items(packet.get("search_queries")))
@@ -136,6 +149,12 @@ def sdk_search_diagnostics_from_telemetry(
         "provider_usage": provider_usage,
         "provider_result_samples": provider_result_samples,
         "search_provider_errors": _compact_errors(errors),
+        "fallback_used": bool(
+            provider_error_fallback_used or quality_fallback_used or deepening_search_used
+        ),
+        "provider_error_fallback_used": provider_error_fallback_used,
+        "quality_fallback_used": quality_fallback_used,
+        "deepening_search_used": deepening_search_used,
         "primary_lane_statuses": _primary_lane_statuses(
             configured=configured,
             attempted=attempted,
@@ -304,8 +323,10 @@ def search_web(query: str, num_results: int = 5) -> list[SearchResult]:
 
     By default this tool is inert. When the operator explicitly enables live research through the
     Keystone environment flags, it follows the shared live search ladder for SDK runs:
-    SearXNG broad recall plus capped hosted Agents web-search and Exa lanes when enabled,
-    with Serper/Tavily/Firecrawl only when `SEARCH_PROVIDER` selects them explicitly.
+    SearXNG broad recall plus capped hosted Agents web-search and Exa/Tavily lanes when
+    enabled. A single provider named naturally by the operator is tried first unless a
+    deliberate non-default runtime override is present; reviewed enabled fallbacks remain
+    available before the tool returns a provider failure.
     """
 
     provider_name = _sdk_live_search_provider_name()
@@ -367,7 +388,38 @@ def _sdk_live_search_provider(
                 live=True,
             ),
         )
-    return build_search_provider(provider=provider_name, live=True)
+    primary = provider_name.value
+    provider_sequence = [primary]
+    if _sdk_agents_web_search_enabled() and primary != SearchProviderName.AGENTS_WEB_SEARCH.value:
+        provider_sequence.append(SearchProviderName.AGENTS_WEB_SEARCH.value)
+    if primary != SearchProviderName.SEARXNG.value:
+        provider_sequence.append(SearchProviderName.SEARXNG.value)
+    deepening_sequence: list[str] = []
+    if _sdk_exa_search_enabled() and primary != SearchProviderName.EXA.value:
+        deepening_sequence.append(SearchProviderName.EXA.value)
+    if _sdk_tavily_search_enabled(query) and primary != SearchProviderName.TAVILY.value:
+        deepening_sequence.append(SearchProviderName.TAVILY.value)
+    hint = derive_request_autonomy_hint(
+        agent_name="sdk_search_web",
+        request_text=_combined_search_request_text(query),
+    )
+    return HybridSearchProvider(
+        provider_sequence=tuple(dict.fromkeys(provider_sequence)),
+        deepening_provider_sequence=tuple(dict.fromkeys(deepening_sequence)),
+        provider_request_budget=_sdk_optional_provider_request_budget(query),
+        parallel_provider_fanout=False,
+        autonomy_hint=hint,
+        quality_assessor=lambda results, request_text: _sdk_assess_search_quality(
+            results=results,
+            company_name=query,
+            request_text=request_text,
+            autonomy_hint=hint,
+        ),
+        provider_factory=lambda provider: build_search_provider(
+            provider=provider,
+            live=True,
+        ),
+    )
 
 
 def _sdk_live_search_provider_name() -> SearchProviderName | None:
@@ -385,9 +437,16 @@ def _sdk_live_search_provider_name() -> SearchProviderName | None:
     if raw_live_research is not None and not parse_bool(raw_live_research):
         return None
     raw_provider = os.getenv("SEARCH_PROVIDER")
-    if raw_provider is None or not raw_provider.strip():
-        return SearchProviderName.SEARXNG
-    provider_name = normalize_search_provider_name(raw_provider)
+    configured_provider = (
+        SearchProviderName.SEARXNG.value
+        if raw_provider is None or not raw_provider.strip()
+        else raw_provider
+    )
+    resolved_provider = resolve_requested_search_provider(
+        request_text=_SDK_SEARCH_REQUEST_CONTEXT.get(),
+        requested_provider=configured_provider,
+    )
+    provider_name = normalize_search_provider_name(resolved_provider)
     if provider_name == SearchProviderName.DRY_RUN:
         return None
     return provider_name

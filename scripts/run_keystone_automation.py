@@ -85,14 +85,19 @@ class LockFile:
         self._fd: int | None = None
 
     def __enter__(self) -> LockFile:
+        import fcntl
+
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            self._fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError as exc:
+            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(self._fd)
+            self._fd = None
             raise SystemExit(
-                f"Automation lock already exists at {self.path}. Review the active run "
-                "or remove the stale lock after confirming no process is running."
+                f"Automation lock is held at {self.path}. Review the active run."
             ) from exc
+        os.ftruncate(self._fd, 0)
         os.write(self._fd, f"pid={os.getpid()}\n".encode())
         return self
 
@@ -100,10 +105,7 @@ class LockFile:
         if self._fd is not None:
             os.close(self._fd)
             self._fd = None
-        try:
-            self.path.unlink()
-        except FileNotFoundError:
-            pass
+        # Keep the inode: unlinking a lock file permits two independent owners.
 
 
 def build_parser() -> argparse.ArgumentParser:

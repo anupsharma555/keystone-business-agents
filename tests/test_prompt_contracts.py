@@ -60,10 +60,7 @@ def _read_skill(name: str) -> str:
 
 
 def _read_repo_doc(path: str) -> str:
-    target = Path(path)
-    if path == "LINEAR_BACKLOG.MD" and not target.is_file():
-        pytest.skip("local-only Linear backlog is unavailable in this clean clone")
-    return target.read_text(encoding="utf-8")
+    return Path(path).read_text(encoding="utf-8")
 
 
 def test_required_prompt_files_exist() -> None:
@@ -211,7 +208,7 @@ def test_dynamic_skill_selector_includes_core_and_specialist_contracts() -> None
         assert SPECIALIST_SKILL_NAMES[agent_name] in selected
         assert set(selected) <= set(AGENT_SKILL_NAMES[agent_name])
         if set(selected) == set(AGENT_SKILL_NAMES[agent_name]):
-            assert agent_name.endswith("_context_agent")
+            assert agent_name.endswith("_context_agent") or agent_name == "rag_retrieval_specialist"
         else:
             assert len(selected) < len(AGENT_SKILL_NAMES[agent_name])
 
@@ -865,18 +862,24 @@ def test_control_plane_runtime_skills_point_to_capability_boundaries() -> None:
 
 
 def test_major_milestones_include_rwm_acceptance_criteria() -> None:
-    backlog = _read_repo_doc("LINEAR_BACKLOG.MD")
     goals = _read_repo_doc("docs/AGENT_GOALS.md")
+    boundaries = _read_repo_doc("docs/AGENT_CAPABILITY_BOUNDARIES.md")
+    normalized_goals = " ".join(goals.split())
+    normalized_boundaries = " ".join(boundaries.split())
 
-    assert "Milestone definition:" in backlog
-    assert "`docs/AGENT_CAPABILITY_BOUNDARIES.md` now defines" in backlog
-    assert "Whether Chief needs a dedicated first-class `ManagerWorkflowPlan`" in backlog
-    assert "`ANU-193`: route correction updates route plans/review notes" in backlog
-    assert "`ANU-194`: Chief broad asks produce internal plans" in backlog
-    assert "`ANU-124`: broad/project/ops/cross-agent asks default to Chief" in backlog
     assert "ANU-193 is the Orchestrator read/write/modify contract" in goals
     assert "ANU-124 and ANU-194 make Chief of Staff" in goals
-    assert "backend graph selection belongs to WorkItem execution\npolicy" in goals
+    assert "backend graph selection belongs to WorkItem execution policy" in normalized_goals
+    assert "This note is the repo-local contract for ANU-193, ANU-194, and ANU-124" in boundaries
+    assert "These writes are planning and review metadata" in boundaries
+    assert "They do not authorize provider mutation" in boundaries
+    assert "revise route advice and specialist briefs" in boundaries
+    assert "Chief manager asks produce internal plans or handoffs" in boundaries
+    assert "agents-as-tools outputs remain advisory/read-plan" in boundaries
+    assert "broad, ambiguous, project/ops, Slack-thread, automation" in normalized_boundaries
+    assert "Whether Chief needs a separate first-class `ManagerWorkflowPlan` schema" in boundaries
+    assert "The backend graph selector owns simple-runner versus LangGraph" in boundaries
+    assert "It does not own business routing, provider permissions" in boundaries
 
 
 def test_anu60_live_slack_proof_plan_preserves_acceptance_boundary() -> None:
@@ -885,7 +888,6 @@ def test_anu60_live_slack_proof_plan_preserves_acceptance_boundary() -> None:
     normalized_proof_plan = " ".join(proof_plan.split())
     index = _read_repo_doc("docs/INDEX.md")
     backlog = _read_repo_doc("docs/ORCHESTRATOR_BRIDGE_BACKLOG.md")
-    linear_backlog = _read_repo_doc("LINEAR_BACKLOG.MD")
     workflow_status = _read_repo_doc("docs/AI_AGENTS_WORKFLOW_TEST_STATUS.md")
     package = json.loads(_read_repo_doc("package.json"))
 
@@ -961,9 +963,6 @@ def test_anu60_live_slack_proof_plan_preserves_acceptance_boundary() -> None:
     assert "`docs/ANU60_LIVE_SLACK_EVIDENCE_TEMPLATE.md`" in index
     assert "`docs/ANU60_LIVE_SLACK_PROOF_PLAN.md`" in backlog
     assert "`docs/ANU60_LIVE_SLACK_EVIDENCE_TEMPLATE.md` as the capture form" in backlog
-    assert "Current ANU-60 handoff: `docs/ANU60_LIVE_SLACK_PROOF_PLAN.md`, with" in linear_backlog
-    assert "`docs/ANU60_LIVE_SLACK_EVIDENCE_TEMPLATE.md` as the capture form" in linear_backlog
-    assert "ANU-60 should remain short of Done" in linear_backlog
     assert "Use `docs/ANU60_LIVE_SLACK_PROOF_PLAN.md` as\n" "the current handoff packet" in workflow_status
     assert "`docs/ANU60_LIVE_SLACK_EVIDENCE_TEMPLATE.md`" in workflow_status
     assert "the capture form before any additional `#ai-agents-workflow` live probe" in workflow_status
@@ -1318,6 +1317,9 @@ def test_gmail_triage_prompt_requires_draft_only_behavior() -> None:
     assert "Outreach Reply Handling" in text
     assert "`list_outreach_tracking_records`" in text
     assert "Treat outreach tracking rows as manual lifecycle context" in text
+    assert "Match the requested conversation type, not merely a human sender" in text
+    assert "Never repeat availability or other\n  scheduling language" in text
+    assert "presenting stale scheduling text as a current reply" in text
 
 
 def test_business_research_analyst_prompt_requires_sources_and_scores() -> None:

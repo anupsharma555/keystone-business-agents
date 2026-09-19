@@ -18,6 +18,10 @@ except ImportError:  # pragma: no cover - keeps fixture CLI usable before depend
             print(value)
 
 
+from keystone_agents.agent_decision_contracts import (
+    outreach_composer_decision_contract,
+    outreach_variant_set_decision_contract,
+)
 from keystone_agents.agents.outreach_composer import (
     DEFAULT_COMPANY_FIXTURE,
     DEFAULT_CONTACT_FIXTURE,
@@ -644,9 +648,6 @@ def _compact_gemini_outcome_to_outreach_draft(
     linkedin_note = str(compact_payload.get("linkedin_note") or "")
     if len(linkedin_note) > 300:
         compact_payload["linkedin_note"] = ""
-    source_ids_used = compact_payload.get("source_ids_used")
-    if isinstance(source_ids_used, list) and "keystone_profile" not in source_ids_used:
-        compact_payload["source_ids_used"] = [*source_ids_used, "keystone_profile"]
     if args.contact_name and not compact_payload.get("contact_name"):
         compact_payload["contact_name"] = args.contact_name
     if args.contact_title and not compact_payload.get("contact_title"):
@@ -884,6 +885,11 @@ def _outreach_sdk_input_from_context(
     founder_profile = context.get("founder_fit_profile")
     outreach_template = context.get("outreach_template")
     example_guidance = context.get("example_guidance") or []
+    approved_drafting_context = _approved_drafting_context_from_payload(
+        args,
+        context,
+        objective_override=objective,
+    )
     context_header = (
         "Attached approved research brief only. Use no outside company facts."
         if context.get("research_brief_only")
@@ -896,6 +902,14 @@ def _outreach_sdk_input_from_context(
             f"Default Keystone writing style guidance: {KEYSTONE_WRITING_STYLE_GUIDANCE}",
             founder_drafting_context(founder_profile),
             f"{json.dumps(jsonable(context), ensure_ascii=True, sort_keys=True)}",
+            (
+                "Approved decision context supplied before drafting:\n"
+                + json.dumps(
+                    jsonable(approved_drafting_context),
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+            ),
         ]
     )
     style_context = (
@@ -1034,6 +1048,13 @@ def _run_single_sdk_synthesis(
         save=args.save,
         storage=storage,
         model_label="sdk-live" if live else "sdk-local",
+        decision_contract=lambda raw, _typed_input: outreach_composer_decision_contract(
+            _approved_drafting_context_from_payload(
+                args,
+                raw,
+                objective_override=objective,
+            ).allowed_source_ids
+        ),
     )
     if compact_gemini:
         outcome = _compact_gemini_outcome_to_outreach_draft(
@@ -1101,9 +1122,6 @@ def _compact_variant_outcome_to_variant_set(
         linkedin_note = str(draft_payload.get("linkedin_note") or "")
         if len(linkedin_note) > 300:
             draft_payload["linkedin_note"] = ""
-        source_ids_used = draft_payload.get("source_ids_used")
-        if isinstance(source_ids_used, list) and "keystone_profile" not in source_ids_used:
-            draft_payload["source_ids_used"] = [*source_ids_used, "keystone_profile"]
         if args.contact_name and not draft_payload.get("contact_name"):
             draft_payload["contact_name"] = args.contact_name
         if args.contact_title and not draft_payload.get("contact_title"):
@@ -1121,7 +1139,7 @@ def _compact_variant_outcome_to_variant_set(
         approved_context=approved_context,
         variant_labels=labels or variant_labels,
         drafts=drafts,
-    )
+    ).model_copy(update={"decision": outcome.final_output.decision})
     return SDKSynthesisOutcome(
         agent_name=outcome.agent_name,
         raw_context=outcome.raw_context,
@@ -1131,6 +1149,12 @@ def _compact_variant_outcome_to_variant_set(
             output=variant_set,
             raw_result=outcome.result.raw_result,
             live=outcome.result.live,
+            usage=outcome.result.usage,
+            cost=outcome.result.cost,
+            budget_guard=outcome.result.budget_guard,
+            request_cache=outcome.result.request_cache,
+            execution_telemetry=outcome.result.execution_telemetry,
+            tool_receipts=outcome.result.tool_receipts,
         ),
         storage=outcome.storage,
         audit_notes=(
@@ -1142,6 +1166,9 @@ def _compact_variant_outcome_to_variant_set(
         model_run_mode=outcome.model_run_mode,
         usage=outcome.usage,
         cost=outcome.cost,
+        budget_guard=outcome.budget_guard,
+        request_cache=outcome.request_cache,
+        execution_telemetry=outcome.execution_telemetry,
         provider_usage_context=outcome.provider_usage_context,
         started_at_unix=outcome.started_at_unix,
         ended_at_unix=outcome.ended_at_unix,
@@ -1197,6 +1224,14 @@ def _run_compact_variant_set_sdk_synthesis(
         save=args.save,
         storage=storage,
         model_label="sdk-live" if live else "sdk-local",
+        decision_contract=lambda raw, _typed_input: outreach_variant_set_decision_contract(
+            _approved_drafting_context_from_payload(
+                args,
+                raw,
+                objective_override=args.goal,
+                max_variants=len(variant_labels),
+            ).allowed_source_ids
+        ),
     )
     return _compact_variant_outcome_to_variant_set(
         args,
@@ -1227,9 +1262,7 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
         run_config_factory=SDK_RUN_CONFIG_FACTORY,
     )
     if live:
-        get_runtime_agent_model_config(
-            "outreach_composer"
-        ).require_live_execution_ready()
+        get_runtime_agent_model_config("outreach_composer").require_live_execution_ready()
     founder_fit_profile = load_founder_fit_profile(args.founder_fit_profile)
     if args.max_variants == 1:
         outcome = _run_single_sdk_synthesis(

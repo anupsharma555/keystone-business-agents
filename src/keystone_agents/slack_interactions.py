@@ -10,6 +10,7 @@ from urllib.parse import parse_qs
 
 from pydantic import BaseModel
 
+from keystone_agents.agent_decision_contracts import outreach_composer_decision_contract
 from keystone_agents.agent_mentions import parse_agent_mention
 from keystone_agents.agents.orchestrator import (
     review_specialist_output,
@@ -1144,7 +1145,7 @@ def _handle_chief_of_staff_action(
         orchestrator_preflight = run_orchestrator_preflight(
             "continue",
             requested_agent=requested_agent,
-            live_manual_plan=live_sdk,
+            live_manual_plan=False,
             database_url=database_url,
         )
         slack_query_prompt = _slack_query_prompt_for_work_item_action(
@@ -1541,7 +1542,7 @@ def _advance_work_item_for_intent(
     orchestrator_preflight = run_orchestrator_preflight(
         request_text,
         requested_agent=resolved_route.value,
-        live_manual_plan=live_sdk,
+        live_manual_plan=False,
         database_url=database_url,
     )
     live_search = live_search_allowed_for_execution(
@@ -2097,6 +2098,7 @@ def _revise_approval_item_direct(
             live=True,
             save=False,
             model_label="sdk-live",
+            decision_contract=outreach_composer_decision_contract(),
         )
         payload = outcome.final_output.model_dump(mode="json")
         revised_subject = str(payload.get("email_subject") or subject).strip()

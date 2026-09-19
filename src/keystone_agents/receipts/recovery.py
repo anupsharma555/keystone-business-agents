@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -291,10 +291,61 @@ def failure_stage_from_exception(exc: BaseException) -> str:
     return "sdk_execution"
 
 
+def verified_provider_write_summary(
+    receipts: Sequence[Mapping[str, Any]],
+) -> str:
+    """Summarize one current provider-verified mutation without model inference."""
+
+    for raw_receipt in reversed(receipts):
+        receipt = dict(raw_receipt)
+        status = str(receipt.get("status") or "").strip().lower()
+        verification = receipt.get("verification")
+        if not (
+            status in {"completed", "done", "ok", "success", "succeeded"}
+            and isinstance(verification, Mapping)
+            and verification.get("passed") is True
+            and receipt_reports_possible_write(receipt)
+        ):
+            continue
+        try:
+            normalized = normalize_provider_mutation_receipt(receipt)
+        except (TypeError, ValueError):
+            continue
+        if not normalized.tool_name or not normalized.operation or not normalized.object_id:
+            continue
+        operation = normalized.operation.replace("_", " ")
+        table = str(receipt.get("table") or "").strip()
+        target = " ".join(part for part in (table, normalized.object_id) if part).strip()
+        duplicate_id = str(receipt.get("duplicate_record_id") or "").strip()
+        if operation == "reconcile duplicate expense":
+            summary = (
+                "Reconciled and provider-verified the exact Airtable expense record "
+                f"{normalized.object_id} in place"
+            )
+            if duplicate_id:
+                summary += f"; duplicate {duplicate_id} was removed and verified absent"
+            return summary + "."
+        if operation in {"update", "update record", "update row"}:
+            return f"Updated and provider-verified {target} in place."
+        if operation in {
+            "create",
+            "create expense from receipt",
+            "create sheet",
+            "create note",
+        }:
+            return f"Created and provider-verified {target}."
+        return (
+            f"Completed and provider-verified the requested {operation} operation "
+            f"for {target}."
+        )
+    return ""
+
+
 __all__ = [
     "ProviderPartialSuccessError",
     "ProviderRecoveryConflictError",
     "ProviderRecoveryError",
     "ProviderRecoveryStore",
     "failure_stage_from_exception",
+    "verified_provider_write_summary",
 ]

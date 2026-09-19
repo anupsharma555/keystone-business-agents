@@ -13,6 +13,8 @@ from json import JSONDecodeError, dumps, loads
 from typing import Any, TypeVar
 from zoneinfo import ZoneInfo
 
+from pydantic import ValidationError
+
 from keystone_agents.costing import (
     AgentRunBudgetExceededError,
     enforce_agent_run_budget,
@@ -23,7 +25,7 @@ from keystone_agents.execution_telemetry import (
     ExecutionTelemetryRecorder,
     compact_execution_telemetry,
 )
-from keystone_agents.local_file_inputs import local_file_input_bundle_from_text
+from keystone_agents.local_file_inputs import local_file_input_bundle_from_operator_input
 from keystone_agents.model_provider import (
     GEMINI_PROVIDER,
     MissingOpenAIAPIKeyError,
@@ -52,14 +54,66 @@ from keystone_agents.receipts.journal import (
     mutation_tool_names,
     reset_tool_receipt_journal,
     retry_receipt_context,
+    tool_invocation_journal,
+    tool_payload_fingerprint,
     tool_receipt_journal,
+)
+from keystone_agents.receipts.mutations import operation_is_mutation
+from keystone_agents.receipts.normalization import identity_fingerprint
+from keystone_agents.runtime.decision_validation import (
+    AgentDecisionContract,
+    AgentDecisionValidationError,
+    SpecialistDecisionEvidence,
+    bind_authoritative_tool_evidence,
+    build_cumulative_decision_repair_evidence_replay,
+    decision_contract_prompt,
+    decision_repair_prompt,
+    decision_validation_telemetry,
+    is_provider_read_tool_name,
+    pre_model_decision_context_telemetry,
+    validate_specialist_decision,
+    verified_candidate_fingerprints_from_receipts,
+)
+from keystone_agents.runtime.execution_deadline import (
+    ExecutionDeadlineExceeded,
+    current_execution_deadline,
+    current_execution_deadline_snapshot,
+)
+from keystone_agents.runtime.output_validation import (
+    OutputValidationDiagnostics,
+    agent_with_output_diagnostics,
+    structured_output_retry_feedback,
+)
+from keystone_agents.runtime.request_budget import (
+    current_model_request_budget_snapshot,
+)
+from keystone_agents.runtime.response_terminal import (
+    response_terminal_diagnostics,
+    response_terminal_failure_kind,
+)
+from keystone_agents.runtime.tool_call_budget import (
+    ToolCallBudgetContract,
+    ToolCallBudgetLedger,
+)
+from keystone_agents.runtime.tool_execution import (
+    ToolExecutionContract,
+    ToolExecutionContractError,
+    build_tool_execution_summary,
+    evaluate_tool_execution_contract,
+    sdk_tool_execution_records,
+    tool_execution_correction_prompt,
 )
 from keystone_agents.sdk import (
     AgentLike,
+    agent_with_isolated_tool_state,
+    agent_with_retry_compatible_tool_choice,
     agent_with_stable_prompt_cache_key,
+    instruction_profile_text,
+    numeric_sdk_request_usage,
     prompt_cache_key_audit_metadata,
     repo_instruction_profile_id,
     run_typed_sdk_sync,
+    sdk_numeric_usage_observations,
 )
 from keystone_agents.sdk_sessions import build_sdk_session_from_env, session_audit_metadata
 from keystone_agents.tools.serper_tool import (
@@ -71,6 +125,35 @@ from keystone_agents.tools.serper_tool import (
 
 TOutput = TypeVar("TOutput")
 TRaw = TypeVar("TRaw")
+
+
+class UnsafeMutationRetryError(RuntimeError):
+    """A mutation may have run without a conclusive retry-safe boundary."""
+
+    def __init__(self, tool_names: Sequence[str]) -> None:
+        self.tool_names = tuple(
+            dict.fromkeys(str(name).strip() for name in tool_names if str(name).strip())
+        )
+        super().__init__(
+            "A mutation tool failed or has unknown completion state; automatic retry "
+            "is blocked to prevent a duplicate write: " + ", ".join(self.tool_names)
+        )
+
+
+class ToolEvidenceReplayError(RuntimeError):
+    """Completed read evidence could not be replayed safely for correction."""
+
+    def __init__(self, *, reason_code: str, feedback: str) -> None:
+        self.reason_code = str(reason_code or "tool_evidence_replay_unavailable")
+        self.feedback = str(feedback or "Completed tool evidence could not be replayed.")
+        super().__init__(f"{self.reason_code}: {self.feedback}")
+
+
+@dataclass(frozen=True)
+class _ToolRetryState:
+    completed_read_tool_names: tuple[str, ...] = ()
+    completed_mutation_tool_names: tuple[str, ...] = ()
+    uncertain_mutation_tool_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -141,13 +224,16 @@ def sdk_input_from_typed_input(
     *,
     live: bool,
     provider: str,
+    trusted_attachment_paths: Sequence[str] = (),
 ) -> str | list[dict[str, Any]]:
     """Render typed input, preserving explicit local PDFs/images for OpenAI live runs."""
 
     prompt = prompt_from_typed_input(value)
     if not live or provider != "openai":
         return prompt
-    bundle = local_file_input_bundle_from_text(prompt)
+    bundle = local_file_input_bundle_from_operator_input(
+        value, attachment_paths=trusted_attachment_paths,
+    )
     if not bundle.has_inputs:
         return prompt
     return bundle.response_input(prompt)
@@ -190,6 +276,7 @@ def run_typed_sdk_agent(
     live: bool = False,
     config: ModelConfig | None = None,
     session: Any | None = None,
+    inherit_env_session: bool = True,
     workflow_name: str | None = None,
     group_id: str | None = None,
     trace_metadata: TraceMetadata | None = None,
@@ -197,7 +284,17 @@ def run_typed_sdk_agent(
     trace_include_sensitive_data: bool | None = None,
     trace_config: TraceConfig | None = None,
     max_turns: int | None = None,
+    tool_correction_max_turns: int | None = None,
+    decision_repair_max_turns: int | None = None,
     recovery_store: ProviderRecoveryStore | None = None,
+    trusted_attachment_paths: Sequence[str] = (),
+    tool_execution_contract: ToolExecutionContract | None = None,
+    tool_call_budget_contract: ToolCallBudgetContract | None = None,
+    preacquired_tool_receipts: Sequence[Mapping[str, Any] | Any] = (),
+    decision_contract: AgentDecisionContract | None = None,
+    structured_retry_evidence_provider: (
+        Callable[[], Sequence[Mapping[str, Any]]] | None
+    ) = None,
 ) -> TypedAgentRunResult[TOutput]:
     """Run an SDK agent through a typed, credential-safe execution path."""
 
@@ -221,8 +318,29 @@ def run_typed_sdk_agent(
         provider=model_provider,
         model_name=model_name,
     )
-    resolved_session = session or build_sdk_session_from_env()
-    prompt = sdk_input_from_typed_input(typed_input, live=live, provider=model_provider)
+    agent = agent_with_isolated_tool_state(agent)
+    resolved_session = (
+        session
+        if session is not None
+        else build_sdk_session_from_env()
+        if inherit_env_session
+        else None
+    )
+    prompt = sdk_input_from_typed_input(
+        typed_input, live=live, provider=model_provider,
+        trusted_attachment_paths=trusted_attachment_paths,
+    )
+    pre_model_source_audit_prompt = _sdk_input_audit_text(prompt)
+    if decision_contract is not None:
+        prompt = _sdk_prompt_with_recovery_context(
+            prompt,
+            decision_contract_prompt(decision_contract),
+        )
+    if tool_call_budget_contract is not None:
+        prompt = _sdk_prompt_with_recovery_context(
+            prompt,
+            tool_call_budget_contract.prompt_context(),
+        )
     base_prompt = prompt
     audit_prompt = _sdk_input_audit_text(prompt)
     request_cache = _sdk_request_cache_metadata(
@@ -231,20 +349,70 @@ def run_typed_sdk_agent(
         session=resolved_session,
         max_turns=max_turns,
     )
+    validation_diagnostics = OutputValidationDiagnostics(output_type)
+    agent = agent_with_output_diagnostics(agent, validation_diagnostics)
+    request_cache["semantic_attempt_turn_limits"] = {
+        "schema": "keystone.semantic_attempt_turn_limits.v1",
+        "initial": max_turns,
+        "tool_correction": tool_correction_max_turns or max_turns,
+        "decision_repair": decision_repair_max_turns or max_turns,
+    }
+    selected_tool_names = list(
+        dict.fromkeys(
+            str(getattr(tool, "name", "") or "").strip()
+            for tool in (getattr(agent, "tools", []) or [])
+            if str(getattr(tool, "name", "") or "").strip()
+        )
+    )
+    request_cache["request_tool_scope"] = {
+        "schema": "keystone.request_tool_scope.v1",
+        "scope_source": "sdk_agent_attached_tools",
+        "selected_tool_count": len(selected_tool_names),
+        "selected_tool_names": selected_tool_names,
+        **(
+            {
+                "tool_call_limits": {
+                    limit.tool_name: limit.max_calls
+                    for limit in tool_call_budget_contract.limits
+                },
+                "max_total_tool_calls": tool_call_budget_contract.max_total_calls,
+            }
+            if tool_call_budget_contract is not None
+            else {}
+        ),
+    }
     rate_limit_retry_count = 0
     structured_output_retry_count = 0
+    decision_repair_count = 0
+    tool_correction_count = 0
+    decision_attempts: list[dict[str, Any]] = []
+    decision_normalizations: list[dict[str, Any]] = []
+    decision_repair_evidence: dict[str, Any] | None = None
+    sdk_attempt_usage_events: list[dict[str, Any]] = []
+    prior_attempted_tool_names: list[str] = []
+    prior_completed_tool_names: list[str] = []
+    structured_replay_context = ""
+    attested_replay_entries: tuple[Mapping[str, Any], ...] = ()
+    search_telemetry: list[dict[str, Any]] = []
     max_rate_limit_retries = _sdk_rate_limit_max_retries(live=live, run_config=run_config)
     max_structured_output_retries = _sdk_structured_output_max_retries(
         live=live,
         run_config=run_config,
     )
     active_session = resolved_session
+    raw_result: Any | None = None
+    decision_raw_results: list[Any] = []
     prior_receipts = recovery_store.receipts if recovery_store is not None else []
     reset_tool_receipt_journal(
         prior_receipts,
         receipt_sink=recovery_store.record_receipt if recovery_store is not None else None,
     )
-    instrument_agent_tools(agent)
+    tool_call_budget = (
+        ToolCallBudgetLedger(tool_call_budget_contract)
+        if tool_call_budget_contract is not None
+        else None
+    )
+    instrument_agent_tools(agent, tool_call_budget=tool_call_budget)
     temporarily_disabled_tools: dict[int, tuple[Any, Any]] = {}
     if prior_receipts:
         prompt = _sdk_prompt_with_recovery_context(
@@ -257,12 +425,124 @@ def run_typed_sdk_agent(
             temporarily_disabled_tools,
         )
     started_at = time.time()
-    model_run_mode = "local_sdk" if run_config is not None else ("live_sdk" if live else "sdk")
+    model_run_mode = "live_sdk" if live else ("local_sdk" if run_config is not None else "sdk")
+    if decision_contract is not None:
+        context_telemetry, context_failure = pre_model_decision_context_telemetry(
+            decision_contract,
+            model_input_text=pre_model_source_audit_prompt,
+        )
+        request_cache["pre_model_decision_context"] = context_telemetry
+        if context_failure is not None:
+            _attach_current_request_budget_snapshot(request_cache)
+            _attach_tool_call_budget_snapshot(request_cache, tool_call_budget)
+            error = AgentDecisionValidationError(context_failure)
+            try:
+                with execution_telemetry.span(
+                    "sdk.pre_model_decision_context",
+                    attributes={
+                        "agent_name": agent.name,
+                        "route": decision_contract.route,
+                        "decision_stage": decision_contract.decision_stage,
+                        "status": "rejected",
+                    },
+                ):
+                    raise error
+            except AgentDecisionValidationError:
+                pass
+            failure_metadata = {
+                "schema": "keystone.sdk_run_failure.v1",
+                "agent_name": agent.name,
+                "provider": model_provider,
+                "model": model_name,
+                "run_mode": model_run_mode,
+                "failure_kind": _failure_kind(error),
+                "attempt_count": 0,
+                "usage": {
+                    "available": True,
+                    "requests": 0,
+                    "model_attempts_started": 0,
+                    "provider_request_count_confirmed": True,
+                    "note": "Context validation failed before any model request.",
+                },
+                "cost": {
+                    "available": True,
+                    "estimated_usd": 0.0,
+                    "note": "No model request was made.",
+                },
+                "request_cache": request_cache,
+                "tool_receipts": [
+                    dict(receipt)
+                    for receipt in preacquired_tool_receipts
+                    if isinstance(receipt, Mapping)
+                ],
+                "preacquired_tool_receipts": [
+                    dict(receipt)
+                    for receipt in preacquired_tool_receipts
+                    if isinstance(receipt, Mapping)
+                ],
+                "tool_invocations": [],
+                "execution_telemetry": execution_telemetry.snapshot(status="failed").model_dump(
+                    mode="json", by_alias=True
+                ),
+            }
+            failure_metadata["tool_execution"] = _tool_execution_summary_from_journals(
+                selected_tool_names=selected_tool_names,
+                invocations=[],
+                tool_receipts=failure_metadata["tool_receipts"],
+                preacquired_tool_receipts=preacquired_tool_receipts,
+                postcondition=None,
+                failed=True,
+            )
+            failure_metadata["request_cache"]["tool_execution"] = failure_metadata["tool_execution"]
+            _attach_sdk_run_failure_metadata(error, failure_metadata)
+            raise error
     while True:
         reset_sdk_search_telemetry()
         set_sdk_search_request_context(audit_prompt)
-        attempt_index = rate_limit_retry_count + structured_output_retry_count + 1
+        attempt_index = (
+            rate_limit_retry_count
+            + structured_output_retry_count
+            + decision_repair_count
+            + tool_correction_count
+            + 1
+        )
+        attempt_max_turns = (
+            decision_repair_max_turns
+            if decision_repair_count and decision_repair_max_turns is not None
+            else tool_correction_max_turns
+            if tool_correction_count and tool_correction_max_turns is not None
+            else max_turns
+        )
+        disabled_tool_names = [
+            str(getattr(tool, "name", "") or "").strip()
+            for tool, _prior_is_enabled in temporarily_disabled_tools.values()
+            if str(getattr(tool, "name", "") or "").strip()
+            and getattr(tool, "is_enabled", True) is False
+        ]
+        attempt_agent, tool_choice_adjustment = (
+            agent_with_retry_compatible_tool_choice(
+                agent,
+                disabled_tool_names=disabled_tool_names,
+            )
+        )
+        if tool_choice_adjustment is not None:
+            request_cache.setdefault("retry_tool_choice_adjustments", []).append(
+                {
+                    **tool_choice_adjustment,
+                    "attempt_index": attempt_index,
+                }
+            )
+        # Do not let a later failed attempt inherit a prior attempt's SDK items.
+        raw_result = None
+        active_deadline = current_execution_deadline()
+        attempt_deadline_stage = f"{agent.name}:semantic_attempt:{attempt_index}"
+        validation_diagnostics.attempt = attempt_index
         try:
+            if active_deadline is not None:
+                active_deadline.admit(
+                    stage=attempt_deadline_stage,
+                    boundary="semantic_attempt",
+                )
             with execution_telemetry.span(
                 "sdk.model_attempt",
                 attempt_index=attempt_index,
@@ -272,6 +552,7 @@ def run_typed_sdk_agent(
                     "model_name": model_name,
                     "run_mode": model_run_mode,
                     "live": live,
+                    "max_turns": attempt_max_turns,
                 },
             ):
                 with activate_provider_read_context(
@@ -281,7 +562,7 @@ def run_typed_sdk_agent(
                     )
                 ):
                     raw_result, output = run_typed_sdk_sync(
-                        agent,
+                        attempt_agent,
                         prompt,
                         output_type,
                         run_config=run_config,
@@ -294,54 +575,640 @@ def run_typed_sdk_agent(
                         tracing_disabled=tracing_disabled,
                         trace_include_sensitive_data=trace_include_sensitive_data,
                         trace_config=trace_config,
-                        max_turns=max_turns,
+                        max_turns=attempt_max_turns,
                     )
-            search_telemetry = consume_sdk_search_telemetry()
+            if active_deadline is not None:
+                active_deadline.checkpoint(
+                    stage=attempt_deadline_stage,
+                    boundary="semantic_attempt",
+                    phase="model_completed",
+                )
+            if tool_call_budget is not None:
+                tool_call_budget.observe_hosted_calls(
+                    sdk_tool_execution_records(raw_result)
+                )
+            _attach_current_request_budget_snapshot(request_cache)
+            _attach_tool_call_budget_snapshot(request_cache, tool_call_budget)
+            decision_raw_results.append(raw_result)
+            sdk_attempt_usage_events.append(
+                {
+                    "attempt_index": attempt_index,
+                    "usage": extract_sdk_usage(raw_result),
+                }
+            )
+            request_cache["model_attempt_usage"] = list(sdk_attempt_usage_events)
+            if tool_execution_contract is not None:
+                current_tool_outcome = evaluate_tool_execution_contract(
+                    raw_result,
+                    tool_execution_contract,
+                    tool_receipts=tool_receipt_journal(),
+                    preacquired_receipts=preacquired_tool_receipts,
+                    prior_attempted_tool_names=prior_attempted_tool_names,
+                    prior_completed_tool_names=prior_completed_tool_names,
+                )
+                prior_attempted_tool_names = list(
+                    current_tool_outcome.attempted_tool_names
+                )
+                prior_completed_tool_names = list(
+                    current_tool_outcome.completed_tool_names
+                )
+                if not current_tool_outcome.satisfied:
+                    if (
+                        current_tool_outcome.prohibited_tool_names
+                        or tool_correction_count >= 1
+                    ):
+                        raise ToolExecutionContractError(current_tool_outcome)
+                    tool_correction_count += 1
+                    request_cache["tool_execution_correction"] = {
+                        "schema": "keystone.tool_execution_correction.v1",
+                        "attempted": True,
+                        "attempt": tool_correction_count,
+                        "postcondition": current_tool_outcome.receipt(),
+                    }
+                    captured_receipts = tool_receipt_journal()
+                    captured_invocations = tool_invocation_journal()
+                    retry_state, disabled_completed_tool_names = (
+                        _prepare_tools_for_retry(
+                            agent,
+                            raw_result=raw_result,
+                            invocations=captured_invocations,
+                            receipts=captured_receipts,
+                            disabled_tools=temporarily_disabled_tools,
+                            disable_completed_reads=True,
+                        )
+                    )
+                    request_cache["tool_execution_correction"].update(
+                        {
+                            "disabled_completed_tool_names": list(
+                                disabled_completed_tool_names
+                            ),
+                            "completed_read_tool_names": list(
+                                retry_state.completed_read_tool_names
+                            ),
+                            "completed_mutation_tool_names": list(
+                                retry_state.completed_mutation_tool_names
+                            ),
+                        }
+                    )
+                    tool_evidence_replay = build_cumulative_decision_repair_evidence_replay(
+                        decision_raw_results,
+                        SpecialistDecisionEvidence.build(
+                            (),
+                            require_complete_assessments=False,
+                        ),
+                        attested_read_outputs=attested_replay_entries,
+                    )
+                    if retry_state.completed_read_tool_names:
+                        if not tool_evidence_replay.ready:
+                            raise ToolEvidenceReplayError(
+                                reason_code=(
+                                    tool_evidence_replay.reason_code
+                                    or "tool_correction_evidence_replay_unavailable"
+                                ),
+                                feedback=(
+                                    tool_evidence_replay.feedback
+                                    or (
+                                        "A completed read cannot be repeated and its "
+                                        "bounded output was unavailable for safe replay."
+                                    )
+                                ),
+                            )
+                        request_cache["tool_execution_correction"][
+                            "evidence_replay"
+                        ] = tool_evidence_replay.telemetry(
+                            disabled_read_tool_names=(
+                                retry_state.completed_read_tool_names
+                            )
+                        )
+                    prompt = _sdk_prompt_with_recovery_context(
+                        base_prompt,
+                        tool_execution_correction_prompt(
+                            tool_execution_contract,
+                            current_tool_outcome,
+                            invocations=captured_invocations,
+                        ),
+                    )
+                    if tool_evidence_replay.ready:
+                        prompt = _sdk_prompt_with_recovery_context(
+                            prompt,
+                            tool_evidence_replay.prompt_context,
+                        )
+                    if captured_receipts:
+                        prompt = _sdk_prompt_with_recovery_context(
+                            prompt,
+                            retry_receipt_context(captured_receipts),
+                        )
+                    active_session = None
+                    search_telemetry.extend(consume_sdk_search_telemetry())
+                    continue
+            if decision_contract is not None:
+                if decision_contract.output_normalizer is not None:
+                    normalization = decision_contract.output_normalizer(output)
+                    if normalization is not None:
+                        decision_normalizations.append(
+                            {
+                                **dict(normalization),
+                                "attempt_index": attempt_index,
+                            }
+                        )
+                        request_cache["decision_normalizations"] = list(
+                            decision_normalizations
+                        )
+                verified_decision_fingerprints = (
+                    verified_candidate_fingerprints_from_receipts(
+                        [*preacquired_tool_receipts, *tool_receipt_journal()]
+                    )
+                )
+                output_decision_evidence = decision_contract.evidence_resolver(output)
+                tool_decision_evidence = (
+                    decision_contract.tool_evidence_resolver(decision_raw_results)
+                    if decision_contract.tool_evidence_resolver is not None
+                    else SpecialistDecisionEvidence.build(())
+                )
+                decision_evidence = bind_authoritative_tool_evidence(
+                    output_decision_evidence,
+                    tool_decision_evidence,
+                )
+                decision_outcome, decision_evidence = validate_specialist_decision(
+                    output,
+                    decision_contract,
+                    verified_candidate_fingerprints=verified_decision_fingerprints,
+                    evidence_override=decision_evidence,
+                )
+                decision_outcome = decision_outcome.model_copy(
+                    update={"repair_attempted": decision_repair_count > 0}
+                )
+                decision_attempt = decision_validation_telemetry(
+                    output,
+                    decision_contract,
+                    decision_evidence,
+                    decision_outcome,
+                    attempt=decision_repair_count + 1,
+                    tool_mode=(
+                        "verified_context_tool_free"
+                        if decision_repair_count and decision_repair_evidence is not None
+                        else "model_called"
+                    ),
+                )
+                decision_attempts.append(decision_attempt)
+                decision_attempt["candidate_universe_source"] = (
+                    "model_tool_outputs"
+                    if tool_decision_evidence.candidate_ids
+                    else decision_contract.pre_model_context_source
+                )
+                request_cache["decision_ownership"] = {
+                    "schema": "keystone.agent_decision_run.v1",
+                    "route": decision_contract.route,
+                    "decision_owner": decision_attempt["decision_owner"],
+                    "decision_stage": decision_contract.decision_stage,
+                    "attempt_count": len(decision_attempts),
+                    "repair_attempted": decision_repair_count > 0,
+                    "attempts": list(decision_attempts),
+                    "candidate_ids": list(decision_attempt["candidate_ids"]),
+                    "selected_candidate_ids": list(decision_attempt["selected_candidate_ids"]),
+                    "excluded_candidate_ids": list(decision_attempt["excluded_candidate_ids"]),
+                    "reasoning": str(decision_attempt.get("reasoning") or ""),
+                    "limitations": list(decision_attempt.get("limitations") or []),
+                    "events": [
+                        event
+                        for attempt_payload in decision_attempts
+                        for event in list(attempt_payload.get("events") or [])
+                    ],
+                    "validator_outcome": decision_outcome.model_dump(mode="json"),
+                    **(
+                        {"repair_evidence": dict(decision_repair_evidence)}
+                        if decision_repair_evidence is not None
+                        else {}
+                    ),
+                }
+                if decision_outcome.status != "accepted":
+                    prior_reason_codes = {
+                        str(
+                            attempt_payload.get("validator_outcome", {}).get(
+                                "reason_code"
+                            )
+                            or ""
+                        )
+                        for attempt_payload in decision_attempts[:-1]
+                    }
+                    repeated_reason = bool(
+                        decision_repair_count
+                        and decision_outcome.reason_code in prior_reason_codes
+                    )
+                    if (
+                        decision_repair_count
+                        < max(0, int(decision_contract.max_decision_repairs))
+                        and not repeated_reason
+                    ):
+                        replay = build_cumulative_decision_repair_evidence_replay(
+                            decision_raw_results,
+                            decision_evidence,
+                            verified_candidate_fingerprints=(
+                                verified_decision_fingerprints
+                            ),
+                            attested_read_outputs=attested_replay_entries,
+                        )
+                        if replay.required and not replay.ready:
+                            replay_telemetry = replay.telemetry()
+                            request_cache["decision_repair_evidence"] = replay_telemetry
+                            request_cache["decision_ownership"]["repair_evidence"] = (
+                                replay_telemetry
+                            )
+                            blocked_outcome = decision_outcome.model_copy(
+                                update={
+                                    "status": "rejected",
+                                    "reason_code": replay.reason_code,
+                                    "feedback": replay.feedback,
+                                }
+                            )
+                            request_cache["decision_ownership"]["validator_outcome"] = (
+                                blocked_outcome.model_dump(mode="json")
+                            )
+                            raise AgentDecisionValidationError(blocked_outcome)
+                        decision_repair_count += 1
+                        request_cache["decision_ownership"]["repair_attempted"] = True
+                        captured_receipts = tool_receipt_journal()
+                        captured_invocations = tool_invocation_journal()
+                        retry_state, disabled_retry_tool_names = (
+                            _prepare_tools_for_retry(
+                                agent,
+                                raw_result=raw_result,
+                                invocations=captured_invocations,
+                                receipts=captured_receipts,
+                                disabled_tools=temporarily_disabled_tools,
+                                disable_completed_reads=False,
+                            )
+                        )
+                        disabled_read_tool_names: tuple[str, ...] = ()
+                        if replay.ready:
+                            disabled_read_tool_names = _disable_decision_repair_tools(
+                                agent,
+                                temporarily_disabled_tools,
+                            )
+                            decision_repair_evidence = replay.telemetry(
+                                disabled_read_tool_names=disabled_read_tool_names,
+                            )
+                            request_cache["decision_repair_evidence"] = dict(
+                                decision_repair_evidence
+                            )
+                            request_cache["decision_ownership"]["repair_evidence"] = dict(
+                                decision_repair_evidence
+                            )
+                        elif _has_verified_preacquired_decision_context(
+                            decision_contract,
+                            verified_candidate_fingerprints=(
+                                verified_decision_fingerprints
+                            ),
+                        ):
+                            disabled_read_tool_names = _disable_decision_repair_tools(
+                                agent,
+                                temporarily_disabled_tools,
+                            )
+                        else:
+                            disabled_read_tool_names = _disable_decision_repair_tools(
+                                agent,
+                                temporarily_disabled_tools,
+                            )
+                            decision_repair_evidence = {
+                                "schema": "keystone.decision_repair_evidence_replay.v1",
+                                "status": "not_required",
+                                "mode": "original_model_input_tool_free",
+                                "source": "original_model_input",
+                                "provider_calls_during_repair": 0,
+                                "disabled_read_tool_names": list(
+                                    disabled_read_tool_names
+                                ),
+                                "candidate_ids": list(
+                                    decision_contract.pre_model_candidate_ids
+                                ),
+                            }
+                            request_cache["decision_repair_evidence"] = dict(
+                                decision_repair_evidence
+                            )
+                            request_cache["decision_ownership"]["repair_evidence"] = dict(
+                                decision_repair_evidence
+                            )
+                        request_cache["decision_ownership"]["retry_safety"] = {
+                            "disabled_completed_tool_names": list(
+                                dict.fromkeys(
+                                    [
+                                        *disabled_retry_tool_names,
+                                        *disabled_read_tool_names,
+                                    ]
+                                )
+                            ),
+                            "completed_mutation_tool_names": list(
+                                retry_state.completed_mutation_tool_names
+                            ),
+                        }
+                        prompt = _sdk_prompt_with_recovery_context(
+                            base_prompt,
+                            decision_repair_prompt(
+                                decision_contract,
+                                decision_evidence,
+                                decision_outcome,
+                                evidence_replay=replay,
+                            ),
+                        )
+                        active_session = None
+                        search_telemetry.extend(consume_sdk_search_telemetry())
+                        continue
+                    error = AgentDecisionValidationError(decision_outcome)
+                    with execution_telemetry.span(
+                        "sdk.decision_validation",
+                        attempt_index=decision_repair_count + 1,
+                        attributes={
+                            "agent_name": agent.name,
+                            "route": decision_contract.route,
+                            "decision_stage": decision_contract.decision_stage,
+                        },
+                    ):
+                        raise error
+            search_telemetry.extend(consume_sdk_search_telemetry())
             break
         except Exception as exc:
-            search_telemetry = consume_sdk_search_telemetry()
-            if (
+            terminal_diagnostics = response_terminal_diagnostics(exc)
+            if terminal_diagnostics:
+                request_cache["response_terminal"] = terminal_diagnostics
+            if isinstance(exc, ValidationError):
+                try:
+                    validation_diagnostics.capture(exc)
+                except Exception:
+                    pass
+            if _is_sdk_structured_output_error(exc):
+                validation_diagnostics.record_unobserved_schema_error()
+            if validation_diagnostics.failures:
+                request_cache["validation_diagnostics"] = validation_diagnostics.snapshot()
+            if active_deadline is not None:
+                active_deadline.checkpoint(
+                    stage=attempt_deadline_stage,
+                    boundary="semantic_attempt",
+                    phase="failed",
+                )
+            _attach_current_request_budget_snapshot(request_cache)
+            _attach_tool_call_budget_snapshot(request_cache, tool_call_budget)
+            search_telemetry.extend(consume_sdk_search_telemetry())
+            if not any(
+                int(event.get("attempt_index") or 0) == attempt_index
+                for event in sdk_attempt_usage_events
+            ):
+                sdk_attempt_usage_events.append(
+                    {
+                        "attempt_index": attempt_index,
+                        "usage": _failed_sdk_attempt_usage(exc),
+                    }
+                )
+                request_cache["model_attempt_usage"] = list(sdk_attempt_usage_events)
+            structured_retry_eligible = bool(
                 structured_output_retry_count < max_structured_output_retries
                 and _is_sdk_structured_output_error(exc)
-            ):
+            )
+            rate_limit_retry_eligible = bool(
+                rate_limit_retry_count < max_rate_limit_retries
+                and _is_sdk_rate_limit_error(exc)
+            )
+            rate_limit_retry_delay: float | None = None
+            if rate_limit_retry_eligible:
+                rate_limit_retry_delay = _sdk_rate_limit_retry_delay_seconds(
+                    exc,
+                    rate_limit_retry_count + 1,
+                )
+                if active_deadline is not None:
+                    try:
+                        rate_limit_retry_delay = active_deadline.admit_wait(
+                            stage=f"{agent.name}:rate_limit_retry_wait",
+                            boundary="retry_wait",
+                            wait_seconds=rate_limit_retry_delay,
+                        )
+                    except ExecutionDeadlineExceeded as deadline_error:
+                        exc = deadline_error
+                        rate_limit_retry_eligible = False
+            captured_retry_receipts = tool_receipt_journal()
+            captured_retry_invocations = tool_invocation_journal()
+            if structured_retry_eligible or rate_limit_retry_eligible:
+                try:
+                    retry_state, disabled_completed_tool_names = (
+                        _prepare_tools_for_retry(
+                            agent,
+                            raw_result=raw_result,
+                            invocations=captured_retry_invocations,
+                            receipts=captured_retry_receipts,
+                            disabled_tools=temporarily_disabled_tools,
+                            disable_completed_reads=True,
+                            allow_durable_mutation_continuation=(
+                                structured_retry_eligible and recovery_store is None
+                            ),
+                        )
+                    )
+                except UnsafeMutationRetryError as retry_error:
+                    exc = retry_error
+                    structured_retry_eligible = False
+                    rate_limit_retry_eligible = False
+                else:
+                    request_cache.setdefault("retry_safety", []).append(
+                        {
+                            "attempt_index": attempt_index,
+                            "retry_kind": (
+                                "structured_output"
+                                if structured_retry_eligible
+                                else "rate_limit"
+                            ),
+                            "disabled_completed_tool_names": list(
+                                disabled_completed_tool_names
+                            ),
+                            "completed_read_tool_names": list(
+                                retry_state.completed_read_tool_names
+                            ),
+                            "completed_mutation_tool_names": list(
+                                retry_state.completed_mutation_tool_names
+                            ),
+                        }
+                    )
+            if structured_retry_eligible:
                 structured_output_retry_count += 1
                 # A failed structured turn may already have persisted its user
                 # input without a valid assistant response. Retry from the same
                 # bounded prompt without carrying that partial session forward.
                 active_session = None
-                captured_receipts = tool_receipt_journal()
-                if captured_receipts:
+                prompt = base_prompt
+                if structured_retry_evidence_provider is not None:
+                    replay_entries = tuple(structured_retry_evidence_provider())
+                    if replay_entries:
+                        replay_context = _structured_output_retry_evidence_context(
+                            replay_entries
+                        )
+                        structured_replay_context = replay_context
+                        prompt = _sdk_prompt_with_recovery_context(
+                            prompt,
+                            replay_context,
+                        )
+                        attested_replay_entries = _verified_replayed_read_entries(
+                            replay_entries, captured_retry_invocations,
+                        )
+                        replayed_read_names = tuple(dict.fromkeys(
+                            str(entry["tool_name"]) for entry in attested_replay_entries
+                        ))
+                        prior_attempted_tool_names = list(dict.fromkeys([
+                            *prior_attempted_tool_names, *replayed_read_names,
+                        ]))
+                        prior_completed_tool_names = list(dict.fromkeys([
+                            *prior_completed_tool_names, *replayed_read_names,
+                        ]))
+                        replay_fingerprint = sha256(
+                            dumps(
+                                list(replay_entries),
+                                ensure_ascii=True,
+                                sort_keys=True,
+                                default=str,
+                            ).encode("utf-8")
+                        ).hexdigest()
+                        request_cache["structured_output_retry_evidence_replay"] = {
+                            "schema": "keystone.structured_retry_evidence_replay.v1",
+                            "status": "model_visible",
+                            "entry_count": len(replay_entries),
+                            "evidence_sha256": replay_fingerprint,
+                            "provider_calls_during_replay": 0,
+                            "verified_completed_read_tool_names": list(replayed_read_names),
+                        }
+                if captured_retry_receipts:
+                    prompt = _sdk_prompt_with_recovery_context(
+                        prompt,
+                        retry_receipt_context(captured_retry_receipts),
+                    )
+                validation_feedback = structured_output_retry_feedback(
+                    request_cache.get("validation_diagnostics"), attempt=attempt_index,
+                )
+                if validation_feedback:
+                    prompt = _sdk_prompt_with_recovery_context(prompt, validation_feedback)
+                continue
+            if rate_limit_retry_eligible:
+                rate_limit_retry_count += 1
+                if captured_retry_receipts:
                     prompt = _sdk_prompt_with_recovery_context(
                         base_prompt,
-                        retry_receipt_context(captured_receipts),
+                        retry_receipt_context(captured_retry_receipts),
                     )
-                    _disable_completed_mutation_tools(
-                        agent,
-                        captured_receipts,
-                        temporarily_disabled_tools,
+                    if structured_replay_context:
+                        prompt = _sdk_prompt_with_recovery_context(
+                            prompt, structured_replay_context,
+                        )
+                    active_session = None
+                time.sleep(float(rate_limit_retry_delay or 0.0))
+                if active_deadline is not None:
+                    active_deadline.checkpoint(
+                        stage=f"{agent.name}:rate_limit_retry_wait",
+                        boundary="retry_wait",
+                        phase="completed",
                     )
-                continue
-            if (
-                rate_limit_retry_count < max_rate_limit_retries
-                and _is_sdk_rate_limit_error(exc)
-            ):
-                rate_limit_retry_count += 1
-                time.sleep(
-                    _sdk_rate_limit_retry_delay_seconds(
-                        exc,
-                        rate_limit_retry_count,
-                    )
-                )
                 continue
             else:
                 for tool, prior_is_enabled in temporarily_disabled_tools.values():
                     tool.is_enabled = prior_is_enabled
-                failure_telemetry = execution_telemetry.snapshot(
-                    status="failed"
-                ).model_dump(mode="json", by_alias=True)
-                confirmed_provider_requests = (
-                    attempt_index if _provider_response_was_observed(exc) else 0
+                captured_failure_receipts = tool_receipt_journal()
+                failure_invocations = tool_invocation_journal()
+                all_failure_receipts = [
+                    *[
+                        dict(receipt)
+                        for receipt in preacquired_tool_receipts
+                        if isinstance(receipt, Mapping)
+                    ],
+                    *captured_failure_receipts,
+                ]
+                # Model responses can be syntactically valid while a post-model
+                # contract rejects their tool evidence or semantic decision.
+                # Record that boundary explicitly so terminal failure telemetry
+                # never misrepresents the completed model span as overall success.
+                try:
+                    with execution_telemetry.span(
+                        "sdk.post_model_contract_failure",
+                        attempt_index=attempt_index,
+                        attributes={
+                            "agent_name": agent.name,
+                            "failure_kind": _failure_kind(exc),
+                        },
+                    ):
+                        raise exc
+                except Exception:
+                    pass
+                failure_telemetry = execution_telemetry.snapshot(status="failed").model_dump(
+                    mode="json", by_alias=True
                 )
+                observed_attempt_usage = _usage_with_explicit_prompt_cache_metadata(
+                    _aggregate_sdk_attempt_usage(sdk_attempt_usage_events),
+                    request_cache=request_cache,
+                )
+                if observed_attempt_usage.get("available") is True:
+                    failure_usage = {
+                        **observed_attempt_usage,
+                        "model_attempts_started": attempt_index,
+                        "provider_request_count_confirmed": bool(
+                            observed_attempt_usage.get("complete") is True
+                            and observed_attempt_usage.get("requests") is not None
+                        ),
+                        "note": (
+                            "Usage covers every observed model response in this "
+                            "failed run."
+                            if observed_attempt_usage.get("complete") is True
+                            else (
+                                "Usage is a lower bound from completed model attempts; "
+                                "at least one failed provider attempt did not expose usage."
+                            )
+                        ),
+                    }
+                    failure_cost = estimate_usage_cost(
+                        provider=model_provider,
+                        model=model_name,
+                        usage=failure_usage,
+                    )
+                    if observed_attempt_usage.get("complete") is not True:
+                        failure_cost = {
+                            **failure_cost,
+                            "complete": False,
+                            "note": (
+                                "Any estimate covers completed attempts only; cost for "
+                                "failed attempts without usage remains unknown."
+                            ),
+                        }
+                else:
+                    request_counts = [
+                        event["usage"].get("requests")
+                        for event in sdk_attempt_usage_events
+                    ]
+                    observed_requests = (
+                        sum(request_counts)
+                        if request_counts and all(type(value) is int for value in request_counts)
+                        else None
+                    )
+                    failure_usage = {
+                        "available": False,
+                        "complete": False,
+                        "requests": observed_requests,
+                        "model_attempts_started": attempt_index,
+                        "provider_request_count_confirmed": False,
+                        "note": (
+                            "Token usage is unavailable. Any request count comes from "
+                            "observed SDK callbacks; unobserved provider consumption "
+                            "remains unknown."
+                        ),
+                    }
+                    failure_cost = {
+                        "available": False,
+                        "note": (
+                            "Cost is unknown because token usage was unavailable for "
+                            "the failed SDK run."
+                        ),
+                    }
+                if rate_limit_retry_count:
+                    request_cache["rate_limit_retries"] = rate_limit_retry_count
+                if structured_output_retry_count:
+                    request_cache["structured_output_retries"] = (
+                        structured_output_retry_count
+                    )
+                    request_cache["structured_output_retry_session_reset"] = True
+                if decision_repair_count:
+                    request_cache["decision_repairs"] = decision_repair_count
+                if tool_correction_count:
+                    request_cache["tool_corrections"] = tool_correction_count
                 failure_metadata = {
                     "schema": "keystone.sdk_run_failure.v1",
                     "agent_name": agent.name,
@@ -350,38 +1217,48 @@ def run_typed_sdk_agent(
                     "run_mode": model_run_mode,
                     "failure_kind": _failure_kind(exc),
                     "attempt_count": attempt_index,
-                    "usage": {
-                        "available": False,
-                        "requests": confirmed_provider_requests,
-                        "model_attempts_started": attempt_index,
-                        "provider_request_count_confirmed": bool(
-                            confirmed_provider_requests
-                        ),
-                        "note": (
-                            (
-                                "A provider response was observed, but token usage was "
-                                "unavailable because the SDK run did not return a result."
-                            )
-                            if confirmed_provider_requests
-                            else (
-                                "The SDK attempt failed before a provider response was "
-                                "observed; provider request consumption is not recorded."
-                            )
-                        ),
-                    },
-                    "cost": {
-                        "available": False,
-                        "note": (
-                            "Cost is unknown because token usage was unavailable for "
-                            "the failed SDK run."
-                        ),
-                    },
+                    "usage": failure_usage,
+                    "cost": failure_cost,
                     "request_cache": {
                         **request_cache,
                         "failed_model_attempts": attempt_index,
                     },
+                    "tool_receipts": all_failure_receipts,
+                    "preacquired_tool_receipts": [
+                        dict(receipt)
+                        for receipt in preacquired_tool_receipts
+                        if isinstance(receipt, Mapping)
+                    ],
+                    "tool_invocations": failure_invocations,
                     "execution_telemetry": failure_telemetry,
                 }
+                if tool_execution_contract is not None:
+                    failure_tool_outcome = evaluate_tool_execution_contract(
+                        None,
+                        tool_execution_contract,
+                        tool_receipts=captured_failure_receipts,
+                        preacquired_receipts=preacquired_tool_receipts,
+                        prior_attempted_tool_names=prior_attempted_tool_names,
+                        prior_completed_tool_names=prior_completed_tool_names,
+                    )
+                    failure_metadata["tool_execution_postcondition"] = (
+                        failure_tool_outcome.receipt()
+                    )
+                    failure_metadata["request_cache"]["tool_execution_postcondition"] = (
+                        failure_tool_outcome.receipt()
+                    )
+                failure_metadata["tool_execution"] = _tool_execution_summary_from_journals(
+                    selected_tool_names=selected_tool_names,
+                    invocations=failure_invocations,
+                    tool_receipts=all_failure_receipts,
+                    preacquired_tool_receipts=preacquired_tool_receipts,
+                    postcondition=failure_metadata.get("tool_execution_postcondition"),
+                    failed=True,
+                    raw_result=raw_result,
+                )
+                failure_metadata["request_cache"]["tool_execution"] = failure_metadata[
+                    "tool_execution"
+                ]
                 guardrail_diagnostics = _sdk_guardrail_failure_diagnostics(exc)
                 if guardrail_diagnostics:
                     failure_metadata["guardrail"] = guardrail_diagnostics
@@ -410,7 +1287,10 @@ def run_typed_sdk_agent(
                     status="error",
                     failure_kind=_failure_kind(exc),
                     retry_count=(
-                        rate_limit_retry_count + structured_output_retry_count
+                        rate_limit_retry_count
+                        + structured_output_retry_count
+                        + decision_repair_count
+                        + tool_correction_count
                     ),
                     duration_ms=round((time.time() - started_at) * 1000, 3),
                     execution_telemetry=failure_telemetry,
@@ -430,17 +1310,53 @@ def run_typed_sdk_agent(
                         failure_metadata,
                     )
                     raise partial_error from exc
-                raise
+                raise exc
     for tool, prior_is_enabled in temporarily_disabled_tools.values():
         tool.is_enabled = prior_is_enabled
     captured_tool_receipts = tool_receipt_journal()
+    captured_tool_invocations = tool_invocation_journal()
     output = _attach_retrieval_diagnostics(output, search_telemetry)
     search_diagnostics = sdk_search_diagnostics_from_telemetry(search_telemetry)
+    tool_execution_outcome = (
+        evaluate_tool_execution_contract(
+            raw_result,
+            tool_execution_contract,
+            tool_receipts=captured_tool_receipts,
+            preacquired_receipts=preacquired_tool_receipts,
+            prior_attempted_tool_names=prior_attempted_tool_names,
+            prior_completed_tool_names=prior_completed_tool_names,
+        )
+        if tool_execution_contract is not None
+        else None
+    )
+    if tool_execution_outcome is not None:
+        request_cache["tool_execution_postcondition"] = tool_execution_outcome.receipt()
+    request_cache["tool_invocations"] = captured_tool_invocations
+    request_cache["tool_execution"] = _tool_execution_summary_from_journals(
+        selected_tool_names=selected_tool_names,
+        invocations=captured_tool_invocations,
+        tool_receipts=captured_tool_receipts,
+        preacquired_tool_receipts=preacquired_tool_receipts,
+        postcondition=(
+            tool_execution_outcome.receipt() if tool_execution_outcome is not None else None
+        ),
+        failed=False,
+        raw_result=raw_result,
+    )
     usage = _usage_with_explicit_prompt_cache_metadata(
-        _extract_sdk_usage(raw_result),
+        _aggregate_sdk_attempt_usage(sdk_attempt_usage_events),
         request_cache=request_cache,
     )
     cost = estimate_usage_cost(provider=model_provider, model=model_name, usage=usage)
+    if usage.get("complete") is not True:
+        cost = {
+            **cost,
+            "complete": False,
+            "note": (
+                "Any estimate covers attempts with reported usage only; at least one "
+                "failed SDK attempt did not expose token usage."
+            ),
+        }
     try:
         with execution_telemetry.span(
             "sdk.budget_check",
@@ -459,9 +1375,9 @@ def run_typed_sdk_agent(
                 strict_unknown_cost=live and run_config is None,
             )
     except Exception as exc:
-        failure_telemetry = execution_telemetry.snapshot(
-            status="failed"
-        ).model_dump(mode="json", by_alias=True)
+        failure_telemetry = execution_telemetry.snapshot(status="failed").model_dump(
+            mode="json", by_alias=True
+        )
         _attach_sdk_run_failure_metadata(
             exc,
             {
@@ -472,11 +1388,23 @@ def run_typed_sdk_agent(
                 "run_mode": model_run_mode,
                 "failure_kind": _failure_kind(exc),
                 "attempt_count": (
-                    rate_limit_retry_count + structured_output_retry_count + 1
+                    rate_limit_retry_count
+                    + structured_output_retry_count
+                    + decision_repair_count
+                    + tool_correction_count
+                    + 1
                 ),
                 "usage": usage,
                 "cost": cost,
                 "request_cache": request_cache,
+                "tool_receipts": captured_tool_receipts,
+                "preacquired_tool_receipts": [
+                    dict(receipt)
+                    for receipt in preacquired_tool_receipts
+                    if isinstance(receipt, Mapping)
+                ],
+                "tool_invocations": captured_tool_invocations,
+                "tool_execution": request_cache["tool_execution"],
                 "execution_telemetry": failure_telemetry,
             },
         )
@@ -495,15 +1423,98 @@ def run_typed_sdk_agent(
             trace_metadata=trace_metadata,
             status="error",
             failure_kind=_failure_kind(exc),
-            retry_count=rate_limit_retry_count + structured_output_retry_count,
+            retry_count=(
+                rate_limit_retry_count
+                + structured_output_retry_count
+                + decision_repair_count
+                + tool_correction_count
+            ),
             duration_ms=round((time.time() - started_at) * 1000, 3),
             execution_telemetry=failure_telemetry,
         )
         raise
+    if tool_execution_outcome is not None and not tool_execution_outcome.satisfied:
+        failure_kind = "required_tool_execution_missing"
+        if tool_execution_outcome.prohibited_tool_names:
+            failure_kind = "forbidden_tool_execution_observed"
+        error = ToolExecutionContractError(tool_execution_outcome)
+        try:
+            with execution_telemetry.span(
+                "sdk.tool_execution_postcondition",
+                attributes={
+                    "agent_name": agent.name,
+                    "stage": tool_execution_outcome.stage,
+                    "failure_kind": failure_kind,
+                },
+            ):
+                raise error
+        except ToolExecutionContractError:
+            pass
+        failure_telemetry = execution_telemetry.snapshot(status="failed").model_dump(
+            mode="json", by_alias=True
+        )
+        failure_metadata = {
+            "schema": "keystone.sdk_run_failure.v1",
+            "agent_name": agent.name,
+            "provider": model_provider,
+            "model": model_name,
+            "run_mode": model_run_mode,
+            "failure_kind": failure_kind,
+            "attempt_count": (
+                rate_limit_retry_count
+                + structured_output_retry_count
+                + decision_repair_count
+                + tool_correction_count
+                + 1
+            ),
+            "usage": usage,
+            "cost": cost,
+            "budget_guard": budget_guard,
+            "request_cache": request_cache,
+            "tool_execution_postcondition": tool_execution_outcome.receipt(),
+            "tool_receipts": captured_tool_receipts,
+            "preacquired_tool_receipts": [
+                dict(receipt)
+                for receipt in preacquired_tool_receipts
+                if isinstance(receipt, Mapping)
+            ],
+            "tool_invocations": captured_tool_invocations,
+            "tool_execution": request_cache["tool_execution"],
+            "execution_telemetry": failure_telemetry,
+        }
+        _attach_sdk_run_failure_metadata(error, failure_metadata)
+        _record_sdk_run_summary_safely(
+            agent_name=agent.name,
+            model_provider=model_provider,
+            model_name=model_name,
+            model_run_mode=model_run_mode,
+            live=live,
+            request_cache=request_cache,
+            usage=usage,
+            cost=cost,
+            budget_guard=budget_guard,
+            search_telemetry=search_telemetry,
+            search_diagnostics=search_diagnostics,
+            raw_result=raw_result,
+            trace_metadata=trace_metadata,
+            status="error",
+            failure_kind=failure_kind,
+            retry_count=(
+                rate_limit_retry_count
+                + structured_output_retry_count
+                + decision_repair_count
+                + tool_correction_count
+            ),
+            duration_ms=round((time.time() - started_at) * 1000, 3),
+            execution_telemetry=failure_telemetry,
+        )
+        raise error
     execution_telemetry.mark_final_response()
-    execution_telemetry_payload = execution_telemetry.snapshot(
-        status="completed"
-    ).model_dump(mode="json", by_alias=True)
+    _attach_current_request_budget_snapshot(request_cache)
+    _attach_tool_call_budget_snapshot(request_cache, tool_call_budget)
+    execution_telemetry_payload = execution_telemetry.snapshot(status="completed").model_dump(
+        mode="json", by_alias=True
+    )
     _record_sdk_run_summary_safely(
         agent_name=agent.name,
         model_provider=model_provider,
@@ -519,7 +1530,12 @@ def run_typed_sdk_agent(
         raw_result=raw_result,
         trace_metadata=trace_metadata,
         status="ok",
-        retry_count=rate_limit_retry_count + structured_output_retry_count,
+        retry_count=(
+            rate_limit_retry_count
+            + structured_output_retry_count
+            + decision_repair_count
+            + tool_correction_count
+        ),
         duration_ms=round((time.time() - started_at) * 1000, 3),
         execution_telemetry=execution_telemetry_payload,
     )
@@ -527,17 +1543,13 @@ def run_typed_sdk_agent(
         agent_name=agent.name,
         output=output,
         raw_result=raw_result,
-        live=live and run_config is None,
+        live=live,
         usage=usage,
         cost=cost,
         budget_guard=budget_guard,
         request_cache={
             **request_cache,
-            **(
-                {"rate_limit_retries": rate_limit_retry_count}
-                if rate_limit_retry_count
-                else {}
-            ),
+            **({"rate_limit_retries": rate_limit_retry_count} if rate_limit_retry_count else {}),
             **(
                 {
                     "structured_output_retries": structured_output_retry_count,
@@ -546,9 +1558,126 @@ def run_typed_sdk_agent(
                 if structured_output_retry_count
                 else {}
             ),
+            **({"decision_repairs": decision_repair_count} if decision_repair_count else {}),
+            **({"tool_corrections": tool_correction_count} if tool_correction_count else {}),
         },
         execution_telemetry=execution_telemetry_payload,
         tool_receipts=captured_tool_receipts,
+    )
+
+
+def _attach_current_request_budget_snapshot(request_cache: dict[str, Any]) -> None:
+    """Expose active request-count and time ledgers without changing behavior."""
+
+    snapshot = current_model_request_budget_snapshot()
+    if snapshot is not None:
+        request_cache["request_budget"] = snapshot
+    deadline_snapshot = current_execution_deadline_snapshot()
+    if deadline_snapshot is not None:
+        request_cache["execution_deadline"] = deadline_snapshot
+
+
+def _attach_tool_call_budget_snapshot(
+    request_cache: dict[str, Any],
+    budget: ToolCallBudgetLedger | None,
+) -> None:
+    """Expose pre-call tool admissions without provider inputs or outputs."""
+
+    if budget is not None:
+        request_cache["tool_call_budget"] = budget.snapshot()
+
+
+def _tool_execution_summary_from_journals(
+    *,
+    selected_tool_names: Sequence[str],
+    invocations: Sequence[Mapping[str, Any]],
+    tool_receipts: Sequence[Mapping[str, Any] | Any],
+    preacquired_tool_receipts: Sequence[Mapping[str, Any] | Any],
+    postcondition: Mapping[str, Any] | None,
+    failed: bool,
+    raw_result: Any | None = None,
+) -> dict[str, Any]:
+    """Build one terminal tool envelope from call-boundary evidence."""
+
+    journal_started = [
+        str(item.get("tool_name") or "").strip()
+        for item in invocations
+        if str(item.get("status") or "") == "started" and str(item.get("tool_name") or "").strip()
+    ]
+    sdk_records = sdk_tool_execution_records(raw_result) if raw_result is not None else ()
+    sdk_started = [record.tool_name for record in sdk_records]
+    started = journal_started or sdk_started
+    preacquired_names = [
+        str(receipt.get("tool_name") or receipt.get("provider") or "").strip()
+        for receipt in preacquired_tool_receipts
+        if isinstance(receipt, Mapping)
+        and str(receipt.get("tool_name") or receipt.get("provider") or "").strip()
+    ]
+    if started:
+        mode = "llm_selected_function_tools"
+    elif preacquired_names:
+        mode = "preacquired_provider_context"
+    elif selected_tool_names:
+        mode = "model_tools_attached_no_call"
+    else:
+        mode = "tool_free"
+    if failed:
+        mode = f"{mode}_failed"
+    durable_receipts: list[Mapping[str, Any]] = []
+    seen_receipts: set[str] = set()
+    for receipt in [*tool_receipts, *preacquired_tool_receipts]:
+        if not isinstance(receipt, Mapping):
+            continue
+        key = dumps(dict(receipt), ensure_ascii=True, sort_keys=True, default=str)
+        if key in seen_receipts:
+            continue
+        seen_receipts.add(key)
+        durable_receipts.append(receipt)
+    preacquired_receipts = [
+        receipt for receipt in preacquired_tool_receipts if isinstance(receipt, Mapping)
+    ]
+    provider_attempt_counts = [
+        int(receipt["provider_request_attempt_count"])
+        for receipt in durable_receipts
+        if isinstance(receipt.get("provider_request_attempt_count"), int)
+    ]
+    provider_success_counts = [
+        int(receipt["provider_request_success_count"])
+        for receipt in durable_receipts
+        if isinstance(receipt.get("provider_request_success_count"), int)
+    ]
+    return build_tool_execution_summary(
+        mode=mode,
+        scope_source="shared_sdk_runner",
+        selected_tool_names=selected_tool_names,
+        model_called_tool_names=started,
+        model_tool_call_count=len(started),
+        tool_output_count=sum(
+            1
+            for item in invocations
+            if str(item.get("status") or "")
+            in {"completed", "reused_verified", "reused_verified_read"}
+        )
+        or sum(1 for record in sdk_records if record.succeeded),
+        workflow_called_tool_names=(),
+        workflow_tool_call_count=0,
+        preacquired_context_tool_names=preacquired_names,
+        preacquired_context_count=len(preacquired_receipts),
+        preacquired_context_source=(
+            "preacquired_provider_context" if preacquired_names else ""
+        ),
+        provider_receipt_count=len(durable_receipts),
+        distinct_persisted_receipt_count=len(durable_receipts),
+        receipt_observation_count=len(tool_receipts) + len(preacquired_tool_receipts),
+        provider_request_attempt_count=(
+            sum(provider_attempt_counts) if provider_attempt_counts else None
+        ),
+        provider_request_success_count=(
+            sum(provider_success_counts) if provider_success_counts else None
+        ),
+        context_receipt_count=len(preacquired_receipts),
+        context_receipt_source=("preacquired_provider_context" if preacquired_names else ""),
+        postcondition=postcondition,
     )
 
 
@@ -646,6 +1775,184 @@ def _disable_completed_mutation_tools(
         tool.is_enabled = False
 
 
+def _tool_retry_state(
+    raw_result: Any,
+    invocations: Sequence[Mapping[str, Any]],
+) -> _ToolRetryState:
+    """Classify completed reads and fail-closed mutation retry evidence."""
+
+    completed_reads: set[str] = set()
+    completed_mutations: set[str] = set()
+    uncertain_mutations: set[str] = set()
+
+    invocation_states: dict[tuple[int, str], set[str]] = {}
+    for item in invocations:
+        tool_name = str(item.get("tool_name") or "").strip()
+        if not tool_name:
+            continue
+        try:
+            invocation_index = int(item.get("invocation_index") or 0)
+        except (TypeError, ValueError):
+            invocation_index = 0
+        invocation_states.setdefault((invocation_index, tool_name), set()).add(
+            str(item.get("status") or "").strip().lower()
+        )
+
+    for (_invocation_index, tool_name), statuses in invocation_states.items():
+        if operation_is_mutation(tool_name):
+            if "failed" in statuses or "started" in statuses and "completed" not in statuses:
+                uncertain_mutations.add(tool_name)
+            elif "completed" in statuses:
+                completed_mutations.add(tool_name)
+        elif "completed" in statuses and is_provider_read_tool_name(tool_name):
+            completed_reads.add(tool_name)
+
+    for record in sdk_tool_execution_records(raw_result) if raw_result is not None else ():
+        if operation_is_mutation(record.tool_name):
+            if record.succeeded:
+                completed_mutations.add(record.tool_name)
+            else:
+                uncertain_mutations.add(record.tool_name)
+        elif record.succeeded and is_provider_read_tool_name(record.tool_name):
+            completed_reads.add(record.tool_name)
+
+    return _ToolRetryState(
+        completed_read_tool_names=tuple(sorted(completed_reads)),
+        completed_mutation_tool_names=tuple(sorted(completed_mutations)),
+        uncertain_mutation_tool_names=tuple(sorted(uncertain_mutations)),
+    )
+
+
+def _disable_tools_by_name(
+    agent: AgentLike,
+    tool_names: Sequence[str],
+    disabled_tools: dict[int, tuple[Any, Any]],
+) -> tuple[str, ...]:
+    names = {str(name).strip() for name in tool_names if str(name).strip()}
+    disabled_names: list[str] = []
+    for tool in list(getattr(agent, "tools", []) or []):
+        tool_name = str(getattr(tool, "name", "") or "").strip()
+        if tool_name not in names:
+            continue
+        tool_id = id(tool)
+        if tool_id not in disabled_tools:
+            disabled_tools[tool_id] = (tool, getattr(tool, "is_enabled", True))
+        tool.is_enabled = False
+        disabled_names.append(tool_name)
+    return tuple(dict.fromkeys(disabled_names))
+
+
+def _prepare_tools_for_retry(
+    agent: AgentLike,
+    *,
+    raw_result: Any,
+    invocations: Sequence[Mapping[str, Any]],
+    receipts: Sequence[Mapping[str, Any]],
+    disabled_tools: dict[int, tuple[Any, Any]],
+    disable_completed_reads: bool,
+    allow_durable_mutation_continuation: bool = False,
+) -> tuple[_ToolRetryState, tuple[str, ...]]:
+    """Disable completed operations and reject an uncertain mutation retry."""
+
+    state = _tool_retry_state(raw_result, invocations)
+    safe_mutation_names: set[str] = set()
+    if allow_durable_mutation_continuation:
+        from keystone_agents.runtime.durable_execution import current_execution
+
+        execution = current_execution()
+        if execution is not None:
+            operations = execution.store.operations(execution.execution_id)
+            completed_names = {
+                operation["tool_name"] for operation in operations
+                if operation["status"] in {"verified", "no_effect"}
+            }
+            unresolved_names = {
+                operation["tool_name"] for operation in operations
+                if operation["status"] not in {"verified", "no_effect"}
+            }
+            safe_mutation_names = completed_names - unresolved_names
+    uncertain_names = set(state.uncertain_mutation_tool_names) - safe_mutation_names
+    if uncertain_names:
+        raise UnsafeMutationRetryError(tuple(sorted(uncertain_names)))
+    if state.uncertain_mutation_tool_names:
+        state = _ToolRetryState(
+            completed_read_tool_names=state.completed_read_tool_names,
+            completed_mutation_tool_names=state.completed_mutation_tool_names,
+        )
+    disabled_names = {
+        *mutation_tool_names(receipts),
+        *state.completed_mutation_tool_names,
+    }
+    # The journal replays verified operations, re-admits proven previews, and
+    # gates distinct writes. Never re-enable an intentionally disabled tool.
+    disabled_names.difference_update(safe_mutation_names)
+    if disable_completed_reads:
+        disabled_names.update(state.completed_read_tool_names)
+    disabled = _disable_tools_by_name(agent, sorted(disabled_names), disabled_tools)
+    return state, disabled
+
+
+def _disable_decision_repair_tools(
+    agent: AgentLike,
+    disabled_tools: dict[int, tuple[Any, Any]],
+) -> tuple[str, ...]:
+    """Make an evidence-backed semantic repair strictly tool-free.
+
+    The replay already contains the bounded evidence needed to repair the
+    structured choice. Disabling every attached tool prevents new evidence,
+    repeated reads, redundant deterministic scoring, and accidental mutation
+    from widening what is intentionally a one-turn repair.
+    """
+
+    return _disable_tools_by_name(
+        agent,
+        [
+            str(getattr(tool, "name", "") or "").strip()
+            for tool in list(getattr(agent, "tools", []) or [])
+        ],
+        disabled_tools,
+    )
+
+
+def _disable_provider_read_tools(
+    agent: AgentLike,
+    disabled_tools: dict[int, tuple[Any, Any]],
+    *,
+    completed_tool_names: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """Disable every admitted provider read while preserving deterministic helpers."""
+
+    completed_names = set(completed_tool_names)
+    disabled_names: list[str] = []
+    for tool in list(getattr(agent, "tools", []) or []):
+        tool_name = str(getattr(tool, "name", "") or "").strip()
+        if not tool_name or (
+            tool_name not in completed_names
+            and not is_provider_read_tool_name(tool_name)
+        ):
+            continue
+        tool_id = id(tool)
+        if tool_id not in disabled_tools:
+            disabled_tools[tool_id] = (tool, getattr(tool, "is_enabled", True))
+        tool.is_enabled = False
+        disabled_names.append(tool_name)
+    return tuple(dict.fromkeys(disabled_names))
+
+
+def _has_verified_preacquired_decision_context(
+    contract: AgentDecisionContract,
+    *,
+    verified_candidate_fingerprints: Sequence[str],
+) -> bool:
+    """Return whether the supplied candidate universe is receipt-bound before repair."""
+
+    candidate_ids = tuple(contract.pre_model_candidate_ids)
+    if not candidate_ids:
+        return False
+    verified = set(verified_candidate_fingerprints)
+    return all(identity_fingerprint(candidate_id) in verified for candidate_id in candidate_ids)
+
+
 def _sdk_prompt_with_recovery_context(
     prompt: str | list[dict[str, Any]],
     recovery_context: str,
@@ -661,6 +1968,65 @@ def _sdk_prompt_with_recovery_context(
             "content": [{"type": "input_text", "text": recovery_context}],
         },
     ]
+
+
+def _verified_replayed_read_tool_names(
+    entries: Sequence[Mapping[str, Any]], invocations: Sequence[Mapping[str, Any]],
+) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(
+        str(entry["tool_name"]) for entry in _verified_replayed_read_entries(entries, invocations)
+    ))
+
+
+def _verified_replayed_read_entries(
+    entries: Sequence[Mapping[str, Any]], invocations: Sequence[Mapping[str, Any]],
+) -> tuple[Mapping[str, Any], ...]:
+    """Credit only exact completed read outputs actually restored to the model input."""
+    starts: dict[tuple[str, int], str] = {}
+    completed: set[tuple[str, str, str]] = set()
+    for invocation in invocations:
+        name = str(invocation.get("tool_name") or "")
+        if operation_is_mutation(name) or not is_provider_read_tool_name(name):
+            continue
+        index = invocation.get("invocation_index")
+        if not isinstance(index, int) or isinstance(index, bool) or index < 1:
+            continue
+        key = (name, index)
+        if invocation.get("status") == "started" and invocation.get("arguments_sha256"):
+            starts[key] = str(invocation["arguments_sha256"])
+        elif invocation.get("status") in {"completed", "reused_verified_read"}:
+            if key in starts and invocation.get("output_sha256"):
+                completed.add((name, starts[key], str(invocation["output_sha256"])))
+    return tuple(
+        entry for entry in entries
+        if isinstance(entry, Mapping) and "arguments" in entry and "output" in entry
+        and (
+            str(entry.get("tool_name") or ""),
+            tool_payload_fingerprint(entry["arguments"]),
+            tool_payload_fingerprint(entry["output"]),
+        ) in completed
+    )
+
+
+def _structured_output_retry_evidence_context(
+    entries: Sequence[Mapping[str, Any]],
+) -> str:
+    """Replay bounded tool outputs after a malformed structured response.
+
+    The caller owns sanitization and size bounds for its evidence provider. The
+    shared runner keeps the payload model-visible but records only a fingerprint
+    and count in telemetry.
+    """
+
+    payload = [dict(entry) for entry in entries]
+    return (
+        "\n\nThe previous model turn called tools successfully but did not return "
+        "valid structured output. Those completed operations are disabled for this "
+        "retry. Use the exact bounded evidence below to return only the required "
+        "structured result; do not invent identities or claim additional provider "
+        "reads.\nVerified model tool evidence:\n"
+        + dumps(payload, ensure_ascii=True, sort_keys=True, default=str)
+    )
 
 
 def _sdk_rate_limit_max_retries(*, live: bool, run_config: Any | None) -> int:
@@ -688,6 +2054,8 @@ def _sdk_structured_output_max_retries(
 
 
 def _is_sdk_structured_output_error(exc: BaseException) -> bool:
+    if response_terminal_diagnostics(exc):
+        return False
     error_type = type(exc).__name__.lower()
     text = f"{error_type} {exc}".lower()
     return bool(
@@ -703,6 +2071,8 @@ def _is_sdk_rate_limit_error(exc: BaseException) -> bool:
     status_code = getattr(exc, "status_code", None)
     if status_code == 429:
         return True
+    if response_terminal_diagnostics(exc):
+        return False
     text = f"{type(exc).__name__} {exc}".lower()
     return "rate limit" in text or "429" in text or "rate_limit_exceeded" in text
 
@@ -732,7 +2102,7 @@ def _attach_retrieval_diagnostics(
     diagnostics = sdk_search_diagnostics_from_telemetry(telemetry_packets)
     if not diagnostics:
         return output
-    model_fields = getattr(output, "model_fields", {})
+    model_fields = getattr(type(output), "model_fields", {})
     if isinstance(model_fields, dict) and "retrieval_diagnostics" in model_fields:
         model_copy = getattr(output, "model_copy", None)
         if callable(model_copy):
@@ -804,6 +2174,34 @@ def _extract_token_detail(value: Any, field_name: str) -> int:
     return _usage_attr(value, field_name)
 
 
+_REQUEST_TOKEN_FIELDS = (
+    "input_tokens", "output_tokens", "total_tokens", "cached_input_tokens",
+    "cache_write_input_tokens", "reasoning_output_tokens",
+)
+
+
+def _sdk_request_usage_entries(raw_result: Any, usage: Any) -> list[dict[str, Any]]:
+    observations = sdk_numeric_usage_observations(raw_result).get("responses") or []
+    if observations:
+        return [{key: row.get(key) for key in _REQUEST_TOKEN_FIELDS} for row in observations]
+    responses = _first_attr(raw_result, "raw_responses") or []
+    if responses:
+        rows = [numeric_sdk_request_usage(
+            _first_attr(response, "usage"), raw_usage=_first_attr(response, "raw_usage"),
+        ) for response in responses]
+    else:
+        entries = _first_attr(usage, "request_usage_entries") or []
+        if entries:
+            rows = [numeric_sdk_request_usage(entry) for entry in entries]
+        elif _first_usage_int(usage, ("requests", "num_model_requests"), default=1) == 1:
+            rows = [numeric_sdk_request_usage(
+                usage, raw_usage=usage if isinstance(usage, Mapping) else None,
+            )]
+        else:
+            rows = []
+    return [{key: row.get(key) for key in _REQUEST_TOKEN_FIELDS} for row in rows]
+
+
 def extract_sdk_usage(raw_result: Any) -> dict[str, Any]:
     """Return safe request/token usage metadata when the SDK exposes it."""
 
@@ -822,6 +2220,8 @@ def extract_sdk_usage(raw_result: Any) -> dict[str, Any]:
             "output_tokens": None,
             "total_tokens": None,
             "cached_input_tokens": None,
+            "cache_write_input_tokens": None,
+            "request_usage_entries": [],
             "reasoning_output_tokens": None,
             "cache_hit_rate": None,
             **prompt_cache_metadata,
@@ -853,6 +2253,12 @@ def extract_sdk_usage(raw_result: Any) -> dict[str, Any]:
             ),
         ),
     )
+    entries = _sdk_request_usage_entries(raw_result, usage)
+    cache_write_counts = [row.get("cache_write_input_tokens") for row in entries]
+    cache_write_tokens = (
+        sum(cache_write_counts)
+        if entries and all(type(value) is int for value in cache_write_counts) else None
+    )
     return {
         "available": True,
         "requests": _first_usage_int(usage, ("requests", "num_model_requests"), default=1),
@@ -871,6 +2277,8 @@ def extract_sdk_usage(raw_result: Any) -> dict[str, Any]:
             ("total_tokens", "total_token_count", "totalTokenCount"),
         ),
         "cached_input_tokens": cached_input_tokens,
+        "cache_write_input_tokens": cache_write_tokens,
+        "request_usage_entries": entries,
         "reasoning_output_tokens": max(
             _extract_token_detail(output_details, "reasoning_tokens"),
             _first_usage_int(usage, ("thoughts_token_count", "thoughtsTokenCount")),
@@ -881,6 +2289,133 @@ def extract_sdk_usage(raw_result: Any) -> dict[str, Any]:
 
 
 _extract_sdk_usage = extract_sdk_usage
+
+
+def _failed_sdk_attempt_usage(exc: BaseException) -> dict[str, Any]:
+    """Project invocation-local numeric callbacks without reopening SDK model data."""
+
+    snapshot = sdk_numeric_usage_observations(exc)
+    responses = snapshot.get("responses") or []
+    if snapshot and snapshot.get("requests_started") == 0 and not responses:
+        return {
+            "available": True,
+            "complete": True,
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "request_usage_entries": [],
+            "reasoning_output_tokens": 0,
+            "cache_hit_rate": 0.0,
+            "prompt_cache_key_present": False,
+            "prompt_cache_key_hash": "",
+            "note": "No SDK model request was admitted during this invocation.",
+        }
+    usages = [
+        {**response, "available": True}
+        for response in responses
+        if all(type(response.get(field)) is int for field in (
+            "requests", "input_tokens", "output_tokens", "total_tokens",
+        ))
+    ]
+    usage = _aggregate_sdk_attempt_usage([{"usage": item} for item in usages])
+    usage.pop("attempt_count", None)
+    usage["complete"] = bool(
+        responses
+        and len(usages) == len(responses) == snapshot.get("requests_started")
+    )
+    if not usages:
+        usage["requests"] = len(responses) if responses else None
+    usage["note"] = (
+        "Numeric usage captured before SDK output validation; no model content retained."
+        if usages
+        else "The failed SDK invocation did not expose numeric token usage."
+    )
+    return usage
+
+
+def _aggregate_sdk_attempt_usage(
+    events: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate completed outer model attempts without hiding missing usage."""
+
+    usages = [
+        dict(event.get("usage") or {})
+        for event in events
+        if isinstance(event.get("usage"), Mapping)
+    ]
+    if not usages:
+        return {
+            "available": False,
+            "complete": False,
+            "attempt_count": len(events),
+            "requests": None,
+            "input_tokens": None,
+            "output_tokens": None,
+            "total_tokens": None,
+            "cached_input_tokens": None,
+            "cache_write_input_tokens": None,
+            "request_usage_entries": [],
+            "reasoning_output_tokens": None,
+            "cache_hit_rate": None,
+            "prompt_cache_key_present": False,
+            "prompt_cache_key_hash": "",
+        }
+    available = [usage for usage in usages if usage.get("available") is True]
+    complete = len(available) == len(events) and all(
+        usage.get("complete") is not False for usage in available
+    )
+
+    def total(field: str) -> int | None:
+        values = [usage.get(field) for usage in available]
+        if not values or any(value is None for value in values):
+            return None
+        return sum(_usage_attr({field: value}, field) for value in values)
+
+    input_tokens = total("input_tokens")
+    cached_input_tokens = total("cached_input_tokens")
+    request_entries = []
+    for usage in available:
+        entries = usage.get("request_usage_entries")
+        if isinstance(entries, list) and entries:
+            request_entries.extend(
+                {key: entry.get(key) for key in _REQUEST_TOKEN_FIELDS}
+                for entry in entries if isinstance(entry, Mapping)
+            )
+        elif usage.get("requests") == 1:
+            request_entries.append({key: usage.get(key) for key in _REQUEST_TOKEN_FIELDS})
+    final_usage = usages[-1]
+    return {
+        "available": bool(available),
+        "complete": complete,
+        "attempt_count": len(events),
+        "requests": total("requests"),
+        "input_tokens": input_tokens,
+        "output_tokens": total("output_tokens"),
+        "total_tokens": total("total_tokens"),
+        "cached_input_tokens": cached_input_tokens,
+        "cache_write_input_tokens": total("cache_write_input_tokens"),
+        "request_usage_entries": request_entries,
+        "reasoning_output_tokens": total("reasoning_output_tokens"),
+        "cache_hit_rate": _cache_hit_rate(input_tokens, cached_input_tokens),
+        "prompt_cache_key_present": any(
+            usage.get("prompt_cache_key_present") is True for usage in usages
+        ),
+        "prompt_cache_key_hash": str(
+            final_usage.get("prompt_cache_key_hash") or ""
+        ),
+        **(
+            {
+                "prompt_cache_key_source": str(
+                    final_usage.get("prompt_cache_key_source") or ""
+                )
+            }
+            if final_usage.get("prompt_cache_key_source")
+            else {}
+        ),
+    }
 
 
 def _cache_hit_rate(input_tokens: int | None, cached_input_tokens: int | None) -> float | None:
@@ -919,20 +2454,14 @@ def _usage_with_explicit_prompt_cache_metadata(
     *,
     request_cache: Mapping[str, Any],
 ) -> dict[str, Any]:
-    if (
-        not request_cache.get("prompt_cache_key_present")
-        or usage.get("prompt_cache_key_present")
-    ):
+    if not request_cache.get("prompt_cache_key_present") or usage.get("prompt_cache_key_present"):
         return usage
     return {
         **usage,
         "prompt_cache_key_present": True,
-        "prompt_cache_key_hash": str(
-            request_cache.get("prompt_cache_key_hash") or ""
-        ),
+        "prompt_cache_key_hash": str(request_cache.get("prompt_cache_key_hash") or ""),
         "prompt_cache_key_source": str(
-            request_cache.get("prompt_cache_key_source")
-            or "explicit_static_profile"
+            request_cache.get("prompt_cache_key_source") or "explicit_static_profile"
         ),
     }
 
@@ -946,11 +2475,18 @@ def _sdk_request_cache_metadata(
 ) -> dict[str, Any]:
     """Return audit-safe fingerprints for cache-sensitive SDK request layout."""
 
-    instructions = str(getattr(agent, "instructions", "") or "")
+    instruction_projection = instruction_profile_text(agent)
+    instructions = instruction_projection or ""
+    instruction_status = (
+        "static_base_and_current_catalog"
+        if instruction_projection is not None
+        else "unresolved_dynamic_callable"
+    )
     tool_names = _ordered_tool_names(getattr(agent, "tools", []) or [])
     output_schema = _output_schema_payload(getattr(agent, "output_type", None))
     static_payload = {
-        "instructions_sha256": _sha256(instructions),
+        "instructions_sha256": _sha256(instructions) if instruction_projection is not None else "",
+        "instruction_profile_status": instruction_status,
         "tool_names": tool_names,
         "output_schema_sha256": _sha256_dumps(output_schema),
     }
@@ -960,6 +2496,7 @@ def _sdk_request_cache_metadata(
         "repo_instruction_profile": repo_instruction_profile_id(),
         "static_prefix_sha256": _sha256_dumps(static_payload),
         "instructions_sha256": static_payload["instructions_sha256"],
+        "instruction_profile_status": instruction_status,
         "tool_names_sha256": _sha256_dumps(tool_names),
         "tool_count": len(tool_names),
         "output_schema_sha256": static_payload["output_schema_sha256"],
@@ -971,7 +2508,8 @@ def _sdk_request_cache_metadata(
         **prompt_cache_key_audit_metadata(agent),
         **session_metadata,
         "note": (
-            "Fingerprints are audit-safe diagnostics for prompt-cache behavior; raw "
+            "Instruction fingerprints cover the static base and current catalog, excluding "
+            "dynamic replay and callback enablement. Unknown callables are unresolved. Raw "
             "instructions, tool schemas, session ids, and prompt text are not stored here."
         ),
     }
@@ -999,10 +2537,21 @@ def _record_sdk_run_summary_safely(
     execution_telemetry: Mapping[str, Any] | None = None,
 ) -> None:
     try:
-        from keystone_agents.trace_processor import record_sdk_run_summary_trace_event
+        from keystone_agents.trace_processor import (
+            record_sdk_run_summary_trace_event,
+            sdk_tool_custom_trace_evidence,
+        )
 
         diagnostics = search_diagnostics or sdk_search_diagnostics_from_telemetry(search_telemetry)
         metadata = dict(trace_metadata or {})
+        custom_evidence = sdk_tool_custom_trace_evidence(raw_result)
+        for key in (
+            "nested_specialist_executions",
+            "nested_live_read_enforcements",
+        ):
+            values = custom_evidence.get(key) or []
+            if values:
+                request_cache[key] = list(values)
         record_sdk_run_summary_trace_event(
             agent_name=agent_name,
             route=str(metadata.get("route") or ""),
@@ -1046,26 +2595,24 @@ def _orchestrator_diagnostics_from_trace_metadata(metadata: dict[str, Any]) -> d
 
 
 def _failure_kind(exc: BaseException) -> str:
-    return re.sub(r"[^a-z0-9_]+", "_", type(exc).__name__.strip().lower()).strip("_")
-
-
-def _provider_response_was_observed(exc: BaseException) -> bool:
-    """Return whether the failure itself proves that a model request reached a response."""
-
-    failure_name = type(exc).__name__.strip().lower()
-    return failure_name in {
-        "modelbehaviorerror",
-        "outputguardrailtripwiretriggered",
-    } or any(
-        marker in failure_name
-        for marker in (
-            "apiconnection",
-            "apiresponse",
-            "badrequest",
-            "internalserver",
-            "ratelimit",
+    terminal_kind = response_terminal_failure_kind(exc)
+    if terminal_kind:
+        return terminal_kind
+    if type(exc).__name__ == "ExecutionDeadlineExceeded":
+        return "execution_soft_deadline_exceeded"
+    if isinstance(exc, ToolEvidenceReplayError):
+        return "tool_correction_evidence_replay_unavailable"
+    if isinstance(exc, UnsafeMutationRetryError):
+        return "mutation_retry_state_unknown"
+    if isinstance(exc, ToolExecutionContractError):
+        return (
+            "forbidden_tool_execution_observed"
+            if exc.outcome.prohibited_tool_names
+            else "required_tool_execution_missing"
         )
-    )
+    if _is_sdk_structured_output_error(exc):
+        return "structured_output_invalid"
+    return re.sub(r"[^a-z0-9_]+", "_", type(exc).__name__.strip().lower()).strip("_")
 
 
 def _sdk_guardrail_failure_diagnostics(exc: BaseException) -> dict[str, list[str]]:
@@ -1131,9 +2678,7 @@ def _session_audit_metadata(session: Any | None) -> dict[str, Any]:
         "session_id_hash": str(metadata.get("session_id_hash") or ""),
         "session_history_mode": str(metadata.get("session_history_mode") or ""),
         "session_history_limit": int(metadata.get("session_history_limit") or 0),
-        "session_truncation_configured": bool(
-            metadata.get("session_truncation_configured")
-        ),
+        "session_truncation_configured": bool(metadata.get("session_truncation_configured")),
     }
 
 
@@ -1293,6 +2838,9 @@ def run_retrieved_sdk_synthesis(
     storage: Any | None = None,
     persist_output: Callable[[TOutput], Mapping[str, Any] | None] | None = None,
     model_label: str | None = None,
+    decision_contract: (
+        AgentDecisionContract | Callable[[TRaw, Any], AgentDecisionContract] | None
+    ) = None,
 ) -> SDKSynthesisOutcome:
     """
     Retrieve and normalize context in Python, synthesize with an SDK agent, then audit.
@@ -1318,7 +2866,7 @@ def run_retrieved_sdk_synthesis(
             resolved_model_name = str(
                 getattr(run_config, "model", "") or model_label or "sdk-local"
             )
-        resolved_model_run_mode = "local_sdk"
+        resolved_model_run_mode = "live_sdk" if live else "local_sdk"
     else:
         resolved_model_config = config or get_runtime_agent_model_config(
             getattr(agent, "name", None),
@@ -1347,15 +2895,36 @@ def run_retrieved_sdk_synthesis(
     )
 
     workflow = workflow_name or f"Keystone {agent.name} SDK synthesis"
+    # Imported lazily to keep the generic execution harness independent from
+    # agent builders while still making every supplied-context synthesis run
+    # emit the same searchable scope evidence as direct agent wrappers.
+    from keystone_agents.capabilities.tool_scope import (
+        tool_scope_receipt_for_agent,
+        tool_scope_trace_metadata_for_agent,
+    )
+
+    scope_receipt = tool_scope_receipt_for_agent(agent)
+    scope_trace = tool_scope_trace_metadata_for_agent(agent)
     resolved_trace_metadata = sdk_synthesis_trace_metadata(
         agent_name=agent.name,
         live=live and run_config is None,
         save=save,
         workflow=workflow,
-        extra=trace_metadata,
+        extra={**dict(trace_metadata or {}), **scope_trace},
     )
+    # Retrieval performed outside the model loop is still part of this run's
+    # evidence boundary. Isolate its receipts so model-selected identities can
+    # be validated against the exact provider results rather than against stale
+    # process-global journal state.
+    reset_tool_receipt_journal()
     raw_context = retrieve()
+    preacquired_tool_receipts = tuple(tool_receipt_journal())
     typed_input = normalize(raw_context)
+    resolved_decision_contract = (
+        decision_contract(raw_context, typed_input)
+        if callable(decision_contract)
+        else decision_contract
+    )
     audit_payload = _audit_payload(
         input_summary=input_summary,
         input_audit_payload=input_audit_payload,
@@ -1390,6 +2959,8 @@ def run_retrieved_sdk_synthesis(
                     tracing_disabled=tracing_disabled,
                     trace_include_sensitive_data=trace_include_sensitive_data,
                     trace_config=trace_config,
+                    preacquired_tool_receipts=preacquired_tool_receipts,
+                    decision_contract=resolved_decision_contract,
                 )
                 if attempt_config is not None:
                     resolved_model_provider = attempt_config.provider
@@ -1426,6 +2997,15 @@ def run_retrieved_sdk_synthesis(
             if finalize_output is not None
             else validated_output
         )
+        request_cache = dict(typed_result.request_cache or {})
+        if scope_receipt:
+            request_cache["request_tool_scope"] = scope_receipt
+        combined_tool_receipts = tuple(
+            [
+                *preacquired_tool_receipts,
+                *tuple(typed_result.tool_receipts or ()),
+            ]
+        )
         typed_result = TypedAgentRunResult(
             agent_name=typed_result.agent_name,
             output=finalized_output,
@@ -1434,9 +3014,9 @@ def run_retrieved_sdk_synthesis(
             usage=typed_result.usage,
             cost=typed_result.cost,
             budget_guard=typed_result.budget_guard,
-            request_cache=typed_result.request_cache,
+            request_cache=request_cache,
             execution_telemetry=typed_result.execution_telemetry,
-            tool_receipts=typed_result.tool_receipts,
+            tool_receipts=combined_tool_receipts,
         )
         usage = typed_result.usage or _extract_sdk_usage(typed_result.raw_result)
         cost = typed_result.cost or estimate_usage_cost(
@@ -1493,17 +3073,21 @@ def run_retrieved_sdk_synthesis(
             exc,
             context=f"{agent.name} SDK run",
         )
+        failure_metadata = sdk_run_failure_metadata(exc)
         if save and storage is not None:
+            failure_output = {
+                "failure": operator_failure.to_dict(),
+                "summary": operator_failure.summary,
+                "next_step": operator_failure.next_step,
+                "send_enabled": False,
+            }
+            if failure_metadata:
+                failure_output["sdk_run_failure"] = failure_metadata
             storage_results["agent_run"] = storage.save_agent_run(
                 agent_name=agent.name,
                 input_payload=audit_payload,
                 input_summary=input_summary,
-                output={
-                    "failure": operator_failure.to_dict(),
-                    "summary": operator_failure.summary,
-                    "next_step": operator_failure.next_step,
-                    "send_enabled": False,
-                },
+                output=failure_output,
                 model=model_label or ("sdk-live" if live and run_config is None else "sdk-local"),
                 dry_run=not (live and run_config is None),
                 status="error",

@@ -10,6 +10,7 @@ from keystone_agents.guardrails import (
     assess_tool_payload_guardrails,
     keystone_input_guardrail,
 )
+from keystone_agents.models import BusinessResearchFocusedBriefSDKInput
 from keystone_agents.schemas.opportunity import (
     OpportunityRecord,
     OpportunityScoutResult,
@@ -97,6 +98,60 @@ def test_input_guardrail_allows_source_context_for_outreach_agent() -> None:
 
     assert not result.tripwire_triggered
     assert "unsupported_claim" not in result.output_info["risk_flags"]
+
+
+def test_input_guardrail_allows_medical_terms_in_admitted_public_evidence() -> None:
+    prompt = BusinessResearchFocusedBriefSDKInput(
+        company_name="NIMH public page",
+        brief_goal="Summarize how the public page frames medication monitoring.",
+        source_context=(
+            "The public education page says a clinician may adjust a treatment plan "
+            "after monitoring benefits and side effects."
+        ),
+    ).to_prompt()
+
+    result = keystone_input_guardrail.guardrail_function(
+        None,
+        SimpleNamespace(name="business_research_analyst"),
+        prompt,
+    )
+
+    assert not result.tripwire_triggered
+    assert "professional_advice" not in result.output_info["risk_flags"]
+
+
+def test_input_guardrail_still_blocks_advice_in_operator_goal() -> None:
+    prompt = BusinessResearchFocusedBriefSDKInput(
+        company_name="NIMH public page",
+        brief_goal="Provide a treatment plan for this psychiatric condition.",
+        source_context="General public education material.",
+    ).to_prompt()
+
+    result = keystone_input_guardrail.guardrail_function(
+        None,
+        SimpleNamespace(name="business_research_analyst"),
+        prompt,
+    )
+
+    assert result.tripwire_triggered
+    assert "professional_advice" in result.output_info["risk_flags"]
+
+
+def test_input_guardrail_still_blocks_phi_in_admitted_public_evidence() -> None:
+    prompt = BusinessResearchFocusedBriefSDKInput(
+        company_name="Public page",
+        brief_goal="Summarize the selected page.",
+        source_context="Patient Alex has a depression diagnosis and started medication.",
+    ).to_prompt()
+
+    result = keystone_input_guardrail.guardrail_function(
+        None,
+        SimpleNamespace(name="business_research_analyst"),
+        prompt,
+    )
+
+    assert result.tripwire_triggered
+    assert "possible_phi" in result.output_info["risk_flags"]
 
 
 def test_input_guardrail_allows_internal_finance_google_doc_artifact_request() -> None:

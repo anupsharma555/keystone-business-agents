@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from keystone_agents.execution_request import (
@@ -9,6 +11,7 @@ from keystone_agents.execution_request import (
     execution_request_planning_text,
     normalize_slack_operator_turn_identity,
 )
+from keystone_agents.instruction_following import resolve_instruction_following_response
 from keystone_agents.schemas.execution_request import ContinuationObjectReference
 from keystone_agents.schemas.manual_request_plan import AskShapePolicy, ManualRequestPlan
 
@@ -127,9 +130,10 @@ def test_slack_turn_identity_ignores_only_leading_app_mention_decoration(
     assert normalize_slack_operator_turn_identity(decorated) == (
         "delete the event you just updated."
     )
-    assert normalize_slack_operator_turn_identity(
-        "Tell @Alex to delete the event."
-    ) == "tell @alex to delete the event."
+    assert (
+        normalize_slack_operator_turn_identity("Tell @Alex to delete the event.")
+        == "tell @alex to delete the event."
+    )
 
 
 def test_planning_text_does_not_replay_same_slack_turn_with_mention_decoration() -> None:
@@ -144,9 +148,7 @@ def test_planning_text_does_not_replay_same_slack_turn_with_mention_decoration()
 
     request = build_execution_request(envelope)
 
-    assert execution_request_planning_text(request) == (
-        "Delete the event you just updated."
-    )
+    assert execution_request_planning_text(request) == ("Delete the event you just updated.")
 
 
 def test_real_slack_continuation_instruction_is_not_part_of_operator_request() -> None:
@@ -171,9 +173,7 @@ def test_real_slack_continuation_instruction_is_not_part_of_operator_request() -
 
     request = build_execution_request(envelope)
 
-    assert request.current_request == (
-        "fix the last reply and return only the same three bullets."
-    )
+    assert request.current_request == ("fix the last reply and return only the same three bullets.")
     assert request.requested_agent == "chief_of_staff"
     assert "Continue the same agent task" not in request.current_request
     assert request.continuation.prior_request == (
@@ -197,9 +197,7 @@ def test_slack_followup_planning_text_keeps_prior_context_and_latest_ask_last() 
 
     planning_text = execution_request_planning_text(request)
 
-    assert planning_text.startswith(
-        "Using only these facts, return three bullets: A; B; C."
-    )
+    assert planning_text.startswith("Using only these facts, return three bullets: A; B; C.")
     assert "Prior result for context: A longer three-bullet answer." in planning_text
     assert planning_text.endswith(
         "Authoritative follow-up: Keep only the three bullets with no note after them."
@@ -246,9 +244,7 @@ def test_provider_followup_planning_text_drops_prior_failed_bot_prose() -> None:
     assert planning_text.startswith(
         "CoS add UT Austin Course Starts on August 15, 2026 to my Google Calendar."
     )
-    assert planning_text.endswith(
-        "Authoritative follow-up: Is it on the calendar now?"
-    )
+    assert planning_text.endswith("Authoritative follow-up: Is it on the calendar now?")
     assert "No specialist or provider action ran" not in planning_text
     assert "WorkItem Failed" not in planning_text
 
@@ -326,17 +322,14 @@ def test_typed_object_envelope_cannot_self_assert_verified_identity() -> None:
     assert "Unverified prior object hint: provider=google_drive" in planning_text
     assert "id=file_123" not in planning_text
     assert "scope.folder_path=KNIOps" not in planning_text
-    assert planning_text.endswith(
-        "Authoritative follow-up: Summarize it in three bullets."
-    )
+    assert planning_text.endswith("Authoritative follow-up: Summarize it in three bullets.")
 
 
 def test_public_result_projects_verified_receipt_into_continuation_object() -> None:
     payload = {
         "status": "done",
         "human_summary": (
-            'Google Calendar event created and verified: "Project Review" '
-            "on 2026-08-04."
+            'Google Calendar event created and verified: "Project Review" on 2026-08-04.'
         ),
         "tool_receipt": {
             "operation": "create_calendar_event",
@@ -879,9 +872,7 @@ def test_new_explicit_agent_in_followup_supersedes_prior_owner() -> None:
 
     request = build_execution_request(envelope)
 
-    assert request.current_request == (
-        "turn this into a three-bullet internal decision note."
-    )
+    assert request.current_request == ("turn this into a three-bullet internal decision note.")
     assert request.requested_agent == "chief_of_staff"
 
 
@@ -902,9 +893,7 @@ def test_adapter_prior_owner_is_typed_advice_not_current_turn_authority() -> Non
     assert request.requested_agent == ""
     assert request.requested_agent_explicit is False
     assert request.continuation.prior_agent == "business_research_analyst"
-    assert execution_request_planning_text(request).startswith(
-        "Assess the supplied company note."
-    )
+    assert execution_request_planning_text(request).startswith("Assess the supplied company note.")
 
 
 def test_missing_optional_continuation_state_does_not_block_normalization() -> None:
@@ -969,6 +958,84 @@ def test_failed_live_structured_result_is_partial_and_keeps_fallback_reviewable(
     assert "live structured-output stage failed" in result.failure_summary
 
 
+def test_failed_structured_result_recovers_verified_provider_write() -> None:
+    payload = {
+        "selected_agent": "chief_of_staff",
+        "human_summary": (
+            'Google Calendar event created and verified: "Quarterly review" on 2026-09-15.'
+        ),
+        "slack_display_title": "Business Agents Partial Result",
+        "output": {
+            "audit_notes": [
+                (
+                    "Live SDK structured output could not be parsed or validated; "
+                    "deterministic Chief of Staff fallback was rendered instead "
+                    "(ModelBehaviorError)."
+                )
+            ]
+        },
+        "tool_receipts": [
+            {
+                "provider": "google_calendar",
+                "operation": "create_calendar_event",
+                "provider_write": True,
+                "verification": {"passed": True},
+            }
+        ],
+        "side_effects": {"calendar_write_performed": True},
+    }
+
+    result = attach_execution_public_result(payload)
+
+    assert result.status == "recovered"
+    assert result.completion_confirmed is True
+    assert result.provider_write_attempted is True
+    assert result.provider_receipt_verified is True
+    assert result.recovery_used is True
+    assert "confirmed by a verified read-back receipt" in result.recovery_notice
+    assert "not confirmed" not in result.recovery_notice
+    assert result.failure_summary == ""
+    assert payload["slack_display_title"] == "Business Agents Result Recovered"
+
+
+def test_nested_calendar_receipt_recovers_historical_chief_failure_shape() -> None:
+    payload = {
+        "selected_agent": "chief_of_staff",
+        "human_summary": (
+            'Google Calendar event created and verified: "Quarterly review" on 2026-09-15.'
+        ),
+        "slack_display_title": "Business Agents Partial Result",
+        "output": {
+            "audit_notes": [
+                (
+                    "Live SDK structured output could not be parsed or validated; "
+                    "deterministic Chief of Staff fallback was rendered instead "
+                    "(ModelBehaviorError)."
+                )
+            ]
+        },
+        "script_payload": {
+            "tool_receipts": [
+                {
+                    "provider": "google_calendar",
+                    "operation": "create_calendar_event",
+                    "provider_write": True,
+                    "verification": {"passed": True},
+                }
+            ],
+            "side_effects": {"calendar_write_performed": True},
+        },
+    }
+
+    result = attach_execution_public_result(payload)
+
+    assert result.status == "recovered"
+    assert result.completion_confirmed is True
+    assert result.provider_receipt_verified is True
+    assert "not confirmed" not in result.recovery_notice
+    assert payload["slack_display_title"] == "Business Agents Result Recovered"
+
+
 def test_needs_approval_is_not_reported_as_blocked_or_failed() -> None:
     payload = {
         "status": "needs_approval",
@@ -1001,6 +1068,36 @@ def test_unverified_provider_write_cannot_claim_completion() -> None:
     assert result.provider_write_attempted is True
     assert result.provider_receipt_verified is False
     assert payload["completion_confirmed"] is False
+
+
+def test_requested_provider_write_without_any_receipt_cannot_claim_completion() -> None:
+    payload = {
+        "status": "done",
+        "slack_display_title": "Business Agents Result Ready",
+        "human_summary": (
+            "Calendar write is blocked because no calendar mutation tool is attached."
+        ),
+        "manual_request_plan": {
+            "source": "heuristic",
+            "requested_agent": "chief_of_staff",
+            "target_agent": "chief_of_staff",
+            "intent": "slack_operations",
+            "provider_system": "slack",
+            "provider_operations": ["create"],
+        },
+        "tool_receipts": [],
+    }
+
+    result = attach_execution_public_result(payload)
+
+    assert result.status == "blocked"
+    assert result.completion_confirmed is False
+    assert result.provider_write_attempted is False
+    assert result.provider_receipt_verified is False
+    assert result.failure_code == "provider_write_receipt_required"
+    assert result.title == "Business Agents Blocked"
+    assert payload["status"] == "blocked"
+    assert payload["slack_display_title"] == "Business Agents Blocked"
 
 
 def test_verified_write_receipt_list_confirms_provider_completion() -> None:
@@ -1208,6 +1305,311 @@ def test_exact_item_contract_omits_decorative_title_for_renderers() -> None:
     assert result.omit_title is True
     assert payload["public_result"]["omit_title"] is True
     assert result.title == "Business Agents Result Ready"
+
+
+def test_raw_exact_output_is_not_verified_without_measured_validation() -> None:
+    payload = {
+        "mode": "live_sdk",
+        "input": "Return exactly two sentences I can paste into Slack.",
+        "human_summary": "The first sentence is present. The second sentence is present.",
+        "user_facing_result_verified": True,
+        "manual_request_plan": {
+            "ask_shape": {
+                "output_form": "unspecified",
+                "output_constraints": {},
+            }
+        },
+    }
+
+    result = attach_execution_public_result(payload)
+
+    assert result.status == "completed"
+    assert result.omit_title is True
+    assert payload["user_facing_result_verified"] is False
+
+
+def test_raw_exact_output_is_verified_after_applicable_passing_validation() -> None:
+    payload = {
+        "mode": "live_sdk",
+        "input": "Return exactly two sentences I can paste into Slack.",
+        "human_summary": "The first sentence is present. The second sentence is present.",
+        "manual_request_plan": {
+            "ask_shape": {
+                "output_form": "unspecified",
+                "output_constraints": {},
+            }
+        },
+        "instruction_following": {
+            "validation": {
+                "applicable": True,
+                "passed": True,
+                "sentence_count": 2,
+            }
+        },
+    }
+
+    result = attach_execution_public_result(payload)
+
+    assert result.status == "completed"
+    assert result.omit_title is True
+    assert payload["user_facing_result_verified"] is True
+
+
+def test_raw_exact_output_is_not_verified_after_failed_validation() -> None:
+    payload = {
+        "mode": "live_sdk",
+        "input": "Return exactly two sentences I can paste into Slack.",
+        "human_summary": "Only one sentence is present.",
+        "instruction_following": {
+            "validation": {
+                "applicable": True,
+                "passed": False,
+                "sentence_count": 1,
+            }
+        },
+    }
+
+    attach_execution_public_result(payload)
+
+    assert payload["user_facing_result_verified"] is False
+
+
+def _public_result_stability_snapshot(payload: dict[str, object]) -> dict[str, object]:
+    public_result = payload["public_result"]
+    assert isinstance(public_result, dict)
+    return {
+        "status": public_result["status"],
+        "completion_confirmed": public_result["completion_confirmed"],
+        "user_facing_result_verified": payload.get("user_facing_result_verified"),
+        "text": public_result["text"],
+        "failure_code": public_result["failure_code"],
+        "failure_summary": public_result["failure_summary"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("case", "payload", "expected"),
+    [
+        (
+            "recovered_valid",
+            {
+                "mode": "live_sdk",
+                "input": "Return exactly two bullets.",
+                "human_summary": "- First\n- Second",
+                "instruction_following": {
+                    "validation": {
+                        "applicable": True,
+                        "passed": True,
+                        "item_count": 2,
+                    }
+                },
+            },
+            ("completed", True, True, ""),
+        ),
+        (
+            "actual_failed",
+            {
+                "mode": "live_sdk",
+                "input": "Return exactly two bullets.",
+                "human_summary": "- First\n- Second\n- Third",
+                "instruction_following": {
+                    "validation": {
+                        "applicable": True,
+                        "passed": False,
+                        "item_count": 3,
+                    }
+                },
+            },
+            ("blocked", False, False, "instruction_following_constraint_failed"),
+        ),
+        (
+            "generated_only_unresolved",
+            {
+                "mode": "live_sdk",
+                "input": "Summarize the supplied finding.",
+                "human_summary": "Alpha is supported.",
+                "manual_request_plan": {
+                    "ask_shape": {"output_constraints": {"item_count_mode": "exact"}}
+                },
+                "instruction_following": {
+                    "validation": {"applicable": False, "passed": True},
+                    "constraint_admission_warnings": ["unresolved_item_count_exact_missing_bounds"],
+                },
+            },
+            ("completed", True, False, ""),
+        ),
+        (
+            "independently_verified_child_with_advisory_metadata",
+            {
+                "mode": "live_sdk",
+                "input": "Summarize the supplied finding.",
+                "human_summary": "Alpha is supported.",
+                "script_payload": {
+                    "status": "done",
+                    "human_summary": "Alpha is supported.",
+                    "user_facing_result_verified": True,
+                    "public_result": {
+                        "status": "completed",
+                        "completion_confirmed": True,
+                        "provider_write_attempted": False,
+                        "text": "Alpha is supported.",
+                    },
+                },
+                "instruction_following": {
+                    "validation": {"applicable": False, "passed": True},
+                    "constraint_admission_warnings": ["unresolved_item_count_exact_missing_bounds"],
+                },
+            },
+            ("completed", True, True, ""),
+        ),
+        (
+            "explicit_false_child",
+            {
+                "mode": "live_sdk",
+                "human_summary": "A plausible but unverified answer.",
+                "script_payload": {
+                    "status": "done",
+                    "human_summary": "A plausible but unverified answer.",
+                    "user_facing_result_verified": False,
+                    "public_result": {
+                        "status": "completed",
+                        "completion_confirmed": True,
+                        "provider_write_attempted": False,
+                    },
+                },
+            },
+            ("blocked", False, False, "child_user_facing_result_unverified"),
+        ),
+    ],
+)
+def test_public_result_assembly_is_stable_across_repeat_and_round_trip(
+    case: str,
+    payload: dict[str, object],
+    expected: tuple[str, bool, bool, str],
+) -> None:
+    original_text = str(payload.get("human_summary") or "")
+
+    first = attach_execution_public_result(payload)
+    first_snapshot = _public_result_stability_snapshot(payload)
+    second = attach_execution_public_result(payload)
+    second_snapshot = _public_result_stability_snapshot(payload)
+    round_tripped_payload = json.loads(json.dumps(payload))
+    round_tripped = attach_execution_public_result(round_tripped_payload)
+    round_trip_snapshot = _public_result_stability_snapshot(round_tripped_payload)
+
+    expected_status, expected_confirmed, expected_verified, expected_failure = expected
+    assert first.status == second.status == round_tripped.status == expected_status, case
+    assert first_snapshot == second_snapshot == round_trip_snapshot, case
+    assert first_snapshot["completion_confirmed"] is expected_confirmed
+    assert first_snapshot["user_facing_result_verified"] is expected_verified
+    assert first_snapshot["failure_code"] == expected_failure
+    if expected_status == "completed":
+        assert first_snapshot["text"] == original_text
+    else:
+        assert first_snapshot["failure_summary"]
+
+
+@pytest.mark.parametrize(
+    ("summary", "expected_verified"),
+    [
+        ("- Alpha is supported.\n- Beta is supported.", True),
+        (
+            "- Alpha is supported.\n- Beta is supported.\n- Gamma is extra.",
+            False,
+        ),
+    ],
+)
+def test_persisted_plan_recovers_raw_exact_items_before_public_verification(
+    summary: str,
+    expected_verified: bool,
+) -> None:
+    request_text = "Summarize the supplied findings in exactly two bullet points."
+    persisted_plan = {
+        "ask_shape": {
+            "output_constraints": {
+                "scope": "entire_response",
+                "item_count_mode": "exact",
+            }
+        }
+    }
+    resolution = resolve_instruction_following_response(
+        summary,
+        original_request=request_text,
+        manual_plan=persisted_plan,
+        live=False,
+    )
+    payload = {
+        "mode": "live_sdk",
+        "input": request_text,
+        "human_summary": summary,
+        "manual_request_plan": persisted_plan,
+        "instruction_following": resolution.metadata(),
+    }
+
+    attach_execution_public_result(payload)
+
+    assert resolution.validation.item_count == summary.count("\n") + 1
+    assert payload["user_facing_result_verified"] is expected_verified
+    assert payload["public_result"]["status"] == ("completed" if expected_verified else "blocked")
+    assert payload["public_result"]["omit_title"] is expected_verified
+
+
+def test_unresolved_persisted_count_metadata_cannot_verify_typed_display() -> None:
+    persisted_plan = {
+        "ask_shape": {
+            "output_constraints": {
+                "item_count_mode": "exact",
+            }
+        }
+    }
+    resolution = resolve_instruction_following_response(
+        "Alpha is supported.",
+        original_request="Summarize the supplied finding.",
+        manual_plan=persisted_plan,
+        live=False,
+    )
+    payload = {
+        "mode": "live_sdk",
+        "input": "Summarize the supplied finding.",
+        "human_summary": "Alpha is supported.",
+        "manual_request_plan": persisted_plan,
+        "instruction_following": resolution.metadata(),
+    }
+
+    attach_execution_public_result(payload)
+
+    assert payload["user_facing_result_verified"] is False
+    assert resolution.metadata()["constraint_admission_warnings"] == [
+        "unresolved_item_count_exact_missing_bounds"
+    ]
+
+    assert payload["user_facing_result_verified"] is False
+
+
+def test_explicit_unverified_child_forces_canonical_public_block() -> None:
+    unverified = "A plausible child summary that is not safe to promote."
+    payload = {
+        "mode": "live_sdk",
+        "human_summary": unverified,
+        "script_payload": {
+            "status": "done",
+            "human_summary": unverified,
+            "user_facing_result_verified": False,
+            "public_result": {
+                "status": "completed",
+                "completion_confirmed": True,
+                "provider_write_attempted": False,
+            },
+        },
+    }
+
+    result = attach_execution_public_result(payload)
+
+    assert result.status == "blocked"
+    assert result.completion_confirmed is False
+    assert result.failure_code == "child_user_facing_result_unverified"
+    assert unverified not in result.text
+    assert payload["user_facing_result_verified"] is False
 
 
 def test_exact_item_contract_keeps_requested_title_section() -> None:

@@ -320,6 +320,23 @@ def test_database_initializes_expected_tables(tmp_path) -> None:
     assert EXPECTED_TABLES <= store.table_names()
 
 
+def test_get_agent_runs_preserves_explicit_link_order_and_decodes_output(tmp_path) -> None:
+    store = SQLiteStore(_database_url(tmp_path))
+    first_id = store.save_agent_run(
+        agent_name="manager",
+        output={"stage": "manager"},
+    )
+    second_id = store.save_agent_run(
+        agent_name="specialist",
+        output={"stage": "specialist"},
+    )
+
+    rows = store.get_agent_runs([second_id, first_id, second_id, 999999])
+
+    assert [row["id"] for row in rows] == [second_id, first_id]
+    assert [row["output"]["stage"] for row in rows] == ["specialist", "manager"]
+
+
 def test_managed_connection_closes_file_backed_connection(tmp_path) -> None:
     store = SQLiteStore(_database_url(tmp_path))
 
@@ -1230,6 +1247,26 @@ def test_outreach_draft_stores_redacted_full_body_for_approval(tmp_path) -> None
     assert draft_json["email_body_hash"]
     assert "email_body_summary" in draft_json
     assert "SHOULD_NOT_APPEAR" not in dump
+
+
+def test_outreach_storage_does_not_resurrect_withheld_legacy_copy(tmp_path) -> None:
+    store = SQLiteStore(_database_url(tmp_path))
+    store.save_outreach_draft(
+        {
+            "company_name": "Example Health",
+            "email_subject": "",
+            "email_body": "",
+            "subject": "WITHHELD SUBJECT",
+            "body": "WITHHELD DRAFT COPY",
+            "approval_state": "pending",
+        }
+    )
+
+    row = store.fetch_all("outreach_drafts")[0]
+
+    assert row["email_subject"] == ""
+    assert row["email_body"] == ""
+    assert "WITHHELD" not in row["draft_json"]
 
 
 def test_storage_tool_wraps_sqlite_store(tmp_path) -> None:

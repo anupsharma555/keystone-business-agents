@@ -40,8 +40,10 @@ Current eval provider boundaries:
 - `firecrawl`: optional Firecrawl scrape path when configured.
 - `browserless`: current placeholder boundary; live rendering is not implemented.
 - `apify`: not a general rendered-page provider in this repo; exposed as unsupported here.
-- `crawl4ai`: optional local/open-source extraction adapter; non-default while
-  repeatable quality evidence is pending.
+- `crawl4ai`: experimental local/open-source extraction adapter. It is excluded
+  from default production fallbacks and live use is blocked unless
+  `KEYSTONE_ENABLE_EXPERIMENTAL_CRAWL4AI=true` is set for an explicit controlled
+  evaluation. Chromium redirect interception is not yet implemented.
 - `playwright`: read-only rendered diagnostics, not routine extraction.
 
 ## Dataset
@@ -134,7 +136,7 @@ This is the selected-page counterpart to the search-provider matrix in
 | Playwright diagnostics | Local rendered-page diagnostics | Ready for explicit read-only diagnostics, not routine extraction | Does not become a production extractor just because search review is requested | Console/page-error/request-failure diagnosis for selected URLs | Use only after static extraction is weak or rendered diagnostics are requested |
 | Browserless | Rendered-browser boundary | Placeholder/eval boundary | Live production adapter and safety constraints are not implemented | JS-heavy selected pages after adapter review | Keep out of production until adapter, safety constraints, and attribution tests exist |
 | Apify | Actor-based future extraction boundary | Not implemented | No reviewed adapter | Not applicable yet | Add adapter/tests before any provider comparison |
-| Crawl4AI | Local/open-source selected-page extractor | Optional adapter implemented | Repeatable quality and latency evidence is still missing | Local extraction lift over Trafilatura on JS-heavy pages | Compare against Trafilatura before runtime promotion |
+| Crawl4AI | Local/open-source selected-page extractor | Experimental eval-only adapter | Browser redirects are not intercepted before navigation; repeatable quality and latency evidence is also missing | Local extraction lift over Trafilatura on controlled JS-heavy pages | Keep blocked by default; add private-address request interception before any production promotion |
 
 Promotion criteria should stay conservative:
 

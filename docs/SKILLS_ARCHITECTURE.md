@@ -69,6 +69,7 @@ Each registered agent also declares one specialist contract bundle:
 
 - Gmail Triage: `gmail_triage_specialist_contracts`
 - Business Research Analyst: `business_research_specialist_contracts`
+- RAG Retrieval Specialist: `rag_retrieval_specialist_contracts`
 - Opportunity Scout: `opportunity_scout_specialist_contracts`
 - Outreach Composer: `outreach_composer_specialist_contracts`
 - Airtable Context: `airtable_context_specialist_contracts`

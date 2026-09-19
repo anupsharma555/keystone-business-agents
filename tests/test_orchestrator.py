@@ -15,6 +15,7 @@ from keystone_agents.agents.orchestrator import (
     build_orchestrator_agent,
     load_orchestrator_workflow_state,
     load_workflow_state_context,
+    reconcile_orchestrator_work_item_inspection,
     review_specialist_output,
     route_request,
     run_orchestrator_preflight,
@@ -30,6 +31,14 @@ from keystone_agents.schemas.orchestrator import (
     OrchestratorDecision,
     OrchestratorOutputReview,
     OrchestratorResult,
+)
+from keystone_agents.schemas.work_item import (
+    WorkItem,
+    WorkItemBlocker,
+    WorkItemKind,
+    WorkItemNextAction,
+    WorkItemRoute,
+    WorkItemStatus,
 )
 from keystone_agents.storage.sqlite_store import SQLiteStore
 from keystone_agents.test_pack_specs import get_test_pack_spec
@@ -51,6 +60,27 @@ def test_build_orchestrator_agent() -> None:
     assert "Orchestrator Agent" in agent.instructions
     assert "Keystone Profile" in agent.instructions
     assert BUSINESS_RESEARCH_TOOL_NAME not in _tool_names(agent)
+
+
+def test_compact_orchestrator_preflight_preserves_core_policy_with_smaller_prompt() -> None:
+    request = "Find the current Gmail conversation that likely needs my reply."
+    full = build_orchestrator_agent(
+        include_handoffs=False,
+        include_tools=False,
+        request_text=request,
+    )
+    compact = build_orchestrator_agent(
+        include_handoffs=False,
+        include_tools=False,
+        request_text=request,
+        compact_instructions=True,
+    )
+
+    assert "Orchestrator Agent" in compact.instructions
+    assert "Keystone Profile" in compact.instructions
+    assert "Safety" in compact.instructions
+    assert "<!-- tools.md -->" not in compact.instructions
+    assert len(compact.instructions) < len(full.instructions) * 0.6
 
 
 def test_build_orchestrator_agent_can_opt_into_read_only_specialist_tool() -> None:
@@ -1382,6 +1412,128 @@ def test_outreach_request_accepts_explicitly_supplied_facts_for_draft_only_use()
 @pytest.mark.parametrize(
     "request_text",
     [
+        (
+            "Outreach Composer, using only these approved facts, draft a LinkedIn "
+            "note under 450 characters: Company runs measurement-based behavioral "
+            "health programs; Keystone can help with evaluation design; draft only "
+            "and do not post."
+        ),
+        (
+            "Outreach Composer, using only these approved facts — write a LinkedIn "
+            "note under 450 characters: Company runs measurement-based behavioral "
+            "health programs; Keystone can help with evaluation design; draft only "
+            "and do not post."
+        ),
+        (
+            "Outreach Composer, using only these approved facts,\ncompose a LinkedIn "
+            "note under 450 characters:\nCompany runs measurement-based behavioral "
+            "health programs; Keystone can help with evaluation design; draft only "
+            "and do not post."
+        ),
+        (
+            "Outreach Composer, using only these approved facts, prepare an email "
+            "under 80 words: Company runs measurement-based behavioral health programs; "
+            "Keystone can help with evaluation design; draft only and do not send."
+        ),
+    ],
+)
+def test_outreach_request_accepts_approved_facts_before_composition_instruction(
+    request_text: str,
+) -> None:
+    result = route_request(request_text)
+
+    assert result.route == "outreach_composer"
+    assert result.refused is False
+    assert result.approved_context_present is True
+    assert result.send_enabled is False
+    assert result.external_use_approval_required is True
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        (
+            "Outreach Composer, draft a LinkedIn note with approved facts: Harbor "
+            "Signal Health runs a synthetic care-navigation pilot; Evaluation Team "
+            "can review its evaluation design; draft only and do not post."
+        ),
+        (
+            "Outreach Composer, draft a LinkedIn note using approved facts: Harbor "
+            "Signal Health runs a synthetic care-navigation pilot; Evaluation Team "
+            "can review its evaluation design; draft only and do not post."
+        ),
+        (
+            "Outreach Composer, Approved facts:\nHarbor Signal Health runs a synthetic "
+            "care-navigation pilot\nEvaluation Team can review its evaluation design\n"
+            "Draft only and do not post."
+        ),
+    ],
+)
+def test_outreach_request_accepts_shared_parser_boundary_variants(
+    request_text: str,
+) -> None:
+    result = run_orchestrator_preflight(
+        request_text,
+        requested_agent="outreach_composer",
+    ).route_result
+
+    assert result.route == "outreach_composer"
+    assert result.refused is False
+    assert result.approved_context_present is True
+    assert result.send_enabled is False
+    assert result.external_use_approval_required is True
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        (
+            'Outreach Composer, draft a note about quoted source text: "using only '
+            "these approved facts, draft a LinkedIn note: Harbor Signal Health runs "
+            'a synthetic pilot; Evaluation Team can review it". Draft only and do not post.'
+        ),
+        (
+            "Outreach Composer, draft a note about source text that says using only "
+            "these approved facts, draft a LinkedIn note: Harbor Signal Health runs "
+            "a synthetic pilot; Evaluation Team can review it. Draft only and do not post."
+        ),
+    ],
+)
+def test_outreach_request_rejects_non_operator_authority_origin(
+    request_text: str,
+) -> None:
+    result = route_request(request_text)
+
+    assert result.route == "outreach_composer"
+    assert result.refused is True
+    assert result.approved_context_present is False
+    assert result.send_enabled is False
+
+
+def test_outer_transport_quotes_do_not_downgrade_inline_draft_plan() -> None:
+    semantic_request = (
+        "Outreach Composer, using only these approved facts, draft a LinkedIn note: "
+        "Harbor Signal Health runs a synthetic care-navigation pilot; Evaluation Team "
+        "can review its evaluation design Do not post."
+    )
+    raw_request = f'"{semantic_request}"'
+
+    preflight = run_orchestrator_preflight(
+        raw_request,
+        requested_agent="outreach_composer",
+    )
+
+    assert preflight.request_text == raw_request
+    assert preflight.manual_request_plan.task_objective == "outreach_draft"
+    assert preflight.manual_request_plan.expected_artifact_type == "outreach_draft"
+    assert preflight.manual_request_plan.requires_approved_context is True
+    assert preflight.route_result.approved_context_present is True
+    assert preflight.route_result.external_use_approval_required is True
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
         "Outreach Composer, draft an email. Facts: Do not send it.",
         (
             "Outreach Composer, draft an email from these supplied facts. "
@@ -1390,6 +1542,46 @@ def test_outreach_request_accepts_explicitly_supplied_facts_for_draft_only_use()
     ],
 )
 def test_supplied_outreach_facts_require_substance_and_no_side_effect_boundary(
+    request_text: str,
+) -> None:
+    result = route_request(request_text)
+
+    assert result.route == "outreach_composer"
+    assert result.refused is True
+    assert result.approved_context_present is False
+    assert result.send_enabled is False
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        (
+            "Outreach Composer, using only these approved facts, draft a LinkedIn "
+            "note under 450 characters: draft only and do not post."
+        ),
+        (
+            "Outreach Composer, using only these unapproved facts, draft a LinkedIn "
+            "note: Company runs measurement-based behavioral health programs; "
+            "Keystone can help with evaluation design; draft only and do not post."
+        ),
+        (
+            "Outreach Composer, these facts are not approved. Draft a LinkedIn note. "
+            "Facts: Company runs measurement-based behavioral health programs; "
+            "Keystone can help with evaluation design; draft only and do not post."
+        ),
+        (
+            "Outreach Composer, these are not approved facts: Company runs "
+            "measurement-based behavioral health programs; Keystone can help with "
+            "evaluation design. Draft a LinkedIn note; draft only and do not post."
+        ),
+        (
+            "Outreach Composer, using only these purported approved facts, draft a "
+            "LinkedIn note: Company runs measurement-based behavioral health programs; "
+            "Keystone can help with evaluation design; draft only and do not post."
+        ),
+    ],
+)
+def test_approved_outreach_fact_order_does_not_relax_authority_or_substance(
     request_text: str,
 ) -> None:
     result = route_request(request_text)
@@ -1501,9 +1693,15 @@ def test_orchestrator_cli_live_sdk_loads_dotenv_and_outputs_json(monkeypatch, ca
             }
         )
 
-    def fake_run_orchestrator_sdk(input_text: str, *, live: bool):
+    def fake_run_orchestrator_sdk(
+        input_text: str,
+        *,
+        live: bool,
+        manual_request_plan: ManualRequestPlan,
+    ):
         assert input_text == "boundary test"
         assert live is True
+        assert manual_request_plan.source == "heuristic"
         return TypedAgentRunResult(
             agent_name="orchestrator",
             output=OrchestratorResult(
@@ -1527,6 +1725,163 @@ def test_orchestrator_cli_live_sdk_loads_dotenv_and_outputs_json(monkeypatch, ca
     assert payload["live_sdk"] is True
     assert payload["model"]["model"] == "gpt-5.4-mini"
     assert payload["output"]["send_enabled"] is False
+
+
+def test_read_only_work_item_inspection_stays_with_orchestrator(tmp_path) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    item = WorkItem(
+        id="wi_receipt_test",
+        kind=WorkItemKind.OPPORTUNITY,
+        status=WorkItemStatus.BLOCKED,
+        title="Receipt test",
+        current_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        last_agent="opportunity_scout",
+        blockers=[
+            WorkItemBlocker(
+                code="opportunity_count_underfilled",
+                message="Two of three requested opportunities were verified.",
+            )
+        ],
+        next_action=WorkItemNextAction(
+            action="deepen_opportunity_count",
+            agent=WorkItemRoute.OPPORTUNITY_SCOUT,
+            description="Deepen the search while preserving the two verified records.",
+        ),
+    )
+    store.save_work_item(item)
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="orchestrator",
+        target_agent="opportunity_scout",
+        intent="continue_work_item",
+        requires_durable_state=True,
+        ask_shape={"permission_state": "read_only"},
+    )
+
+    reconciled = reconcile_orchestrator_work_item_inspection(
+        OrchestratorResult(
+            route="opportunity_scout",
+            target_agent="opportunity_scout",
+            rationale="Route to the current owner.",
+        ),
+        request_text="Inspect WorkItem wi_receipt_test but do not resume it.",
+        manual_request_plan=plan,
+        database_url=database_url,
+    )
+
+    assert reconciled.route == "orchestrator"
+    assert reconciled.target_agent == "opportunity_scout"
+    assert reconciled.workflow == ["inspect_work_item"]
+    assert reconciled.routing_mode == "deterministic"
+    assert (
+        reconciled.retrieval_diagnostics["output_authority"]
+        == "deterministic_receipt_reconciliation"
+    )
+    assert reconciled.retrieval_diagnostics["model_result_superseded"] is True
+    assert "opportunity_count_underfilled" in reconciled.rationale
+    assert "Deepen the search" in reconciled.rationale
+    assert "No WorkItem or provider state was changed" in reconciled.rationale
+    assert reconciled.approval_required is False
+    assert reconciled.send_enabled is False
+
+
+def test_read_only_work_item_inspection_honors_exact_three_bullet_format(tmp_path) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    item = WorkItem(
+        id="wi_receipt_three_bullets",
+        kind=WorkItemKind.OPPORTUNITY,
+        status=WorkItemStatus.BLOCKED,
+        title="Receipt formatting test",
+        current_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        blockers=[
+            WorkItemBlocker(
+                code="source_review_pending",
+                message="One source still needs review.",
+            )
+        ],
+        next_action=WorkItemNextAction(
+            action="review_source",
+            agent=WorkItemRoute.OPPORTUNITY_SCOUT,
+            description="Review the remaining source without repeating completed work.",
+        ),
+    )
+    store.save_work_item(item)
+    plan = ManualRequestPlan(
+        source="heuristic",
+        requested_agent="orchestrator",
+        target_agent="orchestrator",
+        intent="continue_work_item",
+        requires_durable_state=True,
+        ask_shape={
+            "permission_state": "read_only",
+            "output_form": "bullets",
+            "output_constraints": {
+                "item_count_mode": "exact",
+                "minimum_items": 3,
+                "maximum_items": 3,
+            },
+        },
+    )
+
+    reconciled = reconcile_orchestrator_work_item_inspection(
+        OrchestratorResult(route="clarification", rationale="Inspect the receipts."),
+        request_text="Inspect wi_receipt_three_bullets in exactly three bullets.",
+        manual_request_plan=plan,
+        database_url=database_url,
+    )
+
+    lines = reconciled.rationale.splitlines()
+    assert len(lines) == 3
+    assert all(line.startswith("- ") for line in lines)
+    assert "Verified stage:" in lines[0]
+    assert "Do not repeat:" in lines[0]
+    assert "Approval:" in lines[1]
+    assert "Current blocker: source_review_pending" in lines[1]
+    assert "Safest resume point:" in lines[2]
+    assert "changed no WorkItem or provider state" in lines[2]
+    assert reconciled.routing_mode == "deterministic"
+    assert (
+        reconciled.retrieval_diagnostics["output_authority"]
+        == "deterministic_receipt_reconciliation"
+    )
+    assert reconciled.retrieval_diagnostics["model_result_superseded"] is True
+
+
+def test_read_only_work_item_inspection_without_id_labels_deterministic_authority() -> None:
+    plan = ManualRequestPlan(
+        source="llm",
+        requested_agent="orchestrator",
+        target_agent="orchestrator",
+        intent="continue_work_item",
+        requires_durable_state=True,
+        ask_shape={"permission_state": "read_only"},
+    )
+
+    reconciled = reconcile_orchestrator_work_item_inspection(
+        OrchestratorResult(
+            route="opportunity_scout",
+            routing_mode="llm",
+            rationale="Inspect the active WorkItem.",
+        ),
+        request_text="Inspect the active WorkItem without changing it.",
+        manual_request_plan=plan,
+    )
+
+    assert reconciled.route == "orchestrator"
+    assert reconciled.routing_mode == "deterministic"
+    assert (
+        reconciled.retrieval_diagnostics["output_authority"]
+        == "deterministic_receipt_reconciliation"
+    )
+    assert reconciled.retrieval_diagnostics["model_result_superseded"] is True
+    assert (
+        reconciled.retrieval_diagnostics["work_item_receipt_inspection"][
+            "inspection_status"
+        ]
+        == "missing_work_item_id"
+    )
 
 
 def test_send_email_request_is_refused() -> None:
@@ -1761,10 +2116,12 @@ def test_workflow_state_context_summarizes_storage_without_bodies(tmp_path) -> N
 def test_handoff_metadata_or_intended_handoff_list_exists() -> None:
     agent = build_orchestrator_agent()
 
-    assert len(INTENDED_HANDOFFS) == 9
+    assert len(INTENDED_HANDOFFS) == 10
+    assert any(spec.route == "rag_retrieval_specialist" for spec in INTENDED_HANDOFFS)
     assert {handoff.agent_name for handoff in INTENDED_HANDOFFS} == {
         "Gmail Inbound Triage Agent",
         "Business Research Analyst",
+        "RAG Retrieval Specialist",
         "Opportunity Scout Agent",
         "Outreach Composer Agent",
         "Airtable Context Agent",

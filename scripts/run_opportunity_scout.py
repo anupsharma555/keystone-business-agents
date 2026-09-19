@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+import time as time_module
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from keystone_agents.agent_decision_contracts import (
+    opportunity_scout_decision_contract,
+    opportunity_scout_synthesis_decision_contract,
+)
 from keystone_agents.agents.opportunity_scout import (
     apply_opportunity_scout_synthesis,
     build_opportunity_scout_agent,
     build_opportunity_scout_synthesis_agent,
+    run_opportunity_scout_sdk,
     scout_opportunities_fixture,
 )
 from keystone_agents.agents.opportunity_search_planner import resolve_opportunity_search_plan
@@ -47,7 +55,12 @@ from keystone_agents.live_retrieval import (
     run_opportunity_scout_live,
 )
 from keystone_agents.memory import retrieval_tool_performance_memory_item
+from keystone_agents.model_provider import (
+    MissingOpenAIAPIKeyError,
+    get_runtime_agent_model_config,
+)
 from keystone_agents.models import OpportunityScoutSDKInput
+from keystone_agents.operator_failures import known_exception_to_operator_failure
 from keystone_agents.orchestrator.preflight_context import (
     apply_orchestrator_preflight_to_args,
     attach_orchestrator_preflight_payload,
@@ -62,7 +75,11 @@ from keystone_agents.retrieval_policy import (
     assess_role_search_quality,
     derive_request_autonomy_hint,
 )
-from keystone_agents.run import run_retrieved_sdk_synthesis
+from keystone_agents.run import (
+    SDKSynthesisOutcome,
+    run_retrieved_sdk_synthesis,
+    sdk_run_failure_metadata,
+)
 from keystone_agents.schemas.opportunity import (
     OpportunityScoutResult,
     OpportunityScoutSynthesis,
@@ -300,6 +317,61 @@ def _existing_state_for_run(args: argparse.Namespace) -> Any:
     if args.save:
         return StorageTool(args.database_url).list_records("opportunities")
     return None
+
+
+def _truthful_empty_result_summary(
+    result: OpportunityScoutResult,
+    *,
+    requested_count: int,
+) -> str:
+    """Render a useful terminal answer when strict filters legitimately return zero."""
+
+    if result.records:
+        return ""
+    requested = max(1, min(10, int(requested_count)))
+    lines = [
+        (
+            "No opportunity met every requested filter, so I returned "
+            f"0 of {requested} rather than padding the list."
+        )
+    ]
+    if result.human_summary.strip():
+        lines.append(f"Assessment: {result.human_summary.strip()}")
+    lines.append(
+        "Search review: "
+        f"{result.raw_search_result_count} raw result(s), "
+        f"{len(result.filtered_candidates)} filtered candidate(s), and "
+        f"{len(result.review_candidates)} review-only candidate(s)."
+    )
+    if result.constraint_relaxation_suggestion.strip():
+        lines.append(
+            "Next constraint to relax: "
+            f"{result.constraint_relaxation_suggestion.strip()}"
+        )
+    lines.append("No source URL is promoted because no candidate passed all filters.")
+    return "\n".join(lines)
+
+
+def _attach_truthful_empty_result_summary(
+    payload: dict[str, Any],
+    result: OpportunityScoutResult,
+    *,
+    requested_count: int,
+) -> None:
+    """Mirror one validated empty-result summary across child promotion fields."""
+
+    summary = _truthful_empty_result_summary(
+        result,
+        requested_count=requested_count,
+    )
+    if not summary:
+        return
+    for field_name in ("human_summary", "slack_display_text", "display_text", "summary"):
+        payload[field_name] = summary
+    payload["status"] = "completed"
+    payload["empty_result_confirmed"] = True
+    payload["user_facing_result_verified"] = True
+    payload["completion_confirmed"] = True
 
 
 def _load_role_source_fixture(path_value: str | None) -> list[dict[str, Any]]:
@@ -546,6 +618,183 @@ def _retrieve_os1_role_context(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _provider_candidate_universe(tool_receipts: tuple[dict[str, Any], ...]) -> dict[str, Any]:
+    """Summarize the candidate identities returned by model-called searches."""
+
+    search_receipts = [
+        receipt
+        for receipt in tool_receipts
+        if str(receipt.get("tool_name") or "") == "search_web"
+    ]
+    identities = list(
+        dict.fromkeys(
+            str(identity or "").strip()
+            for receipt in search_receipts
+            for identity in list(receipt.get("identity_fingerprints") or [])
+            if str(identity or "").strip()
+        )
+    )
+    return {
+        "schema": "keystone.provider_candidate_universe.v1",
+        "source": "model_called_search_web",
+        "search_receipt_count": len(search_receipts),
+        "candidate_count": sum(
+            int(receipt.get("item_count") or 0) for receipt in search_receipts
+        ),
+        "identity_fingerprints": identities,
+        "bounded": True,
+    }
+
+
+def _run_agent_owned_live_opportunity_synthesis(
+    args: argparse.Namespace,
+    *,
+    run_config: Any | None,
+    live: bool,
+    founder_profile: Any,
+    founder_context: str,
+    preflight_context: str,
+) -> dict[str, Any]:
+    """Let Opportunity Scout search, score, rank, and choose its own handoff."""
+
+    fallback = args.topic or "Find current high-fit opportunities for Keystone."
+    raw_request = _orchestrator_review_request_summary(args, fallback=fallback)
+    provider_guidance = (
+        f"Control-plane search preference: use {args.search_provider} first; "
+        + (
+            f"if it is unavailable, prefer {args.fallback_search_provider} before "
+            "other reviewed fallbacks."
+            if args.fallback_search_provider
+            else "the shared retrieval policy may use reviewed fallbacks."
+        )
+        if args.search_provider
+        else ""
+    )
+    typed_input = OpportunityScoutSDKInput(
+        topic=raw_request,
+        max_results=args.max_results,
+        context="\n\n".join(
+            item
+            for item in (
+                f"Current operator request (authoritative):\n{raw_request}",
+                provider_guidance,
+                founder_context,
+                preflight_context,
+            )
+            if item
+        ),
+        retrieval_hint=_explicit_retrieval_hint(args),
+    )
+    started_at = time_module.time()
+    result = run_opportunity_scout_sdk(
+        typed_input,
+        run_config=run_config,
+        live=live,
+        attach_tools=True,
+        compact_instructions=args.compact_instructions,
+        manual_request_plan=getattr(args, "manual_request_plan", None),
+        provider_retrieval_required=True,
+    )
+    if run_config is not None:
+        model_provider = "local"
+        model_name = str(getattr(run_config, "model", "") or "sdk-local")
+        model_run_mode = "local_sdk"
+    else:
+        config = get_runtime_agent_model_config("opportunity_scout")
+        model_provider = config.provider
+        model_name = config.model
+        model_run_mode = "live_sdk" if live else "sdk"
+    storage_results: dict[str, Any] = {}
+    if args.save:
+        storage = StorageTool(args.database_url)
+        storage_results["agent_run"] = storage.save_agent_run(
+            agent_name="opportunity_scout",
+            input_payload={
+                "raw_request": raw_request,
+                "live_search": True,
+                "execution_mode": "agent_owned_tool_loop",
+            },
+            input_summary=raw_request,
+            output=jsonable(result.final_output),
+            model="sdk-live" if result.live else "sdk-local",
+            dry_run=not result.live,
+            status="success",
+        )
+    outcome = SDKSynthesisOutcome(
+        agent_name="opportunity_scout",
+        raw_context={
+            "mode": "agent_owned_provider_selection",
+            "raw_request_preserved": True,
+            "preacquired_provider_context": False,
+        },
+        typed_input=typed_input,
+        result=result,
+        storage=storage_results,
+        audit_notes=(
+            "Opportunity Scout selected the query, candidates, ranking, and handoff need.",
+            "Python enforced provider fallback, budgets, URL safety, score calculation, "
+            "and identity validation.",
+            "No deterministic helper preselected or substituted an opportunity.",
+        ),
+        model_provider=model_provider,
+        model_name=model_name,
+        model_run_mode=model_run_mode,
+        usage=result.usage,
+        cost=result.cost,
+        budget_guard=result.budget_guard,
+        request_cache=result.request_cache,
+        execution_telemetry=result.execution_telemetry,
+        started_at_unix=started_at,
+        ended_at_unix=time_module.time(),
+    )
+    payload = sdk_synthesis_payload(
+        outcome,
+        include_provider_cost_window=args.include_provider_cost_window,
+        provider_cost_window_seconds=args.provider_cost_window_seconds,
+        openai_cost_project_id=args.openai_cost_project_id,
+    )
+    payload["retrieval"] = {
+        "mode": "agent_owned_tool_loop",
+        "live_search": True,
+        "requested_provider": args.search_provider,
+        "fallback_provider": args.fallback_search_provider,
+    }
+    payload["retrieval_diagnostics"] = jsonable(
+        getattr(result.final_output, "retrieval_diagnostics", {})
+    )
+    payload["tool_receipts"] = list(result.tool_receipts)
+    payload["provider_candidate_universe"] = _provider_candidate_universe(
+        result.tool_receipts
+    )
+    payload["decision_ownership"] = result.request_cache.get("decision_ownership", {})
+    payload["tool_execution"] = result.request_cache.get("tool_execution", {})
+    payload["execution_telemetry"] = result.execution_telemetry
+    payload["founder_fit_profile"] = founder_profile_audit_payload(
+        args.founder_fit_profile,
+        founder_profile,
+    )
+    _attach_truthful_empty_result_summary(
+        payload,
+        result.final_output,
+        requested_count=args.max_results,
+    )
+    attach_orchestrator_preflight_payload(payload, args)
+    if args.orchestrator_review:
+        payload["orchestrator_review"] = build_cli_orchestrator_review(
+            args,
+            run_config_factory=ORCHESTRATOR_REVIEW_RUN_CONFIG_FACTORY,
+            agent_name="opportunity_scout",
+            output=result.final_output,
+            request_summary=raw_request,
+            run_type=(
+                "live SDK + agent-owned live search"
+                if live
+                else "local SDK + agent-owned live search"
+            ),
+        )
+    return payload
+
+
 def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
     if args.live_search:
         require_cli_live_confirmation(
@@ -558,10 +807,27 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
         args,
         run_config_factory=SDK_RUN_CONFIG_FACTORY,
     )
+    if live:
+        try:
+            get_runtime_agent_model_config(
+                "opportunity_scout"
+            ).require_live_execution_ready()
+        except MissingOpenAIAPIKeyError as exc:
+            raise SystemExit(str(exc)) from exc
     retrieval_metadata: dict[str, Any] = {}
     founder_profile = load_founder_fit_profile(args.founder_fit_profile)
     founder_context = founder_search_context(founder_profile) if founder_profile else ""
     preflight_context = orchestrator_preflight_context_text(args)
+
+    if args.live_search and not args.improvement_case:
+        return _run_agent_owned_live_opportunity_synthesis(
+            args,
+            run_config=run_config,
+            live=live,
+            founder_profile=founder_profile,
+            founder_context=founder_context,
+            preflight_context=preflight_context,
+        )
 
     def retrieve() -> Any:
         if args.improvement_case == OS1_IMPROVEMENT_CASE_ID:
@@ -695,6 +961,11 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
             founder_profile=founder_profile,
             founder_profile_path=args.founder_fit_profile,
         )
+        _attach_truthful_empty_result_summary(
+            payload,
+            prefetched_live_result,
+            requested_count=args.max_results,
+        )
         attach_orchestrator_preflight_payload(payload, args)
         return payload
 
@@ -743,6 +1014,13 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
         save=args.save,
         storage=storage,
         model_label="sdk-live" if live else "sdk-local",
+        decision_contract=(
+            opportunity_scout_decision_contract()
+            if legacy_os1_mode
+            else lambda retrieved, _typed_input: (
+                opportunity_scout_synthesis_decision_contract(retrieved)
+            )
+        ),
     )
     payload = sdk_synthesis_payload(
         outcome,
@@ -750,6 +1028,12 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
         provider_cost_window_seconds=args.provider_cost_window_seconds,
         openai_cost_project_id=args.openai_cost_project_id,
     )
+    if isinstance(outcome.final_output, OpportunityScoutResult):
+        _attach_truthful_empty_result_summary(
+            payload,
+            outcome.final_output,
+            requested_count=args.max_results,
+        )
     payload["founder_fit_profile"] = founder_profile_audit_payload(
         args.founder_fit_profile,
         founder_profile,
@@ -886,10 +1170,7 @@ def main() -> int:
         )
 
     if sdk_execution_requested(args):
-        try:
-            payload = _run_sdk_synthesis(args)
-        except RuntimeError as exc:
-            raise SystemExit(str(exc)) from exc
+        payload = _run_sdk_synthesis(args)
         _persist_requested_result(args, payload)
         if args.markdown and not args.json:
             lines = [
@@ -1029,5 +1310,55 @@ def main() -> int:
     return 0
 
 
+def _handle_uncaught_exception(exc: Exception, argv: list[str] | None = None) -> int:
+    """Emit one audit-safe Opportunity failure envelope with child SDK evidence."""
+
+    failure = known_exception_to_operator_failure(exc, context="Opportunity Scout run")
+    sdk_failure = sdk_run_failure_metadata(exc)
+    if "--json" in set(argv or []):
+        payload: dict[str, Any] = {
+            "status": "failed",
+            "agent_name": "opportunity_scout",
+            "send_enabled": False,
+            "output": {
+                "failure": failure.to_dict(),
+                "summary": failure.summary,
+                "next_step": failure.next_step,
+                "send_enabled": False,
+            },
+        }
+        if sdk_failure:
+            payload.update(
+                {
+                    "sdk_failure": sdk_failure,
+                    "usage": sdk_failure.get("usage") or {},
+                    "cost": sdk_failure.get("cost") or {},
+                    "request_cache": sdk_failure.get("request_cache") or {},
+                    "tool_execution": sdk_failure.get("tool_execution") or {},
+                    "tool_receipts": list(sdk_failure.get("tool_receipts") or []),
+                    "execution_telemetry": sdk_failure.get("execution_telemetry") or {},
+                }
+            )
+            request_cache = payload["request_cache"]
+            if isinstance(request_cache, Mapping):
+                decision = request_cache.get("decision_ownership")
+                if isinstance(decision, Mapping):
+                    payload["decision_ownership"] = dict(decision)
+                request_budget = request_cache.get(
+                    "model_request_budget",
+                    request_cache.get("request_budget"),
+                )
+                if isinstance(request_budget, Mapping):
+                    payload["request_budget"] = dict(request_budget)
+        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+    print(failure.summary, file=sys.stderr)
+    print(f"Reason: {failure.reason}", file=sys.stderr)
+    print(f"Next step: {failure.next_step}", file=sys.stderr)
+    return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        raise SystemExit(_handle_uncaught_exception(exc, sys.argv[1:])) from exc

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Generic, TypeVar
 
+from keystone_agents.runtime.request_budget import ModelRequestCapacity
 from keystone_agents.schemas.email_triage import GmailMessageEnvelope
 from keystone_agents.schemas.retrieval import RetrievalHint
 
@@ -18,6 +19,7 @@ DEFAULT_GMAIL_PRIORITY_GROUPING_REQUEST = (
 )
 GMAIL_PRIORITY_BODY_CHAR_LIMIT = 900
 GMAIL_PRIORITY_THREAD_CHAR_LIMIT = 900
+GMAIL_PRIORITY_SOURCE_EVIDENCE_CHAR_LIMIT = 1200
 GMAIL_PRIORITY_STYLE_CHAR_LIMIT = 1200
 
 
@@ -79,6 +81,8 @@ class GmailTriageSDKInput:
     subject: str
     body: str
     request: str = ""
+    request_evaluated_at: str = ""
+    operator_timezone: str = "America/New_York"
     sender_name: str = ""
     sender_email: str = ""
     message_id: str = ""
@@ -86,6 +90,9 @@ class GmailTriageSDKInput:
     received_at: str = ""
     snippet: str = ""
     prior_labels: list[str] = field(default_factory=list)
+    body_evidence: list[dict[str, Any]] = field(default_factory=list)
+    body_content_status: str = "complete"
+    body_content_complete: bool = True
     extracted_links: list[dict[str, Any]] = field(default_factory=list)
     attachment_metadata: list[dict[str, Any]] = field(default_factory=list)
     thread_summary: str = ""
@@ -95,6 +102,9 @@ class GmailTriageSDKInput:
     triage_limitations: list[str] = field(default_factory=list)
     email_style_profile: str = ""
     founder_fit_context: str = ""
+    advisory_context: str = ""
+    gmail_query_hint: str = ""
+    model_request_capacity: ModelRequestCapacity | None = None
 
     @classmethod
     def from_envelope(cls, envelope: GmailMessageEnvelope) -> GmailTriageSDKInput:
@@ -110,6 +120,11 @@ class GmailTriageSDKInput:
             received_at=envelope.received_at,
             snippet=envelope.snippet,
             prior_labels=list(envelope.prior_labels),
+            body_evidence=[
+                item.model_dump(mode="json") for item in envelope.body_evidence
+            ],
+            body_content_status=envelope.body_content_status,
+            body_content_complete=envelope.body_content_complete,
             extracted_links=[link.model_dump(mode="json") for link in envelope.extracted_links],
             attachment_metadata=[
                 attachment.model_dump(mode="json") for attachment in envelope.attachment_metadata
@@ -121,25 +136,138 @@ class GmailTriageSDKInput:
         )
 
     def to_prompt(self) -> str:
+        exact_provider_context = bool(
+            self.message_id
+            or self.thread_id
+            or self.subject
+            or self.body
+            or self.snippet
+            or self.thread_context
+        )
         lines = [
-            "Classify this inbound Gmail message using only sanitized context.",
+            (
+                "Classify this inbound Gmail message using only sanitized context."
+                if exact_provider_context
+                else (
+                    "Resolve and triage the Gmail conversation described by the operator. "
+                    "Use the bounded Gmail query/context tools; the full operator request "
+                    "is authoritative."
+                )
+            ),
             "Never send email. Drafts must remain draft-only and approval-gated.",
         ]
         if self.request:
             lines.extend(["", "Operator request:", self.request])
-        lines.extend(
-            [
-                f"Message ID: {self.message_id}",
-                f"Thread ID: {self.thread_id}",
-                f"Received at: {self.received_at}",
-                f"From: {self.sender_name} <{self.sender_email}>",
-                f"Subject: {self.subject}",
-            ]
-        )
+        if self.gmail_query_hint:
+            query_hint = " ".join(str(self.gmail_query_hint).split())[:500]
+            lines.extend(
+                [
+                    "",
+                    "Advisory Gmail query hint (not authority):",
+                    query_hint,
+                    (
+                        "Use this only when it is consistent with the full operator "
+                        "request and returned provider evidence. You own the actual "
+                        "query arguments, candidate reads, and final decision."
+                    ),
+                ]
+            )
+        if self.model_request_capacity is not None:
+            capacity = self.model_request_capacity.receipt()
+            remaining = capacity["remaining_model_requests"]
+            lines.extend(
+                [
+                    "",
+                    "Enforced model-request capacity:",
+                    (
+                        f"remaining={remaining if remaining is not None else 'unbounded'}; "
+                        "reserve one request for the final typed response."
+                    ),
+                    (
+                        "A normal unresolved Gmail selection needs query, exact-context "
+                        "read, then final response. Start a corrective query only when "
+                        "the latest tool result says capacity admits the correction, a "
+                        "necessary context read, and the final response."
+                    ),
+                    (
+                        "If capacity cannot admit the evidence still needed, return a "
+                        "precise needs_more_context result from the evidence already "
+                        "observed; do not guess or spend the final response reserve on "
+                        "another tool call."
+                    ),
+                ]
+            )
+        if self.advisory_context:
+            lines.extend(["", "Advisory execution context:", self.advisory_context])
+        if self.request_evaluated_at:
+            lines.extend(
+                [
+                    "",
+                    f"Request evaluation time (UTC): {self.request_evaluated_at}",
+                    f"Operator timezone: {self.operator_timezone}",
+                    (
+                        "Interpret relative dates inside each email against that "
+                        "message's received_at timestamp. Do not present an old phrase "
+                        "such as 'tomorrow' as the current state without re-anchoring it."
+                    ),
+                ]
+            )
+        if exact_provider_context:
+            lines.extend(
+                [
+                    f"Message ID: {self.message_id}",
+                    f"Thread ID: {self.thread_id}",
+                    f"Received at: {self.received_at}",
+                    f"From: {self.sender_name} <{self.sender_email}>",
+                    f"Subject: {self.subject}",
+                ]
+            )
         if self.snippet:
             lines.append(f"Snippet: {self.snippet}")
         if self.prior_labels:
             lines.append(f"Prior labels: {', '.join(self.prior_labels)}")
+        if self.body_evidence:
+            lines.extend(
+                [
+                    "",
+                    "Bounded source-preservation evidence:",
+                    (
+                        f"status={self.body_content_status}; "
+                        f"content_complete={str(self.body_content_complete).lower()}"
+                    ),
+                    (
+                        "MIME alternatives may be equivalent, richer, or conflicting. "
+                        "Do not silently concatenate conflicts. Editorial/source quotations "
+                        "are current-message evidence with uncertain original authorship; "
+                        "reply_history belongs to an earlier message or speaker."
+                    ),
+                ]
+            )
+            for index, evidence in enumerate(self.body_evidence, start=1):
+                lines.extend(
+                    [
+                        (
+                            f"Representation {index}: part={evidence.get('part_path', '')}; "
+                            f"mime={evidence.get('mime_type', '')}; "
+                            f"container={evidence.get('container_mime_type', '') or 'root'}; "
+                            f"alternative_group={evidence.get('alternative_group', '') or 'none'}; "
+                            f"role={evidence.get('role', '')}; "
+                            f"complete={str(bool(evidence.get('content_complete'))).lower()}"
+                        ),
+                        str(evidence.get("source_text") or ""),
+                    ]
+                )
+                for quote in evidence.get("quotations", []) or []:
+                    if not isinstance(quote, Mapping):
+                        continue
+                    lines.append(
+                        "Quotation provenance: "
+                        f"kind={quote.get('quote_kind', '')}; "
+                        f"attribution_status={quote.get('attribution_status', '')}; "
+                        f"attribution={quote.get('attribution', '') or '(not supplied)'}"
+                    )
+                for limitation in evidence.get("limitations", []) or []:
+                    lines.append(f"Representation limitation: {limitation}")
         if self.thread_summary or self.thread_context:
             lines.extend(
                 [
@@ -200,7 +328,8 @@ class GmailTriageSDKInput:
                     self.founder_fit_context,
                 ]
             )
-        lines.extend(["", "Normalized body:", self.body])
+        if exact_provider_context:
+            lines.extend(["", "Normalized body:", self.body])
         return "\n".join(line for line in lines if line is not None).strip()
 
 
@@ -403,6 +532,9 @@ class GmailPriorityGroupingSDKInput:
                     received_at=typed_input.received_at,
                     snippet=typed_input.snippet,
                     prior_labels=list(typed_input.prior_labels),
+                    body_evidence=list(typed_input.body_evidence),
+                    body_content_status=typed_input.body_content_status,
+                    body_content_complete=typed_input.body_content_complete,
                     extracted_links=list(typed_input.extracted_links),
                     attachment_metadata=list(typed_input.attachment_metadata),
                     thread_summary=typed_input.thread_summary,
@@ -464,6 +596,37 @@ class GmailPriorityGroupingSDKInput:
                         ),
                     ]
                 )
+            if message.body_evidence:
+                lines.append(
+                    "Bounded source evidence: "
+                    f"status={message.body_content_status}; "
+                    f"content_complete={str(message.body_content_complete).lower()}"
+                )
+                remaining_source_chars = GMAIL_PRIORITY_SOURCE_EVIDENCE_CHAR_LIMIT
+                for evidence in message.body_evidence[:3]:
+                    if remaining_source_chars <= 0:
+                        break
+                    source_text = _compact_prompt_text(
+                        str(evidence.get("source_text") or ""),
+                        limit=min(600, remaining_source_chars),
+                    )
+                    remaining_source_chars -= len(source_text)
+                    quote_kinds = ", ".join(
+                        str(item.get("quote_kind") or "")
+                        for item in evidence.get("quotations", []) or []
+                        if isinstance(item, Mapping)
+                    )
+                    lines.extend(
+                        [
+                            (
+                                f"- mime={evidence.get('mime_type', '')}; "
+                                f"container={evidence.get('container_mime_type', '') or 'root'}; "
+                                f"role={evidence.get('role', '')}; "
+                                f"quote_kinds={quote_kinds or 'none'}"
+                            ),
+                            source_text,
+                        ]
+                    )
             if message.extracted_links:
                 lines.append("Extracted links:")
                 for link in message.extracted_links:
@@ -706,6 +869,32 @@ class ResearchSDKInput:
             )
         if self.source_context:
             lines.extend(["", "Approved source-backed context:", self.source_context])
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class RAGRetrievalSDKInput:
+    """Natural-language query contract for hosted vector-store retrieval."""
+
+    query: str
+    retrieval_mode: str = "auto"
+    max_matches: int = 6
+    context: str = ""
+
+    def to_prompt(self) -> str:
+        lines = [
+            "Query the configured vector-store corpus and return a grounded RAG retrieval result.",
+            f"Operator query: {self.query}",
+            f"Requested retrieval mode: {self.retrieval_mode}",
+            f"Maximum retained matches: {max(1, min(20, int(self.max_matches)))}",
+            "Use natural-language semantic retrieval and retain the nearest useful matches.",
+            (
+                "Call file_search before answering. Do not use web knowledge or invent "
+                "source metadata."
+            ),
+        ]
+        if self.context:
+            lines.extend(["", "Typed orchestration context:", self.context])
         return "\n".join(lines)
 
 

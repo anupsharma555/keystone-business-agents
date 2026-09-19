@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import re
 
+from keystone_agents.outreach_composer.inline_context import (
+    parse_inline_outreach_fact_packet,
+)
 from keystone_agents.schemas.outreach_execution_plan import OutreachExecutionPlan
 
 
@@ -28,19 +31,7 @@ def _has_approved_inline_context(text: str) -> bool:
         )
     ):
         return False
-    return bool(
-        re.search(
-            r"\b(?:"
-            r"(?:these\s+|the\s+following\s+)?approved"
-            r"(?:\s+(?:inline|source|source-backed|source backed))?\s+"
-            r"(?:context|facts|evidence|background|grounding|rationale)"
-            r"|source[-\s]+backed\s+(?:context|facts|evidence|background|grounding)"
-            r"|context\s+approved\s+for\s+(?:drafting|draft-only\s+use|draft\s+only\s+use)"
-            r")\s*:",
-            text,
-            flags=re.I,
-        )
-    )
+    return parse_inline_outreach_fact_packet(text) is not None
 
 
 def infer_outreach_execution_plan(
@@ -50,7 +41,8 @@ def infer_outreach_execution_plan(
 ) -> OutreachExecutionPlan:
     """Infer a safe outreach drafting workflow from a direct agent request."""
 
-    text = " ".join(str(request_text or "").split()).strip()
+    raw_text = str(request_text or "").strip()
+    text = " ".join(raw_text.split())
     lowered = text.lower()
     follow_up = "follow-up" in lowered or "follow up" in lowered or "reply" in lowered
     tracking = any(
@@ -67,7 +59,7 @@ def infer_outreach_execution_plan(
     )
     source_backed = "source-backed" in lowered or "approved" in lowered or "fixture" in lowered
     backend_test = source_backed and "opportunity" in lowered and "do not send" in lowered
-    approved_inline_context = _has_approved_inline_context(text)
+    approved_inline_context = _has_approved_inline_context(raw_text)
 
     return OutreachExecutionPlan(
         source=source,

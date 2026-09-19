@@ -8,6 +8,29 @@ These agents are context and evidence nodes first. They may become graph stages
 when WorkItem state needs resumable checkpoints, but they should not become
 separate subgraphs until validation proves the extra state boundary is useful.
 
+Current execution is not one uniform context-agent lane. Airtable, Workspace,
+and Zotero have direct live CLI paths outside `WorkflowRunner`; RSS and
+Preprints use the signal runtime; Chief calls nested context specialists through
+validated child wrappers over agent tools. The nested wrapper binds selections
+to actual provider candidates, permits one evidence-only repair without rereads,
+fails closed without execution context, returns blocked envelopes rather than
+unvalidated prose, and rejects mutation tools. It remains a distinct call shape
+from the shared direct wrapper. Its validated child decision record is retained
+through SDK tool custom data and is not exposed in the model-visible or public
+result envelope. The unified trace ingests that custom data; a live
+parent-supplied `run_config` is labeled `live_sdk`; and nested live reads enforce
+`live=true` on isolated tool copies while mutation tools remain absent.
+
+The main integration tree now gives RSS/Preprints one evidence-preserving,
+tool-free semantic repair over the first candidate universe without repeating
+the history provider read. Airtable/Workspace/Zotero now have
+provider-authoritative candidate binding, one semantic repair, cumulative
+telemetry, mutation-safe evidence handling, and one bounded missing-required-tool
+correction before semantic validation/repair. Completed read evidence may be
+replayed with completed tools disabled; mutations are never repeated, and
+unavailable replay or a failed corrected postcondition fails closed. They
+remain outside first-class `WorkflowRunner` specialist dispatch.
+
 ## Boundary Summary
 
 | Issue | Agent | Current boundary | Graph candidate edge | Evidence passed downstream |
@@ -31,17 +54,32 @@ Required source fields and uncertainty fields are defined per agent in the
 typed catalog. Downstream Business Research and Opportunity Scout should receive
 bounded evidence packets, not loose prose.
 
+## Model-Visible Selection And Cross-Agent Handoffs
+
+Context acquisition and semantic selection are separate responsibilities. A
+workflow may perform a bounded provider read before a downstream model turn, or
+the context agent may call the read tool itself. In either case, the candidate
+identities, bounded evidence, source limitations, and provider receipt needed
+for the decision must be serialized into the deciding agent's input or returned
+through a tool in the same model loop. Python validates identity, permission,
+ceilings, and receipt truth; it does not choose the substantive winner for the
+agent.
+
+Cross-provider joins use the same rule. For example, a Calendar-to-Gmail reply
+workflow requires a manager-owned Calendar selection bound to the exact events
+returned by the Calendar read, an explicit typed handoff to Gmail Triage, and a
+bounded read-only context packet. Gmail remains the owner of message/thread
+selection and reply judgment. Calendar context is evidence only and cannot
+grant Gmail mutation or send authority.
+
 ## Validation Requirements
 
-Current zero-model SDK evidence: Airtable Context selects and consumes its
-typed base-schema tool from a finance-tracker ask; Google Workspace Context
-selects and consumes scoped Drive search from a file-finding ask; Zotero Context
-selects and consumes typed API metadata from a literature ask. Their separate
-fake-model runs also select guarded Airtable record, Workspace Sheet, and Zotero
-test-note write previews using explicit markers and approval references without
-provider mutation. Their separate live provider lifecycle harnesses prove
-disposable writes and cleanup. The remaining boundary is live-model
-interpretation that joins these layers in one natural-language run.
+The current offline contract matrix covers tool selection/consumption,
+agent-owned candidate decisions, identity-preserving continuation, and guarded
+write previews without provider mutation. Separate provider lifecycle harnesses
+cover marked disposable writes and cleanup. These are distinct proof layers:
+fixture or fake-model coverage does not by itself establish live model,
+provider, Slack, or cross-agent acceptance.
 
 Local SDK session regressions also prove identity-preserving follow-ups: the
 Airtable agent reuses the existing record ID, Workspace reuses the selected

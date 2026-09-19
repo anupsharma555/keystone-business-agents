@@ -24,6 +24,7 @@ from keystone_agents.schemas.context_pack import (
     OutreachContactContext,
     OutreachContextPack,
     ProjectContextPack,
+    RAGRetrievalContextPack,
     ResearchContextPack,
 )
 from keystone_agents.schemas.handoff_types import (
@@ -32,6 +33,7 @@ from keystone_agents.schemas.handoff_types import (
 )
 from keystone_agents.schemas.manual_request_plan import AskShapePolicy
 from keystone_agents.schemas.memory import normalize_memory_key
+from keystone_agents.schemas.source_evidence import compact_source_evidence_context
 from keystone_agents.schemas.work_item import (
     WorkItem,
     WorkItemApprovalGate,
@@ -88,9 +90,21 @@ def create_or_load_work_item(
         existing = store.get_work_item(work_item_id)
         if existing is not None:
             return existing
+    durable_id = ""
+    if store is not None and not work_item_id:
+        from keystone_agents.runtime.durable_execution import current_execution
+        from keystone_agents.storage.sqlite_store import stable_hash
+
+        execution = current_execution()
+        if execution is not None:
+            durable_id = f"wi_{stable_hash(execution.execution_id)[:32]}"
+            existing = store.get_work_item(durable_id)
+            if existing is not None:
+                return existing
     resolved_route = _coerce_route(route)
     target = _target_for_request(request_text, resolved_route)
     return WorkItem(
+        **({"id": durable_id} if durable_id else {}),
         kind=_kind_for_target(resolved_route, target),
         status=WorkItemStatus.NEW,
         title=_title_for_request(request_text, resolved_route),
@@ -111,9 +125,12 @@ def summarize_work_item_for_agent(work_item: WorkItem, *, max_artifacts: int = 5
         "target": work_item.target.model_dump(mode="json"),
         "current_route": work_item.current_route.value,
         "facts": [fact.model_dump(mode="json") for fact in work_item.facts[:12]],
-        "sources": [source.model_dump(mode="json") for source in work_item.sources[:12]],
+        "sources": [
+            source.model_context().model_dump(mode="json") for source in work_item.sources[:12]
+        ],
         "artifact_refs": [
-            ref.model_dump(mode="json") for ref in work_item.artifact_refs[:max_artifacts]
+            compact_source_evidence_context(ref.model_dump(mode="json"))
+            for ref in work_item.artifact_refs[:max_artifacts]
         ],
         "open_blockers": [
             blocker.model_dump(mode="json")
@@ -658,6 +675,10 @@ def build_research_context(work_item: WorkItem) -> dict[str, Any]:
     return _context_pack_payload(build_research_context_pack(work_item))
 
 
+def build_rag_retrieval_context(work_item: WorkItem) -> dict[str, Any]:
+    return _context_pack_payload(build_rag_retrieval_context_pack(work_item))
+
+
 def build_opportunity_context(work_item: WorkItem) -> dict[str, Any]:
     return _context_pack_payload(build_opportunity_context_pack(work_item))
 
@@ -681,6 +702,10 @@ def build_context_pack_for_route(
     resolved = _coerce_route(route)
     if resolved == WorkItemRoute.BUSINESS_RESEARCH_ANALYST:
         return hydrate_context_pack_memory(build_research_context_pack(work_item), work_item, store)
+    if resolved == WorkItemRoute.RAG_RETRIEVAL_SPECIALIST:
+        return hydrate_context_pack_memory(
+            build_rag_retrieval_context_pack(work_item), work_item, store
+        )
     if resolved == WorkItemRoute.OPPORTUNITY_SCOUT:
         return hydrate_context_pack_memory(
             build_opportunity_context_pack(work_item), work_item, store
@@ -717,6 +742,12 @@ def _work_item_adaptation_assessment(
     )
 
 
+def _context_artifacts(work_item: WorkItem) -> list[WorkItemArtifactRef]:
+    return [artifact.model_copy(update={
+        "metadata": compact_source_evidence_context(artifact.metadata),
+    }) for artifact in selected_artifacts(work_item)]
+
+
 def build_research_context_pack(work_item: WorkItem) -> ResearchContextPack:
     ready = research_ready(work_item)
     project_context = build_project_context_pack(work_item)
@@ -736,6 +767,72 @@ def build_research_context_pack(work_item: WorkItem) -> ResearchContextPack:
             work_item, target_agent="business_research_analyst"
         ),
         approved_facts=_approved_facts(work_item),
+        source_refs=[source.model_context() for source in work_item.sources[:12]],
+        retrieved_sources=[source.model_context() for source in work_item.sources[:12]],
+        source_context_status=_source_context_status(work_item),
+        source_context_sample=_source_context_sample(work_item),
+        source_context_focus=_source_context_focus(work_item),
+        source_triage=_source_triage_summary(work_item),
+        ordered_sources=_ordered_sources_for_context_pack(work_item),
+        selected_artifacts=_context_artifacts(work_item),
+        blockers=_open_blockers(work_item),
+        approval_gates=work_item.approval_gates,
+        allowed_next_action=ready.next_action or work_item.next_action,
+        readiness_gates=gates,
+        ready=_required_gates_ready(gates),
+        can_synthesize=_required_gates_ready(gates),
+        missing_requirements=_missing_requirements_from_gates(gates),
+        limitation_notes=_limitation_notes_from_gates(gates),
+        project_context=project_context,
+        signal_trigger=work_item.signal_trigger,
+        summary=_specialist_context_summary(work_item),
+        research_goal=work_item.request_text or work_item.target.name or work_item.target.url,
+        source_bundle_summary=source_summary,
+        missing_evidence=(
+            [] if source_summary else ["No source refs or stored research artifacts yet."]
+        ),
+    )
+
+
+def build_rag_retrieval_context_pack(work_item: WorkItem) -> RAGRetrievalContextPack:
+    query = (work_item.request_text or work_item.target.name).strip()
+    query_ready = ReadinessResult(
+        ready=bool(query),
+        blockers=(
+            ()
+            if query
+            else (
+                WorkItemBlocker(
+                    code="rag_query_required",
+                    message="RAG retrieval requires a natural-language corpus query.",
+                ),
+            )
+        ),
+        next_action=(
+            None
+            if query
+            else WorkItemNextAction(
+                action="provide_rag_query",
+                agent=WorkItemRoute.RAG_RETRIEVAL_SPECIALIST,
+                description=(
+                    "Provide the question, article description, or semantic search request."
+                ),
+            )
+        ),
+    )
+    project_context = build_project_context_pack(work_item)
+    gates = [*_project_context_gates(project_context), _gate("rag_query_readiness", query_ready)]
+    return RAGRetrievalContextPack(
+        work_item_id=work_item.id,
+        current_status=work_item.status,
+        target=work_item.target,
+        request_text=work_item.request_text,
+        constraints=_metadata_text_list(work_item.target.metadata, "manual_constraints"),
+        ask_shape=_work_item_ask_shape(work_item),
+        adaptation_assessment=_work_item_adaptation_assessment(
+            work_item, target_agent="rag_retrieval_specialist"
+        ),
+        approved_facts=_approved_facts(work_item),
         source_refs=work_item.sources[:12],
         retrieved_sources=work_item.sources[:12],
         source_context_status=_source_context_status(work_item),
@@ -746,19 +843,17 @@ def build_research_context_pack(work_item: WorkItem) -> ResearchContextPack:
         selected_artifacts=selected_artifacts(work_item),
         blockers=_open_blockers(work_item),
         approval_gates=work_item.approval_gates,
-        allowed_next_action=ready.next_action or work_item.next_action,
+        allowed_next_action=query_ready.next_action or work_item.next_action,
         readiness_gates=gates,
         ready=_required_gates_ready(gates),
         can_synthesize=_required_gates_ready(gates),
         missing_requirements=_missing_requirements_from_gates(gates),
         limitation_notes=_limitation_notes_from_gates(gates),
         project_context=project_context,
+        signal_trigger=work_item.signal_trigger,
         summary=_specialist_context_summary(work_item),
-        research_goal=work_item.request_text or work_item.target.name or work_item.target.url,
-        source_bundle_summary=source_summary,
-        missing_evidence=(
-            [] if source_summary else ["No source refs or stored research artifacts yet."]
-        ),
+        query=query,
+        max_matches=6,
     )
 
 
@@ -783,14 +878,14 @@ def build_opportunity_context_pack(work_item: WorkItem) -> OpportunityContextPac
             work_item, target_agent="opportunity_scout"
         ),
         approved_facts=_approved_facts(work_item),
-        source_refs=work_item.sources[:12],
-        retrieved_sources=work_item.sources[:12],
+        source_refs=[source.model_context() for source in work_item.sources[:12]],
+        retrieved_sources=[source.model_context() for source in work_item.sources[:12]],
         source_context_status=_source_context_status(work_item),
         source_context_sample=_source_context_sample(work_item),
         source_context_focus=_source_context_focus(work_item),
         source_triage=_source_triage_summary(work_item),
         ordered_sources=_ordered_sources_for_context_pack(work_item),
-        selected_artifacts=selected_artifacts(work_item),
+        selected_artifacts=_context_artifacts(work_item),
         blockers=_open_blockers(work_item),
         approval_gates=work_item.approval_gates,
         allowed_next_action=objective_ready.next_action or work_item.next_action,
@@ -800,6 +895,7 @@ def build_opportunity_context_pack(work_item: WorkItem) -> OpportunityContextPac
         missing_requirements=_missing_requirements_from_gates(gates),
         limitation_notes=_limitation_notes_from_gates(gates),
         project_context=project_context,
+        signal_trigger=work_item.signal_trigger,
         summary=_specialist_context_summary(work_item),
         objective=work_item.request_text or work_item.target.name,
         entity_types=_metadata_text_list(work_item.target.metadata, "entity_types"),
@@ -851,14 +947,14 @@ def build_outreach_context_pack(work_item: WorkItem) -> OutreachContextPack:
             work_item, target_agent="outreach_composer"
         ),
         approved_facts=_approved_facts(work_item),
-        source_refs=work_item.sources[:12],
-        retrieved_sources=work_item.sources[:12],
+        source_refs=[source.model_context() for source in work_item.sources[:12]],
+        retrieved_sources=[source.model_context() for source in work_item.sources[:12]],
         source_context_status=_source_context_status(work_item),
         source_context_sample=_source_context_sample(work_item),
         source_context_focus=_source_context_focus(work_item),
         source_triage=_source_triage_summary(work_item),
         ordered_sources=_ordered_sources_for_context_pack(work_item),
-        selected_artifacts=selected_artifacts(work_item),
+        selected_artifacts=_context_artifacts(work_item),
         blockers=_open_blockers(work_item),
         approval_gates=work_item.approval_gates,
         allowed_next_action=_first_next_action(gates) or work_item.next_action,
@@ -868,6 +964,7 @@ def build_outreach_context_pack(work_item: WorkItem) -> OutreachContextPack:
         missing_requirements=_missing_requirements_from_gates(gates),
         limitation_notes=_limitation_notes_from_gates(gates),
         project_context=project_context,
+        signal_trigger=work_item.signal_trigger,
         summary=_specialist_context_summary(work_item),
         selected_company_artifact=company_ref,
         selected_opportunity_artifact=opportunity_ref,
@@ -906,14 +1003,14 @@ def build_gmail_context_pack(work_item: WorkItem) -> GmailContextPack:
             work_item, target_agent="gmail_triage"
         ),
         approved_facts=_approved_facts(work_item),
-        source_refs=work_item.sources[:12],
-        retrieved_sources=work_item.sources[:12],
+        source_refs=[source.model_context() for source in work_item.sources[:12]],
+        retrieved_sources=[source.model_context() for source in work_item.sources[:12]],
         source_context_status=_source_context_status(work_item),
         source_context_sample=_source_context_sample(work_item),
         source_context_focus=_source_context_focus(work_item),
         source_triage=_source_triage_summary(work_item),
         ordered_sources=_ordered_sources_for_context_pack(work_item),
-        selected_artifacts=selected_artifacts(work_item),
+        selected_artifacts=_context_artifacts(work_item),
         blockers=_open_blockers(work_item),
         approval_gates=work_item.approval_gates,
         allowed_next_action=thread_ready.next_action or work_item.next_action,
@@ -923,6 +1020,7 @@ def build_gmail_context_pack(work_item: WorkItem) -> GmailContextPack:
         missing_requirements=_missing_requirements_from_gates(gates),
         limitation_notes=_limitation_notes_from_gates(gates),
         project_context=project_context,
+        signal_trigger=work_item.signal_trigger,
         summary=_specialist_context_summary(work_item),
         thread_id=thread_id,
         message_id=message_id,
@@ -1418,6 +1516,13 @@ def normalize_target_text(text: str, route: WorkItemRoute) -> str:
             cleaned,
             flags=re.I,
         )
+    elif route == WorkItemRoute.RAG_RETRIEVAL_SPECIALIST:
+        cleaned = re.sub(
+            r"^(rag\s+retrieval(?:\s+specialist)?|vector\s+(?:database|db)\s+specialist|semantic\s+retrieval\s+specialist)[:\s]+",
+            "",
+            cleaned,
+            flags=re.I,
+        )
     elif route == WorkItemRoute.OPPORTUNITY_SCOUT:
         cleaned = re.sub(
             r"^(opportunity\s+scout|scout\s+agent|scout)\s+",
@@ -1443,15 +1548,17 @@ def _context_for_agent(work_item: WorkItem, route: WorkItemRoute) -> dict[str, A
         for fact in work_item.facts
         if fact.approval_state.startswith("approved")
     ][:12]
-    context["source_refs"] = [source.model_dump(mode="json") for source in work_item.sources[:12]]
+    context["source_refs"] = [
+        source.model_context().model_dump(mode="json") for source in work_item.sources[:12]
+    ]
     context["selected_artifacts"] = [
-        artifact.model_dump(mode="json") for artifact in selected_artifacts(work_item)
+        artifact.model_dump(mode="json") for artifact in _context_artifacts(work_item)
     ]
     return context
 
 
 def _context_pack_payload(pack: ContextPack) -> dict[str, Any]:
-    payload = pack.model_dump(mode="json")
+    payload = compact_source_evidence_context(pack.model_dump(mode="json"))
     payload["agent"] = pack.route.value
     return payload
 
@@ -1627,6 +1734,8 @@ def _route_memory_types(route: WorkItemRoute) -> list[str]:
             "workflow_dedup",
             "retrieval_tool_performance",
         ]
+    if route == WorkItemRoute.RAG_RETRIEVAL_SPECIALIST:
+        return ["retrieval_tool_performance", "workflow_dedup"]
     if route == WorkItemRoute.OPPORTUNITY_SCOUT:
         return [
             "opportunity_signal",
@@ -2332,6 +2441,8 @@ def _coerce_route(route: WorkItemRoute | str | None) -> WorkItemRoute:
 def _kind_for_route(route: WorkItemRoute) -> WorkItemKind:
     if route == WorkItemRoute.BUSINESS_RESEARCH_ANALYST:
         return WorkItemKind.COMPANY_RESEARCH
+    if route == WorkItemRoute.RAG_RETRIEVAL_SPECIALIST:
+        return WorkItemKind.RAG_RETRIEVAL
     if route == WorkItemRoute.OPPORTUNITY_SCOUT:
         return WorkItemKind.OPPORTUNITY
     if route == WorkItemRoute.OUTREACH_COMPOSER:
@@ -2361,7 +2472,9 @@ def _kind_for_target(route: WorkItemRoute, target: WorkItemTarget) -> WorkItemKi
 def _target_for_request(text: str, route: WorkItemRoute) -> WorkItemTarget:
     target = normalize_target_text(text, route)
     object_type = (
-        "topic"
+        "vector_store_corpus"
+        if route == WorkItemRoute.RAG_RETRIEVAL_SPECIALIST
+        else "topic"
         if route == WorkItemRoute.OPPORTUNITY_SCOUT
         else "slack_channel"
         if route == WorkItemRoute.CHIEF_OF_STAFF
@@ -2393,6 +2506,8 @@ def _title_for_request(text: str, route: WorkItemRoute) -> str:
             target = extract_zotero_collection_hint(text) or target
             return f"Research brief: {target or 'Untitled target'}"
         return f"Research: {target or 'Untitled target'}"
+    if route == WorkItemRoute.RAG_RETRIEVAL_SPECIALIST:
+        return f"RAG retrieval: {target or 'Untitled query'}"
     if route == WorkItemRoute.OPPORTUNITY_SCOUT:
         return f"Opportunity scan: {target or 'Untitled objective'}"
     if route == WorkItemRoute.OUTREACH_COMPOSER:
