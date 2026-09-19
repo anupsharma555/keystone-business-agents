@@ -14,6 +14,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if os.environ.get("KEYSTONE_CANARY_ACCEPTANCE_PROFILE"):
+        from keystone_agents.canary_acceptance_entrypoint import main as acceptance_main
+
+        return acceptance_main(arguments)
     try:
         config = CanaryRuntimeConfig.from_environment(repo_root=REPO_ROOT)
     except ValueError as exc:

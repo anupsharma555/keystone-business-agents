@@ -18,7 +18,12 @@ from keystone_agents.schemas.company_profile import (
     SourceRecord,
 )
 from keystone_agents.schemas.email_triage import EmailTriageResult
-from keystone_agents.schemas.opportunity import OpportunityRecord, OpportunityScoutResult
+from keystone_agents.schemas.opportunity import (
+    OpportunityRecord,
+    OpportunityScoutResult,
+    OpportunityScoutSynthesis,
+    OpportunityScoutSynthesisDecision,
+)
 from keystone_agents.schemas.outreach import OutreachDraft, OutreachLLMDraftPayload
 from keystone_agents.storage.sqlite_store import SQLiteStore
 from keystone_agents.workflows import (
@@ -203,6 +208,75 @@ def test_company_research_focused_brief_payload_exposes_clean_slack_summary() ->
     assert business_agent_result_display_text(payload) == summary
 
 
+def test_company_research_visible_sources_exclude_unretained_name_collisions() -> None:
+    import scripts.run_company_research as run_company_research
+
+    profile = CompanyProfile(
+        name="Cartwheel",
+        website="https://www.cartwheel.org",
+        sources=[
+            SourceRecord(
+                source_id="agents-web-search:1",
+                title="Cartwheel Robotics",
+                url="https://www.linkedin.com/company/cartwheel-robotics",
+                source_type="google_search",
+                supported_claims=["A consumer robotics company."],
+                confidence=0.6,
+            ),
+            SourceRecord(
+                source_id="website_extract:2",
+                title="Cartwheel school mental-health care",
+                url="https://www.cartwheel.org/",
+                source_type="website",
+                supported_claims=["Cartwheel provides school-based mental-health care."],
+                confidence=0.9,
+            ),
+            SourceRecord(
+                source_id="agents-web-search:3",
+                title="Cartwheel student mental-health funding",
+                url="https://www.prnewswire.com/example-cartwheel-funding",
+                source_type="news",
+                supported_claims=["Funding supports school-based mental-health services."],
+                confidence=0.7,
+            ),
+        ],
+    )
+    evidence = run_company_research._verified_source_evidence_entry(
+        profile,
+        {
+            "resolved_company_url": "https://www.cartwheel.org",
+            "source_triage": {
+                "retained_urls": [
+                    "https://www.cartwheel.org/",
+                    "https://www.prnewswire.com/example-cartwheel-funding",
+                ]
+            },
+        },
+    )
+    payload = {
+        "output_type": "CompanyResearchFocusedBrief",
+        "verified_source_evidence": [evidence],
+        "output": {
+            "company_name": "Cartwheel",
+            "answer": "Cartwheel has source-backed school mental-health context.",
+            "product": "School-based mental-health services.",
+            "sources": [],
+        },
+    }
+
+    summary = run_company_research._company_research_sdk_human_summary(payload)
+
+    assert "https://www.cartwheel.org/" in summary
+    assert "https://www.prnewswire.com/example-cartwheel-funding" in summary
+    assert "cartwheel-robotics" not in summary
+    assert evidence["source_admission"] == {
+        "candidate_count": 3,
+        "admitted_count": 2,
+        "rejected_count": 1,
+        "triage_applied": True,
+    }
+
+
 def test_company_research_focused_brief_preserves_structured_answer_in_slack() -> None:
     import scripts.run_company_research as run_company_research
     from keystone_agents.presentation.public_result import attach_execution_public_result
@@ -253,6 +327,73 @@ def test_company_research_focused_brief_preserves_structured_answer_in_slack() -
         assert payload[field] == summary
     assert payload["public_result"]["text"] == summary
     assert business_agent_result_display_text(payload) == summary
+
+
+def test_company_research_places_repeated_unknowns_only_in_limitations() -> None:
+    import scripts.run_company_research as run_company_research
+
+    payload = {
+        "output_type": "CompanyResearchFocusedBrief",
+        "output": {
+            "company_name": "Cartwheel",
+            "answer": (
+                "Cartwheel appears to be a school-focused mental-health provider with "
+                "public evidence for both an outcome signal and district-facing service "
+                "delivery, but I could not verify a public district or payer partnership "
+                "from the supplied sources. Those are useful signals, but they are company "
+                "claims rather than independently verified third-party outcomes. I did not "
+                "find a clearly verifiable public district partnership or payer partnership "
+                "in the supplied material, so I would treat that part as unconfirmed."
+            ),
+            "product": "School-focused mental-health services.",
+            "unknowns": [
+                "A public district partnership remains unverified.",
+                "A public payer partnership remains unverified.",
+                "Independent third-party verification of the reported outcomes remains unverified.",
+            ],
+            "sources": [
+                {"title": "Cartwheel", "url": "https://www.cartwheel.org/"}
+            ],
+        },
+    }
+
+    summary = run_company_research._company_research_sdk_human_summary(payload)
+    answer, details = summary.split("\n\n*Detailed Summary:*\n", 1)
+
+    assert "district-facing service delivery." in answer
+    assert "could not verify" not in answer
+    assert "did not find" not in answer
+    assert "independently verified" not in answer
+    assert "* Limitations / what remains unverified:" in details
+    assert details.count("public district partnership") == 1
+    assert details.count("public payer partnership") == 1
+    assert details.count("Independent third-party verification") == 1
+
+
+def test_company_research_moves_labeled_caveat_to_single_limitations_section() -> None:
+    import scripts.run_company_research as run_company_research
+
+    payload = {
+        "output_type": "CompanyResearchFocusedBrief",
+        "output": {
+            "company_name": "Example Health",
+            "answer": (
+                "Example Health supports behavioral-health documentation workflows. "
+                "Caveats: the outcomes signal is preliminary because the study was small."
+            ),
+            "product": "Behavioral-health documentation support.",
+            "unknowns": ["Payer adoption remains unverified."],
+            "sources": [{"title": "Example", "url": "https://example.com/evidence"}],
+        },
+    }
+
+    summary = run_company_research._company_research_sdk_human_summary(payload)
+    answer, details = summary.split("\n\n*Detailed Summary:*\n", 1)
+
+    assert "Caveats:" not in answer
+    assert "outcomes signal is preliminary" not in answer
+    assert details.count("outcomes signal is preliminary") == 1
+    assert details.count("Payer adoption remains unverified") == 1
 
 
 def test_company_research_bullet_contract_preserves_answer_and_exact_official_sources() -> None:
@@ -628,6 +769,37 @@ def test_early_run_smoke_cli_save_uses_sqlite_safely(tmp_path: Path) -> None:
     assert store.count("agent_runs") >= 4
     assert store.count("approvals") >= 2
     assert store.count("approval_queue") >= 2
+
+
+def test_company_research_natural_no_save_overrides_bridge_added_save_flag(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "no-save-company.db"
+    payload = _run_cli_json(
+        "run_company_research.py",
+        "--company",
+        "Curebase",
+        "--request-text",
+        (
+            "Research Curebase using the supplied fixture. Read-only; do not create "
+            "outreach or save anything."
+        ),
+        "--fixture",
+        str(FIXTURES / "sample_company_curebase.json"),
+        "--save",
+        "--database-url",
+        f"sqlite:///{database_path}",
+    )
+
+    assert "storage" not in payload
+    assert payload["local_persistence_boundary"] == {
+        "schema": "keystone.local_persistence_boundary.v1",
+        "save_requested": True,
+        "save_allowed": False,
+        "local_persistence_performed": False,
+        "reason": "natural_request_forbids_local_persistence",
+    }
+    assert database_path.exists() is False
 
 
 def test_outreach_draft_cli_can_create_initial_tracking_with_save(tmp_path: Path) -> None:
@@ -1063,6 +1235,7 @@ def test_weekly_opportunity_workflow_live_sdk_synthesis_uses_agent_outputs(
     import keystone_agents.workflows as workflows
 
     calls: list[str] = []
+    synthesis_tool_counts: list[int] = []
 
     class FakeOutcome:
         def __init__(self, final_output):
@@ -1073,8 +1246,23 @@ def test_weekly_opportunity_workflow_live_sdk_synthesis_uses_agent_outputs(
         raw = kwargs["retrieve"]()
         kwargs["normalize"](raw)
         calls.append(output_type.__name__)
-        if output_type is OpportunityScoutResult:
-            return FakeOutcome(raw)
+        synthesis_tool_counts.append(len(kwargs["agent"].tools))
+        if output_type is OpportunityScoutSynthesis:
+            record = raw.records[0]
+            synthesis = OpportunityScoutSynthesis(
+                decisions=[
+                    OpportunityScoutSynthesisDecision(
+                        record_key=record.canonical_entity_key or record.company_name,
+                        include=True,
+                        why_now_signal=record.why_now_signal,
+                        keystone_fit_reason=record.keystone_fit_reason,
+                        recommended_next_step=record.recommended_next_step,
+                        missing_evidence=record.missing_evidence,
+                    )
+                ],
+                audit_summary="Weekly evidence synthesis completed.",
+            )
+            return FakeOutcome(kwargs["finalize_output"](raw, synthesis))
         if output_type is CompanyResearchFocusedBrief:
             return FakeOutcome(
                 CompanyResearchFocusedBrief(
@@ -1141,10 +1329,11 @@ def test_weekly_opportunity_workflow_live_sdk_synthesis_uses_agent_outputs(
     assert "LLM synthesized product summary." in markdown
     assert result.live_sdk_synthesis is True
     assert calls == [
-        "OpportunityScoutResult",
+        "OpportunityScoutSynthesis",
         "CompanyResearchFocusedBrief",
         "OutreachLLMDraftPayload",
     ]
+    assert synthesis_tool_counts == [0, 0, 0]
 
 
 def test_weekly_opportunity_workflow_live_sdk_invalid_outreach_falls_back(
@@ -1160,8 +1349,22 @@ def test_weekly_opportunity_workflow_live_sdk_invalid_outreach_falls_back(
         output_type = kwargs["output_type"]
         raw = kwargs["retrieve"]()
         kwargs["normalize"](raw)
-        if output_type is OpportunityScoutResult:
-            return FakeOutcome(raw)
+        if output_type is OpportunityScoutSynthesis:
+            record = raw.records[0]
+            synthesis = OpportunityScoutSynthesis(
+                decisions=[
+                    OpportunityScoutSynthesisDecision(
+                        record_key=record.canonical_entity_key or record.company_name,
+                        include=True,
+                        why_now_signal=record.why_now_signal,
+                        keystone_fit_reason=record.keystone_fit_reason,
+                        recommended_next_step=record.recommended_next_step,
+                        missing_evidence=record.missing_evidence,
+                    )
+                ],
+                audit_summary="Weekly evidence synthesis completed.",
+            )
+            return FakeOutcome(kwargs["finalize_output"](raw, synthesis))
         if output_type is CompanyResearchFocusedBrief:
             return FakeOutcome(
                 CompanyResearchFocusedBrief(
@@ -1253,8 +1456,12 @@ def test_weekly_opportunity_workflow_keeps_retrieved_candidates_when_sdk_returns
     def fake_run_retrieved_sdk_synthesis(**kwargs):
         raw = kwargs["retrieve"]()
         kwargs["normalize"](raw)
-        if kwargs["output_type"] is OpportunityScoutResult:
-            return FakeOutcome(raw.model_copy(update={"records": [], "source_bundles": []}))
+        if kwargs["output_type"] is OpportunityScoutSynthesis:
+            synthesis = OpportunityScoutSynthesis(
+                decisions=[],
+                audit_summary="No supplied record was retained.",
+            )
+            return FakeOutcome(kwargs["finalize_output"](raw, synthesis))
         if kwargs["output_type"] is CompanyResearchFocusedBrief:
             return FakeOutcome(
                 CompanyResearchFocusedBrief(

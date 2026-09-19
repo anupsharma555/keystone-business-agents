@@ -6,16 +6,20 @@ import threading
 import time
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from keystone_agents.agents import opportunity_scout as scout_module
 from keystone_agents.agents.opportunity_scout import (
+    OPPORTUNITY_FIXTURE_ONLY_TOOL_NAMES,
     apply_opportunity_scout_synthesis,
     build_opportunity_scout_agent,
     build_opportunity_scout_synthesis_agent,
     handoff_to_business_research_analyst_placeholder_impl,
     load_existing_opportunity_state_impl,
+    run_opportunity_scout_sdk,
     save_opportunity_placeholder_impl,
     score_opportunity_impl,
     scout_opportunities_fixture,
@@ -28,9 +32,12 @@ from keystone_agents.agents.opportunity_scout import (
     search_job_posting_sources_impl,
     search_opportunity_sources_placeholder_impl,
 )
+from keystone_agents.capability_profile import compile_request_capability_profile
 from keystone_agents.live_retrieval import run_opportunity_scout_live
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.opportunity import (
     ExistingOpportunityState,
+    FilteredOpportunityCandidate,
     Opportunity,
     OpportunityRecord,
     OpportunityScoutResult,
@@ -224,6 +231,29 @@ def test_formal_opportunity_plan_expands_short_request_across_actionable_lanes()
     assert any(
         "call for proposals" in spec.query.lower() or "cfp" in spec.query.lower() for spec in specs
     )
+
+
+def test_natural_formal_opportunity_request_builds_distilled_queries() -> None:
+    topic = (
+        "We’re looking for near-term U.S. behavioral-health pilot or grant opportunities "
+        "that a small neuroinformatics consultancy could realistically pursue. Find up "
+        "to two with deadlines in the next 90 days, require a public application page "
+        "and clear fit, and use Tavily for deeper deadline checking if basic discovery "
+        "is thin. Return Name | deadline | fit | URL; if only one qualifies, say so "
+        "instead of padding. Read-only; don’t create WorkItems or outreach."
+    )
+
+    plan = scout_module.infer_opportunity_search_plan(topic, desired_count=2)
+    specs = scout_module._build_live_query_specs(topic, search_plan=plan)  # noqa: SLF001
+
+    assert plan.strict_targeting is True
+    assert {"grant_program", "contract_rfp", "conference", "institute"} == set(
+        plan.target_entity_types
+    )
+    assert any("site:grants.gov" in spec.query for spec in specs)
+    assert any("site:sam.gov" in spec.query for spec in specs)
+    assert all("we’re looking" not in spec.query.lower() for spec in specs)
+    assert all("return name" not in spec.query.lower() for spec in specs)
 
 
 @pytest.mark.parametrize("identifier", ["PAR-25-310", "RFA-MH-27-180"])
@@ -1333,19 +1363,61 @@ def test_build_opportunity_scout_agent() -> None:
     assert agent.output_type is OpportunityScoutResult
     assert {
         "search_web",
-        "search_opportunity_sources_placeholder",
-        "load_existing_opportunity_state",
-        "search_funding_news_sources",
-        "search_job_posting_sources",
-        "search_clinical_trials_sources",
-        "search_grant_sources",
-        "search_conference_publication_sources",
-        "search_company_page_sources",
+        "extract_selected_urls_to_source_bundle",
         "extract_research_claims_from_html",
         "score_opportunity",
-        "handoff_to_business_research_analyst_placeholder",
-        "save_opportunity_placeholder",
     } <= {getattr(tool, "name", "") for tool in agent.tools}
+    assert not OPPORTUNITY_FIXTURE_ONLY_TOOL_NAMES.intersection(
+        getattr(tool, "name", "") for tool in agent.tools
+    )
+
+
+def test_fixture_only_tools_require_explicit_offline_attachment() -> None:
+    agent = build_opportunity_scout_agent(
+        request_text="Exercise the offline opportunity fixtures.",
+        include_fixture_tools=True,
+    )
+
+    assert OPPORTUNITY_FIXTURE_ONLY_TOOL_NAMES <= {
+        getattr(tool, "name", "") for tool in agent.tools
+    }
+    assert len(OPPORTUNITY_FIXTURE_ONLY_TOOL_NAMES) == 12
+
+
+def test_active_request_profile_excludes_fixture_only_tools() -> None:
+    plan = ManualRequestPlan(
+        source="canonical:test",
+        target_agent="opportunity_scout",
+        intent="opportunity_search",
+        requires_live_search=True,
+        ask_shape={"evidence_depth": "deep", "permission_state": "read_only"},
+    )
+    profile = compile_request_capability_profile(
+        entrypoint="direct_sdk",
+        agent=build_opportunity_scout_agent(
+            tool_tier="deep_retrieval",
+            manual_request_plan=plan,
+        ),
+        execution_shape="active_opportunity_research",
+        prompt_profile="opportunity_scout",
+        max_turns=4,
+        retrieval_enabled=True,
+        provider_operations=("read",),
+    )
+
+    assert "search_web" in profile.tool_names
+    assert "extract_selected_urls_to_source_bundle" in profile.tool_names
+    assert "structure_web_data_for_schema" not in profile.tool_names
+    assert not OPPORTUNITY_FIXTURE_ONLY_TOOL_NAMES.intersection(profile.tool_names)
+
+
+def test_live_sdk_run_rejects_fixture_only_tool_attachment() -> None:
+    with pytest.raises(ValueError, match="fixture-only tools cannot be attached"):
+        run_opportunity_scout_sdk(
+            "Find a current behavioral-health opportunity.",
+            live=True,
+            include_fixture_tools=True,
+        )
 
 
 def test_build_opportunity_scout_agent_can_detach_tools() -> None:
@@ -1393,6 +1465,7 @@ def test_compact_synthesis_merges_judgment_onto_verified_record() -> None:
     assert merged.records[0].company_name == record.company_name
     assert merged.records[0].sources == record.sources
     assert merged.records[0].keystone_fit_reason == decision.keystone_fit_reason
+    assert merged.human_summary == "One verified opportunity is decision-ready."
     assert "One verified opportunity is decision-ready." in merged.audit_notes
     assert merged.outreach_generated is False
 
@@ -1625,10 +1698,11 @@ def test_source_verification_can_use_agent_html_review(
     assert any("Agent HTML review added 1 claim" in note for note in notes)
 
 
-def test_source_verification_prefers_crawl4ai_fallback(
+def test_source_verification_uses_explicit_controlled_crawl4ai_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK", raising=False)
+    monkeypatch.setenv("KEYSTONE_WEBSITE_EXTRACTOR_FALLBACK", "crawl4ai")
+    monkeypatch.setenv("KEYSTONE_ENABLE_EXPERIMENTAL_CRAWL4AI", "true")
     monkeypatch.setenv("KEYSTONE_ENABLE_OPPORTUNITY_SOURCE_VERIFICATION", "true")
     monkeypatch.setenv("KEYSTONE_OPPORTUNITY_VERIFY_CAP", "1")
     calls: list[str] = []
@@ -2274,8 +2348,7 @@ def test_live_search_enriches_source_bundles_dedupes_state_and_explains_handoff(
     assert "handoff criteria" in record.business_research_analyst_handoff_recommendation
     assert "before any outreach" in record.business_research_analyst_handoff_recommendation
     assert (
-        "validate validate"
-        not in record.business_research_analyst_handoff_recommendation.lower()
+        "validate validate" not in record.business_research_analyst_handoff_recommendation.lower()
     )
     assert record.score_breakdown.component_rationales
     assert record.score_breakdown.source_confidence_score == (
@@ -3688,6 +3761,177 @@ def test_cli_result_output_option_persists_before_rendering(
     cli._persist_requested_result(args, payload)
 
     assert json.loads(output.read_text(encoding="utf-8")) == payload
+
+
+def test_opportunity_uncaught_sdk_failure_preserves_structured_evidence(capsys) -> None:
+    import scripts.run_opportunity_scout as cli
+
+    exc = RuntimeError("decision repair evidence exceeded the replay limit")
+    exc.keystone_sdk_run_failure = {
+        "schema": "keystone.sdk_run_failure.v1",
+        "failure_kind": "agentdecisionvalidationerror",
+        "attempt_count": 2,
+        "usage": {"requests": 2},
+        "cost": {"estimated_usd": 0.02},
+        "request_cache": {
+            "decision_ownership": {
+                "validator_outcome": {
+                    "status": "repair_required",
+                    "reason": "selected_identity_not_in_provider_evidence",
+                }
+            },
+            "model_request_budget": {
+                "schema": "keystone.model_request_budget.v1",
+                "limit": 3,
+                "consumed": 2,
+                "exhausted": False,
+            },
+        },
+        "tool_execution": {
+            "model_called_tool_names": ["search_opportunity_sources"]
+        },
+        "tool_receipts": [{"tool_name": "search_opportunity_sources"}],
+        "execution_telemetry": {"status": "failed"},
+    }
+
+    exit_code = cli._handle_uncaught_exception(exc, ["--json"])
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_code == 1
+    assert payload["status"] == "failed"
+    assert payload["sdk_failure"]["attempt_count"] == 2
+    assert payload["usage"]["requests"] == 2
+    assert payload["tool_execution"]["model_called_tool_names"] == [
+        "search_opportunity_sources"
+    ]
+    assert payload["decision_ownership"]["validator_outcome"]["status"] == (
+        "repair_required"
+    )
+    assert payload["request_budget"]["exhausted"] is False
+    assert payload["send_enabled"] is False
+    assert "decision repair evidence exceeded" in captured.err
+
+
+def test_cli_truthful_empty_result_is_reader_ready_without_padding() -> None:
+    import scripts.run_opportunity_scout as cli
+
+    result = OpportunityScoutResult(
+        topic="Find up to two strict opportunities.",
+        human_summary=(
+            "The retained candidates did not establish both eligibility and a "
+            "verified deadline."
+        ),
+        dry_run=False,
+        search_provider="agents-web-search+exa",
+        raw_search_result_count=24,
+        filtered_candidates=[
+            FilteredOpportunityCandidate(
+                company_name="Synthetic Filtered Candidate",
+                reasons=["Applicant eligibility was not verified."],
+            )
+        ],
+        review_candidates=[
+            FilteredOpportunityCandidate(
+                company_name="Synthetic Review Candidate",
+                reasons=["Deadline evidence needs review."],
+            )
+        ],
+        constraint_relaxation_suggestion="Extend the deadline window.",
+    )
+    payload: dict[str, Any] = {"output": result.model_dump(mode="json")}
+
+    cli._attach_truthful_empty_result_summary(
+        payload,
+        result,
+        requested_count=2,
+    )
+
+    assert payload["status"] == "completed"
+    assert payload["empty_result_confirmed"] is True
+    assert payload["user_facing_result_verified"] is True
+    assert payload["completion_confirmed"] is True
+    assert payload["human_summary"].startswith(
+        "No opportunity met every requested filter, so I returned 0 of 2"
+    )
+    assert "Assessment: The retained candidates" in payload["human_summary"]
+    assert "24 raw result(s)" in payload["human_summary"]
+    assert "No source URL is promoted" in payload["human_summary"]
+    assert payload["human_summary"] == payload["slack_display_text"]
+    assert payload["human_summary"] == payload["display_text"]
+    assert payload["human_summary"] == payload["summary"]
+
+
+def test_parent_promotes_truthful_empty_scout_result_as_completed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    import scripts.run_opportunity_scout as scout_cli
+    from keystone_agents.entrypoints import cli_impl as entry_cli
+
+    request = (
+        "Find up to two open U.S. behavioral-health opportunities with verified "
+        "deadlines. Return zero instead of padding."
+    )
+    result = OpportunityScoutResult(
+        topic=request,
+        human_summary=(
+            "The retained candidates did not establish both eligibility and a "
+            "verified deadline."
+        ),
+        dry_run=False,
+        search_provider="agents-web-search+exa",
+        raw_search_result_count=12,
+        constraint_relaxation_suggestion="Extend the deadline window.",
+    )
+    child_payload: dict[str, Any] = {
+        "output_type": "OpportunityScoutResult",
+        "output": result.model_dump(mode="json"),
+        "send_enabled": False,
+    }
+    scout_cli._attach_truthful_empty_result_summary(
+        child_payload,
+        result,
+        requested_count=2,
+    )
+    monkeypatch.setattr(
+        entry_cli,
+        "run_isolated_child_process",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(child_payload),
+            stderr="",
+        ),
+    )
+
+    exit_code = entry_cli._run_ask_script_live(
+        "opportunity_scout",
+        request,
+        ["unused-child-command"],
+        json_output=True,
+        manual_plan=ManualRequestPlan(
+            source="canonical:test",
+            target_agent="opportunity_scout",
+            intent="opportunity_search",
+            desired_count=2,
+            requires_live_search=True,
+        ),
+        database_url=f"sqlite:///{tmp_path / 'empty-scout.db'}",
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["public_result"]["status"] == "completed"
+    assert payload["public_result"]["completion_confirmed"] is True
+    assert payload["user_facing_result_verified"] is True
+    assert payload["child_result_promotion_receipt"]["reader_ready"] is True
+    assert payload["child_result_promotion_receipt"]["verification_basis"] == [
+        "mirrored_child_display_contract"
+    ]
+    assert payload["human_summary"].startswith(
+        "No opportunity met every requested filter, so I returned 0 of 2"
+    )
 
 
 def test_cli_can_force_fixture_only_search_when_environment_defaults_live(

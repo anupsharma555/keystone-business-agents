@@ -32,7 +32,9 @@ from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.orchestrator.preflight_context import (
     MANUAL_REQUEST_PLAN_ENV,
     ORCHESTRATOR_PREFLIGHT_ENV,
+    ORCHESTRATOR_ROUTE_RESULT_ENV,
 )
+from keystone_agents.planning.compatibility import infer_manual_request_plan
 from keystone_agents.quality_budget import (
     QualityMode,
     chief_of_staff_quality_budget,
@@ -85,6 +87,7 @@ from keystone_agents.tools.internal_data_tools import (
     airtable_delete_test_record_impl,
     airtable_get_base_schema_impl,
     airtable_read_records_impl,
+    airtable_read_schema_detail_impl,
     airtable_reconcile_duplicate_expense_impl,
     airtable_test_record_lifecycle_impl,
     airtable_upload_attachment_impl,
@@ -185,11 +188,16 @@ def test_chief_of_staff_builder_can_structurally_disable_all_tools() -> None:
 def test_chief_calendar_plan_exposes_only_calendar_writes() -> None:
     request = "CoS add “UT AI Agents application due on July 23rd”"
     plan = ManualRequestPlan(
+        source="canonical:stored_work_item",
         requested_agent="chief_of_staff",
         target_agent="chief_of_staff",
         intent="business_system_write",
         target_type="business_system_context",
         provider_system="google_calendar",
+        provider_operations=["create"],
+        provider_action_steps=[
+            {"operation": "create", "resource_type": "calendar_event"}
+        ],
         objective=request,
         primary_target="UT AI Agents application due on July 23rd",
     )
@@ -200,12 +208,10 @@ def test_chief_calendar_plan_exposes_only_calendar_writes() -> None:
     )
     tool_names = {getattr(tool, "name", "") for tool in agent.tools}
 
-    assert {
+    assert tool_names == {
         "create_google_calendar_event",
-        "update_google_calendar_event",
-        "delete_google_calendar_event",
-    } <= tool_names
-    assert "read_google_calendar_window" in tool_names
+        "read_google_calendar_window",
+    }
     assert "airtable_write_record" not in tool_names
     assert "google_doc_write" not in tool_names
     assert "publish_slack_summary" not in tool_names
@@ -213,11 +219,16 @@ def test_chief_calendar_plan_exposes_only_calendar_writes() -> None:
 
 def test_chief_calendar_read_plan_exposes_only_calendar_read() -> None:
     plan = ManualRequestPlan(
+        source="canonical:stored_work_item",
         requested_agent="chief_of_staff",
         target_agent="chief_of_staff",
         intent="context_lookup",
         target_type="business_system_context",
         provider_system="google_calendar",
+        provider_operations=["read"],
+        provider_action_steps=[
+            {"operation": "read", "resource_type": "calendar_event"}
+        ],
         objective="Check whether the referenced event exists.",
         primary_target="Google Calendar event for UT Austin Course Starts on August 15, 2026",
         required_entities=["UT Austin Course Starts"],
@@ -435,11 +446,16 @@ def test_chief_calendar_read_tool_scope_is_stable_across_phrasings(
     request_text: str,
 ) -> None:
     plan = ManualRequestPlan(
+        source="canonical:stored_work_item",
         requested_agent="chief_of_staff",
         target_agent="chief_of_staff",
         intent="context_lookup",
         target_type="business_system_context",
         provider_system="google_calendar",
+        provider_operations=["read"],
+        provider_action_steps=[
+            {"operation": "read", "resource_type": "calendar_event"}
+        ],
         objective="Verify provider state for the referenced event.",
         primary_target="UT Austin Course Starts",
     )
@@ -502,7 +518,7 @@ def test_chief_multi_source_context_plan_exposes_exact_advisors_and_workitems() 
     assert tool_names == {
         specialist_agent_tool_name("gmail_triage"),
         specialist_agent_tool_name("airtable_context_agent"),
-        "inspect_active_work_items",
+        "inspect_active_work_item_execution_summary",
     }
 
 
@@ -678,6 +694,7 @@ def test_chief_of_staff_can_opt_into_all_specialists_as_tools() -> None:
     tool_names = set(tools_by_name)
     specialist_tool_names = {
         specialist_agent_tool_name(spec.route_name) for spec in SPECIALIST_AGENT_SPECS
+        if spec.route_name != "rag_retrieval_specialist"  # Requires explicit route opt-in.
     }
 
     assert specialist_tool_names <= tool_names
@@ -791,6 +808,7 @@ def test_chief_of_staff_specialist_tools_are_advisory_not_write_tools() -> None:
 
     assert {getattr(tool, "name", "") for tool in specialist_tools} == {
         specialist_agent_tool_name(spec.route_name) for spec in SPECIALIST_AGENT_SPECS
+        if spec.route_name != "rag_retrieval_specialist"  # Requires explicit route opt-in.
     }
     for tool in specialist_tools:
         assert getattr(tool, "specialist_write_authorized", False) is False
@@ -975,6 +993,40 @@ def test_chief_agent_binds_authority_into_each_admitted_specialist_tool() -> Non
         assert "## Canonical Manual Request Plan" in rendered
         assert '"gmail_triage"' in rendered
         assert '"airtable_context_agent"' in rendered
+
+
+def test_chief_page_only_advisory_scopes_manager_and_nested_research_tools() -> None:
+    request = (
+        "Chief, have the business research analyst read only Mantra Health's public "
+        "homepage and assess whether it supports a pilot-readiness claim for a college "
+        "mental-health measurement partner, then give me the safest next step. Show "
+        "the source URL, don't search beyond that page, and don't approve or change "
+        "anything: https://mantrahealth.com/"
+    )
+    plan = chief_of_staff_module.infer_manual_request_plan(
+        request,
+        requested_agent="chief_of_staff",
+    )
+
+    agent = build_chief_of_staff_agent(
+        request_text=request,
+        manual_request_plan=plan,
+        include_specialist_tools=True,
+    )
+
+    assert plan.workflow == ["business_research_analyst"]
+    assert plan.primary_target == "https://mantrahealth.com/"
+    assert plan.provider_operations == ["read"]
+    assert plan.requires_live_search is False
+    assert [getattr(tool, "name", "") for tool in agent.tools] == [
+        "inspect_active_work_items",
+        "business_research_analyst_as_specialist_tool",
+    ]
+    specialist_tool = agent.tools[-1]
+    assert getattr(specialist_tool, "nested_tool_names", ()) == (
+        "extract_selected_urls_to_source_bundle",
+        "read_web_source_window",
+    )
 
 
 def test_nested_specialist_output_extractor_returns_reviewable_envelope() -> None:
@@ -1720,9 +1772,100 @@ def test_run_script_consumes_parent_orchestrator_preflight_env(
     assert payload["orchestrator_preflight"]["selected_agent"] == "chief_of_staff"
 
 
+def test_run_script_makes_parent_orchestrator_decision_model_visible(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    script = _load_run_chief_of_staff_script()
+    request = "Review the current Calendar request and take the bounded next step."
+    plan = ManualRequestPlan(
+        source="parent_orchestrator",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="slack_operations",
+        primary_target="current Calendar request",
+        objective=request,
+        task_objective="slack_operations",
+    )
+    route_result = {
+        "route": "chief_of_staff",
+        "target_agent": "chief_of_staff",
+        "routing_mode": "llm",
+        "refused": False,
+        "decision": {
+            "decision_owner": "orchestrator",
+            "decision_stage": "orchestrator_route_selection",
+            "selected_candidate_ids": ["chief_of_staff"],
+            "reasoning": "Chief owns the bounded provider action.",
+            "needs_more_context": False,
+        },
+        "provider_context_decisions": [
+            {
+                "decision_owner": "orchestrator",
+                "decision_stage": "provider_capability_selection",
+                "selected_candidate_ids": ["google_calendar:create"],
+                "reasoning": "The operator requested one Calendar create.",
+                "needs_more_context": False,
+            }
+        ],
+    }
+    preflight = {
+        "advisory_only": True,
+        "selected_agent": "chief_of_staff",
+        "manual_request_plan": plan.model_dump(mode="json"),
+        "route_result": {"route": "chief_of_staff", "refused": False},
+    }
+    captured: dict[str, object] = {}
+
+    class FakeModelConfig:
+        def as_log_dict(self) -> dict[str, str]:
+            return {"provider": "openai", "name": "gpt-test"}
+
+    def fake_run_chief_of_staff_sdk(
+        typed_input: dict[str, object],
+        **_kwargs: object,
+    ) -> TypedAgentRunResult:
+        captured["typed_input"] = typed_input
+        return TypedAgentRunResult(
+            agent_name="chief_of_staff",
+            output=ChiefOfStaffResult(mode="llm", summary="Bounded result."),
+            raw_result={"sdk": "called"},
+            live=True,
+        )
+
+    monkeypatch.setenv(MANUAL_REQUEST_PLAN_ENV, plan.model_dump_json())
+    monkeypatch.setenv(ORCHESTRATOR_PREFLIGHT_ENV, json.dumps(preflight))
+    monkeypatch.setenv(ORCHESTRATOR_ROUTE_RESULT_ENV, json.dumps(route_result))
+    monkeypatch.setattr(script, "load_settings", lambda **_: None)
+    monkeypatch.setattr(
+        script,
+        "get_runtime_agent_model_config",
+        lambda *_args, **_kwargs: FakeModelConfig(),
+    )
+    monkeypatch.setattr(script, "run_chief_of_staff_sdk", fake_run_chief_of_staff_sdk)
+
+    assert script.main(["--live-sdk", "--json", "--input", request]) == 0
+
+    typed_input = captured["typed_input"]
+    assert isinstance(typed_input, dict)
+    assert typed_input["orchestrator_route_result"] == route_result
+    assert typed_input["attach_tools"] is True
+    assert "does not grant provider-write authority" in str(
+        typed_input["orchestrator_route_result_instruction"]
+    )
+    payload = _payload(capsys.readouterr().out)
+    assert "orchestrator_route_result" not in payload
+
+
+@pytest.mark.parametrize(
+    ("planner_args", "expected_live_manual_plan"),
+    [([], False), (["--live-manual-plan"], True)],
+)
 def test_run_script_live_sdk_runs_orchestrator_preflight_when_parent_absent(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    planner_args: list[str],
+    expected_live_manual_plan: bool,
 ) -> None:
     from keystone_agents.agents.orchestrator import OrchestratorPreflight
     from keystone_agents.schemas.orchestrator import OrchestratorResult
@@ -1793,9 +1936,10 @@ def test_run_script_live_sdk_runs_orchestrator_preflight_when_parent_absent(
 
     assert (
         script.main(
-            [
-                "--live-sdk",
-                "--json",
+                [
+                    "--live-sdk",
+                    *planner_args,
+                    "--json",
                 "--input",
                 "chief of staff confirm q2 tax estimated payments due on June 15, 2026",
             ]
@@ -1804,7 +1948,10 @@ def test_run_script_live_sdk_runs_orchestrator_preflight_when_parent_absent(
     )
 
     payload = _payload(capsys.readouterr().out)
-    assert captured["preflight_kwargs"]["live_manual_plan"] is True
+    assert (
+        captured["preflight_kwargs"]["live_manual_plan"]
+        is expected_live_manual_plan
+    )
     assert captured["sdk_kwargs"]["manual_request_plan"] is plan
     assert captured["sdk_kwargs"]["include_specialist_tools"] is False
     assert captured["sdk_args"][0]["include_specialist_tools"] is False
@@ -3534,7 +3681,29 @@ def test_run_script_payload_includes_sdk_usage_cost_and_request_cache() -> None:
         input_text="review agent architecture",
         usage={"available": True, "input_tokens": 100, "cached_input_tokens": 40},
         cost={"amount_usd": 0.01, "currency": "USD"},
-        request_cache={"request_layout": "static_agent_prefix_then_dynamic_typed_input"},
+        request_cache={
+            "request_layout": "static_agent_prefix_then_dynamic_typed_input",
+            "request_tool_scope": {
+                "selected_tool_names": [
+                    "inspect_active_work_item_execution_summary"
+                ]
+            },
+            "tool_execution_postcondition": {
+                "schema": "keystone.tool_execution_postcondition.v1",
+                "mode": "required",
+                "stage": "chief_of_staff_active_work_item_inspection",
+                "satisfied": True,
+                "attempted_tool_names": [
+                    "inspect_active_work_item_execution_summary"
+                ],
+                "completed_tool_names": [
+                    "inspect_active_work_item_execution_summary"
+                ],
+                "receipt_tool_names": [],
+                "missing_groups": [],
+                "prohibited_tool_names": [],
+            },
+        },
     )
 
     assert payload["usage"]["cached_input_tokens"] == 40
@@ -3542,6 +3711,38 @@ def test_run_script_payload_includes_sdk_usage_cost_and_request_cache() -> None:
     assert payload["request_cache"]["request_layout"] == (
         "static_agent_prefix_then_dynamic_typed_input"
     )
+    assert payload["tool_execution"]["selected_tool_names"] == [
+        "inspect_active_work_item_execution_summary"
+    ]
+    assert payload["tool_execution"]["model_called_tool_names"] == [
+        "inspect_active_work_item_execution_summary"
+    ]
+    assert payload["tool_execution"]["postcondition"]["satisfied"] is True
+
+
+def test_run_script_payload_promotes_recorded_tool_execution_without_postcondition() -> None:
+    script = _load_run_chief_of_staff_script()
+    output = plan_chief_of_staff_request("create the approved calendar reminder")
+    recorded = {
+        "mode": "llm_selected_function_tools_failed",
+        "selected_tool_names": ["create_google_calendar_event"],
+        "model_tool_call_count": 1,
+        "model_called_tool_names": ["create_google_calendar_event"],
+        "provider_request_attempt_count": 3,
+        "provider_request_success_count": 3,
+        "provider_receipt_count": 1,
+    }
+
+    payload = script._payload(
+        mode="live_sdk",
+        live_sdk=True,
+        model={"provider": "openai", "name": "gpt-5.4-mini"},
+        output=output,
+        input_text="create the approved calendar reminder",
+        request_cache={"tool_execution": recorded},
+    )
+
+    assert payload["tool_execution"] == recorded
 
 
 def test_run_script_payload_combines_public_summary_and_synthesis_without_metadata() -> None:
@@ -4133,6 +4334,51 @@ def test_run_script_does_not_collapse_calendar_collection_into_exact_title(
     assert receipt is None
 
 
+def test_run_script_executes_complete_plannerless_calendar_read_before_general_chief(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = _load_run_chief_of_staff_script()
+    request = (
+        "CoS, list only the two interviews I have tomorrow from Google Calendar."
+    )
+    plan = infer_manual_request_plan(
+        request,
+        requested_agent="chief_of_staff",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeModelConfig:
+        def as_log_dict(self) -> dict[str, str]:
+            return {"provider": "openai", "name": "gpt-5.4-mini"}
+
+    def fake_direct_calendar(**kwargs: object) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setenv(MANUAL_REQUEST_PLAN_ENV, plan.model_dump_json())
+    monkeypatch.delenv(ORCHESTRATOR_PREFLIGHT_ENV, raising=False)
+    monkeypatch.setattr(script, "load_settings", lambda **_: None)
+    monkeypatch.setattr(
+        script,
+        "get_runtime_agent_model_config",
+        lambda *_args, **_kwargs: FakeModelConfig(),
+    )
+    monkeypatch.setattr(script, "_run_interpreted_calendar_action", fake_direct_calendar)
+    monkeypatch.setattr(
+        script,
+        "run_chief_of_staff_sdk",
+        lambda *_args, **_kwargs: pytest.fail("general Chief path should not run"),
+    )
+
+    assert script.main(["--live-sdk", "--json", "--input", request]) == 0
+    calendar_plan = captured["plan"]
+    assert calendar_plan.operation == "read"
+    assert calendar_plan.date_scope == "tomorrow"
+    assert calendar_plan.query == "interviews"
+    assert calendar_plan.target_count == 2
+    assert captured["manual_plan"].source == "heuristic"
+
+
 def test_run_script_calendar_lookup_falls_back_to_explicit_date_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4343,6 +4589,8 @@ def test_run_script_calendar_write_uses_verified_receipt_for_public_answer() -> 
         'Google Calendar event created and verified: '
         '"UT Austin Course Starts" on 2026-08-15.'
     )
+    assert payload["completion_confirmed"] is True
+    assert payload["public_result"]["completion_confirmed"] is True
     assert "Workflow complete" not in payload["public_result"]["text"]
 
 
@@ -5735,10 +5983,12 @@ def test_internal_data_tools_dry_run_are_gated(monkeypatch: pytest.MonkeyPatch) 
     assert sheet_create["tabs"] == ["Contacts", "Meetings"]
 
     sheet_read = google_sheet_read_table_impl(
-        "https://docs.google.com/spreadsheets/d/sheet123/edit"
+        "https://docs.google.com/spreadsheets/d/sheet123/edit",
+        sheet_name="Operations",
     )
     assert sheet_read["status"] == "dry-run"
     assert sheet_read["spreadsheet_id"] == "sheet123"
+    assert sheet_read["sheet_name"] == "Operations"
 
     sheet_append = google_sheet_append_rows_impl(
         '[{"record_key": "contact-1", "email": "example@example.com"}]'
@@ -5789,6 +6039,297 @@ def test_airtable_schema_summary_is_bounded_to_metadata() -> None:
     assert summary.tables[0].fields[1].select_choices == ["Software", "Meals"]
     assert summary.tables[0].fields[2].is_computed is True
     assert summary.missing_allowed_tables == ["Tax Expenses"]
+
+
+def test_airtable_schema_preserves_exact_semantics_and_exposes_bounded_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    long_description = "Source context. " * 30 + "NOT approved for external use."
+    choice_names = [
+        "Needs — Review",
+        "needs — review",
+        " Ready  ",
+        *[f"State {index}" for index in range(3, 21)],
+    ]
+    choices = [
+        {"id": f"sel{index}", "name": name}
+        for index, name in enumerate(choice_names)
+    ]
+    payload = {
+        "tables": [
+            {
+                "id": "tblEvidence",
+                "name": "Evidence —  Review",
+                "primaryFieldId": "fldExact",
+                "fields": [
+                    {
+                        "id": "fldExact",
+                        "name": "Decision —  source",
+                        "type": "formula",
+                        "options": {
+                            "formula": (
+                                'IF({fldState} = "Needs — Review", '
+                                '"Hold  for review", "Proceed")'
+                            ),
+                            "isValid": True,
+                            "referencedFieldIds": ["fldState"],
+                            "result": {"type": "singleLineText"},
+                        },
+                    },
+                    {
+                        "id": "fldInvalid",
+                        "name": "Invalid derived field",
+                        "type": "formula",
+                        "options": {
+                            "formula": "IF({fldMissing}, 1, 0)",
+                            "isValid": False,
+                            "referencedFieldIds": None,
+                            "result": None,
+                        },
+                    },
+                    {
+                        "id": "fldLookup",
+                        "name": "Reviewed amount",
+                        "type": "multipleLookupValues",
+                        "options": {
+                            "recordLinkFieldId": "fldProjectLink",
+                            "fieldIdInLinkedTable": "fldNetAmount",
+                            "isValid": True,
+                            "result": {
+                                "type": "currency",
+                                "options": {"precision": 2, "symbol": "£"},
+                            },
+                        },
+                    },
+                    {
+                        "id": "fldLink",
+                        "name": "Project link",
+                        "type": "multipleRecordLinks",
+                        "options": {
+                            "linkedTableId": "tblProjects",
+                            "inverseLinkFieldId": "fldBacklink",
+                            "isReversed": False,
+                        },
+                    },
+                    {
+                        "id": "fldDescription",
+                        "name": "Readiness",
+                        "type": "singleSelect",
+                        "description": long_description,
+                        "options": {"choices": choices},
+                    },
+                    {
+                        "id": "fldUnknown",
+                        "name": "Future source state",
+                        "type": "futureProviderType",
+                        "options": {"enabled": False, "count": 0},
+                    },
+                ],
+            }
+        ]
+    }
+    summary = airtable_base_schema_summary_from_metadata(
+        payload,
+        base_id="appSynthetic",
+        base_name="Synthetic source corpus",
+        allowed_tables=("Evidence —  Review",),
+    )
+    fields = {field.field_id: field for field in summary.tables[0].fields}
+
+    assert fields["fldExact"].name == "Decision —  source"
+    assert fields["fldExact"].formula == (
+        'IF({fldState} = "Needs — Review", "Hold  for review", "Proceed")'
+    )
+    assert fields["fldExact"].validity == "valid"
+    assert fields["fldInvalid"].validity == "invalid"
+    assert fields["fldInvalid"].option_value_states["referencedFieldIds"] == "null"
+    assert fields["fldLookup"].record_link_field_id == "fldProjectLink"
+    assert fields["fldLookup"].field_id_in_linked_table == "fldNetAmount"
+    assert fields["fldLookup"].result_options == {"precision": 2, "symbol": "£"}
+    assert fields["fldLink"].linked_table_id == "tblProjects"
+    assert fields["fldLink"].inverse_link_field_id == "fldBacklink"
+    assert fields["fldLink"].linked_table_ids == ["tblProjects"]
+    assert fields["fldDescription"].select_choices_exact[:3] == [
+        "Needs — Review",
+        "needs — review",
+        " Ready  ",
+    ]
+    assert fields["fldDescription"].select_choices_exact[-1] == "State 19"
+    assert fields["fldDescription"].select_choices_coverage["has_more"] is True
+    assert "NOT approved" not in fields["fldDescription"].description
+    assert fields["fldDescription"].description_coverage["has_more"] is True
+    assert fields["fldUnknown"].field_mode == "unknown"
+    assert fields["fldUnknown"].is_manual is False
+
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "appSynthetic")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_synthetic")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Evidence —  Review")
+    monkeypatch.setattr(internal_data_tools, "_airtable_send", lambda *_args, **_kwargs: payload)
+    request = fields["fldDescription"].detail_read_request
+    assert request is not None
+    pages: list[dict[str, object]] = []
+    while request:
+        page = airtable_read_schema_detail_impl(live=True, **request)
+        pages.append(page)
+        request = page["continuation"]["next_request"]  # type: ignore[index,assignment]
+    reconstructed = "".join(str(page["detail_text"]) for page in pages)
+
+    assert json.loads(reconstructed)["description"] == long_description
+    assert json.loads(reconstructed)["options"]["choices"][-1]["name"] == "State 20"
+    assert all(len(str(page["detail_text"])) <= 2_000 for page in pages)
+    assert pages[-1]["read_window"]["complete"] is True  # type: ignore[index]
+
+
+def test_airtable_schema_field_index_advances_and_snapshot_change_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fields = [
+        {"id": f"fld{index:02d}", "name": f"Field {index:02d}", "type": "singleLineText"}
+        for index in range(23)
+    ]
+    payload = {
+        "tables": [
+            {
+                "id": "tblEvidence",
+                "name": "Evidence",
+                "primaryFieldId": "fld00",
+                "fields": fields,
+            }
+        ]
+    }
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "appSynthetic")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_synthetic")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Evidence")
+    monkeypatch.setattr(internal_data_tools, "_airtable_send", lambda *_args, **_kwargs: payload)
+    schema = airtable_get_base_schema_impl(live=True)
+    table = schema["schema"]["tables"][0]
+    assert len(table["fields"]) == 20
+    continuation = table["fields_coverage"]["next_request"]
+    page = airtable_read_schema_detail_impl(live=True, **continuation)
+
+    assert [field["field_id"] for field in page["fields"]] == ["fld20", "fld21", "fld22"]
+    assert page["coverage"] == {
+        "unit": "field",
+        "start": 20,
+        "end": 23,
+        "full_count": 23,
+        "has_more": False,
+        "complete": True,
+    }
+    changed_payload = {
+        "tables": [
+            {
+                **payload["tables"][0],
+                "fields": [*fields, {"id": "fld23", "name": "Field 23", "type": "number"}],
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        internal_data_tools,
+        "_airtable_send",
+        lambda *_args, **_kwargs: changed_payload,
+    )
+    stale = airtable_read_schema_detail_impl(live=True, **continuation)
+    assert stale["status"] == "source_changed"
+    assert stale["detail_text"] == ""
+
+
+def test_airtable_schema_stable_ids_preserve_similarly_named_tables_and_fields() -> None:
+    payload = {
+        "tables": [
+            {
+                "id": "tblCurrent",
+                "name": "Evidence",
+                "primaryFieldId": "fldCurrentName",
+                "fields": [
+                    {
+                        "id": "fldCurrentStatus",
+                        "name": "Status",
+                        "type": "singleLineText",
+                    }
+                ],
+            },
+            {
+                "id": "tblArchive",
+                "name": "evidence ",
+                "primaryFieldId": "fldArchiveName",
+                "fields": [
+                    {
+                        "id": "fldArchiveStatus",
+                        "name": "status ",
+                        "type": "singleLineText",
+                    }
+                ],
+            },
+        ]
+    }
+
+    summary = airtable_base_schema_summary_from_metadata(
+        payload,
+        base_id="appSynthetic",
+        allowed_tables=("Evidence", "evidence "),
+    )
+
+    assert [(table.table_id, table.name) for table in summary.tables] == [
+        ("tblCurrent", "Evidence"),
+        ("tblArchive", "evidence "),
+    ]
+    assert [
+        (table.fields[0].field_id, table.fields[0].name)
+        for table in summary.tables
+    ] == [
+        ("fldCurrentStatus", "Status"),
+        ("fldArchiveStatus", "status "),
+    ]
+
+
+def test_airtable_schema_preview_stays_compact_without_dropping_visible_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "tables": [
+            {
+                "id": f"tbl{table_index:02d}",
+                "name": f"Table {table_index:02d}",
+                "primaryFieldId": f"fld{table_index:02d}00",
+                "fields": [
+                    {
+                        "id": f"fld{table_index:02d}{field_index:02d}",
+                        "name": f"Field {table_index:02d}-{field_index:02d}",
+                        "type": "singleLineText",
+                    }
+                    for field_index in range(20)
+                ],
+            }
+            for table_index in range(12)
+        ]
+    }
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "appSynthetic")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_synthetic")
+    monkeypatch.setenv(
+        "AIRTABLE_ALLOWED_TABLES",
+        ",".join(table["name"] for table in payload["tables"]),
+    )
+    monkeypatch.setattr(internal_data_tools, "_airtable_send", lambda *_args, **_kwargs: payload)
+
+    result = airtable_get_base_schema_impl(live=True)
+    raw_chars = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    preview_chars = len(
+        json.dumps(result["schema"], ensure_ascii=False, separators=(",", ":"))
+    )
+    visible_fields = sum(
+        len(table["fields"])
+        for table in result["schema"]["tables"]
+    )
+
+    assert visible_fields == 240
+    assert result["schema"]["total_table_count"] == 12
+    assert preview_chars <= raw_chars * 4
+    assert all(
+        "detail_read_request" not in field
+        for table in result["schema"]["tables"]
+        for field in table["fields"]
+    )
 
 
 def test_airtable_schema_live_can_persist_prompt_safe_memory(
@@ -5889,6 +6430,157 @@ def test_airtable_fetch_all_paginates_live_records(
     assert requests[1]["params"] == {"pageSize": 100, "offset": "itr_next"}
 
 
+def test_airtable_terminal_exact_cap_is_complete_and_offset_is_continuable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Evidence")
+    terminal_records = [
+        {"id": "recAlpha", "fields": {"Amount": 0, "Flag": False, "Related": []}},
+        {"id": "recBeta", "fields": {"Amount": -4, "Nested": {"unit": "£"}}},
+    ]
+    monkeypatch.setattr(
+        internal_data_tools,
+        "_airtable_send",
+        lambda *_args, **_kwargs: {"records": terminal_records},
+    )
+    terminal = airtable_read_records_impl(
+        "Evidence",
+        fetch_all=True,
+        max_records=2,
+        live=True,
+    )
+
+    assert terminal["records"] == terminal_records
+    assert terminal["truncated"] is False
+    assert terminal["has_more"] is False
+    assert terminal["content_complete"] is True
+    assert terminal["pagination"]["status"] == "complete"
+
+    monkeypatch.setattr(
+        internal_data_tools,
+        "_airtable_send",
+        lambda *_args, **_kwargs: {
+            "records": terminal_records[:1],
+            "offset": "itr_next_exact",
+        },
+    )
+    preview = airtable_read_records_impl(
+        "Evidence",
+        max_records=2,
+        live=True,
+    )
+    assert preview["records"] == terminal_records[:1]
+    assert preview["truncated"] is True
+    assert preview["has_more"] is True
+    assert preview["next_offset"] == "itr_next_exact"
+    assert preview["continuation"]["next_request"]["offset"] == "itr_next_exact"
+
+    monkeypatch.setattr(
+        internal_data_tools,
+        "_airtable_send",
+        lambda *_args, **_kwargs: {"records": []},
+    )
+    empty = airtable_read_records_impl("Evidence", max_records=2, live=True)
+    assert empty["records"] == []
+    assert empty["item_count"] == 0
+    assert empty["content_complete"] is True
+    assert empty["has_more"] is False
+
+
+def test_airtable_pagination_stops_repeated_cursor_and_discloses_duplicates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Evidence")
+    calls: list[str] = []
+
+    def repeated_page(request: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        request_offset = str(request["params"].get("offset") or "")  # type: ignore[union-attr]
+        calls.append(request_offset)
+        record = {
+            "id": "recAlpha",
+            "fields": {
+                "Amount": 0,
+                "Flag": False,
+                "Text": "",
+                "Related": [],
+                "Nested": {"unit": "£", "amount": -2.5},
+            },
+        }
+        return {"records": [record], "offset": "repeat-synthetic"}
+
+    monkeypatch.setattr(internal_data_tools, "_airtable_send", repeated_page)
+    result = airtable_read_records_impl(
+        "Evidence",
+        fetch_all=True,
+        max_records=3,
+        live=True,
+    )
+
+    assert calls == ["", "repeat-synthetic"]
+    assert [record["id"] for record in result["records"]] == ["recAlpha"]
+    assert result["duplicate_record_ids"] == ["recAlpha"]
+    assert result["pagination"]["status"] == "repeated_offset"
+    assert result["content_complete"] is False
+    assert result["continuation"]["available"] is False
+
+
+def test_airtable_pagination_preserves_conflicting_repeat_and_bounds_empty_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Evidence")
+    calls: list[str] = []
+
+    def conflicting_page(request: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        request_offset = str(request["params"].get("offset") or "")  # type: ignore[union-attr]
+        calls.append(request_offset)
+        amount = 1 if not request_offset else 2
+        return {
+            "records": [{"id": "recConflict", "fields": {"Amount": amount}}],
+            "offset": "repeat-conflict",
+        }
+
+    monkeypatch.setattr(internal_data_tools, "_airtable_send", conflicting_page)
+    conflict = airtable_read_records_impl(
+        "Evidence",
+        fetch_all=True,
+        max_records=3,
+        live=True,
+    )
+    assert len(conflict["records"]) == 1
+    assert conflict["record_identity_conflicts"] == [
+        {
+            "record_id": "recConflict",
+            "first_record": {"id": "recConflict", "fields": {"Amount": 1}},
+            "repeated_record": {"id": "recConflict", "fields": {"Amount": 2}},
+        }
+    ]
+
+    empty_calls: list[str] = []
+
+    def empty_page(request: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        request_offset = str(request["params"].get("offset") or "")  # type: ignore[union-attr]
+        empty_calls.append(request_offset)
+        return {"records": [], "offset": "repeat-empty"}
+
+    monkeypatch.setattr(internal_data_tools, "_airtable_send", empty_page)
+    empty = airtable_read_records_impl(
+        "Evidence",
+        fetch_all=True,
+        max_records=3,
+        live=True,
+    )
+    assert empty_calls == ["", "repeat-empty"]
+    assert empty["records"] == []
+    assert empty["pagination"]["status"] == "repeated_offset"
+    assert empty["truncated"] is True
+
+
 def test_airtable_allowed_tables_and_update_matching_are_guarded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5960,6 +6652,89 @@ def test_airtable_tool_blocks_create_when_operator_scope_is_update(
     assert result["operation"] == "create"
     assert result["allowed_operation"] == "update"
     assert "operator-approved" in result["reason"]
+
+
+def test_airtable_expense_write_normalizes_quarter_label_to_existing_period_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")
+
+    result = airtable_write_record_impl(
+        '{"Estimated Tax Periods": "Q3"}',
+        table="Business Expenses",
+        record_id="rec_existing",
+        operation="update",
+    )
+
+    assert result["status"] == "dry-run"
+    assert result["request"]["payload"]["fields"] == {"Estimated Tax Periods": "3"}
+
+
+def test_airtable_expense_write_blocks_unknown_period_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")
+
+    result = airtable_write_record_impl(
+        '{"Estimated Tax Periods": "late summer"}',
+        table="Business Expenses",
+        record_id="rec_existing",
+        operation="update",
+    )
+
+    assert result["status"] == "blocked"
+    assert "1, 2, 3, or 4" in result["reason"]
+
+
+def test_airtable_live_expense_update_reads_existing_periods_before_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AIRTABLE_BASE_ID", "app_finance")
+    monkeypatch.setenv("AIRTABLE_ACCESS_TOKEN", "pat_test")
+    monkeypatch.setenv("AIRTABLE_ALLOWED_TABLES", "Business Expenses")
+    monkeypatch.setenv("AIRTABLE_ALLOW_WRITES", "true")
+    monkeypatch.setenv("AIRTABLE_WRITE_DRY_RUN", "false")
+    requests: list[dict[str, object]] = []
+
+    def fake_send(request: dict[str, object], **_: object) -> dict[str, object]:
+        requests.append(request)
+        if request["method"] == "PATCH":
+            return {"id": "rec_existing", "fields": {"Estimated Tax Periods": "3"}}
+        params = request.get("params", {})
+        if isinstance(params, dict) and "filterByFormula" in params:
+            return {
+                "records": [
+                    {
+                        "id": "rec_existing",
+                        "fields": {"Estimated Tax Periods": "3"},
+                    }
+                ]
+            }
+        return {
+            "records": [
+                {"id": "rec_prior", "fields": {"Estimated Tax Periods": "3"}},
+                {"id": "rec_existing", "fields": {"Estimated Tax Periods": "Q3"}},
+            ]
+        }
+
+    monkeypatch.setattr(internal_data_tools, "_airtable_send", fake_send)
+
+    result = airtable_write_record_impl(
+        '{"Estimated Tax Periods": "Q3"}',
+        table="Business Expenses",
+        record_id="rec_existing",
+        approval_reference="approval:period-correction",
+        operation="update",
+        live=True,
+    )
+
+    assert result["status"] == "success"
+    assert result["verification"]["passed"] is True
+    assert result["period_context"]["existing_values"] == ["3", "Q3"]
+    patch_request = next(request for request in requests if request["method"] == "PATCH")
+    assert patch_request["payload"]["fields"] == {"Estimated Tax Periods": "3"}
 
 
 def test_google_workspace_token_path_prefers_new_key_then_legacy_fallback(
@@ -6182,6 +6957,67 @@ def test_airtable_schema_aware_field_coercion_covers_configured_finance_types() 
         "Computed Airtable field `Investment Income` is read-only.",
         "Attachment field `Attachments` requires the dedicated attachment tool.",
     ]
+
+
+def test_airtable_partial_or_unknown_schema_cannot_authorize_extra_writes() -> None:
+    fields, errors = internal_data_tools._coerce_airtable_write_fields(
+        [
+            {
+                "name": "Future State",
+                "field_type": "futureProviderType",
+                "field_mode": "unknown",
+                "is_manual": False,
+            },
+            {
+                "name": "Status",
+                "field_type": "singleSelect",
+                "field_mode": "manual",
+                "is_manual": True,
+                "select_choices_exact": ["Needs — Review", "Ready"],
+                "select_choices_coverage": {"has_more": True, "complete": False},
+            },
+        ],
+        {
+            "Future State": "enabled",
+            "Status": "Later option not yet read",
+        },
+    )
+
+    assert fields == {}
+    assert errors == [
+        "Airtable field `Future State` has unknown writability.",
+        "Value for `Status` is incompatible with singleSelect.",
+    ]
+
+    ambiguous_fields, ambiguous_errors = internal_data_tools._coerce_airtable_write_fields(
+        [
+            {
+                "name": "Decision",
+                "field_type": "singleSelect",
+                "field_mode": "manual",
+                "is_manual": True,
+                "select_choices_exact": ["Needs — Review", "needs — review"],
+            }
+        ],
+        {"Decision": "NEEDS — REVIEW"},
+    )
+    exact_fields, exact_errors = internal_data_tools._coerce_airtable_write_fields(
+        [
+            {
+                "name": "Decision",
+                "field_type": "singleSelect",
+                "field_mode": "manual",
+                "is_manual": True,
+                "select_choices_exact": ["Needs — Review", "needs — review"],
+            }
+        ],
+        {"Decision": "needs — review"},
+    )
+
+    assert ambiguous_fields == {}
+    assert ambiguous_errors == ["Value for `Decision` is incompatible with singleSelect."]
+    assert exact_fields == {"Decision": "needs — review"}
+    assert exact_errors == []
 
 
 def test_airtable_live_write_can_enforce_schema_aware_finance_fields(
@@ -6703,6 +7539,15 @@ def test_airtable_create_expense_from_receipt_dry_run_maps_and_attaches(
     result = airtable_create_expense_from_receipt_impl(
         str(receipt),
         table="Business Expenses",
+        receipt_fields_json=json.dumps(
+            {
+                "vendor": "Example Print Inc.",
+                "receipt_date": "2026-06-28",
+                "estimated_tax_periods": "Q3",
+                "total": "76.80",
+            },
+            sort_keys=True,
+        ),
         category="Professional",
         payment_method="Credit card (personal)",
         live=False,
@@ -6710,7 +7555,7 @@ def test_airtable_create_expense_from_receipt_dry_run_maps_and_attaches(
 
     assert result["status"] == "dry-run"
     assert result["mapped_fields"]["Expense Client/Vendor"] == "Example Print Inc."
-    assert result["mapped_fields"]["Estimated Tax Periods"] == "Q3"
+    assert result["mapped_fields"]["Estimated Tax Periods"] == "3"
     assert result["mapped_fields"]["Total Expenses"] == 76.8
     assert result["mapped_fields"]["Categories"] == "Professional"
     assert result["mapped_fields"]["Payment Method"] == ["Credit card (personal)"]
@@ -6719,6 +7564,7 @@ def test_airtable_create_expense_from_receipt_dry_run_maps_and_attaches(
     assert result["attachment_result"]["request"]["payload"]["file"].startswith("<base64 ")
     assert result["mapping"]["attachment_field"]["field_id"] == "fldAttachment"
     assert result["approval_reference"] == "airtable-direct:receipt-test"
+    assert "model_receipt_fields_used" in result["evidence_notes"]
 
 
 def test_airtable_create_expense_from_receipt_accepts_model_receipt_facts_and_schema_fields(
@@ -6799,7 +7645,7 @@ def test_airtable_create_expense_from_receipt_accepts_model_receipt_facts_and_sc
 
     assert result["status"] == "dry-run"
     assert result["receipt_evidence"]["vendor"] == "Acme Labs"
-    assert result["receipt_evidence"]["estimated_tax_periods"] == "Q4"
+    assert result["receipt_evidence"]["estimated_tax_periods"] == "4"
     assert result["mapped_fields"] == {
         "Merchant": "Acme Labs",
         "Expense Date": "2026-09-15",
@@ -7025,6 +7871,16 @@ def test_airtable_create_expense_from_receipt_live_success_writes_then_attaches(
         "keystone_agents.tools.internal_data_tools.airtable_upload_attachment_impl",
         fake_upload,
     )
+    monkeypatch.setattr(
+        "keystone_agents.tools.internal_data_tools._airtable_expense_period_context",
+        lambda *_args, **_kwargs: {
+            "status": "verified",
+            "canonical_value": "3",
+            "existing_values": ["1", "2", "3", "4"],
+            "provider_read": True,
+            "record_count": 20,
+        },
+    )
     receipt = tmp_path / "receipt.pdf"
     receipt.write_bytes(b"%PDF-1.4\nreceipt fixture")
 
@@ -7045,6 +7901,8 @@ def test_airtable_create_expense_from_receipt_live_success_writes_then_attaches(
     assert upload_call["record_id"] == "rec_created"
     assert upload_call["field_id"] == "fldAttachment"
     assert result["write_result"]["record_id"] == "rec_created"
+    assert json.loads(str(write_call["fields_json"]))["Estimated Tax Periods"] == "3"
+    assert result["period_context"]["existing_values"] == ["1", "2", "3", "4"]
     assert result["attachment_result"]["status"] == "success"
     assert result["operation"] == "create_expense_from_receipt"
     assert result["record_id"] == "rec_created"
@@ -7075,6 +7933,69 @@ def test_airtable_duplicate_expense_reconciliation_is_dry_run_safe() -> None:
     assert result["record_id"] == "recKeep123456789"
     assert result["duplicate_record_id"] == "recDuplicate12345"
     assert result["verification"]["passed"] is False
+
+
+def test_airtable_expense_period_context_requires_existing_exact_base_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        internal_data_tools,
+        "airtable_read_records_impl",
+        lambda *_args, **_kwargs: {
+            "status": "success",
+            "records": [
+                {"id": "rec1", "fields": {"Estimated Tax Periods": "1"}},
+                {"id": "rec2", "fields": {"Estimated Tax Periods": "2"}},
+                {"id": "rec3", "fields": {"Estimated Tax Periods": "3"}},
+                {"id": "rec4", "fields": {"Estimated Tax Periods": "4"}},
+                {"id": "recBad", "fields": {"Estimated Tax Periods": "Q3"}},
+            ],
+        },
+    )
+
+    result = internal_data_tools._airtable_expense_period_context(
+        "Business Expenses",
+        base_alias="finance_tax_tracker",
+        base_id="app_finance",
+        canonical_period="3",
+    )
+
+    assert result == {
+        "status": "verified",
+        "canonical_value": "3",
+        "existing_values": ["1", "2", "3", "4", "Q3"],
+        "provider_read": True,
+        "record_count": 5,
+    }
+
+
+def test_airtable_expense_period_context_blocks_invented_group_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        internal_data_tools,
+        "airtable_read_records_impl",
+        lambda *_args, **_kwargs: {
+            "status": "success",
+            "records": [
+                {"id": "rec1", "fields": {"Estimated Tax Periods": "1"}},
+                {"id": "rec2", "fields": {"Estimated Tax Periods": "2"}},
+                {"id": "recBad", "fields": {"Estimated Tax Periods": "Q3"}},
+                {"id": "rec4", "fields": {"Estimated Tax Periods": "4"}},
+            ],
+        },
+    )
+
+    result = internal_data_tools._airtable_expense_period_context(
+        "Business Expenses",
+        base_alias="finance_tax_tracker",
+        base_id="app_finance",
+        canonical_period="3",
+    )
+
+    assert result["status"] == "blocked"
+    assert result["canonical_value"] == "3"
+    assert result["existing_values"] == ["1", "2", "4", "Q3"]
 
 
 def test_airtable_create_expense_from_receipt_uses_live_schema_field_ids(
@@ -7148,6 +8069,16 @@ def test_airtable_create_expense_from_receipt_uses_live_schema_field_ids(
                 {names_by_id[field_id]: value for field_id, value in provider_fields.items()}
             )
             return {"id": "rec_created", "fields": provider_fields}
+        params = request.get("params")
+        if isinstance(params, dict) and params.get("pageSize") == 100:
+            return {
+                "records": [
+                    {
+                        "id": "rec_existing",
+                        "fields": {"Estimated Tax Periods": "3"},
+                    }
+                ]
+            }
         return {"records": [{"id": "rec_created", "fields": written_fields}]}
 
     monkeypatch.setattr(internal_data_tools, "_airtable_send", fake_send)
@@ -7174,13 +8105,14 @@ def test_airtable_create_expense_from_receipt_uses_live_schema_field_ids(
     )
 
     assert result["status"] == "success"
-    post_request = requests[0]
+    post_request = next(request for request in requests if request["method"] == "POST")
     assert post_request["params"] == {"returnFieldsByFieldId": "true"}
     assert "fldReceiptAvailable" in post_request["payload"]["fields"]
     assert "Receipt Available" not in post_request["payload"]["fields"]
     assert result["write_result"]["schema_validation"]["provider_field_ids_used"] is True
     assert result["verification"]["create_read_back"] is True
     assert result["verification"]["attachment_read_back"] is True
+    assert result["period_context"]["existing_values"] == ["3"]
 
 
 def test_airtable_create_expense_from_receipt_blocks_without_attachment_field_before_write(
@@ -7279,13 +8211,34 @@ def test_chief_of_staff_live_business_expense_receipt_uses_llm_tool_path(
         "/tmp/example-business-cards-receipt.pdf"
     )
 
-    result = run_chief_of_staff_sdk(request, live=True)
+    result = run_chief_of_staff_sdk(
+        request,
+        live=True,
+        manual_request_plan=ManualRequestPlan(
+            source="canonical:stored_work_item",
+            requested_agent="chief_of_staff",
+            target_agent="chief_of_staff",
+            intent="business_system_write",
+            primary_target="Business Expenses",
+            target_type="business_system_context",
+            provider_system="airtable",
+            provider_operations=["create", "attach"],
+            provider_action_steps=[
+                {"operation": "create", "resource_type": "airtable_record"},
+                {"operation": "attach", "resource_type": "airtable_attachment"},
+            ],
+            ask_shape={"permission_state": "approval_required"},
+        ),
+    )
 
     assert result.raw_result == {"sdk": "called"}
     typed_input = captured["typed_input"]
     assert isinstance(typed_input, dict)
     assert typed_input["request"] == request
     assert "finance_expense_receipt_instruction" in typed_input
+    assert "Never let both layers execute the same mutation" in typed_input[
+        "finance_expense_receipt_instruction"
+    ]
     provider_context = {
         item["key"]: item["value"] for item in typed_input["provider_call_context"]
     }
@@ -7303,6 +8256,7 @@ def test_chief_of_staff_live_business_expense_receipt_uses_llm_tool_path(
     assert tool_plan["arguments"]["local_file_path"].endswith(
         "example-business-cards-receipt.pdf"
     )
+    assert "Use exactly one mutation owner" in tool_plan["side_effect_boundary"]
     assert "Inspect Airtable schema before creating the record." in tool_plan[
         "llm_reasoning_required"
     ]
@@ -7356,6 +8310,24 @@ def test_chief_of_staff_receipt_typed_input_preserves_pdf_for_openai_model(
     assert "airtable_create_expense_from_receipt" in text_part["text"]
     assert file_part["filename"] == "receipt.pdf"
     assert str(file_part["file_data"]).startswith("data:application/pdf;base64,")
+
+
+def test_chief_input_does_not_promote_provider_file_paths_to_attachment_authority(tmp_path) -> None:
+    from keystone_agents.agents.chief_of_staff import _chief_of_staff_sdk_input_for_request
+    from keystone_agents.run import sdk_input_from_typed_input
+
+    path = tmp_path / "provider-context.pdf"
+    path.write_bytes(b"%PDF-1.4\nsynthetic context")
+    request = "Summarize the supplied evidence."
+    prepared = _chief_of_staff_sdk_input_for_request(
+        {"request": request, "provider_context": str(path), "raw_request": str(path)},
+        raw_request_text=request,
+    )
+
+    assert prepared["raw_request"] == request
+    result = sdk_input_from_typed_input(prepared, live=True, provider="openai")
+    assert isinstance(result, str)
+    assert str(path) in result
 
 
 def test_chief_of_staff_live_receipt_blocks_without_attachment_gate(
@@ -8607,7 +9579,7 @@ def test_attachment_path_is_never_rendered_as_supplied_context_fallback() -> Non
     )
 
 
-def test_supplied_context_sdk_output_cannot_reintroduce_clarification_route(
+def test_supplied_context_sdk_output_is_not_silently_rewritten_by_python(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request_text = (
@@ -8636,9 +9608,7 @@ def test_supplied_context_sdk_output_cannot_reintroduce_clarification_route(
 
     result = run_chief_of_staff_sdk(request_text, live=True)
 
-    assert result.output.recommended_route.workflow_type == "project-context-review"
-    assert result.output.recommended_route.command_text == ""
-    assert result.output.recommended_route.target_channel == "current-thread"
+    assert result.output.recommended_route.workflow_type == "clarification"
     assert result.output.durable_handoff is None
     assert result.output.context_handoffs == []
 

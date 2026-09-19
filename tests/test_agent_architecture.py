@@ -24,7 +24,9 @@ from keystone_agents.schemas.opportunity import OpportunityScoutResult
 from keystone_agents.schemas.orchestrator import OrchestratorResult
 from keystone_agents.schemas.outreach import OutreachDraft
 from keystone_agents.sdk import Agent
-from keystone_agents.tools.internal_data_tools import GOOGLE_WORKSPACE_TOOL_NAMES
+from keystone_agents.tools.internal_data_tools import (
+    GOOGLE_WORKSPACE_DELEGATED_TOOL_NAMES,
+)
 
 AIRTABLE_READ_TOOL_NAMES = {"airtable_get_base_schema", "airtable_read_records"}
 AIRTABLE_WRITE_TOOL_NAMES = {"airtable_write_record"}
@@ -92,10 +94,7 @@ def test_all_builders_return_sdk_agents_with_prompts_and_guardrails() -> None:
             OpportunityScoutResult,
             {
                 "search_web",
-                "search_opportunity_sources_placeholder",
                 "score_opportunity",
-                "handoff_to_business_research_analyst_placeholder",
-                "save_opportunity_placeholder",
             },
         ),
         (
@@ -198,18 +197,60 @@ def test_main_agents_expose_allowlisted_local_context_tools() -> None:
 
 
 def test_main_agents_expose_scoped_google_workspace_tools() -> None:
-    agents = [
+    delegated_agents = [
         build_gmail_triage_agent(),
         build_business_research_analyst_agent(),
         build_opportunity_scout_agent(),
         build_outreach_composer_agent(),
         build_orchestrator_agent(),
-        build_chief_of_staff_agent(),
     ]
+    chief = build_chief_of_staff_agent()
 
-    expected_tools = set(GOOGLE_WORKSPACE_TOOL_NAMES)
-    for agent in agents:
-        assert expected_tools <= _tool_names(agent)
+    delegated_tools = set(GOOGLE_WORKSPACE_DELEGATED_TOOL_NAMES)
+    for agent in delegated_agents:
+        assert delegated_tools <= _tool_names(agent)
+        assert "google_drive_media_ocr_read" not in _tool_names(agent)
+    assert delegated_tools <= _tool_names(chief)
+    assert "google_drive_media_ocr_read" not in _tool_names(chief)
+
+
+def test_drive_pdf_ocr_is_owned_by_workspace_and_exact_chief_plan() -> None:
+    workspace = AGENT_REGISTRY["google_workspace_context_agent"].build_agent()
+    airtable = AGENT_REGISTRY["airtable_context_agent"].build_agent()
+    exact_chief = build_chief_of_staff_agent(
+        request_text="Read the selected scanned PDF in Drive.",
+        manual_request_plan=ManualRequestPlan(
+            source="canonical:stored_work_item",
+            target_agent="chief_of_staff",
+            intent="context_lookup",
+            primary_target="drive-file-selected-by-preflight",
+            target_type="business_system_context",
+            provider_system="google_workspace",
+            provider_operations=["read"],
+            provider_action_steps=[
+                {"operation": "read", "resource_type": "google_drive_file"}
+            ],
+        ),
+    )
+    broad_chief = build_chief_of_staff_agent(
+        request_text="Review our Workspace context.",
+        manual_request_plan=ManualRequestPlan(
+            source="canonical:stored_work_item",
+            target_agent="chief_of_staff",
+            intent="context_lookup",
+            target_type="business_system_context",
+            provider_system="google_workspace",
+            provider_operations=["read"],
+            provider_action_steps=[
+                {"operation": "read", "resource_type": "google_document"}
+            ],
+        ),
+    )
+
+    assert "google_drive_media_ocr_read" in _tool_names(workspace)
+    assert "google_drive_media_ocr_read" in _tool_names(exact_chief)
+    assert "google_drive_media_ocr_read" not in _tool_names(broad_chief)
+    assert "google_drive_media_ocr_read" not in _tool_names(airtable)
 
 
 def test_main_agents_expose_schema_first_airtable_read_tools() -> None:
@@ -332,6 +373,29 @@ def test_airtable_semantic_receipt_plan_selects_same_tool_across_phrasings(
     assert _tool_names(agent) == {"airtable_create_expense_from_receipt"}
 
 
+def test_airtable_prefix_stripped_receipt_plan_exposes_composite_lifecycle_tool() -> None:
+    from keystone_agents.agents.airtable_context import build_airtable_context_agent
+    from keystone_agents.planning.compatibility import infer_manual_request_plan
+
+    request = (
+        "add /tmp/KBA_TEST_RECEIPT.pdf to Airtable Business Expenses. "
+        "Use 2026-08-05 as Date of Expense and attach the exact PDF. "
+        "Verify the record and attachment; do not create a duplicate."
+    )
+    manual_plan = infer_manual_request_plan(
+        request,
+        requested_agent="airtable_context_agent",
+    )
+    agent = build_airtable_context_agent(
+        request_text=request,
+        manual_plan=manual_plan,
+        tool_tier="internal_write",
+        compact_instructions=True,
+    )
+
+    assert _tool_names(agent) == {"airtable_create_expense_from_receipt"}
+
+
 def test_airtable_receipt_update_cannot_expose_create_tools() -> None:
     from keystone_agents.agents.airtable_context import build_airtable_context_agent
 
@@ -346,6 +410,7 @@ def test_airtable_receipt_update_cannot_expose_create_tools() -> None:
 
     assert _tool_names(agent) == {
         "airtable_get_base_schema",
+        "airtable_read_schema_detail",
         "airtable_read_records",
         "airtable_reconcile_duplicate_expense",
         "airtable_write_record",
@@ -367,6 +432,7 @@ def test_airtable_receipt_verification_exposes_only_read_tools() -> None:
 
     assert _tool_names(agent) == {
         "airtable_get_base_schema",
+        "airtable_read_schema_detail",
         "airtable_read_records",
     }
 
@@ -608,6 +674,45 @@ def test_invalid_canonical_workspace_plan_does_not_reopen_phrase_fallback() -> N
     assert tools == []
 
 
+def test_workspace_media_and_slides_requests_attach_bounded_tools() -> None:
+    from keystone_agents.agents.google_workspace_context import (
+        _google_workspace_context_tools,
+    )
+
+    media_tools = _google_workspace_context_tools(
+        request_text="Read the text from this scanned PDF in Drive.",
+        tool_tier="core_read",
+    )
+    slide_plan = ManualRequestPlan(
+        source="llm",
+        target_agent="google_workspace_context_agent",
+        intent="business_system_write",
+        provider_system="google_workspace",
+        provider_operations=["create", "verify"],
+        provider_action_steps=[
+            {"operation": "create", "resource_type": "google_slide_deck"},
+            {"operation": "verify", "resource_type": "google_slide_deck"},
+        ],
+    )
+    slide_tools = _google_workspace_context_tools(
+        request_text="Create the approved slide deck and verify it.",
+        manual_plan=slide_plan,
+        tool_tier="internal_write",
+    )
+
+    assert {tool.name for tool in media_tools} == {
+        "google_drive_search_files",
+        "google_drive_get_file_metadata",
+        "google_drive_media_ocr_read",
+    }
+    assert {tool.name for tool in slide_tools} == {
+        "google_drive_search_files",
+        "google_drive_get_file_metadata",
+        "google_slide_deck_read",
+        "google_slide_deck_write",
+    }
+
+
 def test_read_only_ceiling_removes_cross_provider_write_tools() -> None:
     from keystone_agents.agents.airtable_context import _airtable_context_tools
     from keystone_agents.agents.google_workspace_context import (
@@ -672,6 +777,7 @@ def test_read_only_ceiling_removes_cross_provider_write_tools() -> None:
     zotero_names = {getattr(tool, "name", "") for tool in zotero_tools}
     assert airtable_names <= {
         "airtable_get_base_schema",
+        "airtable_read_schema_detail",
         "airtable_read_records",
         "airtable_aggregate_records",
     }
@@ -736,11 +842,10 @@ def test_every_write_capable_agent_receives_shared_direct_execution_contract() -
     } <= checked
 
 
-def test_main_agents_expose_web_data_structuring_helper() -> None:
+def test_only_agents_with_schema_shaping_work_expose_web_structuring_helper() -> None:
     agents = [
         build_gmail_triage_agent(),
         build_business_research_analyst_agent(),
-        build_opportunity_scout_agent(),
         build_outreach_composer_agent(),
         build_orchestrator_agent(),
         build_chief_of_staff_agent(),
@@ -748,6 +853,10 @@ def test_main_agents_expose_web_data_structuring_helper() -> None:
 
     for agent in agents:
         assert WEB_STRUCTURING_TOOL_NAMES <= _tool_names(agent)
+
+    assert WEB_STRUCTURING_TOOL_NAMES.isdisjoint(
+        _tool_names(build_opportunity_scout_agent())
+    )
 
 
 def test_main_agents_expose_web_search_when_needed() -> None:

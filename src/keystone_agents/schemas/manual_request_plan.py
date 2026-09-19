@@ -12,6 +12,7 @@ ManualTargetAgent = Literal[
     "orchestrator",
     "gmail_triage",
     "business_research_analyst",
+    "rag_retrieval_specialist",
     "opportunity_scout",
     "outreach_composer",
     "chief_of_staff",
@@ -27,6 +28,7 @@ ManualRequestIntent = Literal[
     "route_request",
     "company_research",
     "research_brief",
+    "rag_retrieval",
     "opportunity_search",
     "opportunity_to_outreach_loop",
     "gmail_triage",
@@ -45,6 +47,7 @@ ManualTaskObjective = Literal[
     "route_or_continue",
     "entity_research",
     "source_research",
+    "corpus_retrieval",
     "opportunity_discovery",
     "contact_discovery",
     "outreach_draft",
@@ -62,6 +65,7 @@ ManualExpectedArtifactType = Literal[
     "none",
     "research_brief",
     "source_summary",
+    "rag_retrieval_result",
     "opportunity_record",
     "contact_candidates",
     "outreach_draft",
@@ -81,6 +85,7 @@ ManualTargetType = Literal[
     "zotero_collection",
     "zotero_article",
     "article_collection",
+    "vector_store_corpus",
     "gmail_thread",
     "gmail_message_collection",
     "topic",
@@ -100,6 +105,7 @@ ManualProviderSystem = Literal[
     "airtable",
     "google_workspace",
     "zotero",
+    "openai_vector_store",
     "slack",
 ]
 
@@ -182,6 +188,9 @@ ManualZoteroRequestedField = Literal[
     "title",
     "authors",
     "publication_title",
+    "publication_date",
+    "doi",
+    "url",
     "abstract",
     "metadata",
     "children",
@@ -263,7 +272,12 @@ class ManualProviderResultSetScope(BaseModel):
     airtable_estimated_period: int | None = Field(default=None, ge=1, le=4)
     airtable_year: int | None = Field(default=None, ge=2000, le=2200)
     aggregate_total: str = ""
+    aggregate_display_total: str = ""
     aggregate_currency: str = ""
+    aggregate_unit_kind: str = ""
+    aggregate_unit_symbol: str = ""
+    aggregate_unit_precision: int | None = Field(default=None, ge=0, le=20)
+    aggregate_unit_source: str = ""
     item_refs: list[str] = Field(default_factory=list)
     complete: bool = False
     verified: bool = False
@@ -281,7 +295,10 @@ class ManualProviderResultSetScope(BaseModel):
         "airtable_period_field",
         "airtable_date_field",
         "aggregate_total",
+        "aggregate_display_total",
         "aggregate_currency",
+        "aggregate_unit_kind",
+        "aggregate_unit_source",
         mode="before",
     )
     @classmethod
@@ -295,6 +312,21 @@ class ManualProviderResultSetScope(BaseModel):
             return None
         try:
             return max(0, min(500, int(value)))
+        except (TypeError, ValueError):
+            return None
+
+    @field_validator("aggregate_unit_symbol", mode="before")
+    @classmethod
+    def _preserve_unit_symbol(cls, value: object) -> str:
+        return str(value or "")
+
+    @field_validator("aggregate_unit_precision", mode="before")
+    @classmethod
+    def _clean_unit_precision(cls, value: object) -> int | None:
+        if value in (None, "") or isinstance(value, bool):
+            return None
+        try:
+            return max(0, min(20, int(value)))
         except (TypeError, ValueError):
             return None
 
@@ -323,6 +355,40 @@ class ManualProviderActionStep(BaseModel):
     resource_type: ManualProviderResourceType = "unspecified"
 
 
+class ProviderContextRequirement(BaseModel):
+    """One read-only provider dependency for a different primary action owner.
+
+    This contract carries context needs only. It cannot grant provider writes,
+    change ``provider_system``, or choose a provider object for the specialist.
+    """
+
+    provider_system: ManualProviderSystem
+    operations: list[Literal["read", "search", "verify"]] = Field(
+        default_factory=lambda: ["read"]
+    )
+    resource_type: ManualProviderResourceType = "unspecified"
+    purpose: str = ""
+    required: bool = True
+
+    @field_validator("operations", mode="before")
+    @classmethod
+    def _read_only_operations(cls, value: object) -> list[str]:
+        values = value if isinstance(value, list | tuple | set) else [value]
+        allowed = {"read", "search", "verify"}
+        return list(
+            dict.fromkeys(
+                str(item or "").strip().lower()
+                for item in values
+                if str(item or "").strip().lower() in allowed
+            )
+        ) or ["read"]
+
+    @field_validator("purpose", mode="before")
+    @classmethod
+    def _clean_purpose(cls, value: object) -> str:
+        return " ".join(str(value or "").replace("\u2014", "-").split())[:500]
+
+
 class ManualRequestPlan(BaseModel):
     """Pre-execution semantic plan for manual CLI and Slack agent calls."""
 
@@ -336,6 +402,9 @@ class ManualRequestPlan(BaseModel):
     provider_system: ManualProviderSystem = "unspecified"
     provider_operations: list[ManualProviderOperation] = Field(default_factory=list)
     provider_action_steps: list[ManualProviderActionStep] = Field(default_factory=list)
+    provider_context_requirements: list[ProviderContextRequirement] = Field(
+        default_factory=list
+    )
     provider_read_scope: ManualProviderReadScope = "unspecified"
     provider_result_mode: ManualProviderResultMode = "unspecified"
     provider_selection_order: ManualProviderSelectionOrder = "unspecified"
@@ -437,6 +506,28 @@ class ManualRequestPlan(BaseModel):
             seen.add(key)
             deduped.append(item)
         return deduped
+
+    @field_validator("provider_context_requirements", mode="before")
+    @classmethod
+    def _clean_provider_context_requirements(cls, value: object) -> list[object]:
+        values = value if isinstance(value, list | tuple | set) else [value]
+        output: list[object] = []
+        seen: set[tuple[str, str]] = set()
+        for item in values:
+            if isinstance(item, ProviderContextRequirement):
+                provider = item.provider_system
+                resource_type = item.resource_type
+            elif isinstance(item, dict):
+                provider = str(item.get("provider_system") or "").strip().lower()
+                resource_type = str(item.get("resource_type") or "unspecified").strip().lower()
+            else:
+                continue
+            key = (provider, resource_type)
+            if not provider or provider == "unspecified" or key in seen:
+                continue
+            seen.add(key)
+            output.append(item)
+        return output[:4]
 
     @field_validator("gmail_requested_fields", mode="before")
     @classmethod

@@ -153,17 +153,18 @@ _CONTEXT_AGENT_CONTRACTS: tuple[ContextAgentContract, ...] = (
         mutation_level=ContextMutationLevel.APPROVED_INTERNAL_WRITE,
         read_boundary=[
             "scoped Drive folders and file metadata",
-            "Google Docs content and bounded Google Sheets tabs/ranges",
+            "Google Docs content, bounded Google Sheets tabs/ranges, and slide-deck text",
+            "bounded text/OCR from one exact scoped Drive PDF or image",
             "internal opportunity, contact, company, source-note, and follow-up artifacts",
         ],
         write_boundary=[
-            "create folders, docs, sheets, tabs, rows, and internal artifacts only with exact "
-            "destination and approval scope",
+            "create folders, docs, sheets, slide decks, tabs, rows, and internal artifacts only "
+            "with exact destination and approval scope",
             "preserve source refs and audit refs for every proposed artifact mutation",
         ],
         modify_boundary=[
-            "rename folders, update docs, update rows/tabs, remove tabs/rows, or trash files only "
-            "with exact target identity and approval",
+            "rename folders, update docs or slide-deck content, update rows/tabs, remove "
+            "tabs/rows, or trash files only with exact target identity and approval",
             "broad delete/share remains outside this contract",
         ],
         blocked_actions=[
@@ -194,6 +195,8 @@ _CONTEXT_AGENT_CONTRACTS: tuple[ContextAgentContract, ...] = (
                 "drive_folder_id",
                 "file_id",
                 "doc_id",
+                "presentation_id",
+                "slide_id",
                 "sheet_id",
                 "tab_name",
                 "row_key_or_range",
@@ -211,6 +214,8 @@ _CONTEXT_AGENT_CONTRACTS: tuple[ContextAgentContract, ...] = (
         ],
         validation_requirements=[
             "document synthesis fixture",
+            "scoped PDF/image OCR fixture",
+            "approval-gated Slides create/edit and provider read-back fixture",
             "opportunity/contact artifact creation plan fixture",
             "sheet-row update fixture",
             "folder/file identity blocker",
@@ -314,6 +319,7 @@ _CONTEXT_AGENT_CONTRACTS: tuple[ContextAgentContract, ...] = (
         write_boundary=[
             "internal insight summaries, trend notes, source bundles, and downstream "
             "context packets only",
+            "WorkItem-local trigger, deduplication, and resume checkpoints only",
             "no feed mutation or Slack posting from this context agent",
         ],
         modify_boundary=[
@@ -361,6 +367,8 @@ _CONTEXT_AGENT_CONTRACTS: tuple[ContextAgentContract, ...] = (
         ],
         subgraph_promotion_requirements=[
             "persisted insight-cluster state",
+            "stable trigger identity, revision-aware deduplication, and resumable "
+            "WorkItem checkpoints",
             "validation that digest synthesis is deeper than article listing",
             "source freshness repair edge before external factual claims",
         ],
@@ -369,6 +377,7 @@ _CONTEXT_AGENT_CONTRACTS: tuple[ContextAgentContract, ...] = (
             "theme clustering fixture",
             "opportunity signal extraction fixture",
             "stale/current-source caveat assertion",
+            "dry-run and persisted trigger/dedup/checkpoint lifecycle assertions",
             "blocked feed mutation assertion",
         ],
         milestone_notes=[
@@ -388,6 +397,7 @@ _CONTEXT_AGENT_CONTRACTS: tuple[ContextAgentContract, ...] = (
         write_boundary=[
             "internal article summaries, evidence packets, opportunity signals, source bundles, "
             "and downstream context packets only",
+            "WorkItem-local trigger, version-aware deduplication, and resume checkpoints only",
             "no source record mutation from this context agent",
         ],
         modify_boundary=[
@@ -439,6 +449,8 @@ _CONTEXT_AGENT_CONTRACTS: tuple[ContextAgentContract, ...] = (
         ],
         subgraph_promotion_requirements=[
             "paper-set synthesis fixtures",
+            "stable trigger identity, version-aware deduplication, and resumable "
+            "WorkItem checkpoints",
             "preliminary-claim caveat checks",
             "source freshness/verification repair edge before external use",
         ],
@@ -447,6 +459,7 @@ _CONTEXT_AGENT_CONTRACTS: tuple[ContextAgentContract, ...] = (
             "paper-set synthesis fixture",
             "opportunity implication extraction fixture",
             "preliminary-claim caveat assertion",
+            "dry-run and persisted trigger/dedup/checkpoint lifecycle assertions",
             "blocked source mutation assertion",
         ],
         milestone_notes=[

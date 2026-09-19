@@ -57,6 +57,9 @@ def estimate_usage_cost(
             ),
         )
 
+    if "cache_write_input_per_1m_usd" in entry:
+        return _estimate_cache_write_usage_cost(entry, usage)
+
     input_tokens = _int_value(usage.get("input_tokens"))
     cached_input_tokens = min(input_tokens, _int_value(usage.get("cached_input_tokens")))
     uncached_input_tokens = max(0, input_tokens - cached_input_tokens)
@@ -97,6 +100,96 @@ def estimate_usage_cost(
         "note": (
             "Estimated from provider response token usage and the checked-in pricing "
             "table. This is not an invoice record."
+        ),
+    }
+
+
+def _estimate_cache_write_usage_cost(
+    entry: dict[str, Any], usage: dict[str, Any]
+) -> dict[str, Any]:
+    """Price each request once, retaining uncertainty about cache writes or tiers."""
+
+    def incomplete(note: str) -> dict[str, Any]:
+        return {
+            **_cost_unavailable(source="usage_details_incomplete", note=note),
+            "complete": False,
+            "pricing_model": entry["model"],
+            "pricing_source_url": entry["source_url"],
+        }
+
+    fields = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens")
+    request_count = usage.get("requests")
+    if usage.get("complete") is False or type(request_count) is not int or request_count < 0:
+        return incomplete("Complete request-count usage is required for this pricing model.")
+    if usage.get("service_tier") not in {None, "default", "standard"}:
+        return incomplete("Only Standard processing is covered by this pricing row.")
+    entries = usage.get("request_usage_entries")
+    if request_count == 0:
+        if any(usage.get(field) not in {0, None} for field in fields):
+            return incomplete("Zero requests conflict with nonzero reported token usage.")
+        entries = []
+    elif not entries:
+        if request_count != 1:
+            return incomplete("Per-request usage is required to select long-context prices.")
+        entries = [usage]
+    if not isinstance(entries, list) or len(entries) != request_count:
+        return incomplete("Per-request usage is missing or does not match the request count.")
+    totals = dict.fromkeys(fields, 0)
+    components = dict.fromkeys(
+        ("input", "cached_input", "cache_write_input", "output"), Decimal("0")
+    )
+    long_requests = 0
+    for item in entries:
+        if not isinstance(item, dict) or any(
+            type(item.get(key)) is not int or item[key] < 0 for key in fields
+        ):
+            return incomplete(
+                "Provider cache-read, cache-write, input and output counts must be explicit; "
+                "missing values are unknown."
+            )
+        ordinary = (
+            item["input_tokens"] - item["cached_input_tokens"] - item["cache_write_input_tokens"]
+        )
+        if ordinary < 0:
+            return incomplete("Cache reads and writes exceed the reported input-token total.")
+        long_context = item["input_tokens"] > int(entry["long_context_input_threshold"])
+        long_requests += int(long_context)
+        prefix = "long_context_" if long_context else ""
+        for component, count in (
+            ("input", ordinary),
+            ("cached_input", item["cached_input_tokens"]),
+            ("cache_write_input", item["cache_write_input_tokens"]),
+            ("output", item["output_tokens"]),
+        ):
+            components[component] += _token_cost(
+                count, _decimal(entry[f"{prefix}{component}_per_1m_usd"])
+            )
+        for key in fields:
+            totals[key] += item[key]
+    if any(usage.get(key) is not None and usage[key] != totals[key] for key in fields):
+        return incomplete("Aggregate token totals disagree with the per-request usage.")
+    totals["input_tokens"] -= totals["cached_input_tokens"] + totals["cache_write_input_tokens"]
+    amount = sum(components.values(), Decimal("0"))
+    return {
+        "amount_usd": _money_float(amount),
+        "estimated_usd": _money_float(amount),
+        "actual_usd": None,
+        "currency": "USD",
+        "source": "local_pricing_table",
+        "confidence": "estimate",
+        "complete": True,
+        "pricing_provider": entry["provider"],
+        "pricing_model": entry["model"],
+        "pricing_as_of": entry["as_of"],
+        "pricing_source_url": entry["source_url"],
+        "pricing_tier": "standard",
+        "long_context_requests": long_requests,
+        "billable_tokens": totals,
+        "components_usd": {key: _money_float(value) for key, value in components.items()},
+        "note": (
+            "Standard model-token estimate from per-request usage, including cache writes "
+            "and long-context rates. Not an invoice; excludes hosted-tool charges and "
+            "regional or account-specific pricing."
         ),
     }
 
@@ -493,7 +586,9 @@ def _match_pricing_entry(
         aliases = [str(alias).strip().lower() for alias in entry.get("aliases", [])]
         candidates = [row_model, *aliases]
         for candidate in candidates:
-            if normalized_model == candidate or normalized_model.startswith(f"{candidate}-"):
+            if normalized_model == candidate or (
+                not entry.get("exact_match") and normalized_model.startswith(f"{candidate}-")
+            ):
                 return entry
     return None
 

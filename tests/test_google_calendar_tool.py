@@ -213,6 +213,76 @@ def test_calendar_create_verifies_daily_recurrence(monkeypatch) -> None:
     assert created["recurrence"] == ["RRULE:FREQ=DAILY;COUNT=5"]
 
 
+def test_calendar_create_rejects_corrupt_end_and_timezone_readback(monkeypatch) -> None:
+    class CorruptReadbackCalendarTool(FakeCalendarTool):
+        def create_event(
+            self,
+            calendar_id: str,
+            event_id: str,
+            payload: dict[str, Any],
+        ) -> dict[str, Any]:
+            created = super().create_event(calendar_id, event_id, payload)
+            self.events[event_id]["end"] = {
+                "dateTime": "2026-09-15T18:00:00-04:00",
+                "timeZone": "UTC",
+            }
+            return created
+
+    monkeypatch.setenv(GOOGLE_CALENDAR_WRITE_ENV, "true")
+    result = create_google_calendar_event_impl(
+        "Q3 estimated payment review",
+        "2026-09-15",
+        start_time="14:00",
+        end_time="14:30",
+        timezone="America/New_York",
+        approval_reference="approved-corrupt-readback-test",
+        live=True,
+        tool=CorruptReadbackCalendarTool(),  # type: ignore[arg-type]
+    )
+
+    assert result["status"] == "verification_failed"
+    assert result["verification"]["passed"] is False
+    assert result["verification"]["end_match"] is False
+    assert result["verification"]["timezone_match"] is False
+
+
+def test_calendar_create_is_idempotent_across_approval_paraphrases(monkeypatch) -> None:
+    monkeypatch.setenv(GOOGLE_CALENDAR_WRITE_ENV, "true")
+    tool = FakeCalendarTool()
+
+    first = create_google_calendar_event_impl(
+        "Q3 estimated payment due",
+        "2026-09-15",
+        approval_reference="direct-root-approval",
+        live=True,
+        tool=tool,  # type: ignore[arg-type]
+    )
+    retry = create_google_calendar_event_impl(
+        "Q3 estimated payment due",
+        "2026-09-15",
+        approval_reference="approved-followup-paraphrase",
+        live=True,
+        tool=tool,  # type: ignore[arg-type]
+    )
+
+    assert first["event_id"] == retry["event_id"]
+    assert first["already_existed"] is False
+    assert retry["already_existed"] is True
+    assert [name for name, _value in tool.calls].count("create") == 1
+    assert retry["verification"]["passed"] is True
+    assert first["provider"] == "google_calendar"
+    assert first["provider_read"] is True
+    assert first["provider_write"] is True
+    assert first["provider_mutated"] is True
+    assert first["verified"] is True
+    assert first["complete"] is True
+    assert first["provider_request_attempt_count"] == 3
+    assert retry["provider_read"] is True
+    assert retry["provider_write"] is False
+    assert retry["provider_mutated"] is False
+    assert retry["provider_request_attempt_count"] == 1
+
+
 def test_calendar_plan_bounds_title_before_schedule_and_plural_notes() -> None:
     plan = infer_calendar_action_plan(
         "create a calendar event titled KBA_TEST_CAL_ANU120_R4 on July 15, 2026 "

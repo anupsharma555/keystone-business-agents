@@ -19,7 +19,11 @@ from keystone_agents.agents.outreach_composer import (
     check_unsupported_claims,
 )
 from keystone_agents.config import Settings, require_live_mode
-from keystone_agents.guardrails import assess_text_guardrails, assess_tool_payload_guardrails
+from keystone_agents.guardrails import (
+    assess_text_guardrails,
+    assess_tool_payload_guardrails,
+    redact_secret_like_text,
+)
 from keystone_agents.models import AgentRunRequest, RunMode
 from keystone_agents.run import run_agent_dry
 from keystone_agents.sdk import LocalAgent, ToolGuardrailViolation
@@ -212,6 +216,29 @@ def test_unsupported_outreach_claim_is_flagged() -> None:
     assert tool_result["unsupported_claims"]
 
 
+def test_unapproved_organization_attribute_is_flagged_but_approved_one_is_allowed() -> None:
+    draft = "Cedar Grove is a physician-led care organization."
+
+    blocked = check_unsupported_claims(draft, allowed_claims=[])
+    allowed = check_unsupported_claims(
+        draft,
+        allowed_claims=["Cedar Grove is a physician-led care organization."],
+    )
+
+    assert blocked["has_unsupported_claims"] is True
+    assert any("physician-led" in claim for claim in blocked["unsupported_claims"])
+    assert allowed["has_unsupported_claims"] is False
+
+
+def test_negated_organization_attribute_does_not_authorize_the_claim() -> None:
+    result = check_unsupported_claims(
+        "Cedar Grove is a physician-led organization.",
+        allowed_claims=["Do not call Cedar Grove physician-led."],
+    )
+
+    assert result["has_unsupported_claims"] is True
+
+
 def test_unsupported_claim_guardrail_allows_negative_instructions() -> None:
     assessment = assess_text_guardrails(
         "Do not invent customers, case studies, or a track record absent from the brief."
@@ -235,6 +262,21 @@ def test_tool_guardrail_assessment_blocks_secrets_and_send_like_actions() -> Non
     assert "secret" in secret_assessment.risk_flags
     assert not send_assessment.allowed
     assert "send_like_action" in send_assessment.risk_flags
+
+
+def test_secret_redaction_preserves_surrounding_read_only_evidence() -> None:
+    redacted = redact_secret_like_text(
+        "Interview link token=redactionfixture123 remains relevant to the meeting."
+    )
+
+    assert "redactionfixture123" not in redacted
+    assert "Interview link" in redacted
+    assessment = assess_tool_payload_guardrails(
+        "read_gmail_context",
+        {"summary": redacted},
+        output=True,
+    )
+    assert assessment.allowed
 
 
 def test_tool_guardrail_allows_storing_no_send_policy_metadata() -> None:

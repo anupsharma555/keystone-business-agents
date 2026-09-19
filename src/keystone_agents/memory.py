@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Iterable, Sequence
-from datetime import UTC, datetime
 from typing import Any, Literal
 
 from keystone_agents.schemas.approval import (
@@ -446,17 +445,8 @@ def build_chief_of_staff_memory_context(
         approved_only=True,
         safe_for_prompt=True,
     )
-    all_relevant = store.list_memory_items(approved_only=True, safe_for_prompt=True)
-    superseded_ids = {
-        item.supersedes_memory_id for item in all_relevant if item.supersedes_memory_id
-    }
-    filtered = [
-        item
-        for item in records
-        if (item.id not in superseded_ids) and not _memory_item_is_expired(item)
-    ]
     missing_reason = ""
-    if not filtered:
+    if not records:
         missing_reason = (
             "No approved prompt-safe Chief of Staff strategic memory matched this request."
         )
@@ -465,7 +455,7 @@ def build_chief_of_staff_memory_context(
         route=route,
         object_key=object_key or "",
         memory_types=list(selected_types),
-        records=filtered,
+        records=records,
         missing_reason=missing_reason,
         approved_only=True,
         safe_for_prompt=True,
@@ -1145,18 +1135,6 @@ def _bounded_score(value: Any) -> int:
         return max(0, min(100, int(value)))
     except (TypeError, ValueError):
         return 0
-
-
-def _memory_item_is_expired(item: MemoryItem) -> bool:
-    if not item.expires_at:
-        return False
-    try:
-        expires_at = datetime.fromisoformat(item.expires_at.replace("Z", "+00:00"))
-    except ValueError:
-        return True
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=UTC)
-    return expires_at <= datetime.now(UTC)
 
 
 def _first_non_empty(*values: Any) -> str:

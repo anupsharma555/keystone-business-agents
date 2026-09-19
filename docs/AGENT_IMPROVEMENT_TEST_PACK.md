@@ -995,6 +995,28 @@ Check:
 - Read-only provider receipts remain inspectable.
 - No provider mutation, send, Slack post, or unrelated tool family is admitted.
 
+### CA-7: Source Attachment To Shared PDF Interpretation
+
+Run separately after each source-specific acquisition tool exists:
+
+1. Gmail resolves one exact message and attachment ID, or Airtable resolves one
+   exact base/table/record/field/attachment identity.
+2. The source owner downloads only the bounded supported PDF/image bytes and
+   emits a sanitized acquisition receipt.
+3. Google Workspace or Chief interprets the bounded content through the shared
+   PDF/media layer without receiving broader mailbox or Airtable authority.
+
+Check:
+
+- Gmail and Airtable do not receive the raw Drive OCR tool merely because the
+  request mentions a PDF.
+- No model-selected arbitrary URL, provider record, or filesystem path is read.
+- MIME type, byte/page/character limits, exact source identity, hash, and
+  no-persistence status are visible in the receipt.
+- A mismatched or missing message, attachment, record, field, or provider ID
+  fails closed before content interpretation.
+- No draft, send, record update, attachment upload, or external write occurs.
+
 ## Future Conversion Targets
 
 Use this pack to create:

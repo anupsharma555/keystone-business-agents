@@ -913,7 +913,10 @@ def test_run_sdk_sync_delegates_to_live_config_and_runner(
 
     class FakeRunner:
         @staticmethod
-        def run_sync(agent: object, prompt: str, *, run_config: object) -> dict[str, object]:
+        def run_sync(
+            agent: object, prompt: str, *, run_config: object, hooks: object
+        ) -> dict[str, object]:
+            calls["hooks"] = hooks
             return {"agent": agent, "prompt": prompt, "run_config": run_config}
 
     agent = object()
@@ -928,6 +931,7 @@ def test_run_sdk_sync_delegates_to_live_config_and_runner(
     )
 
     assert result == {"agent": agent, "prompt": "Prompt", "run_config": "run-config"}
+    assert callable(getattr(calls["hooks"], "on_llm_end", None))
     assert calls["build_kwargs"] == {
         "workflow_name": "workflow",
         "group_id": None,

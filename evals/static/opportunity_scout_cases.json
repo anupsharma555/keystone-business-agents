@@ -8,7 +8,11 @@
     "expected": {
       "top_company": "Curebase",
       "ranking_order": ["Curebase", "MindSpan Digital Health", "NeuroFlow"],
-      "strategic_fit_terms": ["clinical AI", "evidence generation"],
+      "strategic_fit": {
+        "opportunity_types": ["trial technology"],
+        "required_signals": ["hiring evidence", "clinical trial launch"],
+        "source_confidence_min": 70
+      },
       "why_now_terms": ["Hiring", "decentralized trial"],
       "outside_consulting_likelihood_min": 80,
       "priority_score_min": 80,
@@ -31,7 +35,11 @@
     },
     "expected": {
       "top_company": "NeuroFlow",
-      "strategic_fit_terms": ["behavioral health"],
+      "strategic_fit": {
+        "opportunity_types": ["behavioral health AI"],
+        "required_signals": ["payer partnership", "publication or outcomes evidence"],
+        "source_confidence_min": 70
+      },
       "why_now_terms": ["payer partnership", "outcomes evidence"],
       "outside_consulting_likelihood_min": 70,
       "priority_score_min": 70,
@@ -54,7 +62,11 @@
     },
     "expected": {
       "top_company": "AffectAI Research",
-      "strategic_fit_terms": ["behavioral health", "evidence generation"],
+      "strategic_fit": {
+        "opportunity_types": ["behavioral health AI"],
+        "required_signals": ["validation study", "hiring evidence"],
+        "source_confidence_min": 80
+      },
       "why_now_terms": ["Company page", "validation"],
       "outside_consulting_likelihood_min": 80,
       "priority_score_min": 80,
@@ -108,7 +120,10 @@
     },
     "expected": {
       "top_company": "Sparse Signal Labs",
-      "strategic_fit_terms": ["grant or collaboration opportunity"],
+      "strategic_fit": {
+        "opportunity_types": ["grant or collaboration opportunity"],
+        "required_signals": ["conference activity"]
+      },
       "why_now_terms": ["conference poster"],
       "outside_consulting_likelihood_max": 69,
       "priority_score_max": 69,
@@ -136,7 +151,11 @@
     "expected": {
       "top_company": "Curebase Inc.",
       "ranking_order": ["Curebase Inc.", "NeuroFlow"],
-      "strategic_fit_terms": ["trial technology"],
+      "strategic_fit": {
+        "opportunity_types": ["trial technology"],
+        "required_signals": ["validation study", "hiring evidence"],
+        "source_confidence_min": 70
+      },
       "why_now_terms": ["Hiring", "Validation"],
       "outside_consulting_likelihood_min": 80,
       "priority_score_min": 80,

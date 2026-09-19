@@ -19,6 +19,7 @@ from keystone_agents.agents import (
     opportunity_scout,
     orchestrator,
     outreach_composer,
+    rag_retrieval_specialist,
 )
 from keystone_agents.company_research import research_company_fixture
 from keystone_agents.context_sources import context_source_by_id, context_source_catalog
@@ -27,6 +28,7 @@ from keystone_agents.schemas.email_triage import EmailTriageResult
 from keystone_agents.schemas.opportunity import OpportunityScoutResult
 from keystone_agents.schemas.orchestrator import OrchestratorResult
 from keystone_agents.schemas.outreach import OutreachDraft
+from keystone_agents.schemas.rag_retrieval import RAGRetrievalResult
 from keystone_agents.tools import gmail_tool, memory_tool
 from keystone_agents.tools.apify_tool import fetch_linkedin_or_profile_placeholder
 from keystone_agents.tools.approval_tool import create_approval_queue_item
@@ -83,6 +85,17 @@ CANONICAL_SPECIALISTS = (
             "safety_policy.md",
             "tools.md",
             "business_research_analyst.md",
+        ),
+    ),
+    (
+        "rag_retrieval_specialist",
+        rag_retrieval_specialist.build_rag_retrieval_specialist_agent,
+        RAGRetrievalResult,
+        (
+            "keystone_profile.md",
+            "safety_policy.md",
+            "tools.md",
+            "rag_retrieval_specialist.md",
         ),
     ),
     (
@@ -615,7 +628,11 @@ def test_canonical_builders_return_structured_sdk_agents_with_guardrails() -> No
         assert agent.output_type is output_type
         assert issubclass(agent.output_type, BaseModel)
         assert agent.handoff_description
-        assert agent.tools
+        if name == "rag_retrieval_specialist":
+            # Hosted corpus access is explicitly configured; fixture mode stays inert.
+            assert not agent.tools
+        else:
+            assert agent.tools
         assert agent.input_guardrails
         assert agent.output_guardrails
         assert "<!-- repo_runtime_policy.md -->" in agent.instructions

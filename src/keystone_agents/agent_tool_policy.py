@@ -24,6 +24,7 @@ GOOGLE_WORKSPACE_READ_TOOLS = frozenset(
         "google_drive_list_folder",
         "google_drive_search_files",
         "google_drive_get_file_metadata",
+        "google_drive_media_ocr_read",
         "google_slide_deck_read",
         "presentation_search_local",
         "presentation_read_local",
@@ -35,6 +36,7 @@ GOOGLE_WORKSPACE_WRITE_TOOLS = GOOGLE_WORKSPACE_ALLOWED_TOOLS - GOOGLE_WORKSPACE
 AIRTABLE_READ_ALLOWED_TOOLS = frozenset(
     {
         "airtable_get_base_schema",
+        "airtable_read_schema_detail",
         "airtable_read_records",
         "airtable_aggregate_records",
     }
@@ -192,12 +194,28 @@ CORE_READ_TOOL_NAMES = frozenset(
         "list_channel_automation_bindings",
         "summarize_automation_health",
         "list_pending_automation_approvals",
+        "inspect_active_work_item_execution_summary",
         "inspect_active_work_items",
+        "inspect_work_item_execution_receipts",
+        "read_work_item_source_evidence",
+        "read_web_source_window",
         "read_linked_article",
         "retrieve_rss_announcement_history",
+        "read_rss_announcement_evidence",
         "retrieve_preprint_announcement_history",
+        "read_preprint_announcement_evidence",
+        "inspect_signal_lifecycle",
+        "inspect_gmail_mailbox_schema",
+        "query_gmail_message_summaries",
+        "read_gmail_context",
         "get_gmail_message",
         "file_search",
+        "load_contact_context",
+        "load_crm_account_context",
+        "load_approved_contact_context",
+        "load_approved_crm_context",
+        "load_approved_outreach_examples",
+        "check_unsupported_claims",
         *ZOTERO_READ_CONTEXT_TOOL_NAMES,
         *GOOGLE_WORKSPACE_READ_TOOLS,
         *AIRTABLE_READ_ALLOWED_TOOLS,
@@ -223,6 +241,7 @@ DEEP_RETRIEVAL_TOOL_NAMES = (
     frozenset(
         {
             "fetch_company_page",
+            "extract_selected_urls_to_source_bundle",
             "extract_research_claims_from_html",
             "fetch_linkedin_or_profile_placeholder",
             "discover_public_company_contacts",
@@ -241,15 +260,23 @@ DEEP_RETRIEVAL_TOOL_NAMES = (
     | WEB_STRUCTURING_ALLOWED_TOOLS
 )
 DIAGNOSTIC_TOOL_NAMES = PLAYWRIGHT_RESEARCH_ALLOWED_TOOLS | BROWSER_DIAGNOSTIC_ALLOWED_TOOLS
-CONTACT_CONTEXT_TOOL_NAMES = frozenset(
+CONTACT_CONTEXT_READ_TOOL_NAMES = frozenset(
     {
         "load_contact_context",
         "load_crm_account_context",
         "load_approved_contact_context",
         "load_approved_crm_context",
         "load_approved_outreach_examples",
+        "check_unsupported_claims",
+    }
+)
+CONTACT_CONTEXT_PREPARATION_TOOL_NAMES = frozenset(
+    {
         "build_approved_outreach_drafting_context",
     }
+)
+CONTACT_CONTEXT_TOOL_NAMES = (
+    CONTACT_CONTEXT_READ_TOOL_NAMES | CONTACT_CONTEXT_PREPARATION_TOOL_NAMES
 )
 CALENDAR_WRITE_TOOL_NAMES = frozenset(
     {
@@ -264,7 +291,7 @@ INTERNAL_WRITE_TOOL_NAMES = (
     | AIRTABLE_TEST_LIFECYCLE_TOOLS
     | GOOGLE_WORKSPACE_WRITE_TOOLS
     | frozenset({"google_doc_test_lifecycle"})
-    | CONTACT_CONTEXT_TOOL_NAMES
+    | CONTACT_CONTEXT_PREPARATION_TOOL_NAMES
     | CALENDAR_WRITE_TOOL_NAMES
     | frozenset(
         {
@@ -276,7 +303,6 @@ INTERNAL_WRITE_TOOL_NAMES = (
             "send_gmail_test_draft",
             "create_approval_queue_item",
             "create_approval_request_placeholder",
-            "check_unsupported_claims",
             "compose_outreach_draft_llm_constrained",
             "build_call_prep_artifact",
             "build_follow_up_schedule_record",
@@ -288,6 +314,8 @@ INTERNAL_WRITE_TOOL_NAMES = (
             "save_outreach_dedup_memory",
             "learn_email_style_profile",
             "save_initial_outreach_tracking_record",
+            "prepare_signal_lifecycle_checkpoint",
+            "advance_signal_lifecycle_checkpoint",
             *ZOTERO_IMPORT_TOOL_NAMES,
             *ZOTERO_TEST_NOTE_TOOL_NAMES,
             *ZOTERO_TEST_LIBRARY_TOOL_NAMES,
@@ -314,6 +342,14 @@ TOOL_TIER_BY_NAME: dict[str, ToolTier] = {
 
 
 AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
+    "rag_retrieval_specialist": AgentToolPolicy(
+        agent_name="rag_retrieval_specialist",
+        allowed_tool_names=frozenset({"file_search"}),
+        rationale=(
+            "RAG retrieval is a read-only hosted vector-store lane. It may use file_search "
+            "but has no web-search, provider-write, messaging, or publishing tools."
+        ),
+    ),
     "business_research_analyst": AgentToolPolicy(
         agent_name="business_research_analyst",
         allowed_tool_names=frozenset(
@@ -330,6 +366,9 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
                 "search_web",
                 "file_search",
                 "fetch_company_page",
+                "extract_selected_urls_to_source_bundle",
+                "read_web_source_window",
+                "read_work_item_source_evidence",
                 "extract_research_claims_from_html",
                 "fetch_linkedin_or_profile_placeholder",
                 "discover_public_company_contacts",
@@ -363,6 +402,8 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
                 "retrieve_memory",
                 "check_workflow_duplicate",
                 "search_web",
+                "extract_selected_urls_to_source_bundle",
+                "read_web_source_window",
                 "search_opportunity_sources_placeholder",
                 "load_existing_opportunity_state",
                 "search_funding_news_sources",
@@ -441,6 +482,9 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
         agent_name="gmail_triage",
         allowed_tool_names=frozenset(
             {
+                "inspect_gmail_mailbox_schema",
+                "query_gmail_message_summaries",
+                "read_gmail_context",
                 "get_gmail_message",
                 "apply_gmail_labels",
                 "modify_gmail_message_state",
@@ -512,18 +556,34 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
     ),
     "rss_context_agent": AgentToolPolicy(
         agent_name="rss_context_agent",
-        allowed_tool_names=frozenset({"retrieve_rss_announcement_history"}),
+        allowed_tool_names=frozenset(
+            {
+                "retrieve_rss_announcement_history",
+                "read_rss_announcement_evidence",
+                "inspect_signal_lifecycle",
+                "prepare_signal_lifecycle_checkpoint",
+                "advance_signal_lifecycle_checkpoint",
+            }
+        ),
         rationale=(
             "The RSS context agent reads canonical local RSS/#announcements history "
-            "and returns advisory Chief of Staff context without writes."
+            "and may maintain WorkItem-local trigger checkpoints without provider writes."
         ),
     ),
     "preprints_context_agent": AgentToolPolicy(
         agent_name="preprints_context_agent",
-        allowed_tool_names=frozenset({"retrieve_preprint_announcement_history"}),
+        allowed_tool_names=frozenset(
+            {
+                "retrieve_preprint_announcement_history",
+                "read_preprint_announcement_evidence",
+                "inspect_signal_lifecycle",
+                "prepare_signal_lifecycle_checkpoint",
+                "advance_signal_lifecycle_checkpoint",
+            }
+        ),
         rationale=(
             "The preprints context agent reads canonical local preprint/#knowledge-hub "
-            "history and returns advisory Chief of Staff context without writes."
+            "history and may maintain WorkItem-local trigger checkpoints without provider writes."
         ),
     ),
     "orchestrator": AgentToolPolicy(
@@ -536,6 +596,7 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
                 "retrieve_memory",
                 "route_request_placeholder",
                 "load_orchestrator_workflow_state",
+                "inspect_work_item_execution_receipts",
                 "load_pending_approval_items",
                 "file_search",
                 "search_web",
@@ -583,7 +644,9 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
                 "list_channel_automation_bindings",
                 "summarize_automation_health",
                 "list_pending_automation_approvals",
+                "inspect_active_work_item_execution_summary",
                 "inspect_active_work_items",
+                "inspect_work_item_execution_receipts",
                 "publish_document_report",
                 "publish_internal_artifact",
                 "publish_table_mirror",
@@ -591,6 +654,7 @@ AGENT_TOOL_POLICIES: dict[str, AgentToolPolicy] = {
                 "read_linked_article",
                 "search_web",
                 "airtable_get_base_schema",
+                "airtable_read_schema_detail",
                 "airtable_read_records",
             }
         )

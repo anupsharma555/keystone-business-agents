@@ -36,16 +36,232 @@ from keystone_agents.manual_request import (
     resolve_manual_request_owner,
 )
 from keystone_agents.outreach_composer.execution_plan import infer_outreach_execution_plan
+from keystone_agents.planning.compatibility import selected_public_page_url
+from keystone_agents.planning.composition_admission import (
+    is_selected_public_url_read_plan,
+)
+from keystone_agents.runtime.provider_context import (
+    ProviderContextStageResult,
+    provider_context_requirements_satisfied,
+)
 from keystone_agents.schemas.approval import ApprovalState
+from keystone_agents.schemas.decision_ownership import (
+    AgentDecisionRecord,
+    DecisionValidatorOutcome,
+)
 from keystone_agents.schemas.manual_request_plan import (
     AskShapePolicy,
     ManualProviderActionStep,
     ManualProviderResultSetScope,
     ManualRequestPlan,
+    ProviderContextRequirement,
 )
 from keystone_agents.schemas.output_constraints import InterpretedOutputConstraints
 from keystone_agents.semantic_execution import ExecutionIntentAuthority
 from keystone_agents.test_pack_specs import get_test_pack_spec
+
+
+def _offline_orchestrator_preflight(
+    request_text: str,
+    *,
+    requested_agent: str | None = None,
+    **_kwargs: object,
+):
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent=requested_agent,
+    ).model_copy(update={"source": "llm"})
+    return cli.OrchestratorPreflight(
+        request_text=request_text,
+        requested_agent=requested_agent,
+        advisory_only=requested_agent not in {None, "orchestrator"},
+        selected_agent=plan.target_agent,
+        manual_request_plan=plan,
+        route_result=cli.route_request(request_text, manual_plan=plan),
+        sdk_usage_events=[{"usage": {"requests": 1}}],
+    )
+
+
+@pytest.mark.parametrize(
+    "rendered_url",
+    [
+        "https://www.nimh.nih.gov/health/topics/technology-and-the-future-of-mental-health-treatment",
+        (
+            "<https://www.nimh.nih.gov/health/topics/technology-and-the-future-of-mental-health-treatment"
+            "|NIMH treatment technology page>"
+        ),
+    ],
+)
+def test_selected_public_page_read_compiles_to_one_exact_provider_read(
+    rendered_url: str,
+) -> None:
+    request = (
+        "Could you read only this NIMH page and give me two concise, source-supported "
+        "facts? Include the final URL and any extraction limitation. Don't search "
+        f"elsewhere or change anything: {rendered_url}"
+    )
+
+    plan = infer_manual_request_plan(
+        request,
+        requested_agent="business_research_analyst",
+    )
+
+    assert plan.primary_target == (
+        "https://www.nimh.nih.gov/health/topics/technology-and-the-future-of-mental-health-treatment"
+    )
+    assert plan.target_type == "url"
+    assert plan.provider_operations == ["read"]
+    assert plan.provider_read_scope == "single_item"
+    assert plan.task_objective == "source_research"
+    assert plan.expected_artifact_type == "source_summary"
+    assert plan.requires_live_search is False
+    assert plan.ask_shape.prior_context_dependency == "selected_context"
+    assert plan.ask_shape.permission_state == "read_only"
+    assert plan.ask_shape.strict_filter_mode == "exact"
+    assert request in plan.objective
+    assert is_selected_public_url_read_plan(plan) is True
+
+
+def test_selected_public_page_read_accepts_natural_give_me_slack_request() -> None:
+    request = (
+        "I’m looking at this NIMH page before a planning call. Using only the page "
+        "itself, give me two short bullets on what it says about how psychotherapy can "
+        "be delivered or evaluated, then one sentence on what KNI should not infer from "
+        "it. Include the final page URL and mention any extraction limitation. Please "
+        "don’t search elsewhere, look for contacts, save anything, or change anything: "
+        "<https://www.nimh.nih.gov/health/topics/psychotherapies|"
+        "nimh.nih.gov/health/topics/psychotherapies>"
+    )
+
+    plan = infer_manual_request_plan(
+        request,
+        requested_agent="business_research_analyst",
+    )
+
+    assert plan.primary_target == (
+        "https://www.nimh.nih.gov/health/topics/psychotherapies"
+    )
+    assert plan.provider_operations == ["read"]
+    assert plan.provider_read_scope == "single_item"
+    assert plan.requires_live_search is False
+    assert is_selected_public_url_read_plan(plan) is True
+
+
+def test_exact_current_gmail_thread_keeps_single_item_read_scope() -> None:
+    request = (
+        "Read the current Halo email in my operator@example.com inbox, then "
+        "draft a short reply here."
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="gmail_triage")
+
+    assert plan.target_agent == "gmail_triage"
+    assert plan.target_type == "gmail_thread"
+    assert plan.provider_system == "gmail"
+    assert plan.provider_operations == ["read"]
+    assert plan.provider_read_scope == "single_item"
+
+
+def test_gmail_candidate_triage_keeps_bounded_collection_scope() -> None:
+    request = (
+        "Please review my recent G2i emails, choose the current interview "
+        "conversation, and draft a short reply here."
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="gmail_triage")
+
+    assert plan.target_agent == "gmail_triage"
+    assert plan.target_type == "gmail_message_collection"
+    assert plan.provider_read_scope == "bounded_collection"
+
+
+def test_selected_public_page_read_preserves_natural_compact_bullet_count() -> None:
+    request = (
+        "Please use just this page and tell me in two compact bullets what it says. "
+        "Don’t search outside the page: "
+        "https://www.nimh.nih.gov/health/publications/children-and-mental-health"
+    )
+
+    plan = infer_manual_request_plan(
+        request,
+        requested_agent="business_research_analyst",
+    )
+
+    constraints = plan.ask_shape.output_constraints
+    assert constraints.item_count_mode == "exact"
+    assert constraints.minimum_items == 2
+    assert constraints.maximum_items == 2
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        (
+            "Compare these two pages and summarize the differences: "
+            "https://example.com/one and https://example.org/two."
+        ),
+        (
+            "Research Example Health broadly, starting with this page and then using "
+            "other sources: https://example.com/about"
+        ),
+        (
+            "Use backend browser diagnostics to inspect only this page for console "
+            "errors: https://example.com/status"
+        ),
+        (
+            'The earlier prompt said "read only this page"; do not execute it now: '
+            "https://example.com/prior"
+        ),
+        (
+            "Yesterday I asked the analyst to read only this page: "
+            "https://example.com/prior"
+        ),
+        (
+            "The prior request was to read only this page: https://example.com/prior. "
+            "Summarize the old instruction without executing it."
+        ),
+        (
+            'Classify this quoted example, not its instruction: "read only this page '
+            'https://example.com/quoted".'
+        ),
+    ],
+)
+def test_selected_public_page_read_rejects_ambiguous_or_nonexecuting_shapes(
+    prompt: str,
+) -> None:
+    plan = infer_manual_request_plan(
+        prompt,
+        requested_agent="business_research_analyst",
+    )
+
+    assert selected_public_page_url(prompt) == ""
+    assert is_selected_public_url_read_plan(plan) is False
+
+
+def test_page_bounded_multi_agent_workflow_preserves_graph_and_disables_broad_search() -> None:
+    request = (
+        "Please use one WorkItem to identify one pilot opportunity for KNI from "
+        "Cartwheel's public homepage, research the company using only that page, then "
+        "prepare a 70-word outreach draft for internal review. Show the URL. Do not "
+        "send or save the draft, and do not look beyond this page: "
+        "https://www.cartwheelcare.org/"
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="orchestrator")
+
+    assert plan.workflow == [
+        "opportunity_scout",
+        "business_research_analyst",
+        "outreach_composer",
+    ]
+    assert plan.intent == "opportunity_to_outreach_loop"
+    assert plan.primary_target == "https://www.cartwheelcare.org/"
+    assert plan.target_type == "url"
+    assert plan.provider_operations == ["read"]
+    assert plan.requires_live_search is False
+    assert plan.requires_durable_state is True
+    assert plan.ask_shape.permission_state == "draft_only"
+    assert is_selected_public_url_read_plan(plan) is True
 
 
 def test_manual_plan_preserves_exact_source_table_and_no_broadening_shape() -> None:
@@ -595,12 +811,12 @@ def test_natural_gmail_reply_draft_root_preserves_bounded_read_scope() -> None:
     assert plan.gmail_exclude_threads_with_operator_reply is True
     assert plan.draft_policy == "draft_only_when_reply_needed"
     assert plan.side_effect_policy == "draft_or_read_only"
-    assert plan.workflow == ["gmail_triage", "outreach_composer"]
-    assert plan.intent == "outreach_draft"
-    assert plan.task_objective == "outreach_draft"
-    assert plan.expected_artifact_type == "outreach_draft"
+    assert plan.workflow == []
+    assert plan.intent == "gmail_triage"
+    assert plan.task_objective == "gmail_triage"
+    assert plan.expected_artifact_type == "gmail_triage_report"
     assert plan.outreach_channel == "internal_slack"
-    assert plan.requires_durable_state is True
+    assert plan.requires_durable_state is False
     assert plan.requires_approved_context is False
     assert plan.ask_shape.output_form == "draft"
 
@@ -610,11 +826,18 @@ def test_natural_gmail_reply_draft_root_preserves_bounded_read_scope() -> None:
     )
 
     assert canonical_execution.operation == "draft_reply"
+    assert canonical_execution.read_scope == "collection"
+    assert canonical_execution.max_messages == 4
     assert canonical_execution.mailbox_direction == "inbound"
     assert canonical_execution.date_scope == "yesterday"
     assert canonical_execution.create_gmail_drafts is False
     assert canonical_execution.draft_replies_in_output is True
     assert canonical_execution.live_read_required is True
+    assert canonical_execution.candidate_helpers == [
+        "query_gmail_message_summaries",
+        "read_gmail_context",
+        "gmail_triage_sdk",
+    ]
 
 
 def test_live_planner_cannot_drop_bounded_read_then_internal_draft_stage() -> None:
@@ -652,11 +875,11 @@ def test_live_planner_cannot_drop_bounded_read_then_internal_draft_stage() -> No
     merged = merge_manual_request_plan(base, incomplete_live_plan)
 
     assert merged.target_agent == "gmail_triage"
-    assert merged.workflow == ["gmail_triage", "outreach_composer"]
-    assert merged.requires_durable_state is True
-    assert merged.intent == "outreach_draft"
-    assert merged.task_objective == "outreach_draft"
-    assert merged.expected_artifact_type == "outreach_draft"
+    assert merged.workflow == []
+    assert merged.requires_durable_state is False
+    assert merged.intent == "gmail_triage"
+    assert merged.task_objective == "gmail_triage"
+    assert merged.expected_artifact_type == "gmail_triage_report"
     assert merged.provider_system == "gmail"
     assert merged.provider_operations == ["read"]
     assert merged.provider_read_scope == "bounded_collection"
@@ -664,7 +887,7 @@ def test_live_planner_cannot_drop_bounded_read_then_internal_draft_stage() -> No
     assert merged.gmail_exclude_threads_with_operator_reply is True
     assert merged.outreach_channel == "internal_slack"
     assert any(
-        "omitted one execution stage" in warning
+        "one-agent Gmail read, rank, and Slack-reply" in warning
         for warning in merged.planner_warnings
     )
 
@@ -684,8 +907,8 @@ def test_negative_filter_and_positive_draft_remain_separate_in_same_sentence() -
     assert "draft a short response here" in positive
     assert "skip anything" not in positive
     assert plan.gmail_exclude_threads_with_operator_reply is True
-    assert plan.workflow == ["gmail_triage", "outreach_composer"]
-    assert plan.expected_artifact_type == "outreach_draft"
+    assert plan.workflow == []
+    assert plan.expected_artifact_type == "gmail_triage_report"
 
 
 def test_complete_bounded_read_then_draft_clears_planner_context_prerequisite() -> None:
@@ -721,15 +944,16 @@ def test_complete_bounded_read_then_draft_clears_planner_context_prerequisite() 
     merged = merge_manual_request_plan(base, candidate)
 
     assert merged.target_agent == "gmail_triage"
-    assert merged.workflow == ["gmail_triage", "outreach_composer"]
+    assert merged.workflow == []
     assert merged.provider_system == "gmail"
     assert merged.provider_operations == ["read"]
     assert merged.provider_read_scope == "bounded_collection"
     assert merged.provider_result_mode == "items"
-    assert merged.expected_artifact_type == "outreach_draft"
+    assert merged.expected_artifact_type == "gmail_triage_report"
     assert merged.outreach_channel == "internal_slack"
     assert merged.recipient == ""
     assert merged.requires_approved_context is False
+    assert merged.requires_durable_state is False
     assert merged.missing_required_information == []
 
 
@@ -1407,6 +1631,22 @@ def test_manual_plan_treats_negated_calendar_add_as_read_only_gmail_triage() -> 
     assert plan.task_objective == "gmail_triage"
 
 
+def test_personal_schedule_question_selects_typed_calendar_read_without_provider_jargon() -> None:
+    plan = infer_manual_request_plan(
+        "CoS, what interviews do I have tomorrow?",
+        requested_agent="chief_of_staff",
+    )
+
+    assert plan.target_agent == "chief_of_staff"
+    assert plan.intent == "context_lookup"
+    assert plan.target_type == "business_system_context"
+    assert plan.provider_system == "google_calendar"
+    assert plan.provider_operations == ["read"]
+    assert plan.provider_read_scope == "bounded_collection"
+    assert plan.provider_result_mode == "items"
+    assert plan.ask_shape.permission_state == "read_only"
+
+
 def test_manual_plan_preserves_exact_sentence_summary_stop_shape() -> None:
     plan = infer_manual_request_plan(
         "Summarize Example Health in exactly 2 sentences using fixture context only. "
@@ -1809,6 +2049,105 @@ def test_typed_provider_affinity_routes_fully_named_followup_without_phrase_depe
     assert plan.target_agent == target_agent
     assert plan.intent == intent
     assert plan.provider_system == provider_system
+
+
+def test_explicit_calendar_create_is_not_rewritten_by_prior_slack_context() -> None:
+    request = (
+        "@KNI CoS, add event for Q3 estimated payment due on September 15th, "
+        "2026 as all day event in google calendar."
+    )
+
+    plan = resolve_manual_request_plan(
+        request,
+        requested_agent="chief_of_staff",
+        workflow_state={
+            "execution_continuation": {
+                "prior_agent": "chief_of_staff",
+                "provider_affinity": "",
+            },
+            "recent_slack_thread": [{"summary": "Earlier Chief response."}],
+            "slack_context": {"thread_ts": "1785790917.312769"},
+        },
+    )
+
+    assert plan.target_agent == "chief_of_staff"
+    assert plan.intent == "business_system_write"
+    assert plan.provider_system == "google_calendar"
+    assert plan.provider_operations == ["create"]
+    assert plan.primary_target == (
+        "add event for Q3 estimated payment due on September 15th, 2026 as all day "
+        "event in google calendar"
+    )
+
+
+def test_calendar_approval_continuation_preserves_exact_prior_operation_and_target() -> None:
+    prior_request = (
+        "@KNI CoS, add event for Q3 estimated payment due on September 15th, "
+        "2026 as all day event in google calendar."
+    )
+
+    plan = resolve_manual_request_plan(
+        "Approved to write it.",
+        requested_agent="chief_of_staff",
+        workflow_state={
+            "execution_continuation": {
+                "prior_agent": "chief_of_staff",
+                "provider_affinity": "calendar",
+                "prior_request": prior_request,
+            },
+            "recent_slack_thread": [
+                {"summary": "The requested Calendar write still needs execution."}
+            ],
+            "slack_context": {"thread_ts": "1785790917.312769"},
+        },
+    )
+
+    assert plan.target_agent == "chief_of_staff"
+    assert plan.intent == "business_system_write"
+    assert plan.provider_system == "google_calendar"
+    assert plan.provider_operations == ["create"]
+    assert plan.primary_target == (
+        "add event for Q3 estimated payment due on September 15th, 2026 as all day "
+        "event in google calendar"
+    )
+
+
+@pytest.mark.parametrize(
+    "workflow_state",
+    [
+        {},
+        {
+            "execution_continuation": {
+                "prior_agent": "chief_of_staff",
+                "provider_affinity": "calendar",
+                "prior_request": "List tomorrow's calendar events without changing them.",
+            }
+        },
+        {
+            "execution_continuation": {
+                "prior_agent": "chief_of_staff",
+                "provider_affinity": "gmail",
+                "prior_request": (
+                    "Add Q3 estimated payment due on September 15th, 2026 to "
+                    "Google Calendar."
+                ),
+            }
+        },
+    ],
+)
+def test_bare_approval_cannot_invent_or_cross_provider_write_authority(
+    workflow_state: dict[str, object],
+) -> None:
+    plan = resolve_manual_request_plan(
+        "Approved to write it.",
+        requested_agent="chief_of_staff",
+        workflow_state=workflow_state,
+    )
+
+    assert not (
+        plan.intent == "business_system_write"
+        and plan.provider_operations == ["create"]
+    )
     assert plan.workflow == []
     assert not any("did not contain enough information" in item for item in plan.planner_warnings)
 
@@ -2077,6 +2416,43 @@ def test_context_agent_negated_side_effect_constraints_remain_read_only_context(
     assert plan.target_agent == "rss_context_agent"
     assert plan.intent == "context_lookup"
     assert plan.planner_warnings == []
+
+
+def test_airtable_curly_apostrophe_negative_actions_never_grant_write_tools() -> None:
+    plan = infer_manual_request_plan(
+        "Could you check the finance base and summarize how many vendor expenses "
+        "were logged during June 2026, along with total spend by category? Please "
+        "inspect the fields first and only read the records; don’t add, alter, "
+        "attach, or remove anything.",
+        requested_agent="airtable_context_agent",
+    )
+
+    assert plan.target_agent == "airtable_context_agent"
+    assert plan.intent == "context_lookup"
+    assert plan.ask_shape.permission_state == "read_only"
+    assert set(plan.provider_operations) <= {"read", "search", "verify"}
+
+
+@pytest.mark.parametrize(
+    "lead",
+    [
+        "I’m reviewing Ellipsis Health.",
+        "I am assessing Ellipsis Health for a possible engagement.",
+        "We’re looking at Ellipsis Health before planning next quarter.",
+        "We are considering Ellipsis Health as a research partner.",
+    ],
+)
+def test_conversational_company_research_lead_extracts_named_company(
+    lead: str,
+) -> None:
+    plan = infer_manual_request_plan(
+        f"{lead} Verify its current public evidence and partnership signals.",
+        requested_agent="business_research_analyst",
+    )
+
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.intent == "company_research"
+    assert plan.primary_target == "Ellipsis Health"
 
 
 def test_slack_thread_sample_reply_is_draft_text_not_send_blocker() -> None:
@@ -2658,9 +3034,66 @@ def test_manual_plan_captures_word_limit_after_described_outreach_artifact() -> 
         requested_agent="outreach_composer",
     )
 
-    assert plan.ask_shape.output_constraints.scope == "answer"
+    assert plan.ask_shape.output_constraints.scope == "draft_body"
     assert plan.ask_shape.output_constraints.word_count_mode == "under"
     assert plan.ask_shape.output_constraints.word_count == 100
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected_words", "expected_scope"),
+    [
+        ("Please prepare a 70-word outreach draft for internal review.", 70, "draft_body"),
+        ("Could you give me a 90‑word brief for the meeting?", 90, "answer"),
+        ("Keep the response to a 45-word note.", 45, "draft_body"),
+    ],
+)
+def test_manual_plan_captures_attributive_exact_word_count(
+    prompt: str,
+    expected_words: int,
+    expected_scope: str,
+) -> None:
+    plan = infer_manual_request_plan(prompt, requested_agent="outreach_composer")
+
+    constraints = plan.ask_shape.output_constraints
+    assert constraints.scope == expected_scope
+    assert constraints.word_count_mode == "exact"
+    assert constraints.word_count == expected_words
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Summarize the policy containing a 70-word note.",
+        "The source says it is a 70-word brief.",
+        "Analyze a 70-word source excerpt and return three bullets.",
+        "Review the 2026-08-15 deadline and GPT-5.4 model notes.",
+        "Use the 70-word draft above to prepare two bullets.",
+    ],
+)
+def test_manual_plan_does_not_promote_described_numeric_text_to_word_constraint(
+    prompt: str,
+) -> None:
+    plan = infer_manual_request_plan(prompt, requested_agent="outreach_composer")
+
+    constraints = plan.ask_shape.output_constraints
+    assert constraints.word_count_mode == "unspecified"
+    assert constraints.word_count is None
+
+
+def test_manual_plan_captures_word_range_after_described_outreach_artifact() -> None:
+    plan = infer_manual_request_plan(
+        "Outreach Composer, prepare a 100-130 word first-contact email using "
+        "only these approved facts.",
+        requested_agent="outreach_composer",
+    )
+
+    constraints = plan.ask_shape.output_constraints
+    assert constraints.scope == "answer"
+    assert constraints.word_count_mode == "unspecified"
+    assert constraints.word_count is None
+    assert constraints.minimum_words == 100
+    assert constraints.maximum_words == 130
+    assert constraints.has_deterministic_requirements() is True
 
 
 def test_manual_plan_keeps_meeting_speaking_request_as_opportunity_record() -> None:
@@ -2694,6 +3127,113 @@ def test_manual_plan_routes_generic_opportunity_to_outreach_loop_to_workflow() -
     assert plan.desired_count == 1
     assert plan.requires_live_search is True
     assert "behavioral health" in plan.constraints
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        (
+            "Could you find two currently open opportunities that a small "
+            "neuroinformatics consultancy could realistically pursue this fall? "
+            "Compare fit, eligibility, deadline, and evidence quality. If the best "
+            "one depends on a company claim you can't verify, have that claim checked "
+            "before you finalize. Don't save anything or draft outreach."
+        ),
+        (
+            "Find three open grants for a small clinical AI consultancy and compare "
+            "eligibility, timing, evidence strength, and KNI fit. Keep it read-only."
+        ),
+        (
+            "Which two current partnership opportunities look most realistic? Compare "
+            "sponsor, deadline, feasibility, and source quality before recommending one."
+        ),
+        (
+            "I'm looking for one live U.S. non-dilutive funding or pilot opening that "
+            "a small behavioral-health AI consultancy could pursue before early November. "
+            "Compare the strongest current options, choose one, and give me its deadline, "
+            "why it fits Keystone, the biggest eligibility concern, and the official URL. "
+            "Keep this read-only."
+        ),
+        (
+            "Could you look for a single open accelerator cohort or pilot program for a "
+            "small clinical AI consultancy, then recommend the strongest current fit?"
+        ),
+        (
+            "Between current grants and non-dilutive funding calls, which one looks most "
+            "realistic for Keystone before November?"
+        ),
+        (
+            "Surface one live pilot opening for a behavioral-health measurement company "
+            "and explain the deadline, fit, and main eligibility risk."
+        ),
+        (
+            "I'm looking for one live U.K. pilot opening for a small clinical AI "
+            "consultancy. Choose the strongest current option and explain its deadline."
+        ),
+    ],
+)
+def test_manual_plan_keeps_opportunity_comparison_dimensions_with_scout(
+    prompt: str,
+) -> None:
+    plan = infer_manual_request_plan(prompt, requested_agent="orchestrator")
+
+    assert plan.target_agent == "opportunity_scout"
+    assert plan.intent == "opportunity_search"
+    assert plan.task_objective == "opportunity_discovery"
+
+
+def test_explicit_scout_natural_funding_request_keeps_scout_owner() -> None:
+    prompt = (
+        "Opportunity Scout, I'm looking for one live U.S. non-dilutive funding or "
+        "pilot opening that a small behavioral-health AI consultancy could pursue "
+        "before early November. Compare the strongest current options, choose one, "
+        "and give me its deadline, why it fits Keystone, the biggest eligibility "
+        "concern, and the official URL. Keep this read-only."
+    )
+
+    plan = infer_manual_request_plan(prompt, requested_agent="opportunity_scout")
+
+    assert plan.requested_agent == "opportunity_scout"
+    assert plan.target_agent == "opportunity_scout"
+    assert plan.intent == "opportunity_search"
+    assert plan.task_objective == "opportunity_discovery"
+
+
+def test_explicit_scout_curly_apostrophe_funding_request_keeps_scout_owner() -> None:
+    prompt = (
+        "Opportunity Scout, I’m looking for one live U.S. pilot opening for a small "
+        "behavioral-health AI consultancy. Choose the best current fit and keep it "
+        "read-only."
+    )
+
+    plan = infer_manual_request_plan(prompt, requested_agent="opportunity_scout")
+
+    assert plan.target_agent == "opportunity_scout"
+    assert plan.intent == "opportunity_search"
+
+
+def test_opportunity_match_does_not_cross_an_ordinary_sentence_boundary() -> None:
+    prompt = (
+        "I'm looking for background on Northstar Care's U.S. market position. "
+        "A pilot opening is mentioned in its materials, but summarize the company only."
+    )
+
+    plan = infer_manual_request_plan(prompt, requested_agent="orchestrator")
+
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.intent == "company_research"
+
+
+def test_company_list_comparison_still_routes_to_business_research() -> None:
+    plan = infer_manual_request_plan(
+        "Compare Acme Health, Beta Labs, and Gamma Care and explain which company "
+        "has the strongest evidence base.",
+        requested_agent="orchestrator",
+    )
+
+    assert plan.target_agent == "business_research_analyst"
+    assert plan.intent == "company_research"
+    assert plan.primary_target == "Acme Health vs Beta Labs vs Gamma Care"
 
 
 @pytest.mark.parametrize(
@@ -3827,6 +4367,93 @@ def test_provider_draft_boundary_does_not_cancel_requested_slack_composition(
     assert merged.provider_operations == []
 
 
+def test_natural_approved_synthetic_setup_admits_bounded_outreach_draft() -> None:
+    request = (
+        "Here’s an approved synthetic setup for a practice: Pine Harbor Behavioral "
+        "Health says it runs measurement-based care across three community clinics and "
+        "wants cleaner reporting; no person or email has been approved. Write a friendly "
+        "organization-level introduction in 90-110 words for internal review, then add "
+        "one separate Contact gap line. Stay within these facts. Don’t research, send, "
+        "post, save, open an approval, or update tracking."
+    )
+
+    plan = infer_manual_request_plan(
+        request,
+        requested_agent="outreach_composer",
+    )
+    constraints = plan.ask_shape.output_constraints
+
+    assert plan.target_agent == "outreach_composer"
+    assert plan.intent == "outreach_draft"
+    assert plan.primary_target == "Pine Harbor Behavioral Health"
+    assert "approved_synthetic" in plan.ask_shape.source_type_preference
+    assert plan.requires_approved_context is False
+    assert plan.requires_live_search is False
+    assert plan.ask_shape.audience_scope == "internal"
+    assert constraints.minimum_words == 90
+    assert constraints.maximum_words == 110
+    assert constraints.scope == "draft_body"
+
+
+def test_natural_give_me_introduction_is_a_section_scoped_outreach_draft() -> None:
+    request = (
+        "Here is an approved synthetic scenario: Cedar Grove Care Collaborative says "
+        "it helps community clinics improve behavioral-health measurement and has not "
+        "approved a contact. Give me an 85-105 word internal organization introduction, "
+        "then put the contact gap on its own line. Use only those facts. Don't research, "
+        "send, save, open an approval, or update a record."
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="outreach_composer")
+
+    assert plan.target_agent == "outreach_composer"
+    assert plan.intent == "outreach_draft"
+    assert plan.expected_artifact_type == "outreach_draft"
+    assert plan.ask_shape.output_form == "draft"
+    assert plan.ask_shape.permission_state == "draft_only"
+    assert plan.ask_shape.audience_scope == "internal"
+    assert plan.ask_shape.output_constraints.minimum_words == 85
+    assert plan.ask_shape.output_constraints.maximum_words == 105
+    assert plan.ask_shape.output_constraints.scope == "draft_body"
+    assert plan.ask_shape.output_constraints.required_sections == ["Contact gap"]
+    assert plan.ask_shape.output_constraints.require_section_headings is True
+
+
+def test_word_range_summary_of_a_note_remains_answer_scoped() -> None:
+    plan = infer_manual_request_plan(
+        "Write an 85-105 word summary of this supplied note for internal review.",
+        requested_agent="chief_of_staff",
+    )
+
+    assert plan.ask_shape.output_constraints.minimum_words == 85
+    assert plan.ask_shape.output_constraints.maximum_words == 105
+    assert plan.ask_shape.output_constraints.scope == "answer"
+
+
+def test_approved_fictional_setup_and_our_internal_review_keep_outreach_owner() -> None:
+    request = (
+        "Outreach Composer, here's an approved fictional setup: Riverbend Outcomes "
+        "Network supports community practices with behavioral-health measurement and "
+        "wants clearer reporting; no person or address is approved. Could you give me "
+        "a 90-100 word organization introduction for our internal review, followed by "
+        "a separate Contact gap line? Stay inside those facts. Please don't research, "
+        "send, post, save, open an approval, or change tracking."
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="outreach_composer")
+
+    assert plan.target_agent == "outreach_composer"
+    assert plan.intent == "outreach_draft"
+    assert plan.primary_target == "Riverbend Outcomes Network"
+    assert plan.expected_artifact_type == "outreach_draft"
+    assert plan.ask_shape.audience_scope == "internal"
+    assert plan.ask_shape.permission_state == "draft_only"
+    assert plan.ask_shape.output_constraints.scope == "draft_body"
+    assert plan.ask_shape.output_constraints.required_sections == ["Contact gap"]
+    assert plan.requires_live_search is False
+    assert "comparison-format" not in plan.constraints
+
+
 @pytest.mark.parametrize(
     "composition_boundary",
     [
@@ -4035,6 +4662,50 @@ def test_llm_local_document_target_selects_chief_without_keyword_match() -> None
     assert merged.target_type == "local_document_collection"
 
 
+@pytest.mark.parametrize(
+    ("requested_agent", "request_text"),
+    [
+        (
+            "rss_context_agent",
+            "Check the saved RSS lifecycle checkpoint without advancing it.",
+        ),
+        (
+            "preprints_context_agent",
+            "Check the saved preprint lifecycle checkpoint without advancing it.",
+        ),
+    ],
+)
+def test_llm_local_document_mislabel_does_not_displace_explicit_signal_specialist(
+    requested_agent: str,
+    request_text: str,
+) -> None:
+    fallback = infer_manual_request_plan(
+        request_text,
+        requested_agent=requested_agent,
+    )
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent=requested_agent,
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        task_objective="context_lookup",
+        expected_artifact_type="context_summary",
+        provider_system="unspecified",
+        provider_operations=["read", "verify"],
+        primary_target="saved signal lifecycle",
+        target_type="local_document_collection",
+    )
+
+    merged = merge_manual_request_plan(fallback, candidate)
+
+    assert merged.target_agent == requested_agent
+    assert merged.target_type == "article_collection"
+    assert any(
+        "explicitly addressed context specialist" in warning
+        for warning in merged.planner_warnings
+    )
+
+
 def test_live_manual_plan_keeps_exact_operator_count_and_no_draft_safety() -> None:
     fallback = infer_manual_request_plan(
         "Summarize my top three unread emails from today and do not draft replies.",
@@ -4084,6 +4755,19 @@ def test_manual_plan_distinguishes_review_copy_from_provider_draft() -> None:
     )
 
     assert plan.target_agent == "gmail_triage"
+    assert plan.draft_policy == "draft_only_when_reply_needed"
+
+
+def test_gmail_set_aside_wording_does_not_grant_provider_update_authority() -> None:
+    plan = infer_manual_request_plan(
+        "I had an interview at 10:30 this morning. Find the current Gmail "
+        "conversation, set aside cancellations or old times, and give me a brief "
+        "Slack-only follow-up saying thanks. Don't create a Gmail draft or send "
+        "anything.",
+        requested_agent="gmail_triage",
+    )
+
+    assert plan.provider_operations == ["read"]
     assert plan.draft_policy == "draft_only_when_reply_needed"
 
 
@@ -4183,6 +4867,31 @@ def test_manual_plan_routes_finance_receipt_write_to_business_system_plan(
     assert plan.intent == "business_system_write"
     assert plan.task_objective == "business_system_write"
     assert plan.target_type == "business_system_context"
+    assert plan.expected_artifact_type == "business_system_write_plan"
+    assert plan.side_effect_policy == "internal_write_approval_required"
+
+
+def test_manual_plan_preserves_prefix_stripped_airtable_receipt_lifecycle() -> None:
+    request = (
+        "add /tmp/KBA_TEST_RECEIPT.pdf to Airtable Business Expenses. "
+        "Use 2026-08-05 as Date of Expense and attach the exact PDF. "
+        "This exact one-record live write and attachment upload is approved. "
+        "Verify the record and attachment; do not create a duplicate."
+    )
+
+    plan = infer_manual_request_plan(
+        request,
+        requested_agent="airtable_context_agent",
+    )
+
+    assert plan.requested_agent == "airtable_context_agent"
+    assert plan.target_agent == "airtable_context_agent"
+    assert plan.intent == "business_system_write"
+    assert plan.task_objective == "business_system_write"
+    assert plan.primary_target == "Business Expenses"
+    assert plan.target_type == "business_system_context"
+    assert plan.provider_system == "airtable"
+    assert plan.provider_operations == ["create", "attach", "verify"]
     assert plan.expected_artifact_type == "business_system_write_plan"
     assert plan.side_effect_policy == "internal_write_approval_required"
 
@@ -4788,7 +5497,7 @@ def test_llm_provider_read_scope_survives_canonical_plan_merge() -> None:
     assert merged.provider_read_scope == "bounded_collection"
 
 
-def test_internal_gmail_collection_draft_becomes_a_staged_workflow() -> None:
+def test_internal_gmail_collection_draft_stays_in_one_agent_owned_loop() -> None:
     request = (
         "CoS, find one email from today that seems worth following up on for KNI "
         "and draft a brief reply here in this Slack thread. Don't send it or "
@@ -4829,12 +5538,12 @@ def test_internal_gmail_collection_draft_becomes_a_staged_workflow() -> None:
     execution = resolve_gmail_execution_plan(request, manual_plan=merged)
 
     assert merged.target_agent == "gmail_triage"
-    assert merged.workflow == ["gmail_triage", "outreach_composer"]
-    assert merged.intent == "outreach_draft"
-    assert merged.task_objective == "outreach_draft"
-    assert merged.expected_artifact_type == "outreach_draft"
+    assert merged.workflow == []
+    assert merged.intent == "gmail_triage"
+    assert merged.task_objective == "gmail_triage"
+    assert merged.expected_artifact_type == "gmail_triage_report"
     assert merged.outreach_channel == "internal_slack"
-    assert merged.requires_durable_state is True
+    assert merged.requires_durable_state is False
     assert merged.requires_approved_context is False
     assert merged.draft_policy == "no_drafts_requested"
     assert execution.operation == "draft_reply"
@@ -5139,6 +5848,7 @@ def test_cli_live_opportunity_scout_uses_script_retrieval_path(monkeypatch, caps
         )
 
     monkeypatch.setattr(cli, "run_isolated_child_process", fake_run)
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", _offline_orchestrator_preflight)
 
     assert (
         cli.main(
@@ -5188,6 +5898,7 @@ def test_cli_live_browser_diagnostics_named_research_reroutes_to_chief(monkeypat
         )
 
     monkeypatch.setattr(cli, "run_isolated_child_process", fake_run)
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", _offline_orchestrator_preflight)
 
     assert (
         cli.main(
@@ -5232,6 +5943,7 @@ def test_cli_live_business_research_url_target_passes_company_url(monkeypatch, c
         )
 
     monkeypatch.setattr(cli, "run_isolated_child_process", fake_run)
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", _offline_orchestrator_preflight)
 
     assert (
         cli.main(
@@ -5297,6 +6009,30 @@ def test_gmail_execution_plan_maps_recent_actionable_threads_to_priority_groupin
     assert "gmail_priority_grouping_sdk" in plan.candidate_helpers
 
 
+def test_gmail_execution_plan_keeps_one_conditional_reply_agent_owned() -> None:
+    request = (
+        "Can you help me find a recent message where someone was waiting for my "
+        "feedback on a deck, report, or proposal? Please compare up to four plausible "
+        "current conversations, decide whether one clearly needs an answer, and write "
+        "a short reply for me here if it does. If none is convincing, say what you "
+        "checked and why you're unsure. Keep this read-only—don't draft in Gmail, "
+        "send, label, archive, or modify anything."
+    )
+
+    plan = infer_gmail_execution_plan(request)
+
+    assert plan.operation == "draft_reply"
+    assert plan.read_scope == "collection"
+    assert plan.max_messages == 4
+    assert plan.create_gmail_drafts is False
+    assert plan.draft_replies_in_output is True
+    assert plan.candidate_helpers == [
+        "query_gmail_message_summaries",
+        "read_gmail_context",
+        "gmail_triage_sdk",
+    ]
+
+
 def test_natural_today_email_summary_preserves_calendar_scope_and_batch_shape() -> None:
     request = "Can you summarize my emails from today?"
     manual = infer_manual_request_plan(request, requested_agent="orchestrator")
@@ -5326,6 +6062,483 @@ def test_natural_find_email_and_draft_preserves_sender_search_hint() -> None:
     assert execution.gmail_query == 'newer_than:3d "example health"'
     assert execution.create_gmail_drafts is False
     assert execution.draft_replies_in_output is True
+
+
+def test_calendar_thread_followup_switches_to_read_only_gmail_reply_copy() -> None:
+    request = (
+        "Can you find the email thread associated with the interview you just listed "
+        "and write a short reply here saying I’m looking forward to it? Please don’t "
+        "send it or create a Gmail draft—just give me the copy in this thread."
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="orchestrator")
+    execution = resolve_gmail_execution_plan(request, manual_plan=plan)
+
+    assert plan.target_agent == "gmail_triage"
+    assert plan.provider_system == "gmail"
+    assert plan.provider_operations == ["read"]
+    assert plan.ask_shape.prior_context_dependency == "selected_context"
+    assert execution.operation == "draft_reply"
+    assert execution.read_scope == "thread"
+    assert execution.create_gmail_drafts is False
+    assert execution.draft_replies_in_output is True
+    assert execution.side_effect_policy == "read_only_or_draft_only"
+
+
+@pytest.mark.parametrize(
+    ("request_text", "query"),
+    [
+        (
+            "Use the G2i interview on tomorrow’s calendar to identify the related "
+            "email conversation, read that thread, and give me a brief reply here. "
+            "Keep it in Slack—don’t send anything or save a Gmail draft.",
+            '"G2i"',
+        ),
+        (
+            "Find the email thread associated with the Acme Health meeting and write "
+            "a concise response here. Don't send it or create a Gmail draft.",
+            '"Acme Health"',
+        ),
+        (
+            "Using my Northstar call from Calendar, locate the related email "
+            "conversation and return reply copy in this Slack thread only.",
+            '"Northstar"',
+        ),
+        (
+            "Use the G2i interview already identified on tomorrow’s calendar to find "
+            "the related Gmail conversation. Read that thread and give me a concise "
+            "reply here. Keep this as Slack copy only; don’t send it or save a Gmail "
+            "draft.",
+            '"G2i"',
+        ),
+    ],
+)
+def test_source_provider_selector_does_not_override_gmail_action_owner(
+    request_text: str,
+    query: str,
+) -> None:
+    plan = infer_manual_request_plan(request_text, requested_agent="orchestrator")
+    execution = resolve_gmail_execution_plan(request_text, manual_plan=plan)
+
+    assert plan.target_agent == "gmail_triage"
+    assert plan.provider_system == "gmail"
+    assert set(plan.provider_operations) <= {"read", "search", "verify"}
+    assert plan.gmail_query == query
+    assert execution.operation == "draft_reply"
+    assert execution.gmail_query == query
+    assert execution.create_gmail_drafts is False
+    assert execution.draft_replies_in_output is True
+
+
+def test_calendar_remains_owner_when_email_is_only_event_description_content() -> None:
+    request = (
+        "List tomorrow's Google Calendar events and include any email address in the "
+        "event descriptions. Read-only; do not modify Calendar or Gmail."
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="orchestrator")
+
+    assert plan.target_agent == "chief_of_staff"
+    assert plan.provider_system == "google_calendar"
+    assert plan.provider_operations == ["read"]
+
+
+@pytest.mark.parametrize(
+    "mailbox_category",
+    [
+        "event notices",
+        "calendar invite emails",
+        "meeting reminders",
+        "appointment confirmations",
+    ],
+)
+def test_gmail_message_categories_do_not_require_calendar_context(
+    mailbox_category: str,
+) -> None:
+    request = (
+        "Gmail Triage, find the recent MassChallenge conversation where a real "
+        "person followed up about an application or next step. Compare it with "
+        f"automated confirmations, {mailbox_category}, and older scheduling "
+        "messages, then decide whether I owe a reply. If yes, give me exactly two "
+        "sentences I can paste here; if no, explain why in one sentence. Keep "
+        "Gmail unchanged—no draft, labels, archive, or send."
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="gmail_triage")
+
+    assert plan.target_agent == "gmail_triage"
+    assert plan.provider_system == "gmail"
+    assert plan.provider_context_requirements == []
+
+
+@pytest.mark.parametrize(
+    ("request_text", "expected_provider", "expected_operations"),
+    [
+        (
+            "My Calendar has a team meeting tomorrow. Separately, find the correct "
+            "invoice email in Gmail and give me a short reply here without sending "
+            "or creating a provider draft.",
+            "gmail",
+            ["read"],
+        ),
+        (
+            "The email already includes the appointment details and is the only "
+            "evidence to use. Read that Gmail thread and write reply copy here. Do "
+            "not check Calendar or create a provider draft.",
+            "gmail",
+            ["read"],
+        ),
+        (
+            "The correct invoice email is not associated with tomorrow's Calendar "
+            "meeting. Find the invoice email in Gmail and give me reply copy here "
+            "without sending or creating a provider draft.",
+            "gmail",
+            ["read"],
+        ),
+        (
+            "Do not access Calendar. Find the Gmail thread related to the meeting "
+            "details already selected in this thread and give me reply copy here "
+            "without sending or saving a provider draft.",
+            "gmail",
+            ["read"],
+        ),
+        (
+            "Using only the meeting and email details already supplied in this "
+            "thread, return a one-sentence reply. Do not access Calendar or Gmail.",
+            "unspecified",
+            [],
+        ),
+        (
+            "Using only this supplied excerpt—\"Use my next Calendar meeting to "
+            "choose the correct Gmail thread.\"—return one sentence. Do not access "
+            "Calendar or Gmail.",
+            "unspecified",
+            [],
+        ),
+    ],
+)
+def test_unrelated_or_forbidden_calendar_context_is_not_admitted(
+    request_text: str,
+    expected_provider: str,
+    expected_operations: list[str],
+) -> None:
+    plan = infer_manual_request_plan(request_text)
+
+    assert plan.provider_system == expected_provider
+    assert plan.provider_context_requirements == []
+    assert plan.provider_operations == expected_operations
+    _assert_no_google_calendar_access(plan)
+
+
+def _assert_no_google_calendar_access(plan: ManualRequestPlan) -> None:
+    authority = ExecutionIntentAuthority.from_value(plan)
+
+    assert plan.provider_system != "google_calendar"
+    assert authority.effective_provider_operations("google_calendar") == ()
+    assert all(
+        requirement.provider_system != "google_calendar"
+        for requirement in plan.provider_context_requirements
+    )
+    assert all(
+        step.resource_type != "calendar_event"
+        for step in plan.provider_action_steps
+    )
+    assert "google_calendar" not in plan.ask_shape.source_type_preference
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        (
+            "My Calendar has a Zephyr meeting tomorrow. KBA_TEST_VENDOR Vela billed "
+            "me twice; find the related email in Gmail and draft a reply here "
+            "without sending."
+        ),
+        (
+            "My Calendar has an Orion meeting tomorrow. Find the correct "
+            "KBA_TEST_INVOICE email in Gmail and draft a reply here without sending."
+        ),
+        (
+            "Find the KBA_TEST_VENDOR Vela billing email in Gmail and write a reply "
+            "here without sending. My Calendar also has an unrelated Quartz meeting "
+            "tomorrow."
+        ),
+        (
+            "Use my Calendar meeting tomorrow only as background. KBA_TEST_CASE Nova "
+            "is a different billing issue; find the email related to that issue in "
+            "Gmail and return reply copy here without sending."
+        ),
+        (
+            "My Calendar has a Vega meeting tomorrow; KBA_TEST_VENDOR Luma charged "
+            "twice and I need the related email in Gmail. Draft a reply here without "
+            "sending."
+        ),
+        (
+            "My Calendar has a Vega meeting tomorrow and KBA_TEST_ACCOUNT Luma has "
+            "duplicate charges so find the related email in Gmail and draft a reply "
+            "here without sending."
+        ),
+        (
+            "My Calendar has a Vega meeting tomorrow. KBA_TEST_ACCOUNT Luma has "
+            "duplicate charges and I need the related email in Gmail. Draft a reply "
+            "here without sending."
+        ),
+        (
+            "My Calendar has a Vega meeting tomorrow and KBA_TEST_VENDOR Luma charged "
+            "twice, so find its email in Gmail and draft a reply here without sending."
+        ),
+        (
+            "My Calendar has a Vega meeting tomorrow, then find KBA_TEST_CASE Nova "
+            "and choose the related email in Gmail. Return reply copy here without "
+            "sending."
+        ),
+    ],
+)
+def test_calendar_background_does_not_authorize_calendar_access_for_gmail_reply(
+    request_text: str,
+) -> None:
+    plan = infer_manual_request_plan(request_text)
+
+    assert plan.target_agent == "gmail_triage"
+    assert plan.provider_system == "gmail"
+    assert plan.provider_operations == ["read"]
+    assert plan.draft_policy == "draft_only_when_reply_needed"
+    assert plan.ask_shape.permission_state in {"read_only", "draft_only"}
+    _assert_no_google_calendar_access(plan)
+
+
+def test_calendar_only_inline_wording_does_not_manufacture_gmail_ownership() -> None:
+    plan = infer_manual_request_plan(
+        "Read tomorrow's Calendar meeting details and give me a response here "
+        "without sending email."
+    )
+
+    assert plan.target_agent == "chief_of_staff"
+    assert plan.provider_system == "google_calendar"
+    assert plan.provider_operations == ["read"]
+    assert plan.provider_context_requirements == []
+
+
+def test_calendar_modification_is_not_converted_to_gmail_context() -> None:
+    plan = infer_manual_request_plan(
+        "Move my next KBA_TEST_CLIENT Calendar appointment to 11:00 AM and show me the "
+        "staged details. Do not send email."
+    )
+
+    assert plan.target_agent == "chief_of_staff"
+    assert plan.provider_system == "google_calendar"
+    assert plan.provider_operations == ["update"]
+    assert plan.provider_context_requirements == []
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Use the event at 10 tomorrow to locate the matching Gmail thread and reply here.",
+        "Use the appointment tomorrow to find its related email and give me reply copy here.",
+        (
+            "I have an interview tomorrow morning; find its corresponding inbox "
+            "conversation and give me reply copy here."
+        ),
+        (
+            "Check my Google Calendar for the next G2i meeting, then find its Gmail "
+            "thread and give me reply copy here."
+        ),
+    ],
+)
+def test_concrete_calendar_selector_still_requires_calendar_context(
+    request_text: str,
+) -> None:
+    plan = infer_manual_request_plan(request_text, requested_agent="gmail_triage")
+
+    assert any(
+        requirement.provider_system == "google_calendar"
+        and requirement.resource_type == "calendar_event"
+        for requirement in plan.provider_context_requirements
+    )
+
+
+@pytest.mark.parametrize("clue", [
+    "a meeting in Nevada next year",
+    "the upcoming interview event for developers",
+    "an appointment reminder for the software onboarding call tomorrow",
+])
+def test_event_described_in_email_does_not_require_calendar_lookup(clue):
+    request = (
+        f"I remember a recent email about {clue}. Can you find it in "
+        "reader@example.test and explain the details? Use the email and reply here."
+    )
+    plan = infer_manual_request_plan(request, requested_agent="gmail_triage")
+    assert plan.provider_context_requirements == []
+
+
+def _explicit_calendar_to_gmail_merge_plans(
+    requirements: list[ProviderContextRequirement],
+) -> tuple[ManualRequestPlan, ManualRequestPlan]:
+    request = (
+        "Using selected Calendar context, choose the associated Gmail conversation "
+        "and return reply copy here. Do not send or create a Gmail draft."
+    )
+    fallback = ManualRequestPlan(
+        source="heuristic",
+        requested_agent="orchestrator",
+        target_agent="chief_of_staff",
+        intent="context_lookup",
+        objective=request,
+        task_objective="context_lookup",
+        expected_artifact_type="context_summary",
+        target_type="business_system_context",
+        provider_system="google_calendar",
+        provider_operations=["read"],
+        provider_action_steps=[
+            ManualProviderActionStep(
+                operation="read",
+                resource_type="calendar_event",
+            )
+        ],
+        ask_shape=AskShapePolicy(permission_state="read_only"),
+        side_effect_policy="draft_or_read_only",
+    )
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="orchestrator",
+        target_agent="gmail_triage",
+        intent="gmail_triage",
+        objective=request,
+        task_objective="gmail_triage",
+        expected_artifact_type="gmail_triage_report",
+        target_type="gmail_thread",
+        provider_system="gmail",
+        provider_operations=["search", "read", "verify"],
+        provider_action_steps=[
+            ManualProviderActionStep(
+                operation="search",
+                resource_type="gmail_thread",
+            ),
+            ManualProviderActionStep(
+                operation="read",
+                resource_type="gmail_thread",
+            ),
+        ],
+        provider_context_requirements=requirements,
+        provider_read_scope="single_item",
+        constraints=["Do not send or create a Gmail draft."],
+        draft_policy="no_drafts_requested",
+        outreach_channel="internal_slack",
+        requires_approved_context=False,
+        requires_durable_state=False,
+        ask_shape=AskShapePolicy(
+            permission_state="read_only",
+            output_form="draft",
+            audience_scope="internal",
+        ),
+        side_effect_policy="draft_or_read_only",
+    )
+    return fallback, candidate
+
+
+@pytest.mark.parametrize("candidate_as_dict", [False, True])
+def test_merge_preserves_required_provider_context_for_downstream_admission(
+    candidate_as_dict: bool,
+) -> None:
+    requirement = ProviderContextRequirement(
+        provider_system="google_calendar",
+        operations=["search", "read", "verify"],
+        resource_type="calendar_event",
+        purpose="Select one verified event before Gmail chooses the conversation.",
+        required=True,
+    )
+    fallback, candidate = _explicit_calendar_to_gmail_merge_plans([requirement])
+
+    merged = merge_manual_request_plan(
+        fallback,
+        candidate.model_dump(mode="json") if candidate_as_dict else candidate,
+    )
+    admission = provider_context_requirements_satisfied(merged, [])
+
+    assert merged.target_agent == "gmail_triage"
+    assert merged.provider_system == "gmail"
+    assert merged.provider_operations == ["search", "read", "verify"]
+    assert merged.draft_policy == "no_drafts_requested"
+    assert any(
+        constraint.lower().rstrip(".") == "do not send or create a gmail draft"
+        for constraint in merged.constraints
+    )
+    assert all(
+        isinstance(step, ManualProviderActionStep)
+        for step in merged.provider_action_steps
+    )
+    assert merged.provider_context_requirements == [requirement]
+    assert isinstance(
+        merged.provider_context_requirements[0],
+        ProviderContextRequirement,
+    )
+    assert admission == (
+        False,
+        ["google_calendar:calendar_event"],
+    )
+
+
+@pytest.mark.parametrize("optional_requirement", [None, False])
+def test_merge_preserves_empty_and_optional_provider_context(
+    optional_requirement: bool | None,
+) -> None:
+    requirements = (
+        []
+        if optional_requirement is None
+        else [
+            ProviderContextRequirement(
+                provider_system="google_calendar",
+                operations=["read"],
+                resource_type="calendar_event",
+                purpose="Use Calendar only when optional context is available.",
+                required=optional_requirement,
+            )
+        ]
+    )
+    fallback, candidate = _explicit_calendar_to_gmail_merge_plans(requirements)
+
+    merged = merge_manual_request_plan(fallback, candidate)
+
+    assert provider_context_requirements_satisfied(merged, []) == (True, [])
+    assert len(merged.provider_context_requirements) == len(requirements)
+    if requirements:
+        assert merged.provider_context_requirements[0] == requirements[0]
+        assert merged.provider_context_requirements[0].required is False
+
+
+def test_merged_provider_context_accepts_matching_verified_stage() -> None:
+    requirement = ProviderContextRequirement(
+        provider_system="google_calendar",
+        operations=["read"],
+        resource_type="calendar_event",
+        purpose="Select the verified event before Gmail chooses the conversation.",
+    )
+    fallback, candidate = _explicit_calendar_to_gmail_merge_plans([requirement])
+    merged = merge_manual_request_plan(fallback, candidate)
+    stage = ProviderContextStageResult(
+        provider_system="google_calendar",
+        resource_type="calendar_event",
+        selected_object={"event_id": "event-synthetic"},
+        decision=AgentDecisionRecord(
+            decision_owner="chief_of_staff",
+            decision_stage="calendar_context_selection",
+            selected_candidate_id="event-synthetic",
+            reasoning="Selected the only verified event.",
+        ),
+        validator_outcome=DecisionValidatorOutcome(
+            status="accepted",
+            decision_stage="calendar_context_selection",
+            selected_candidate_id="event-synthetic",
+            candidate_count=1,
+            selected_identity_in_candidate_set=True,
+            selected_identity_was_read=True,
+            reason_code="manager_selection_bound_to_calendar_result_set",
+        ),
+        read_only=True,
+    )
+
+    assert provider_context_requirements_satisfied(merged, [stage]) == (True, [])
 
 
 def test_cos_gmail_read_and_slack_copy_delegates_to_one_gmail_owner() -> None:
@@ -5979,6 +7192,24 @@ def test_outreach_execution_plan_accepts_approved_inline_context_labels() -> Non
     assert plan.use_default_approved_fixture_for_backend_test is False
 
 
+def test_outreach_curly_unsent_request_is_draft_only_and_extracts_company() -> None:
+    request = (
+        "I want a thoughtful first touch to the person who currently leads clinical "
+        "partnerships at Fort Health. Please verify the best public contact or role, "
+        "then draft a concise email and LinkedIn note. Keep both drafts unsent, and "
+        "don’t create a Gmail draft or contact record."
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="outreach_composer")
+
+    assert plan.target_agent == "outreach_composer"
+    assert plan.intent == "outreach_draft"
+    assert plan.task_objective == "outreach_draft"
+    assert plan.ask_shape.permission_state == "draft_only"
+    assert plan.primary_target == "Fort Health"
+    assert not any("Send request blocked" in warning for warning in plan.planner_warnings)
+
+
 def test_cli_live_gmail_priority_grouping_uses_agent_execution_plan(
     monkeypatch,
     capsys,
@@ -6003,6 +7234,7 @@ def test_cli_live_gmail_priority_grouping_uses_agent_execution_plan(
         )
 
     monkeypatch.setattr(cli, "run_isolated_child_process", fake_run)
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", _offline_orchestrator_preflight)
 
     assert (
         cli.main(
@@ -6030,6 +7262,36 @@ def test_cli_live_gmail_priority_grouping_uses_agent_execution_plan(
     assert "--priority-grouping" in captured["command"]
     assert captured["command"][captured["command"].index("--lookback-days") + 1] == "7"
     assert captured["command"][captured["command"].index("--gmail-query") + 1] == "newer_than:7d"
+
+
+@pytest.mark.parametrize(
+    ("request_text", "expected_query"),
+    [
+        (
+            "Review Gmail threads from the last 7 days related to Keystone opportunities.",
+            "newer_than:7d",
+        ),
+        (
+            "Triage messages from the past 14 days about possible partnerships.",
+            "newer_than:14d",
+        ),
+        (
+            "Summarize email conversations from today connected to current opportunities.",
+            None,
+        ),
+    ],
+)
+def test_gmail_time_window_prose_is_not_misread_as_a_sender(
+    request_text: str,
+    expected_query: str | None,
+) -> None:
+    plan = infer_manual_request_plan(request_text, requested_agent="gmail_triage")
+
+    if expected_query is None:
+        assert plan.gmail_query.startswith("after:")
+        assert '"today connected"' not in plan.gmail_query
+    else:
+        assert plan.gmail_query == expected_query
 
 
 def test_cli_live_outreach_backend_fixture_request_stops_at_preflight(monkeypatch, capsys) -> None:
@@ -6142,6 +7404,147 @@ def test_chief_multi_source_read_compiles_context_owners_without_research_route(
         "work_items",
     ]
     assert plan.requires_durable_state is True
+
+
+def test_chief_read_only_work_item_inventory_requires_receipt_state() -> None:
+    request = (
+        "Chief of Staff, among all active, non-archived WorkItems, identify the one "
+        "that has waited longest without a new event, report its age, current route, "
+        "blocker or next action, and count pending approvals. Read-only; do not "
+        "continue, approve, or modify anything."
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+
+    assert plan.target_agent == "chief_of_staff"
+    assert plan.intent == "continue_work_item"
+    assert plan.requires_durable_state is True
+    assert plan.ask_shape.permission_state == "read_only"
+
+
+def test_chief_work_item_inventory_preserves_candidate_count_and_owner() -> None:
+    request = (
+        "Chief of Staff, among the three most recently updated blocked, non-archived "
+        "WorkItems, show each candidate's current route and last verified stage, choose "
+        "the one with the clearest safe next action, and report pending approvals. "
+        "Do not continue, approve, or change anything."
+    )
+    fallback = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+    candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="clarification",
+        intent="clarification",
+        objective=request,
+        missing_required_information=["exact WorkItem id"],
+    )
+
+    merged = merge_manual_request_plan(fallback, candidate)
+
+    assert fallback.desired_count == 3
+    assert fallback.desired_count_explicit is True
+    assert merged.requested_agent == "chief_of_staff"
+    assert merged.target_agent == "chief_of_staff"
+    assert merged.intent == "continue_work_item"
+    assert merged.task_objective == "context_lookup"
+    assert merged.expected_artifact_type == "context_summary"
+    assert merged.desired_count == 3
+    assert merged.ask_shape.permission_state == "read_only"
+    assert merged.requires_durable_state is True
+
+
+def test_pending_approval_inventory_does_not_grant_approval_authority() -> None:
+    request = (
+        "Chief of Staff, inspect blocked WorkItems, report whether each has a pending "
+        "approval, and count the pending approvals. Read-only; do not continue, "
+        "approve, or modify anything."
+    )
+
+    plan = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+
+    assert plan.intent == "continue_work_item"
+    assert plan.requires_durable_state is True
+    assert plan.ask_shape.permission_state == "read_only"
+
+
+@pytest.mark.parametrize(
+    ("request_text", "expected_target"),
+    [
+        (
+            "Business Research Analyst, start with Exa and assess Brightline's "
+            "pediatric behavioral-health offering. Verify one outcome claim and "
+            "one payer signal from public sources. Read-only; no outreach or saved "
+            "artifacts.",
+            "Brightline",
+        ),
+        (
+            "Business Research Analyst, begin with Tavily and evaluate Hazel Health's "
+            "school-based behavioral-health offering. Show me the public evidence. "
+            "Read-only; do not save anything.",
+            "Hazel Health",
+        ),
+        (
+            "Could you use OpenAI web search to take a look at Lyra Health's employer "
+            "offering and tell me what the evidence supports? Read-only.",
+            "Lyra Health",
+        ),
+        (
+            "Please try Exa first for Spring Health's payer partnerships and flag "
+            "anything that is only a company claim. Keep this read-only and don't "
+            "save anything.",
+            "Spring Health",
+        ),
+    ],
+)
+def test_provider_first_company_research_keeps_possessive_company_target(
+    request_text: str,
+    expected_target: str,
+) -> None:
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent="business_research_analyst",
+    )
+
+    assert plan.intent == "company_research"
+    assert plan.primary_target == expected_target
+    assert plan.requires_live_search is True
+    assert plan.ask_shape.permission_state == "read_only"
+
+
+def test_llm_context_lookup_cannot_drop_read_only_work_item_receipts() -> None:
+    request = (
+        "Chief of Staff, inspect active WorkItems and pending approvals. Read-only; "
+        "do not continue, approve, or modify anything."
+    )
+    fallback = infer_manual_request_plan(request, requested_agent="chief_of_staff")
+    candidate = fallback.model_copy(
+        deep=True,
+        update={
+            "source": "llm",
+            "intent": "route_request",
+            "task_objective": "context_lookup",
+            "expected_artifact_type": "context_summary",
+            "target_type": "business_system_context",
+            "requires_durable_state": False,
+        },
+    )
+
+    merged = merge_manual_request_plan(
+        fallback,
+        candidate,
+        allow_contextual_delegation=True,
+    )
+
+    assert merged.target_agent == "chief_of_staff"
+    assert merged.intent == "continue_work_item"
+    assert merged.task_objective == "context_lookup"
+    assert merged.expected_artifact_type == "context_summary"
+    assert merged.requires_durable_state is True
+    assert merged.ask_shape.permission_state == "read_only"
+    assert any(
+        "read-only WorkItem inspection contract" in warning
+        for warning in merged.planner_warnings
+    )
 
 
 def test_llm_cannot_collapse_chief_multi_source_read_to_one_provider() -> None:
@@ -6540,7 +7943,7 @@ def test_zotero_selection_rank_is_bounded_in_the_schema() -> None:
         )
 
 
-def test_explicit_zotero_latest_abstract_has_exact_two_request_ceiling() -> None:
+def test_explicit_zotero_latest_abstract_reserves_bounded_recovery() -> None:
     request = (
         "@KNI Zotero Context Agent, read the abstract of the most recently added "
         "journal article in my library and tell me the one finding that matters "
@@ -6564,11 +7967,13 @@ def test_explicit_zotero_latest_abstract_has_exact_two_request_ceiling() -> None
         effective_live_search=False,
     )
 
-    assert estimate["min"] == 2
-    assert estimate["max"] == 2
+    assert estimate["min"] == 3
+    assert estimate["max"] == 5
     assert estimate["stages"] == [
         "manual_request_planner",
+        "orchestrator_preflight",
         "zotero_context_agent_direct_sdk",
+        "conditional_zotero_context_agent_bounded_recovery",
     ]
 
 
@@ -6585,3 +7990,63 @@ def test_explicit_zotero_agent_can_delegate_clear_web_research() -> None:
     assert plan.provider_system == "unspecified"
     assert plan.provider_operations == []
     assert plan.requires_live_search is True
+
+
+def test_live_planner_cannot_erase_read_only_work_item_inspection_contract() -> None:
+    request = (
+        "Hey Chief of Staff, review the three most recently updated blocked WorkItems, "
+        "show each owner and last verified stage, and tell me whether an approval is "
+        "waiting. Keep this read-only; do not continue, rerun, approve, or change anything."
+    )
+    fallback = infer_manual_request_plan(
+        request,
+        requested_agent="chief_of_staff",
+    )
+    generic_live_candidate = ManualRequestPlan(
+        source="llm",
+        requested_agent="chief_of_staff",
+        target_agent="chief_of_staff",
+        intent="route_request",
+        provider_system="unspecified",
+        provider_operations=["read"],
+        requires_durable_state=False,
+        ask_shape={"permission_state": "read_only"},
+        objective=request,
+    )
+
+    merged = merge_manual_request_plan(fallback, generic_live_candidate)
+
+    assert merged.intent == "continue_work_item"
+    assert merged.requires_durable_state is True
+    assert merged.provider_operations == []
+    assert merged.ask_shape.permission_state == "read_only"
+
+
+@pytest.mark.parametrize(
+    "prompt_text",
+    [
+        (
+            "I have two possible stages: a market scan and, much later, a possible "
+            "introduction. No company, recipient, or approved claims has been selected. "
+            "Before any work begins, give me only the safe sequence and the first "
+            "decision I need to make. Do not research, hand off, save, or draft anything."
+        ),
+        (
+            "I need an evidence-backed vendor landscape and, after review, perhaps a "
+            "partnership note. I do not know which specialist should own the first step, "
+            "and there is no selected company or recipient. Give me the safe order and "
+            "the first clarification you need. Do not run tools, create artifacts, or draft."
+        ),
+    ],
+)
+def test_nonexecuting_ambiguous_workflow_design_stays_with_clarification(
+    prompt_text: str,
+) -> None:
+    plan = infer_manual_request_plan(prompt_text, requested_agent="orchestrator")
+
+    assert plan.target_agent == "clarification"
+    assert plan.intent == "clarification"
+    assert plan.workflow == []
+    assert plan.requires_live_search is False
+    assert plan.requires_durable_state is False
+    assert plan.provider_operations == []

@@ -29,6 +29,7 @@ from keystone_agents.agents.business_research_analyst import (
 )
 from keystone_agents.agents.opportunity_scout import build_opportunity_scout_agent
 from keystone_agents.agents.orchestrator import INTENDED_HANDOFFS, build_orchestrator_agent
+from keystone_agents.capabilities.catalog import instruction_profile_text
 from keystone_agents.sdk import (
     Agent,
     build_model_settings,
@@ -46,60 +47,65 @@ SKILLS_ROOT = PROJECT_ROOT / "src" / "keystone_agents" / "skills"
 
 STATIC_PREFIX_FINGERPRINTS = {
     "gmail_triage": {
-        "instructions_sha256": "050d964165f1f7db418585ed3aad7cdf7eceb3377b505c8f566fb10c080c87f0",
-        "tool_names_sha256": "ee36d9e7d7f2340fc94887c18d726abe4ce97e82f18d0b5ce189a04b8268f8ea",
-        "output_schema_sha256": "e1a026effe1e04882613026e7e6a2e27da7de6c51e1dde08289c88462866e4f5",
+        "instructions_sha256": "cacc99d31ba51016195aa4ef7b5bc7c42274ffbdaa0520acad4ba47b0cf25792",
+        "tool_names_sha256": "7363ff1e9c76e8f477af66a812c9a8116691604c51ed68d1f70b93f6112b93b4",
+        "output_schema_sha256": "42ef2b014989eb11bb8b3dcae8b8b3fd937e33272ae562e92eb9023c5dc6cde7"
     },
     "business_research_analyst": {
-        "instructions_sha256": "abdc42ae3644c40374cbb13d6951de279d8557e61abbbe39121229ead333ea72",
-        "tool_names_sha256": "a9f26c0e0237174742fdc53f1c4e7ce5c8936f492b353f5ef6e3adfb4c34a35e",
-        "output_schema_sha256": "2692dd7ff8ec994408d46ce397c174fa115bf7cf19453cbe6a4a4ad5d303667d",
+        "instructions_sha256": "a140965a81e647d50d514e67822917bff6c89a6c1c487f29e94078326fde9f2e",
+        "tool_names_sha256": "2f40cad113c0a5e031f969d39dbfde851cd27fa13abd6c8ac5b7d7cd612bdabe",
+        "output_schema_sha256": "feaea1322b89b637193b4514a4774c031eb4a3d0ecaef162abe13116185c3fc8"
+    },
+    "rag_retrieval_specialist": {
+        "instructions_sha256": "1393cbbe8819cba28839355899da4271556d780ab3c47218c873c40c144970d9",
+        "tool_names_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "output_schema_sha256": "0924032eaa83589b6e8a92c5d3c49fdc927995598184e4c6c6d43a673f8193d6"
     },
     "opportunity_scout": {
-        "instructions_sha256": "4425eadde360e2a7ac626fb1260b87c270b1728d8853a06ff52f67ac8eb5004c",
-        "tool_names_sha256": "ace37ad8d7eef4c988ac31f6848c03a502b9dfb1efe502400c1720e9cc194ce1",
-        "output_schema_sha256": "4af554b78c7f1ed345bf17c96c42e83198632aa244f5989bdf4c9e26cfa4bc5d",
+        "instructions_sha256": "bb34ee463ec9ae0b81a7c70e9f82f33d20dcbc964352dd9afc85915089b01464",
+        "tool_names_sha256": "11af4029345ccdcb3ec2287e1a91e53391d4ad9e44324574984c31e86d8ce399",
+        "output_schema_sha256": "6619d4b688ba020b2492f169ca2a85fda8a4606a507dc223440a5a109bcd5668"
     },
     "outreach_composer": {
-        "instructions_sha256": "991ffb15918d475c6a486ee201286555a282eec961b2b22fd1ce3b4506ae7e2b",
-        "tool_names_sha256": "6092ed57d03b82170c380457199725a537ab0d16cf199a5393920a1b096815fe",
-        "output_schema_sha256": "3f8204f88ba20d29b12d01686c2a7bb7e08b036464d23fcac49dc35570d81ea4",
+        "instructions_sha256": "304e3718deab2a2947f3571a21da6599d8fa55d5e7c51dd31c379884422d2319",
+        "tool_names_sha256": "5a7b62f096ae42d9499642af1f89b47f850f0ac89ee6feb500bcde203705f6b4",
+        "output_schema_sha256": "43ecdc7e630e3b1a5f60de46a961a424eba0f8c4a791cd80b89d566ffe01bf2c"
     },
     "airtable_context_agent": {
-        "instructions_sha256": "6047986019c757b36ec361e711e46ce91d49b9f16a39fc1b129e09df97524e36",
-        "tool_names_sha256": "979b646d14a50a835564d06261d641e28eba27076c11a1dee1d32e374dd9c375",
-        "output_schema_sha256": "7d4017a4e6833b52f2c408fe16352594a5fa2b393e740433a25b77b2934c4984",
+        "instructions_sha256": "ce993ccfb26bb6898c1774f1e49f304d8edcdbc1e67c85004c95a757144fcdb1",
+        "tool_names_sha256": "def24ef9628ea20812b088d5dec602be8044e2d1f8777bb8f581b582f9f8a5a6",
+        "output_schema_sha256": "0cc10736f7d15eda9511e39458c9a8f91ae093f2a3d876c1809569a86d659c62"
     },
     "google_workspace_context_agent": {
-        "instructions_sha256": "eeb17574ead1a9fdc8aa6a2d36a5ecdec74f9cc3a367e802a9894090b3a95ab1",
-        "tool_names_sha256": "de65bc3bd0d7a52816c8aa81108ba89fc9c3ac1f230b83ac92348d8646cb8f00",
-        "output_schema_sha256": "0867caddb9fe5c3340ac958ea02ddb62d972f31d5f164f9fbc722d55386c55c8",
+        "instructions_sha256": "3a4686d69c6608fb21b9fcc6b9610e2b48ef4b9226059fd55f00dcd45f16ab84",
+        "tool_names_sha256": "31f25b0b1bf5b672634cad9cb1434c0c2b4c5f722ba41a0a783e809e1cbecab3",
+        "output_schema_sha256": "ab79b01b12622292bb3f6bdee32d6ea50e0bdce0ef73617de1f982d1ac0ee9f2"
     },
     "zotero_context_agent": {
-        "instructions_sha256": "6d3ea6ac7c037c623f996ca2e27b64afa99022d3ad108f33cc74da41feb01d3c",
+        "instructions_sha256": "6134743f50581f8b2b49ab386f321e55840eb261b6c02ea0e0b9043d5a4d3963",
         "tool_names_sha256": "157efe138d475b9b0eb13961c0e598b47f58037480732babd614b98019ecc526",
-        "output_schema_sha256": "efa1b731da05cfd915b319d730cf84019d76dd22d0a5f199818546deedac5bb8",
+        "output_schema_sha256": "3c77001f4b3b9255d7211ecf93cac61c46319283c777030ca276562be497ad6f"
     },
     "rss_context_agent": {
-        "instructions_sha256": "1bc8ceacf2dfa3eccd4961527fe0679af05948ac0c634395cb90b01ebeddfd8e",
-        "tool_names_sha256": "f31fcf99ce67500ab85ceb6130f6c81c8fdeea9668c82ffd10eaf4862b47a55f",
-        "output_schema_sha256": "c81421b84589b67baca97d6ae5bc0a8468adbe9bd3b10d1c13639a3148d68936",
+        "instructions_sha256": "46a70062181d7a35a3b0a9587106d898bc9f55e4c40984841e04623a5ea6ec89",
+        "tool_names_sha256": "bc30cef46242b8d0a15644b1a4101f798d7b2a954318d627d988c4c37ea44ee2",
+        "output_schema_sha256": "f29520fe32adbc184aeac2351584d860891cd307feed3848ae151a93207c4498"
     },
     "preprints_context_agent": {
-        "instructions_sha256": "5a6098dde4ebc5a9031f592e257897413a57821fe31d56ebfe3010df525de062",
-        "tool_names_sha256": "985bb3e5f395ac4fdab0e2243e450e60eaeab20c34646431415a94dbbb9bef08",
-        "output_schema_sha256": "0c360ba87ef900bd5c658029374a445b6c14c22b9067207d8b7ad083c4b1d702",
+        "instructions_sha256": "b3489cb9ffc47d3e997165f57e860cab09387edec7c74bb604a7e08242063995",
+        "tool_names_sha256": "e7f0e140b410b6c05354ae3b6e33ce424dfce60d09e205c4d9f7d80eb0b56e19",
+        "output_schema_sha256": "7491586988c2e8b03a5811ae94699267786483b949548047b5be898787469e0a"
     },
     "orchestrator": {
-        "instructions_sha256": "c1982ffa6a1563608505a8e08ebf70404dec3fed0d74b3640ec60d1e5503173b",
-        "tool_names_sha256": "d1452b1d9a45ccd89c167d726fc4d4cdf612b8834f6616f7e08524efa4ae0817",
-        "output_schema_sha256": "98f0e154658a465df86c498fbf9b1a6c84028fbd02eedef97d1549ef5b5887e7",
+        "instructions_sha256": "86d67df008a57af5cdc795cc589612dfc6dc6df081ee54f6b99e5aeae9392462",
+        "tool_names_sha256": "d57d63506543d4ec46131f24a3f3e64a98fc50bf996a3c59629c5de66ee1f6c2",
+        "output_schema_sha256": "b661ecc6298a304709693b32f2cd7ee29bfadd54fbebe589c4bdd708c0993fa0"
     },
     "chief_of_staff": {
-        "instructions_sha256": "4dfa7df09a4cf8a16fd2b8d71b2b676213e2386c1ad13777917df7cd64cbf931",
-        "tool_names_sha256": "5d10d910810cfa07005226805bbaf378f7420af4d3133d8d88d9db8667f804ff",
-        "output_schema_sha256": "c172f11e63550cf751d67a22c72020c661cf35d7a9f6b118274dd7ffdea1e5b9",
-    },
+        "instructions_sha256": "e33c8a04ced2ff52fcf4c58132f66be97954d111eaa8909b65ee1921720acc04",
+        "tool_names_sha256": "8048af129fda950491143e09f38c94257de40e91ae96d9feedaed22f79334860",
+        "output_schema_sha256": "2de4f02033461c076c09eb6b4b77a2ab623e6404dbacdfc6a4c7ffe9274590a4"
+    }
 }
 
 
@@ -127,7 +133,7 @@ def _sha256(value: object) -> str:
 def _static_prefix_fingerprint(agent: Agent) -> dict[str, str]:
     schema = agent.output_type.model_json_schema() if agent.output_type is not None else {}
     return {
-        "instructions_sha256": _sha256(str(agent.instructions)),
+        "instructions_sha256": _sha256(instruction_profile_text(agent)),
         "tool_names_sha256": _sha256(_ordered_tool_names(agent)),
         "output_schema_sha256": _sha256(schema),
     }
@@ -137,6 +143,7 @@ def test_registry_has_canonical_agents() -> None:
     assert set(AGENT_REGISTRY) == {
         "gmail_triage",
         "business_research_analyst",
+        "rag_retrieval_specialist",
         "opportunity_scout",
         "outreach_composer",
         "airtable_context_agent",
@@ -150,6 +157,7 @@ def test_registry_has_canonical_agents() -> None:
     assert [spec.route_name for spec in REGISTERED_AGENT_SPECS] == [
         "gmail_triage",
         "business_research_analyst",
+        "rag_retrieval_specialist",
         "opportunity_scout",
         "outreach_composer",
         "airtable_context_agent",
@@ -194,6 +202,20 @@ def test_registered_agents_have_builders_schemas_prompts_and_validation() -> Non
             assert (PROJECT_ROOT / eval_path).exists(), eval_path
 
 
+def test_provider_agent_cards_declare_extraction_and_workspace_live_gates() -> None:
+    research = AGENT_REGISTRY["business_research_analyst"]
+    workspace = AGENT_REGISTRY["google_workspace_context_agent"]
+
+    assert "live_extraction=true" in research.live_flags_required
+    assert "KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true" in research.live_flags_required
+    assert any("public HTTP(S) only" in note for note in research.safety_notes)
+    assert {
+        "KEYSTONE_GOOGLE_WORKSPACE_LIVE_READS=true",
+        "GOOGLE_WORKSPACE_WRITES_ENABLED=true",
+        "approval_reference",
+    } <= set(workspace.live_flags_required)
+
+
 def test_source_layer_policy_separates_local_hosted_and_public_search() -> None:
     policy = source_layer_policy_for_tools(
         (
@@ -218,21 +240,21 @@ def test_source_layer_policy_separates_local_hosted_and_public_search() -> None:
     assert "current public facts" in " ".join(
         str(item) for item in by_layer["public_web_search"]["use_for"]
     )
-    assert "latest user question" in str(
-        by_layer["local_kni_documents"]["reasoning_contract"]
-    )
+    assert "latest user question" in str(by_layer["local_kni_documents"]["reasoning_contract"])
     assert "organizer" in str(by_layer["local_kni_documents"]["reasoning_contract"])
-    assert "registered agent" in str(
-        by_layer["local_kni_documents"]["reasoning_contract"]
-    )
+    assert "registered agent" in str(by_layer["local_kni_documents"]["reasoning_contract"])
 
 
-def test_registered_builders_match_declared_schema_and_tools() -> None:
+def test_registered_builders_match_declared_schema_and_tools_bidirectionally() -> None:
     for spec in REGISTERED_AGENT_SPECS:
         agent = spec.build_agent()
+        attached_tools = _tool_names(agent)
+        declared_tools = set(spec.tools)
+        optional_tools = set(spec.optional_tools)
         assert isinstance(agent, Agent)
         assert agent.output_type is spec.resolve_output_schema()
-        assert set(spec.tools) <= _tool_names(agent)
+        assert attached_tools - optional_tools == declared_tools, spec.route_name
+        assert attached_tools <= declared_tools | optional_tools, spec.route_name
         assert agent.handoff_description
         assert agent.input_guardrails
         assert agent.output_guardrails
@@ -280,7 +302,9 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
         "google_drive_list_folder",
         "google_drive_search_files",
         "google_drive_get_file_metadata",
+        "google_drive_media_ocr_read",
         "google_slide_deck_read",
+        "google_slide_deck_write",
         "presentation_search_local",
         "presentation_read_local",
         "presentation_extract_slide_copy_local",
@@ -328,13 +352,29 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
         "google_sheet_update_row",
     } <= zotero_tool_names
     assert disallowed_tool_names("airtable_context_agent", sorted(airtable_tool_names)) == []
-    assert disallowed_tool_names(
-        "google_workspace_context_agent",
-        sorted(workspace_tool_names),
-    ) == []
+    assert (
+        disallowed_tool_names(
+            "google_workspace_context_agent",
+            sorted(workspace_tool_names),
+        )
+        == []
+    )
     assert disallowed_tool_names("zotero_context_agent", sorted(zotero_tool_names)) == []
-    assert rss_tool_names == {"retrieve_rss_announcement_history"}
-    assert preprints_tool_names == {"retrieve_preprint_announcement_history"}
+    signal_lifecycle_tools = {
+        "inspect_signal_lifecycle",
+        "prepare_signal_lifecycle_checkpoint",
+        "advance_signal_lifecycle_checkpoint",
+    }
+    assert rss_tool_names == {
+        "retrieve_rss_announcement_history",
+        "read_rss_announcement_evidence",
+        *signal_lifecycle_tools,
+    }
+    assert preprints_tool_names == {
+        "retrieve_preprint_announcement_history",
+        "read_preprint_announcement_evidence",
+        *signal_lifecycle_tools,
+    }
     assert disallowed_tool_names("rss_context_agent", sorted(rss_tool_names)) == []
     assert disallowed_tool_names("preprints_context_agent", sorted(preprints_tool_names)) == []
     assert tool_tier_for_name("airtable_write_record") == ToolTier.INTERNAL_WRITE
@@ -361,7 +401,12 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
     assert tool_tier_for_name("zotero_write_test_item") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("zotero_delete_test_item") == ToolTier.INTERNAL_WRITE
     assert tool_tier_for_name("retrieve_rss_announcement_history") == ToolTier.CORE_READ
+    assert tool_tier_for_name("read_rss_announcement_evidence") == ToolTier.CORE_READ
     assert tool_tier_for_name("retrieve_preprint_announcement_history") == ToolTier.CORE_READ
+    assert tool_tier_for_name("read_preprint_announcement_evidence") == ToolTier.CORE_READ
+    assert tool_tier_for_name("inspect_signal_lifecycle") == ToolTier.CORE_READ
+    assert tool_tier_for_name("prepare_signal_lifecycle_checkpoint") == ToolTier.INTERNAL_WRITE
+    assert tool_tier_for_name("advance_signal_lifecycle_checkpoint") == ToolTier.INTERNAL_WRITE
 
     nested_airtable = AGENT_REGISTRY["airtable_context_agent"].build_agent(
         tool_tier=ToolTier.DIAGNOSTIC
@@ -372,9 +417,7 @@ def test_context_agents_support_direct_writes_but_nested_tier_is_advisory() -> N
     nested_zotero = AGENT_REGISTRY["zotero_context_agent"].build_agent(
         tool_tier=ToolTier.DIAGNOSTIC
     )
-    nested_rss = AGENT_REGISTRY["rss_context_agent"].build_agent(
-        tool_tier=ToolTier.DIAGNOSTIC
-    )
+    nested_rss = AGENT_REGISTRY["rss_context_agent"].build_agent(tool_tier=ToolTier.DIAGNOSTIC)
     nested_preprints = AGENT_REGISTRY["preprints_context_agent"].build_agent(
         tool_tier=ToolTier.DIAGNOSTIC
     )
@@ -405,6 +448,15 @@ def test_build_model_settings_defaults_to_usage_and_prompt_cache(monkeypatch) ->
 
     assert getattr(settings, "include_usage", None) is True
     assert getattr(settings, "prompt_cache_retention", None) == "24h"
+
+
+def test_build_model_settings_preserves_bounded_initial_tool_choice(monkeypatch) -> None:
+    monkeypatch.delenv("KEYSTONE_SDK_INCLUDE_USAGE", raising=False)
+    monkeypatch.delenv("KEYSTONE_SDK_PROMPT_CACHE_RETENTION", raising=False)
+
+    settings = build_model_settings(tool_choice="query_gmail_message_summaries")
+
+    assert settings.tool_choice == "query_gmail_message_summaries"
 
 
 def test_build_sdk_agent_applies_cache_friendly_defaults(monkeypatch) -> None:
@@ -501,9 +553,44 @@ def test_tool_tiers_keep_search_and_write_surfaces_separate() -> None:
 
 def test_search_heavy_agent_builders_support_tiered_tool_attachment() -> None:
     research_core = build_business_research_analyst_research_brief_agent(tool_tier="core_read")
-    research_deep = build_business_research_analyst_research_brief_agent(tool_tier="deep_retrieval")
-    scout_web = build_opportunity_scout_agent(tool_tier="web_search")
-    scout_diagnostic = build_opportunity_scout_agent(tool_tier="diagnostic")
+    research_deep = build_business_research_analyst_research_brief_agent(
+        tool_tier="deep_retrieval",
+        manual_request_plan={
+            "source": "canonical:test",
+            "target_agent": "business_research_analyst",
+            "intent": "research_brief",
+            "requires_live_search": True,
+            "ask_shape": {
+                "evidence_depth": "deep",
+                "permission_state": "read_only",
+            },
+        },
+    )
+    scout_web = build_opportunity_scout_agent(
+        tool_tier="web_search",
+        manual_request_plan={
+            "source": "canonical:test",
+            "target_agent": "opportunity_scout",
+            "intent": "opportunity_search",
+            "requires_live_search": True,
+            "ask_shape": {
+                "evidence_depth": "standard",
+                "permission_state": "read_only",
+            },
+        },
+    )
+    scout_diagnostic = build_opportunity_scout_agent(
+        tool_tier="diagnostic",
+        manual_request_plan={
+            "source": "canonical",
+            "target_agent": "opportunity_scout",
+            "intent": "browser_diagnostics",
+            "ask_shape": {
+                "evidence_depth": "deep",
+                "permission_state": "read_only",
+            },
+        },
+    )
 
     research_core_tools = _tool_names(research_core)
     research_deep_tools = _tool_names(research_deep)
@@ -556,7 +643,7 @@ def test_registered_agent_static_prefix_fingerprints_are_stable(monkeypatch) -> 
 
         assert (
             _static_prefix_fingerprint(first_agent) == STATIC_PREFIX_FINGERPRINTS[spec.route_name]
-        )
+        ), spec.route_name
         assert _static_prefix_fingerprint(first_agent) == _static_prefix_fingerprint(second_agent)
         assert _ordered_tool_names(first_agent) == _ordered_tool_names(second_agent)
         assert "<!-- repo_runtime_policy.md -->" in str(first_agent.instructions)
@@ -594,6 +681,31 @@ def test_context_agents_have_compact_direct_instruction_profiles(
     assert f"<!-- {source_prompt} -->" in compact_text
     assert "<!-- tools.md -->" not in compact_text
     assert "<!-- slack-posting-rules.md -->" not in compact_text
+
+
+@pytest.mark.parametrize(
+    "route",
+    ["rss_context_agent", "preprints_context_agent"],
+)
+def test_signal_context_instructions_allow_only_bounded_empty_result_reformulation(
+    route: str,
+) -> None:
+    instructions = str(
+        AGENT_REGISTRY[route].build_agent(
+            request_text="Review bounded saved history.",
+            tool_tier="core_read",
+            compact_instructions=True,
+        ).instructions
+    )
+
+    assert "one changed" in instructions
+    assert "same approved history source" in instructions or (
+        "same already-authorized source" in instructions
+    )
+    assert "original operator request" in instructions
+    assert "abbreviation expansion" in instructions
+    assert "Do not use an empty query" in instructions
+    assert "yourself exactly once" not in instructions
 
 
 def test_direct_zotero_read_catalog_is_request_scoped() -> None:
@@ -668,9 +780,7 @@ def test_direct_zotero_write_catalog_preserves_native_mutation_boundary() -> Non
         compact_instructions=True,
     )
     test_lifecycle = AGENT_REGISTRY["zotero_context_agent"].build_agent(
-        request_text=(
-            "Create, revise, and remove one marked KBA_TEST_NOTE Zotero note lifecycle."
-        ),
+        request_text=("Create, revise, and remove one marked KBA_TEST_NOTE Zotero note lifecycle."),
         tool_tier="internal_write",
         compact_instructions=True,
     )
@@ -681,11 +791,7 @@ def test_direct_zotero_write_catalog_preserves_native_mutation_boundary() -> Non
         "zotero_read_item_children",
     }
     assert "zotero_write_test_note" not in _tool_names(ordinary_note)
-    assert _tool_names(test_lifecycle) == {
-        "zotero_read_api_metadata",
-        "zotero_read_item_children",
-        "zotero_test_note_lifecycle",
-    }
+    assert _tool_names(test_lifecycle) == {"zotero_test_note_lifecycle"}
 
 
 def test_orchestrator_registry_declares_read_only_specialist_tools() -> None:
@@ -711,7 +817,9 @@ def test_chief_of_staff_registry_declares_all_specialist_tools() -> None:
     policy = tool_policy_for_agent("chief_of_staff")
     agent = spec.build_agent(include_specialist_tools=True)
     generated_tool_names = {
-        specialist_agent_tool_name(specialist.route_name) for specialist in SPECIALIST_AGENT_SPECS
+        specialist_agent_tool_name(specialist.route_name)
+        for specialist in SPECIALIST_AGENT_SPECS
+        if specialist.route_name != "rag_retrieval_specialist"
     }
     tool_names = _tool_names(agent)
 
@@ -802,9 +910,7 @@ def test_orchestrator_handoff_specs_expose_typed_contracts() -> None:
         ".ZoteroContextResult"
     )
     assert handoffs["rss_context_agent"].output_schema.endswith(".RssContextResult")
-    assert handoffs["preprints_context_agent"].output_schema.endswith(
-        ".PreprintsContextResult"
-    )
+    assert handoffs["preprints_context_agent"].output_schema.endswith(".PreprintsContextResult")
 
 
 def test_agent_cards_are_json_safe_extension_metadata() -> None:
@@ -853,9 +959,7 @@ def test_agent_cards_expose_sanitized_file_search_runtime_status(
     )
 
     cards_by_route = {card["route_name"]: card for card in agent_cards()}
-    chief_status = cards_by_route["chief_of_staff"]["runtime_tool_availability"][
-        "file_search"
-    ]
+    chief_status = cards_by_route["chief_of_staff"]["runtime_tool_availability"]["file_search"]
     gmail_status = cards_by_route["gmail_triage"]["runtime_tool_availability"]
 
     assert chief_status["configured"] is True
@@ -881,3 +985,10 @@ def test_chief_of_staff_agent_card_exposes_local_kni_document_status() -> None:
     assert "local_kni_documents" in status
     assert status["local_kni_documents"]["local_only"] is True
     assert status["local_kni_documents"]["send_enabled"] is False
+
+
+def test_agent_cards_declare_the_runtime_catalog_prompt():
+    for card in agent_cards():
+        assert card["shared_runtime_prompt_files"] == ["runtime_capability_catalog.md"]
+        metadata = prompt_metadata_for_files(card["shared_runtime_prompt_files"])
+        assert metadata[0]["name"] == "runtime_capability_catalog"

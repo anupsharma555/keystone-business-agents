@@ -174,10 +174,13 @@ def test_sdk_session_from_args_honors_default_enabled_without_flags(
     ]
     assert os.environ[SDK_SESSIONS_ENABLED_ENV] == "true"
     assert os.environ[SDK_SESSION_HISTORY_LIMIT_ENV] == str(DEFAULT_SESSION_HISTORY_LIMIT)
-    monkeypatch.delenv(SDK_SESSIONS_ENABLED_ENV, raising=False)
-    monkeypatch.delenv(SDK_SESSION_ID_ENV, raising=False)
-    monkeypatch.delenv(SDK_SESSION_DB_ENV, raising=False)
-    monkeypatch.delenv(SDK_SESSION_HISTORY_LIMIT_ENV, raising=False)
+    for key in (
+        SDK_SESSIONS_ENABLED_ENV,
+        SDK_SESSION_ID_ENV,
+        SDK_SESSION_DB_ENV,
+        SDK_SESSION_HISTORY_LIMIT_ENV,
+    ):
+        os.environ.pop(key, None)
 
 
 def test_sdk_session_from_args_honors_explicit_history_limit(
@@ -221,10 +224,13 @@ def test_sdk_session_from_args_honors_explicit_history_limit(
     )
     assert calls == [(expected_id, db_path, 7)]
     assert os.environ[SDK_SESSION_HISTORY_LIMIT_ENV] == "7"
-    monkeypatch.delenv(SDK_SESSIONS_ENABLED_ENV, raising=False)
-    monkeypatch.delenv(SDK_SESSION_ID_ENV, raising=False)
-    monkeypatch.delenv(SDK_SESSION_DB_ENV, raising=False)
-    monkeypatch.delenv(SDK_SESSION_HISTORY_LIMIT_ENV, raising=False)
+    for key in (
+        SDK_SESSIONS_ENABLED_ENV,
+        SDK_SESSION_ID_ENV,
+        SDK_SESSION_DB_ENV,
+        SDK_SESSION_HISTORY_LIMIT_ENV,
+    ):
+        os.environ.pop(key, None)
 
 
 def test_work_item_records_sdk_session_metadata(tmp_path: Path) -> None:

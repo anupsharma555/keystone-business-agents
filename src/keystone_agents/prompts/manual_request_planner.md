@@ -287,8 +287,8 @@ Populate:
   2, 3, and 2 respectively. Keep it null when no ordinal was requested. Do not
   turn an ordinal provider selection into a web-search or general ranking task.
 - `zotero_requested_fields` for explicit Zotero output fields such as `title`,
-  `authors`, `publication_title`, `abstract`, `metadata`, `children`, or
-  `full_text`. Keep this empty for non-Zotero work.
+  `authors`, `publication_title`, `publication_date`, `doi`, `url`, `abstract`,
+  `metadata`, `children`, or `full_text`. Keep this empty for non-Zotero work.
 - `provider_read_scope=single_item` when a read targets one named or referenced
   provider object, such as one event, record, message, or document. Use
   `bounded_collection` when the requested answer requires a bounded provider
@@ -394,6 +394,14 @@ Populate:
   public prospecting or decision-maker discovery, which belongs to Business
   Research and may require web search. If Gmail access is explicitly forbidden,
   do not select Gmail and do not pretend the internal contact was verified.
+- When one provider is needed only to identify or ground an action owned by a
+  different provider, keep `provider_system` as the primary action provider and
+  add the source provider to `provider_context_requirements`. Requirements are
+  read-only (`search`, `read`, `verify`); they cannot grant mutations or choose
+  the final object for the specialist. For example, finding a Calendar meeting
+  and preparing a reply to its associated email has Gmail as the primary
+  provider plus a read-only Google Calendar event context requirement. Preserve
+  the complete raw request for both stages.
 - For outreach, fill `recipient`, `outreach_channel`, and `tone` when clear.
   Keep `requires_approved_context=true` for external copy. Use the internal
   Slack exception above only for operator-returned team copy grounded entirely

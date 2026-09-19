@@ -9,12 +9,19 @@ def _plan(
     target_agent: str,
     intent: str,
     provider_system: str = "google_calendar",
+    provider_operations: list[str] | None = None,
+    permission_state: str = "unspecified",
 ) -> ManualRequestPlan:
+    operations = provider_operations
+    if operations is None:
+        operations = ["create"] if intent == "business_system_write" else ["read"]
     return ManualRequestPlan(
         source="llm",
         target_agent=target_agent,
         intent=intent,
         provider_system=provider_system,
+        provider_operations=operations,
+        ask_shape={"permission_state": permission_state},
     )
 
 
@@ -78,6 +85,24 @@ def test_provider_wording_cannot_override_semantic_provider_identity() -> None:
             target_agent="chief_of_staff",
             intent="business_system_write",
             provider_system="airtable",
+        ),
+        allowed_agents={"chief_of_staff"},
+    )
+
+    assert admission.mode == "semantic_planning"
+    assert admission.positive_intent is False
+    assert admission.can_execute_provider_action is False
+
+
+def test_read_only_plan_cannot_admit_calendar_mutation() -> None:
+    admission = admit_provider_action(
+        provider="google_calendar",
+        provider_action_bound=True,
+        semantic_plan=_plan(
+            target_agent="chief_of_staff",
+            intent="business_system_write",
+            provider_operations=["create"],
+            permission_state="read_only",
         ),
         allowed_agents={"chief_of_staff"},
     )

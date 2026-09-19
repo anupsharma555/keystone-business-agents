@@ -1,0 +1,4 @@
+interface:
+  display_name: "KBA Propagate Agent Fixes"
+  short_description: "Propagate one diagnosed KBA fix across shared paths"
+  default_prompt: "Use $kba-propagate-agent-fixes to apply a diagnosed KBA fix across analogous agents, routes, and workflow seams."

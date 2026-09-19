@@ -61,3 +61,46 @@ def test_skill_selection_explains_route_trigger_and_context_reasons() -> None:
         for reason in reasons["evidence_attribution_and_claim_mapping"]
     )
     assert "context_flag:needs_workspace_artifact" in reasons["workspace_artifact_governance"]
+
+
+def test_optional_skills_do_not_activate_from_incidental_substrings_or_empty_field_names():
+    incidental = explain_agent_skill_selection(
+        "orchestrator", compact=True,
+        request_text=("Return an inspectable evidence-based summary of outcomes. "
+                      "attachment_metadata=[]; email_style_profile=''."),
+    )
+    assert "data_schema_mapping" not in incidental
+    assert "artifact_evidence_handling" not in incidental
+    assert "workflow_lifecycle_tracking" not in incidental
+    actual = explain_agent_skill_selection(
+        "orchestrator", compact=True,
+        request_text="Inspect the table fields and the attached statement.pdf.",
+    )
+    assert "data_schema_mapping" in actual
+    assert "artifact_evidence_handling" in actual
+
+
+def test_optional_search_skill_honors_negation_but_preserves_positive_contrast_and_core():
+    negated = explain_agent_skill_selection(
+        "orchestrator", request_text="Do not search the web; summarize the supplied email.",
+        compact=True,
+    )
+    assert "source_triage_decision" not in negated
+    positive = explain_agent_skill_selection(
+        "orchestrator", compact=True,
+        request_text="Do not search the web; instead search the supplied source candidates.",
+    )
+    assert "source_triage_decision" in positive
+    protected = explain_agent_skill_selection(
+        "gmail_triage", request_text="Do not send or change anything. Summarize the email.",
+    )
+    assert "context_permission_gating" in protected
+    assert "action_boundary_enforcement" in protected
+
+
+def test_verified_context_flags_still_activate_needed_skill_without_keyword():
+    selected = explain_agent_skill_selection(
+        "orchestrator", compact=True, request_text="Review the selected evidence.",
+        context_flags={"needs_artifact_evidence": True},
+    )
+    assert selected["artifact_evidence_handling"] == ("context_flag:needs_artifact_evidence",)

@@ -4,11 +4,13 @@ from keystone_agents.retrieval_policy import (
     HybridSearchProvider,
     RetrievalAutonomyHint,
     RetrievalQualityAssessment,
+    assess_company_search_quality,
     assess_opportunity_search_quality,
     build_provider_sequence,
     build_provider_use_ladder,
     coerce_retrieval_autonomy_hint,
     derive_request_autonomy_hint,
+    filter_company_search_results_for_entity,
 )
 from keystone_agents.schemas.retrieval import RetrievalHint
 from keystone_agents.tools.search_provider import (
@@ -41,6 +43,92 @@ def _assessment(
         reasons=reasons,
         missing_source_lanes=missing_source_lanes,
     )
+
+
+def test_company_entity_filter_excludes_single_word_name_collisions() -> None:
+    results = [
+        SearchResult(
+            title="Cartwheel school mental-health care",
+            link="https://www.cartwheel.org/",
+            snippet="School districts use Cartwheel for student mental-health care.",
+            source="agents-web-search",
+        ),
+        SearchResult(
+            title="Cartwheel student mental-health funding",
+            link="https://www.prnewswire.com/example-cartwheel-funding",
+            snippet="Cartwheel raised funding for school-based student mental-health services.",
+            source="agents-web-search",
+        ),
+        SearchResult(
+            title="Cartwheel Robotics",
+            link="https://www.linkedin.com/company/cartwheel-robotics",
+            snippet="A consumer robotics company.",
+            source="agents-web-search",
+        ),
+        SearchResult(
+            title="Cartwheel family first-aid products",
+            link="https://www.linkedin.com/company/go-cartwheel",
+            snippet="Non-toxic head-lice treatments for families.",
+            source="agents-web-search",
+        ),
+    ]
+
+    admitted = filter_company_search_results_for_entity(
+        results,
+        company_name="Cartwheel",
+        company_url="https://www.cartwheel.org",
+        request_text=(
+            "Look into Cartwheel's school-based mental-health work and find an outcome "
+            "and a district or payer partnership."
+        ),
+    )
+
+    assert [item.link for item in admitted] == [
+        "https://www.cartwheel.org/",
+        "https://www.prnewswire.com/example-cartwheel-funding",
+    ]
+
+
+def test_company_quality_escalates_after_off_target_name_collisions_are_removed() -> None:
+    assessment = assess_company_search_quality(
+        results=[
+            SearchResult(
+                title="Cartwheel school mental-health care",
+                link="https://www.cartwheel.org/",
+                snippet="Cartwheel provides school-based mental-health care.",
+                source="agents-web-search",
+            ),
+            SearchResult(
+                title="Cartwheel Robotics",
+                link="https://www.linkedin.com/company/cartwheel-robotics",
+                snippet="A consumer robotics company.",
+                source="agents-web-search",
+            ),
+            SearchResult(
+                title="Cartwheel family first-aid products",
+                link="https://www.linkedin.com/company/go-cartwheel",
+                snippet="Non-toxic head-lice treatments for families.",
+                source="agents-web-search",
+            ),
+            SearchResult(
+                title="Cart.com funding",
+                link="https://www.businesswire.com/example-cart-funding",
+                snippet="Commerce infrastructure funding news.",
+                source="agents-web-search",
+            ),
+        ],
+        company_name="Cartwheel",
+        company_url="https://www.cartwheel.org",
+        request_text=(
+            "Look into Cartwheel's school-based mental-health work and find an outcome "
+            "and a district or payer partnership."
+        ),
+        autonomy_hint=RetrievalAutonomyHint(source="test"),
+    )
+
+    assert assessment.result_count == 1
+    assert assessment.needs_precision_search is True
+    assert any("off-target" in reason for reason in assessment.reasons)
 
 
 def test_build_provider_sequence_defaults_to_searxng_only() -> None:
@@ -442,6 +530,45 @@ def test_hybrid_search_provider_can_fan_out_across_providers() -> None:
     assert [result.source for result in results] == ["searxng", "serper"]
     assert telemetry["parallel_provider_fanout"] is True
     assert telemetry["search_providers_used"] == ["searxng", "serper"]
+
+
+def test_parallel_provider_fanout_caps_the_model_visible_candidate_set() -> None:
+    class FakeProvider:
+        def __init__(self, source: str) -> None:
+            self.source = source
+
+        def search_web(self, query: str, num_results: int = 5) -> list[SearchResult]:
+            return [
+                SearchResult(
+                    title=f"{self.source} result {index}",
+                    link=f"https://{self.source}.example.test/{index}",
+                    snippet=f"{query} result {index}",
+                    source=self.source,
+                )
+                for index in range(num_results)
+            ]
+
+    provider = HybridSearchProvider(
+        provider_sequence=("searxng", "agents-web-search", "exa"),
+        autonomy_hint=RetrievalAutonomyHint(source="test"),
+        quality_assessor=lambda results, _query: _assessment(
+            result_count=len(results),
+            needs_precision_search=False,
+        ),
+        provider_factory=FakeProvider,
+        parallel_provider_fanout=True,
+    )
+
+    results = provider.search_web("one current accelerator", num_results=5)
+
+    assert len(results) == 5
+    assert len({result.link for result in results}) == 5
+    assert {result.source for result in results} == {
+        "searxng",
+        "agents-web-search",
+        "exa",
+    }
+    assert provider.collected_results() == results
 
 
 def test_hybrid_search_provider_keeps_parallel_optional_errors_nonfatal() -> None:

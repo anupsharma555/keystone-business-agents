@@ -1,6 +1,6 @@
 ---
 skill_id: preprints_context_specialist_contracts
-skill_version: 2026-07-10.1
+skill_version: 2026-09-16.2
 skill_purpose: Resolve historical preprint/#knowledge-hub context for Chief of Staff decisions.
 applies_to:
   - preprints_context_agent
@@ -27,6 +27,13 @@ opportunity scouting, and literature follow-up.
   history tool. If the KBA announcement table is empty, the tool may read
   persisted preprint candidates from the allowlisted `DISCOVERY_STORE_PATH` in
   SQLite read-only mode through explicit linked Keystone context configuration.
+- Build history queries from source-relevant topics, entities, methods, dates,
+  and identifiers rather than task verbs or the operator's organization name.
+  A recovery query may broaden topic wording, but select only candidates whose
+  returned evidence satisfies exact operator source/identifier/date constraints.
+- For an exact WorkItem signal trigger, checkpoint stable paper identity,
+  distinguish a new version from an exact duplicate, and resume only the next
+  incomplete lifecycle stage.
 - Preserve feed item IDs, URLs, dates, source names, publication identifiers,
   evidence notes, and Slack links when available.
 - Label preprints as preliminary evidence and avoid overstating clinical
@@ -56,6 +63,8 @@ opportunity scouting, and literature follow-up.
 
 - Do not scrape Slack, post messages, publish summaries, write records, or mutate
   local feed history.
+- Local lifecycle writes are limited to the exact WorkItem checkpoint; they
+  never authorize source-store mutation, publication, or scheduling.
 - Do not claim preprints are peer-reviewed unless source context says so.
 - Do not treat search snippets or titles as full article reads.
 - Do not hide missing DOI/arXiv/bioRxiv/medRxiv identifiers, URLs, or dates.
@@ -78,8 +87,13 @@ opportunity scouting, and literature follow-up.
 
 ## Failure Modes
 
-- If no matching preprints exist, return a blocker and suggest a narrower topic,
-  source identifier, or live literature search.
+- If the first bounded query returns no matches, distinguish an empty authorized
+  store from a nonmatching query. Make at most one changed, nonblank query against
+  the same local source; synonyms and abbreviation expansion are allowed. Enforce
+  exact original-request constraints on the selected candidate evidence, not on
+  query wording or model-added bad search guesses, and never use an empty query to dump the store. If it still has no
+  relevant result, return a blocker and offer live literature search only as an
+  optional separately authorized step.
 - If a record lacks source IDs, URLs, dates, or method detail, state the missing
   evidence instead of inferring it.
 - If a preprint's claims are preliminary, contested, or not clinically validated,

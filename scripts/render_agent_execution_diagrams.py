@@ -56,7 +56,7 @@ NODE_LABELS = {
     "__end__": "END",
     "normalize_request": "normalize_request\nPreserve raw ask + bounded context",
     "orchestrator_preflight": (
-        "orchestrator_preflight\nLLM interpretation, safe defaults, route advice"
+        "orchestrator_preflight\nAgent-owned route/workflow decision + safe defaults"
     ),
     "state_followup": "state_followup\nAnswer state-only follow-up or continue",
     "prepare_work_item": "prepare_work_item\nCanonical WorkItem + typed context pack",
@@ -64,13 +64,14 @@ NODE_LABELS = {
         node_name: f"{node_name}\n{description}"
         for node_name, description in CONTEXT_STAGE_LABELS.items()
     },
+    "run_rag_retrieval": "run_rag_retrieval\nRAG Retrieval Specialist",
     "run_business_research": "run_business_research\nBusiness Research Analyst",
     "run_opportunity_scout": "run_opportunity_scout\nOpportunity Scout",
     "run_gmail_triage": "run_gmail_triage\nGmail Triage",
     "run_outreach_composer": "run_outreach_composer\nOutreach Composer",
     "run_chief_of_staff": "run_chief_of_staff\nChief of Staff manager",
     "run_unsupported_route": "run_unsupported_route\nUseful blocker + next safe action",
-    "finalize_step": "finalize_step\nValidate result + update canonical state",
+    "finalize_step": "finalize_step\nValidate decision/tool evidence + update canonical state",
     "manager_loop_continue": "manager_loop_continue\nAdvance another planned stage",
     "manager_loop_finalize": "manager_loop_finalize\nCompose terminal graph result",
     "approval_checkpoint": "approval_checkpoint\nPause before gated next action",
@@ -143,374 +144,229 @@ def _registered_workflow_agent_names() -> tuple[str, ...]:
     )
 
 
-def _runtime_group_label(topology: RuntimeTopology, node_ids: tuple[str, ...]) -> str:
-    present = [node_id for node_id in node_ids if node_id in topology.nodes]
-    return "\n".join(present)
-
-
 def build_integrated_architecture_dot(
     topology: RuntimeTopology,
     *,
     generated_date: str,
 ) -> str:
-    """Return one readable overall map with an ordered execution backbone."""
+    """Return a compact conceptual request-to-answer overview."""
 
-    context_nodes = tuple(node for node in topology.nodes if node.startswith("stage_"))
-    specialist_nodes = tuple(node for node in topology.nodes if node.startswith("run_"))
-    expected_nodes = {
-        "__start__",
-        "__end__",
-        "normalize_request",
+    runtime_nodes = set(topology.nodes)
+    required_runtime_nodes = {
         "orchestrator_preflight",
-        "state_followup",
         "prepare_work_item",
         "finalize_step",
         "manager_loop_continue",
         "manager_loop_finalize",
         "approval_checkpoint",
-        *context_nodes,
-        *specialist_nodes,
+        "__end__",
     }
-    missing_nodes = expected_nodes - set(topology.nodes)
-    if missing_nodes:
+    missing_nodes = required_runtime_nodes - runtime_nodes
+    if missing_nodes or not any(node.startswith("stage_") for node in runtime_nodes):
+        missing = sorted(missing_nodes) or ["stage_* context nodes"]
         raise ValueError(
-            "Integrated architecture cannot summarize missing runtime nodes: "
-            + ", ".join(sorted(missing_nodes))
+            "Integrated overview cannot summarize the current runtime: "
+            + ", ".join(missing)
         )
 
-    registered_workflow = "\n".join(_registered_workflow_agent_names())
-    graph_control = (
-        "Preserve the raw ask\n"
-        "Orchestrator preflight\n"
-        "State-aware follow-up\n"
-        "(__start__ • normalize_request • orchestrator_preflight • state_followup)"
-    )
-    graph_context = (
-        "Stage only the evidence the request needs\n"
-        "feed/preprint • Airtable • Workspace • Zotero\n"
-        f"({_runtime_group_label(topology, context_nodes).replace(chr(10), ' • ')})"
-    )
-    graph_specialists = (
-        "Run the next owning agent\n"
-        "Research • Chief • Gmail • Opportunity • Outreach\n"
-        f"({_runtime_group_label(topology, specialist_nodes).replace(chr(10), ' • ')})"
-    )
-    graph_manager = (
-        "Continue the next planned stage\n"
-        "or finalize one reviewed result\n"
-        "(manager_loop_continue • manager_loop_finalize)"
-    )
-    context_purposes = {
-        "airtable_context_agent": "Base, table, field, and record evidence",
-        "google_workspace_context_agent": "Drive, Docs, and Sheets evidence",
-        "zotero_context_agent": "Library, collection, and item evidence",
-        "rss_context_agent": "Feed and article evidence",
-        "preprints_context_agent": "Preprint and article evidence",
-    }
-    context_catalog_rows: list[str] = []
-    for spec in SPECIALIST_AGENT_SPECS:
-        if spec.route_name in WORKFLOW_ROUTES:
-            continue
-        context_catalog_rows.append(
-            f"{spec.agent_name} — "
-            f"{context_purposes.get(spec.route_name, 'Read-only bounded evidence')}"
-        )
-    context_catalog = "\n".join(context_catalog_rows)
-
+    workflow_catalog = "\n".join(_registered_workflow_agent_names())
+    context_catalog = "\n".join(_registered_context_agent_names())
     lines = [
         "digraph kba_integrated_agent_architecture {",
-        '  graph [rankdir=TB, bgcolor="#f8fafc", pad="0.28", nodesep="0.34", '
-        'ranksep="0.58", splines=polyline, compound=true, newrank=true, '
-        'ratio="compress", '
-        'fontname="Arial", fontsize=21, labelloc=t, '
-        'label="Keystone Business Agents — one natural-language request, two execution shapes\\n'
-        f"Generated {generated_date} • numbered arrows show request order • "
-        "context staging can feed either path • "
-        f"graph branch derived from {len(topology.nodes)} compiled nodes / "
-        f'{len(topology.edges)} compiled edges"];',
+        '  graph [rankdir=TB, bgcolor="#f8fafc", pad="0.30", nodesep="0.42", '
+        'ranksep="0.62", splines=ortho, compound=true, newrank=true, '
+        'fontname="Arial", fontsize=22, labelloc=t, '
+        'label="Keystone Business Agents — clear conceptual overview\\n'
+        f'Generated {generated_date} • request → interpretation → selected path → '
+        'verified evidence → answer"];',
         '  node [shape=box, style="rounded,filled", color="#94a3b8", '
-        'fillcolor="#ffffff", fontname="Arial", fontsize=10, margin="0.15,0.10"];',
-        '  edge [color="#475569", fontcolor="#334155", fontname="Arial", '
-        'fontsize=9, penwidth=1.35, arrowsize=0.66];',
+        'fillcolor="#ffffff", fontname="Arial", fontsize=13, margin="0.20,0.14", '
+        'penwidth=1.6];',
+        '  edge [color="#475569", fontname="Arial", penwidth=1.8, arrowsize=0.78];',
         "",
-        "  subgraph cluster_intake {",
-        '    label="A — NATURAL-LANGUAGE CONTROL PLANE"; fontsize=15; '
-        'color="#fdba74"; fontcolor="#9a3412"; style="rounded,dashed";',
-        '    entry [label="1  Operator entry\\n@KNI CoS • direct agent mention\\n'
-        'Slack action • continuation • automation", fillcolor="#f1f5f9", '
-        'color="#64748b", width=2.7];',
-        '    payload [label="2  Preserve the request\\nRaw ask + bounded thread + saved '
-        'work identity\\npayload manifest • truncation • attachment proof", '
-        'fillcolor="#eff6ff", color="#2563eb", width=3.0];',
+        "  subgraph cluster_control {",
+        '    label="UNDERSTAND AND AUTHORIZE"; fontsize=15; color="#fdba74"; '
+        'fontcolor="#9a3412"; style="rounded,dashed"; margin=22;',
+        '    request [label="1  REQUEST\\nSlack • CLI • schedule\\nPreserve raw ask + '
+        'bounded context", fillcolor="#f1f5f9", color="#64748b", width=2.6];',
         (
-            f'    orchestrator [label="3  {ORCHESTRATOR_AGENT_SPEC.agent_name}\\n'
-            "Interpret the goal, likely owner, assumptions, and next safe action\\n"
-            'An agent mention is routing advice—not authority", fillcolor="#fff7ed", '
-            'color="#ea580c", penwidth=2.0, width=3.8];'
+            f'    orchestrator [label="2  {ORCHESTRATOR_AGENT_SPEC.agent_name.upper()}\\n'
+            'Interpret meaning • uncertainty\\nowner • constraints • safe defaults\\n'
+            'Agent mention is advice—not authority", fillcolor="#fff7ed", '
+            'color="#ea580c", penwidth=2.4, width=3.2];'
         ),
-        '    context_resolution [label="4  Resolve uncertainty intelligently\\nInfer safe '
-        'defaults • retrieve bounded context\\nask only about material ambiguity", '
-        'fillcolor="#fff7ed", color="#ea580c", width=3.3];',
-        '    gates [label="5  Set the safe execution envelope\\napproval • exact identity '
-        '• provider/live gates\\nsource sufficiency • exact write scope", '
-        'fillcolor="#fffbeb", color="#d97706", width=3.2];',
-        '    shape [shape=diamond, label="6  Execution shape?\\nBounded single owner\\n'
-        'or stateful / multi-owner", fillcolor="#eef2ff", color="#4f46e5", '
-        'width=2.6, height=1.05];',
-        "    { rank=same; entry; payload; orchestrator; }",
-        "    { rank=same; context_resolution; gates; shape; }",
+        '    gates [label="3  SAFE EXECUTION ENVELOPE\\napproval • identity • source '
+        'sufficiency\\nprovider/live scope • exact writes\\nmodel budget", '
+        'fillcolor="#fffbeb", color="#d97706", width=3.0];',
+        '    choose [shape=diamond, label="4  CHOOSE ONE PATH\\nBounded single owner\\n'
+        'or resumable / approval-dependent\\nambiguous / multi-owner", '
+        'fillcolor="#eef2ff", color="#4f46e5", width=3.0, height=1.3];',
+        "    { rank=same; request; orchestrator; gates; choose; }",
         "  }",
         "",
-        "  subgraph cluster_context_agents {",
-        '    label="OPTIONAL READ / CONTEXT STAGING — invoked only when the request '
-        'needs evidence"; fontsize=15; color="#7dd3fc"; fontcolor="#075985"; '
-        'style="rounded,dashed";',
+        "  subgraph cluster_paths {",
+        '    label="EXECUTION PATHS — CONTEXT OPTIONAL"; fontsize=15; '
+        'labeljust=r; color="#a5b4fc"; fontcolor="#3730a3"; '
+        'style="rounded,dashed"; margin=22;',
         (
-            '    context_catalog [label="Registered read/context specialists\\n'
+            f'    direct [label="5A  DIRECT / SINGLE OWNER\\nOwning specialist, or '
+            f'{CHIEF_OF_STAFF_AGENT_SPEC.agent_name}\\ndelegates one bounded task\\n'
+            'No graph implied", fillcolor="#ecfdf5", color="#16a34a", width=3.5];'
+        ),
+        (
+            '    workitem [label="5B  WORKITEM / OPTIONAL LANGGRAPH\\nSQLite business '
+            'state + typed context pack\\nChief / manager selects the next owner\\n'
+            'manager loop • approval pause • resume\\ngraph checkpoint proof is separate", '
+            'fillcolor="#f5f3ff", color="#7c3aed", penwidth=2.2, width=3.7];'
+        ),
+        (
+            '    context [label="OPTIONAL CONTEXT — ONLY WHEN NEEDED\\n'
             f'{_dot_quote(context_catalog)[1:-1]}\\n'
-            'Selected by meaning; stage evidence only", fillcolor="#f0f9ff", '
-            'color="#0284c7", width=5.4];'
+            'Bounded read evidence • model-visible\\nNo inherited write authority", '
+            'fillcolor="#f0f9ff", color="#0284c7", width=3.7];'
         ),
-        '    context_contract [label="Typed evidence packet\\nsource refs • schema • exact '
-        'object identity\\nconstraints • uncertainty • blockers", '
-        'fillcolor="#e0f2fe", color="#0284c7", penwidth=2.0, width=3.4];',
-        "    { rank=same; context_catalog; context_contract; }",
+        "    { rank=same; direct; workitem; context; }",
         "  }",
         "",
-        "  subgraph cluster_direct {",
-        '    label="B1 — DIRECT / BOUNDED SINGLE-OWNER"; fontsize=15; '
-        'color="#86efac"; fontcolor="#166534"; style="rounded,dashed";',
+        "  subgraph cluster_result {",
+        '    label="REASON → VERIFY → ANSWER"; fontsize=15; labeljust=l; '
+        'color="#86efac"; fontcolor="#166534"; style="rounded,dashed"; '
+        'margin=22;',
         (
-            f'    direct_owner [label="7A  One owner\\nDirect specialist, or '
-            f'{CHIEF_OF_STAFF_AGENT_SPEC.agent_name}\\ndelegates one bounded task", '
-            'fillcolor="#ecfdf5", color="#16a34a", width=3.0];'
+            '    specialist [label="6  SELECTED SPECIALIST REASONS\\n'
+            f'{_dot_quote(workflow_catalog)[1:-1]}\\n'
+            'Raw ask + Orchestrator memo + context", fillcolor="#ecfdf5", '
+            'color="#16a34a", width=3.6];'
         ),
-        (
-            '    direct_specialist [label="8A  Owning SDK specialist\\n'
-            f'{_dot_quote(registered_workflow)[1:-1]}\\n'
-            'or one registered context specialist", '
-            'fillcolor="#ecfdf5", color="#16a34a", width=3.0];'
-        ),
-        '    direct_tool [label="9A  Typed helper executes exact scope\\nread • query • '
-        'create • update\\nmarked cleanup • read-after-write", fillcolor="#ecfdf5", '
-        'color="#16a34a", width=3.0];',
+        '    evidence [label="7  EVIDENCE + TOOL BOUNDARY\\nAttached tools ≠ actual tool '
+        'calls\\nSDK tool call + output • workflow helper/read\\npre-acquired verified '
+        'context\\npermission • exact scope • read-back • receipt", '
+        'fillcolor="#eff6ff", color="#2563eb", width=3.8];',
+        '    review [label="8  RECONCILE\\nOrchestrator + deterministic review\\n'
+        'request coverage • receipt truth\\nsafe repair or useful blocker", '
+        'fillcolor="#fff7ed", color="#ea580c", width=3.2];',
+        '    answer [label="9  ONE ANSWER\\nSlack • CLI • artifact\\nResult first; '
+        'proof boundaries visible", fillcolor="#eff6ff", color="#2563eb", '
+        'penwidth=2.2, width=2.8];',
         "  }",
         "",
-        "  subgraph cluster_graph {",
-        '    label="B2 — WORKITEM / LANGGRAPH RUNTIME — stateful or multi-owner"; '
-        'fontsize=15; color="#a5b4fc"; fontcolor="#3730a3"; style="rounded,dashed";',
-        (
-            '    graph_control [label="7B  Request control\\n'
-            f'{_dot_quote(graph_control)[1:-1]}", '
-            'fillcolor="#fff7ed", color="#ea580c", width=2.6];'
-        ),
-        '    graph_workitem [label="8B  Canonical WorkItem\\nprepare_work_item • SQLite '
-        'state\\ntyped context pack + selected backend", fillcolor="#f5f3ff", '
-        'color="#7c3aed", penwidth=2.0, width=2.8];',
-        (
-            '    graph_context [label="9B  Graph context stages\\n'
-            f'{_dot_quote(graph_context)[1:-1]}", '
-            'fillcolor="#f0f9ff", color="#0284c7", width=2.8];'
-        ),
-        (
-            '    graph_agents [label="10B  Specialist branches\\n'
-            f'{_dot_quote(graph_specialists)[1:-1]}", '
-            'fillcolor="#ecfdf5", color="#16a34a", width=2.8];'
-        ),
-        '    graph_finalize [label="11B  finalize_step\\nValidate result + update canonical '
-        'state", fillcolor="#f5f3ff", color="#7c3aed", width=2.7];',
-        (
-            '    graph_manager [label="12B  Continue or finish\\n'
-            f'{_dot_quote(graph_manager)[1:-1]}", '
-            'fillcolor="#eef2ff", color="#4f46e5", width=2.7];'
-        ),
-        '    graph_approval [label="Approval branch\\napproval_checkpoint\\nPause at the '
-        'exact gated action", fillcolor="#fffbeb", color="#d97706", width=2.6];',
-        '    graph_end [label="Terminal branch\\n__end__ • reviewed WorkItem result", '
-        'shape=oval, fillcolor="#f1f5f9", color="#64748b", width=2.8];',
-        "    { rank=same; graph_control; graph_workitem; graph_context; }",
-        "    { rank=same; graph_agents; graph_finalize; graph_manager; }",
-        "    { rank=same; graph_approval; graph_end; }",
-        "  }",
-        "",
-        "  subgraph cluster_integrations {",
-        '    label="C — TOOLS, PROVIDERS, AND VERIFIED STATE"; fontsize=15; '
-        'color="#93c5fd"; fontcolor="#1e40af"; style="rounded,dashed";',
-        '    providers [label="Bounded provider integrations\\nCalendar • Gmail • Airtable '
-        '• Workspace • Zotero\\nSlack • search/extraction • local stores", '
-        'fillcolor="#eff6ff", color="#2563eb", width=3.4];',
-        '    receipt [label="13  Verified receipt\\nprovider ID • completed stages • '
-        'read-back\\npartial-success state • safe retry point", '
-        'fillcolor="#eff6ff", color="#2563eb", penwidth=2.0, width=3.4];',
-        "    { rank=same; providers; receipt; }",
-        "  }",
-        "",
-        "  subgraph cluster_output {",
-        '    label="D — REVIEW, RENDER, AND FEEDBACK"; fontsize=15; '
-        'color="#f9a8d4"; fontcolor="#9d174d"; style="rounded,dashed";',
-        '    review [label="14  Orchestrator / deterministic review\\nrequest coverage • '
-        'receipt truth • safety\\nuseful blocker or repair", '
-        'fillcolor="#fff7ed", color="#ea580c", width=3.3];',
-        '    render [label="15  One operator-facing answer\\nSlack thread • CLI • '
-        'artifact\\nresult first; metadata stays secondary", fillcolor="#eff6ff", '
-        'color="#2563eb", width=3.3];',
-        '    telemetry [label="Traces • logs • evals • audit\\nroute + tool + cost + '
-        'receipt linkage", fillcolor="#fdf2f8", color="#db2777", width=3.0];',
-        "    { rank=same; review; render; telemetry; }",
-        "  }",
-        "",
-        '  entry -> payload [label="1"];',
-        '  payload -> orchestrator [label="2"];',
-        '  orchestrator -> context_resolution [label="3"];',
-        '  context_resolution -> gates [label="4"];',
-        '  gates -> shape [label="5"];',
-        '  context_resolution -> context_catalog [label="optional bounded retrieval", '
-        'color="#0284c7", style=dashed, constraint=false];',
-        '  context_catalog -> context_contract [label="typed evidence", '
-        'color="#0284c7", arrowsize=0.60];',
-        "",
-        '  shape -> direct_owner [label="6A  direct", color="#16a34a"];',
-        '  direct_owner -> direct_specialist [label="7A", color="#16a34a"];',
-        '  context_contract -> direct_specialist [label="optional context", '
-        'color="#0284c7", style=dashed];',
-        '  direct_specialist -> direct_tool [label="8A", color="#16a34a"];',
-        '  direct_tool -> providers [label="9A  exact call", color="#16a34a"];',
-        "",
-        '  shape -> graph_control [label="6B  graph", color="#4f46e5"];',
-        '  graph_control -> graph_workitem [label="7B", color="#4f46e5"];',
-        '  graph_workitem -> graph_context [label="8B", color="#0284c7"];',
-        '  context_contract -> graph_context [label="typed context", '
-        'color="#0284c7", style=dashed];',
-        '  graph_context -> graph_agents [label="9B", color="#0284c7"];',
-        '  graph_agents -> graph_finalize [label="10B", color="#16a34a"];',
-        '  graph_finalize -> graph_manager [label="11B", color="#7c3aed"];',
-        '  graph_manager -> graph_workitem [label="next stage", color="#4f46e5", '
-        'constraint=false];',
-        '  graph_manager -> graph_approval [label="gated", color="#d97706"];',
-        '  graph_approval -> graph_workitem [label="resume", color="#d97706", '
-        'constraint=false];',
-        '  graph_manager -> graph_end [label="complete", color="#4f46e5"];',
-        '  graph_agents -> providers [label="typed calls", color="#16a34a"];',
-        "",
-        '  providers -> receipt [label="10A / provider state", color="#2563eb"];',
-        '  graph_end -> receipt [label="12B", color="#4f46e5"];',
-        '  receipt -> review [label="13"];',
-        '  review -> render [label="14"];',
-        '  render -> telemetry [label="15  same caller/thread", color="#db2777"];',
-        "  { rank=same; direct_owner; graph_control; }",
-        "  { rank=same; direct_tool; graph_end; graph_approval; }",
+        '  request -> orchestrator;',
+        '  orchestrator -> gates;',
+        '  gates -> choose;',
+        '  choose -> direct [color="#16a34a"];',
+        '  choose -> workitem [color="#4f46e5"];',
+        '  orchestrator -> context [color="#0284c7", style=dashed, constraint=false];',
+        '  direct -> specialist [color="#16a34a"];',
+        '  workitem -> specialist [color="#4f46e5"];',
+        '  workitem -> workitem [color="#7c3aed", constraint=false];',
+        '  context -> specialist [color="#0284c7", style=dashed];',
+        '  specialist -> evidence [color="#16a34a"];',
+        '  evidence -> review [color="#2563eb"];',
+        '  review -> answer;',
         "}",
     ]
     return "\n".join(lines) + "\n"
 
 
 def build_request_sequence_dot(*, generated_date: str) -> str:
-    """Return a numbered direct-versus-stateful request flow in DOT."""
+    """Return a compact left-to-right direct-versus-stateful request flow."""
 
     context_names = " • ".join(_registered_context_agent_names())
     workflow_names = " • ".join(_registered_workflow_agent_names())
     lines = [
         "digraph kba_request_execution_sequence {",
-        '  graph [rankdir=TB, bgcolor="#f8fafc", pad="0.35", nodesep="0.38", '
-        'ranksep="0.62", splines=polyline, fontname="Arial", fontsize=22, '
+        '  graph [rankdir=LR, bgcolor="#f8fafc", pad="0.30", nodesep="0.30", '
+        'ranksep="0.52", splines=ortho, newrank=true, fontname="Arial", fontsize=20, '
         'labelloc=t, label="Keystone @KNI request execution sequence\\n'
-        f"Generated {generated_date} • semantic interpretation first; "
-        'deterministic gates remain authoritative"];',
+        f"Generated {generated_date} • read left to right • semantic ownership and "
+        'execution shape are separate"];',
         '  node [shape=box, style="rounded,filled", color="#94a3b8", '
-        'fillcolor="#ffffff", fontname="Arial", fontsize=12, margin="0.16,0.10"];',
-        '  edge [color="#475569", fontcolor="#334155", fontname="Arial", '
-        'fontsize=10, penwidth=1.5, arrowsize=0.75];',
+        'fillcolor="#ffffff", fontname="Arial", fontsize=10, margin="0.15,0.10", '
+        'width=2.20];',
+        '  edge [color="#475569", fontname="Arial", penwidth=1.45, arrowsize=0.70];',
         "",
-        '  entry [label="Operator entry\\n@KNI CoS • direct agent ask • '
-        'Slack action • automation", '
-        'fillcolor="#f1f5f9", color="#64748b"];',
+        '  entry [label="1  Preserve the operator request\\nSlack • CLI • schedule\\n'
+        'raw ask + bounded context", fillcolor="#f1f5f9", color="#64748b"];',
         (
-            f'  interpret [label="{ORCHESTRATOR_AGENT_SPEC.agent_name} preflight\\n'
-            "Interpret the goal, preserve "
-            'wording, and treat an agent mention as routing advice", '
+            f'  interpret [label="2  {ORCHESTRATOR_AGENT_SPEC.agent_name}\\n'
+            'interpret meaning • uncertainty\\nowner • constraints • safe defaults\\n'
+            'agent mention = routing advice", '
             'fillcolor="#fff7ed", color="#ea580c", penwidth=2.0];'
         ),
         (
-            '  uncertainty [label="Resolve uncertainty intelligently\\nInfer safe defaults '
-            '→ retrieve bounded context → clarify only material ambiguity", '
-            'fillcolor="#fff7ed", color="#ea580c"];'
-        ),
-        (
-            '  gates [label="Deterministic policy gates\\nApproval • record identity • live '
-            'flags • exact write scope • source sufficiency", '
+            '  gates [label="3  Python validates the envelope\\nsafety • exact identity '
+            '• approval\\nprovider scope • source sufficiency\\nN+1 model call blocked before '
+            'dispatch", '
             'fillcolor="#fffbeb", color="#d97706"];'
         ),
         (
-            '  backend [shape=diamond, label="Execution shape?\\nBounded single owner or '
-            'stateful / multi-owner", fillcolor="#eef2ff", color="#4f46e5", '
-            'width=2.9, height=1.0];'
+            '  backend [shape=diamond, label="4  Choose execution shape\\nbounded '
+            'single owner\\nor resumable / approval-dependent\\nambiguous / multi-owner", '
+            'fillcolor="#eef2ff", color="#4f46e5", width=2.55, height=1.18];'
         ),
         "",
         "  subgraph cluster_direct {",
-        '    label="DIRECT / SINGLE-OWNER PATH"; color="#86efac"; '
+        '    label="A — DIRECT / SINGLE OWNER"; color="#86efac"; '
         'fontcolor="#166534"; style="rounded,dashed";',
         (
-            '    direct_owner [label="Owning SDK specialist\\nor Chief of Staff delegates '
-            f'one bounded task ({CHIEF_OF_STAFF_AGENT_SPEC.agent_name})", '
-            'fillcolor="#ecfdf5", color="#16a34a"];'
-        ),
-        (
-            '    direct_tool [label="Typed provider helper\\nRead / query / scoped write / '
-            'modify / marked test cleanup", fillcolor="#ecfdf5", color="#16a34a"];'
+            '    direct_owner [label="5A  Optional bounded context\\n6A  Owning specialist '
+            'reasons\\n'
+            f'{CHIEF_OF_STAFF_AGENT_SPEC.agent_name} may delegate\\none selected owner", '
+            'fillcolor="#ecfdf5", color="#16a34a", width=2.55];'
         ),
         "  }",
         "",
         "  subgraph cluster_stateful {",
-        '    label="WORKITEM / LANGGRAPH PATH"; color="#a5b4fc"; '
+        '    label="B — WORKITEM / OPTIONAL LANGGRAPH"; color="#a5b4fc"; '
         'fontcolor="#3730a3"; style="rounded,dashed";',
         (
-            '    workitem [label="Canonical WorkItem\\nSQLite state + selected backend + '
-            'typed context packs", fillcolor="#f5f3ff", color="#7c3aed"];'
-        ),
-        (
-            '    context [label="Read-only context staging\\n'
-            f'{_dot_quote(context_names)[1:-1]}", fillcolor="#f0f9ff", color="#0284c7"];'
-        ),
-        (
-            '    specialists [label="Specialist / Chief manager loop\\n'
-            f'{_dot_quote(workflow_names)[1:-1]}", fillcolor="#ecfdf5", color="#16a34a"];'
-        ),
-        (
-            '    checkpoint [label="Approval checkpoint when required\\nPause, block, or '
-            'resume the exact next action", fillcolor="#fffbeb", color="#d97706"];'
+            '    graph_owner [label="5B  Canonical WorkItem + context pack\\n'
+            'SQLite business state ≠ graph checkpoint proof\\n'
+            '6B  Chief / manager + owning specialist\\n'
+            'loop or approval checkpoint when required", '
+            'fillcolor="#f5f3ff", color="#7c3aed", width=3.05];'
         ),
         "  }",
         "",
         (
-            '  receipt [label="Verified provider or workflow receipt\\nRead-back and exact '
-            'outcome override speculative completion prose", '
-            'fillcolor="#eff6ff", color="#2563eb"];'
+            '  context_catalog [shape=note, label="5  Context specialists stage typed '
+            'evidence only when needed in A or B\\n'
+            f'{_dot_quote(context_names)[1:-1]}\\n'
+            'model-visible evidence • no inherited write authority", '
+            'fillcolor="#f0f9ff", color="#0284c7", width=3.2];'
         ),
         (
-            '  review [label="Orchestrator / deterministic output review\\nCheck request '
-            'coverage, blockers, safety, and receipt truth", '
-            'fillcolor="#fff7ed", color="#ea580c"];'
+            '  specialist_catalog [shape=note, label="Registered workflow owners used by A or B\\n'
+            f'{_dot_quote(workflow_names)[1:-1]}", fillcolor="#ecfdf5", '
+            'color="#16a34a", width=3.0];'
         ),
         (
-            '  render [label="Operator-facing result\\nSlack / CLI / artifact renderer shows '
-            'what happened and what remains", fillcolor="#eff6ff", color="#2563eb"];'
+            '  provider [label="7  Provider / tool result\\nexact admitted permission + '
+            'read-back\\n'
+            'model call • SDK tool call • helper\\npre-acquired context stay distinct", '
+            'fillcolor="#eff6ff", color="#2563eb", width=2.75];'
+        ),
+        (
+            '  review [label="8  Reconcile decision + receipt\\nOrchestrator / deterministic '
+            'review\\nperformed • not performed • unknown", '
+            'fillcolor="#fff7ed", color="#ea580c", width=2.50];'
+        ),
+        (
+            '  render [label="9  Render one answer\\nSlack • CLI • artifact\\n'
+            'result first; metadata secondary", fillcolor="#eff6ff", '
+            'color="#2563eb", width=2.25];'
         ),
         "",
-        '  entry -> interpret [label="1  raw request + bounded context"];',
-        '  interpret -> uncertainty [label="2  semantic plan + assumptions"];',
-        '  uncertainty -> gates [label="3  resolved context or targeted blocker"];',
-        '  gates -> backend [label="4  safe execution envelope"];',
-        '  backend -> direct_owner [label="5A  bounded single owner", color="#16a34a"];',
-        '  direct_owner -> direct_tool [label="6A  exact operation", color="#16a34a"];',
-        '  direct_tool -> receipt [label="7A  read-back", color="#16a34a"];',
-        '  backend -> workitem [label="5B  stateful / multi-owner", color="#4f46e5"];',
-        '  workitem -> context [label="6B  stage only relevant context", color="#0284c7"];',
-        '  context -> specialists [label="7B  evidence handoff", color="#0284c7"];',
-        '  specialists -> checkpoint [label="8B  if next action is gated", color="#d97706"];',
-        '  specialists -> receipt [label="8B  completed safe step", color="#16a34a"];',
-        '  checkpoint -> receipt [label="9B  approved, blocked, or paused", color="#d97706"];',
-        '  receipt -> review [label="8A / 10B  structured result"];',
-        '  review -> render [label="9A / 11B  one reviewed answer"];',
+        '  entry -> interpret;',
+        '  interpret -> gates;',
+        '  gates -> backend;',
+        '  backend -> direct_owner [color="#16a34a"];',
+        '  backend -> graph_owner [color="#4f46e5"];',
+        '  direct_owner -> provider [color="#16a34a"];',
+        '  graph_owner -> provider [color="#4f46e5"];',
+        '  provider -> review;',
+        '  review -> render;',
+        '  { rank=same; direct_owner; graph_owner; context_catalog; specialist_catalog; }',
         "}",
     ]
     return "\n".join(lines) + "\n"
@@ -550,8 +406,16 @@ def _topology_edge_line(edge: RuntimeEdge) -> str:
         attrs["color"] = "#22c55e"
     if edge.source in {"finalize_step", "approval_checkpoint"}:
         attrs["color"] = "#d97706"
-    if edge.label:
-        attrs["label"] = edge.label
+    display_label = edge.label or {
+        ("finalize_step", "manager_loop_continue"): "continue",
+        ("manager_loop_continue", "prepare_work_item"): "next stage loop",
+        ("finalize_step", "manager_loop_finalize"): "finish",
+        ("manager_loop_finalize", "__end__"): "terminal",
+        ("finalize_step", "approval_checkpoint"): "approval required",
+        ("approval_checkpoint", "__end__"): "pause / resume boundary",
+    }.get((edge.source, edge.target), "")
+    if display_label:
+        attrs["label"] = display_label
     if edge.source == edge.target or (
         edge.source == "manager_loop_continue" and edge.target == "prepare_work_item"
     ):
@@ -604,34 +468,41 @@ def build_workitem_topology_dot(
         '  graph [rankdir=TB, bgcolor="#f8fafc", pad="0.35", nodesep="0.28", '
         'ranksep="0.58", splines=polyline, newrank=true, concentrate=true, '
         'fontname="Arial", fontsize=22, labelloc=t, '
-        'label="Executable KBA WorkItem / LangGraph topology\\n'
+        'label="Compiled executable KBA WorkItem / LangGraph topology\\n'
         f'Generated {generated_date} from build_work_item_langgraph().get_graph() • '
-        f'{len(topology.nodes)} nodes • {len(topology.edges)} edges"];',
+        f'{len(topology.nodes)} nodes • {len(topology.edges)} edges • '
+        'dashed = compiled conditional choice • context stages are conditional\\n'
+        'node presence does not imply named-route dispatch; display labels annotate '
+        'unchanged runtime edges"];',
         '  node [shape=box, style="rounded,filled", color="#94a3b8", '
         'fillcolor="#ffffff", fontname="Arial", fontsize=10, margin="0.12,0.08"];',
         '  edge [fontname="Arial", fontsize=8, arrowsize=0.55];',
         "",
         "  subgraph cluster_control {",
-        '    label="1 — REQUEST CONTROL + CANONICAL STATE"; color="#fdba74"; '
-        'fontcolor="#9a3412"; style="rounded,dashed";',
+        '    label="1 — CONTROL + WORKITEM STATE"; color="#fdba74"; '
+        'fontcolor="#9a3412"; fontsize=13; labeljust=l; margin=24; '
+        'style="rounded,dashed";',
         *(_dot_node(node, attrs=_node_style(node)) for node in control_nodes if node in node_set),
         "  }",
         "",
         "  subgraph cluster_context {",
-        '    label="2 — READ-ONLY CONTEXT STAGING"; color="#7dd3fc"; '
-        'fontcolor="#075985"; style="rounded,dashed";',
+        '    label="2 — CONTEXT STAGING"; color="#7dd3fc"; '
+        'fontcolor="#075985"; fontsize=13; labeljust=r; margin=24; '
+        'style="rounded,dashed";',
         *(_dot_node(node, attrs=_node_style(node)) for node in context_nodes),
         "  }",
         "",
         "  subgraph cluster_specialists {",
-        '    label="3 — SDK SPECIALISTS / CHIEF MANAGER"; color="#86efac"; '
-        'fontcolor="#166534"; style="rounded,dashed";',
+        '    label="3 — SPECIALISTS / CHIEF"; color="#86efac"; '
+        'fontcolor="#166534"; fontsize=13; labeljust=l; margin=24; '
+        'style="rounded,dashed";',
         *(_dot_node(node, attrs=_node_style(node)) for node in specialist_nodes),
         "  }",
         "",
         "  subgraph cluster_lifecycle {",
-        '    label="4 — FINALIZE, LOOP, OR CHECKPOINT"; color="#c4b5fd"; '
-        'fontcolor="#5b21b6"; style="rounded,dashed";',
+        '    label="4 — FINALIZE / LOOP / APPROVAL"; color="#c4b5fd"; '
+        'fontcolor="#5b21b6"; fontsize=13; labeljust=l; margin=24; '
+        'style="rounded,dashed";',
         *(
             _dot_node(node, attrs=_node_style(node))
             for node in lifecycle_nodes
@@ -645,7 +516,8 @@ def build_workitem_topology_dot(
                 "",
                 "  subgraph cluster_unclassified {",
                 '    label="UNCLASSIFIED RUNTIME NODES"; color="#fca5a5"; '
-                'fontcolor="#991b1b"; style="rounded,dashed";',
+                'fontcolor="#991b1b"; fontsize=14; labeljust=l; '
+                'style="rounded,dashed";',
                 *(_dot_node(node, attrs=_node_style(node)) for node in ungrouped),
                 "  }",
             ]
@@ -690,13 +562,31 @@ def _render_svg(dot_source: str, *, dot_binary: str) -> str:
     return svg.replace("<svg ", f"{marker}\n<svg ", 1)
 
 
+def _render_png(dot_source: str, *, dot_binary: str) -> bytes:
+    result = subprocess.run(
+        [dot_binary, "-Tpng"],
+        input=dot_source.encode("utf-8"),
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Graphviz PNG rendering failed with exit code "
+            f"{result.returncode}: {result.stderr.decode('utf-8', errors='replace').strip()}"
+        )
+    if not result.stdout.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise RuntimeError("Graphviz returned output without a PNG signature.")
+    return result.stdout
+
+
 def _write_diagram(
     output_dir: Path,
     *,
     stem: str,
     dot_source: str,
     dot_binary: str,
-) -> tuple[Path, Path]:
+    include_png: bool = False,
+) -> tuple[Path, ...]:
     dot_path = output_dir / f"{stem}.dot"
     svg_path = output_dir / f"{stem}.svg"
     dot_path.write_text(dot_source, encoding="utf-8")
@@ -704,7 +594,12 @@ def _write_diagram(
         _render_svg(dot_source, dot_binary=dot_binary),
         encoding="utf-8",
     )
-    return dot_path, svg_path
+    outputs: list[Path] = [dot_path, svg_path]
+    if include_png:
+        png_path = output_dir / f"{stem}.png"
+        png_path.write_bytes(_render_png(dot_source, dot_binary=dot_binary))
+        outputs.append(png_path)
+    return tuple(outputs)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -741,6 +636,7 @@ def main(argv: list[str] | None = None) -> int:
                 generated_date=args.generated_date,
             ),
             dot_binary=dot_binary,
+            include_png=True,
         ),
         *_write_diagram(
             output_dir,

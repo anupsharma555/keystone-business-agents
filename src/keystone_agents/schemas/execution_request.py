@@ -99,6 +99,11 @@ class DirectAgentResponseInput(BaseModel):
     selected_context: str = ""
     output_constraints: dict[str, Any] = Field(default_factory=dict)
 
+    @property
+    def raw_request(self) -> str:
+        """Expose only the authenticated operator request to attachment acquisition."""
+        return self.original_request
+
     def to_prompt(self) -> str:
         sections = [
             f"Selected agent: {self.requested_agent}",

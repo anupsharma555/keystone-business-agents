@@ -890,6 +890,51 @@
           "prompt": "@KNI CoS, keep this for revision. Northstar Care sells referral-navigation software but has no audited outcomes. Work out what is supported, choose the first validation gap, and draft one internal update. Stay within the note and don't use providers."
         }
       ]
+    },
+    {
+      "id": "rag_semantic_article_lookup",
+      "expected": {
+        "target_agent": "rag_retrieval_specialist",
+        "intent": "rag_retrieval",
+        "provider": "openai_vector_store",
+        "provider_operations": [
+          "read"
+        ],
+        "execution_shape": "direct_single_owner",
+        "side_effect_policy": "draft_or_read_only",
+        "primary_target": "clinician trust in clinical AI",
+        "target_type": "vector_store_corpus",
+        "task_objective": "corpus_retrieval",
+        "expected_artifact_type": "rag_retrieval_result",
+        "objective": "Find relevant articles in the configured vector store about clinician trust in clinical AI and ground the answer in retrieved evidence.",
+        "constraints": [
+          "configured vector store only",
+          "cite retrieved evidence",
+          "no corpus writes"
+        ]
+      },
+      "variants": [
+        {
+          "form": "direct imperative",
+          "prompt": "@KNI RAG retrieval specialist find articles in the configured vector store about clinician trust in clinical AI. Cite retrieved evidence and keep the corpus unchanged."
+        },
+        {
+          "form": "passive voice",
+          "prompt": "@KNI RAG retrieval specialist articles about clinician trust in clinical AI should be found in the configured vector store, with retrieved evidence cited and no corpus changes."
+        },
+        {
+          "form": "polite question",
+          "prompt": "@KNI RAG retrieval specialist could you look for the closest articles about clinician trust in clinical AI in our configured vector store? Cite the supporting passages and do not change anything."
+        },
+        {
+          "form": "partial article recollection",
+          "prompt": "@KNI RAG retrieval specialist I remember an article about clinician trust in clinical AI but not its title. Find the nearest matches in the configured vector store and cite what supports the match. Read only."
+        },
+        {
+          "form": "evidence gap framing",
+          "prompt": "@KNI RAG retrieval specialist is there evidence in the configured vector store about clinician trust in clinical AI? Cite retrieved passages, explain uncertainty if nothing matches, and keep this read-only."
+        }
+      ]
     }
   ]
 }

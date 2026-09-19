@@ -4,6 +4,10 @@ Start here when changing or operating the repository.
 
 ## Run Locally
 
+- `docs/KBA_V2_IMPLEMENTATION.md`: durable graph/direct execution, verification evidence,
+  and remaining operational acceptance.
+- `docs/KBA_V2_EXPERIMENTS.md`: seven controlled architecture and evidence experiments.
+- `docs/KBA_AGENTS_API_ASSESSMENT.md`: managed Agents API option and a bounded future pilot.
 - `README.md`: setup, dry-run commands, package overview.
 - `docs/RUNBOOK.md`: operator checklist for local and live-test workflows.
 - `docs/DEPLOYMENT.md`: live integration setup, rollback, cost controls, and operations.
@@ -18,7 +22,9 @@ Start here when changing or operating the repository.
 - `docs/ANU60_LIVE_SLACK_EVIDENCE_TEMPLATE.md`: copyable evidence template for
   filling the ANU-60 live Slack probe results after approval.
 - `docs/AGENT_CAPABILITY_BOUNDARIES.md`: ANU-193/194/124 Orchestrator and Chief
-  read/write/modify boundaries, agents-as-tools, durable handoff, graph selector,
+  read/write/modify boundaries, agent-owned decisions, tool-origin accounting,
+  bounded validation/recovery, agents-as-tools, cross-provider context, durable
+  handoff, current 11-agent route-level classification, graph selector,
   unresolved decisions, and test acceptance criteria.
 - `docs/BASIC_AGENT_EXECUTION_SMOKE_TASKS.md`: concise ANU-174 operator smoke
   queue with offline, live-read, and write-gated validation lanes.
@@ -77,9 +83,10 @@ Start here when changing or operating the repository.
   Chief of Staff `ask` runs and live WorkItems enable scoped sessions by
   default; other specialists require inherited context or explicit opt-in.
   `--sdk-session-id`, `--sdk-session-db`, and `--no-sdk-session` control it.
-- `--live-manual-plan`: optional LLM planning stage. The planner stores compact
-  route guidance while Orchestrator preflight reads the raw request and context
-  before specialists execute. Configure planner provider routing with
+- `--live-manual-plan`: optional comparison/evaluation stage for the standalone
+  LLM planner. `ManualRequestPlan` remains a compatibility and constraint
+  envelope, but planner output does not override an agent-owned semantic
+  decision or Python authority gate. Configure the experiment provider with
   `KEYSTONE_MANUAL_PLANNER_PROVIDER_POLICY`.
 - `work-items continue/show/timeline/select/approve-context`: state management
   commands for existing WorkItems.

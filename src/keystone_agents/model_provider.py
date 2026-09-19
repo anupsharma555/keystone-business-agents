@@ -30,10 +30,32 @@ KEYSTONE_GEMINI_FALLBACK_BASE_URL_ENV = "KEYSTONE_GEMINI_FALLBACK_BASE_URL"
 GEMINI_PROVIDER = "gemini"
 GEMINI_OPENAI_COMPAT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 SUPPORTED_PROVIDERS = frozenset({DEFAULT_PROVIDER, GEMINI_PROVIDER})
+# This reviewed price/reserve contract must not follow future operating defaults.
+CANARY_ACCEPTANCE_OPENAI_MODEL = "gpt-5.4-mini"
+CANARY_TERRA_MODEL = "gpt-5.6-terra"
+CANARY_LUNA_MODEL = "gpt-5.6-luna"
 OPENAI_COMPATIBLE_GATEWAY_PROVIDERS = frozenset({GEMINI_PROVIDER})
 MASKED_SECRET = "[masked]"
 FALSE_VALUES = {"", "0", "false", "no", "off"}
 TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def uses_terra_cache_controls(model: object) -> bool:
+    """Match the reviewed Terra model without changing any default model policy."""
+    return str(model or "").strip().lower() == CANARY_TERRA_MODEL
+
+
+def uses_gpt56_cache_controls(model: object) -> bool:
+    """Match reviewed Terra/Luna IDs without assuming compatibility of other aliases."""
+    return str(model or "").strip().lower() in {CANARY_TERRA_MODEL, CANARY_LUNA_MODEL}
+
+
+def gmail_selection_reasoning_effort(model_override: str | None = None) -> str | None:
+    """Give the audited mini model a bounded reasoning budget for mailbox selection."""
+    config = get_runtime_agent_model_config("gmail_triage", model_override=model_override)
+    if config.provider == "openai" and config.model == CANARY_ACCEPTANCE_OPENAI_MODEL:
+        return "low"
+    return None
 
 TRACE_METADATA_MAX_STRING_LENGTH = 200
 FORBIDDEN_TRACE_METADATA_KEY_TERMS = (

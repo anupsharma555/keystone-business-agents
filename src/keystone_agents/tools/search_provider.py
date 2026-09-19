@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from keystone_agents.config import load_settings
 from keystone_agents.guardrails import (
@@ -30,6 +31,18 @@ SERPER_NEWS_URL = "https://google.serper.dev/news"
 SERPER_IMAGES_URL = "https://google.serper.dev/images"
 EXA_SEARCH_PATH = "/search"
 DEFAULT_TIMEOUT_SECONDS = 10.0
+_TRACKING_QUERY_PARAMETERS = frozenset(
+    {
+        "dclid",
+        "fbclid",
+        "gbraid",
+        "gclid",
+        "mc_cid",
+        "mc_eid",
+        "msclkid",
+        "wbraid",
+    }
+)
 
 
 class SearchProviderName(StrEnum):
@@ -131,10 +144,54 @@ class SearchResult(BaseModel):
 
     title: str = Field(min_length=1)
     link: str = Field(min_length=1)
+    candidate_id: str = Field(default="", max_length=200)
     snippet: str = ""
     source: str = "search"
     date: str | None = None
     content: str | None = None
+
+    @model_validator(mode="after")
+    def populate_candidate_id(self) -> SearchResult:
+        """Expose one provider-agnostic identity to the model and validators."""
+
+        self.candidate_id = search_result_candidate_id(self.link)
+        return self
+
+
+def canonical_search_result_url(value: object) -> str:
+    """Canonicalize a public result URL for cross-provider candidate identity."""
+
+    raw = " ".join(str(value or "").strip().split())
+    if not raw:
+        return ""
+    parsed = urlsplit(raw)
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    if not scheme or not hostname:
+        return raw
+    port = parsed.port
+    default_port = (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    netloc = hostname if port is None or default_port else f"{hostname}:{port}"
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/") or "/"
+    query_pairs = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if not key.casefold().startswith("utm_")
+        and key.casefold() not in _TRACKING_QUERY_PARAMETERS
+    ]
+    return urlunsplit(
+        (scheme, netloc, path, urlencode(sorted(query_pairs), doseq=True), "")
+    )
+
+
+def search_result_candidate_id(value: object) -> str:
+    """Return a stable, model-visible identity derived from canonical URL."""
+
+    canonical_url = canonical_search_result_url(value)
+    digest = hashlib.sha256(canonical_url.encode("utf-8")).hexdigest()[:24]
+    return f"web-candidate:{digest}"
 
 
 class AgentsWebSearchResult(BaseModel):

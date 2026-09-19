@@ -766,6 +766,8 @@ def _request_coverage_required(manual_plan: dict[str, Any] | None) -> bool:
                 "scope",
                 "word_count_mode",
                 "word_count",
+                "minimum_words",
+                "maximum_words",
                 "sentence_count_mode",
                 "sentence_count",
                 "item_count_mode",

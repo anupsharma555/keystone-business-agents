@@ -181,6 +181,72 @@ def test_chief_nested_tool_input_restores_all_advisory_boundaries() -> None:
     } <= set(tool_input.side_effect_boundaries)
 
 
+def test_chief_failure_reconciliation_preserves_verified_airtable_write() -> None:
+    payload: dict[str, object] = {
+        "status": "failed",
+        "human_summary": "The model did not finish.",
+        "public_result": {
+            "status": "failed",
+            "title": "Business Agents Run Failed",
+            "text": "The model did not finish.",
+            "completion_confirmed": False,
+            "provider_write_attempted": False,
+        },
+    }
+    receipt = {
+        "status": "success",
+        "operation": "create_expense_from_receipt",
+        "tool_name": "airtable_create_expense_from_receipt",
+        "provider": "airtable",
+        "table": "Business Expenses",
+        "record_id": "recVerifiedExpense",
+        "provider_write": True,
+        "verification": {"passed": True},
+    }
+
+    chief_script._reconcile_verified_write_after_sdk_failure(
+        payload,
+        tool_receipts=[receipt],
+        sdk_failure={"failure_kind": "model_tool_turns_exhausted"},
+    )
+
+    assert payload["status"] == "partial"
+    assert payload["block_kind"] == "verified_provider_write_synthesis_incomplete"
+    assert "Do not repeat the write" in str(payload["human_summary"])
+    assert payload["request_cache"]["post_side_effect_reconciliation"][
+        "retry_mutation"
+    ] is False
+    assert payload["side_effects"]["external_write_performed"] is True
+    assert payload["side_effects"]["evidence_complete"] is True
+    assert payload["public_result"]["status"] == "partial"
+
+
+def test_chief_failure_reconciliation_ignores_unverified_write() -> None:
+    payload: dict[str, object] = {
+        "status": "failed",
+        "human_summary": "The provider result was not verified.",
+    }
+    receipt = {
+        "status": "partial",
+        "operation": "update",
+        "tool_name": "airtable_write_record",
+        "provider": "airtable",
+        "record_id": "recUnverifiedExpense",
+        "provider_write": True,
+        "verification": {"passed": False},
+    }
+
+    chief_script._reconcile_verified_write_after_sdk_failure(
+        payload,
+        tool_receipts=[receipt],
+        sdk_failure={"failure_kind": "provider_verification_failed"},
+    )
+
+    assert payload["status"] == "failed"
+    assert "request_cache" not in payload
+    assert "side_effects" not in payload
+
+
 def test_chief_schema_blocks_unscoped_post_and_direct_send() -> None:
     with pytest.raises(ValidationError):
         ChiefOfStaffResult(send_enabled=True)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from hashlib import sha256
 from typing import Any
 
@@ -24,6 +24,7 @@ RECOVERY_SAFE_RECEIPT_KEYS = {
     "file_id",
     "folder_id",
     "spreadsheet_id",
+    "presentation_id",
     "item_key",
     "collection_key",
     "message_id",
@@ -31,6 +32,7 @@ RECOVERY_SAFE_RECEIPT_KEYS = {
     "html_link",
     "provider_link",
     "provider_write",
+    "provider_mutated",
     "verification",
     "dry_run",
     "live",
@@ -70,6 +72,7 @@ JOURNAL_SAFE_RECEIPT_KEYS = {
     "file_id",
     "folder_id",
     "spreadsheet_id",
+    "presentation_id",
     "item_key",
     "collection_key",
     "message_id",
@@ -87,8 +90,13 @@ JOURNAL_SAFE_RECEIPT_KEYS = {
     "html_link",
     "provider_link",
     "provider_write",
+    "provider_mutated",
+    "provider_request_attempt_count",
+    "provider_request_success_count",
     "events",
     "verification",
+    "verified",
+    "complete",
     "send_enabled",
     "dry_run",
     "live",
@@ -102,6 +110,7 @@ OBJECT_ID_KEYS = (
     "file_id",
     "folder_id",
     "spreadsheet_id",
+    "presentation_id",
     "item_key",
     "collection_key",
     "message_id",
@@ -118,6 +127,9 @@ RECOVERY_IDENTITY_KEYS_BY_TOOL_OPERATION = {
     ),
     ("google_sheet_create", "create_sheet"): ("spreadsheet_id",),
     ("google_drive_create_folder", "create_folder"): ("folder_id",),
+    ("google_drive_rename_folder", "rename_folder"): ("folder_id",),
+    ("google_drive_remove_folder", "remove_folder"): ("folder_id",),
+    ("google_slide_deck_write", "write_slide_deck"): ("presentation_id",),
 }
 RECOVERY_IDENTITY_GUARDED_TOOLS = frozenset(
     tool_name for tool_name, _operation in RECOVERY_IDENTITY_KEYS_BY_TOOL_OPERATION
@@ -155,6 +167,31 @@ def payload_digest(payload: Mapping[str, Any]) -> str:
     return sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def identity_fingerprint(value: object) -> str:
+    """Hash one exact provider identity for trace-safe candidate binding."""
+
+    clean = " ".join(str(value or "").split())
+    return sha256(clean.encode("utf-8")).hexdigest() if clean else ""
+
+
+def identity_fingerprints(values: Any) -> list[str]:
+    """Return unique fingerprints for a bounded provider identity collection."""
+
+    if isinstance(values, str | bytes | bytearray) or isinstance(values, Mapping):
+        items = [values]
+    elif isinstance(values, Iterable):
+        items = list(values)[:100]
+    else:
+        items = [values]
+    return list(
+        dict.fromkeys(
+            fingerprint
+            for fingerprint in (identity_fingerprint(item) for item in items)
+            if fingerprint
+        )
+    )[:100]
+
+
 def normalize_tool_output_receipt(
     tool_name: str,
     output: Any,
@@ -167,6 +204,29 @@ def normalize_tool_output_receipt(
             parsed = json.loads(parsed)
         except json.JSONDecodeError:
             return None
+    if tool_name == "search_web" and isinstance(parsed, list | tuple):
+        items = list(parsed)[:100]
+        identities: list[object] = []
+        for item in items:
+            if hasattr(item, "model_dump"):
+                item = item.model_dump(mode="json")
+            if not isinstance(item, Mapping):
+                continue
+            identity = (
+                item.get("link")
+                or item.get("url")
+                or item.get("source_url")
+                or item.get("source_id")
+            )
+            if identity:
+                identities.append(identity)
+        return {
+            "status": "success" if items else "not_found",
+            "operation": "search",
+            "item_count": len(items),
+            "identity_fingerprints": identity_fingerprints(identities),
+            "tool_name": tool_name,
+        }
     if hasattr(parsed, "model_dump"):
         parsed = parsed.model_dump(mode="json")
     if not isinstance(parsed, Mapping):
@@ -238,6 +298,8 @@ def normalize_provider_mutation_receipt(
 
 __all__ = [
     "JOURNAL_SAFE_RECEIPT_KEYS",
+    "identity_fingerprint",
+    "identity_fingerprints",
     "OBJECT_ID_KEYS",
     "RECOVERY_IDENTITY_GUARDED_TOOLS",
     "RECOVERY_IDENTITY_KEYS_BY_TOOL_OPERATION",

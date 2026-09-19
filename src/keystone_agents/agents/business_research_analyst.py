@@ -6,10 +6,18 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse
 
+from keystone_agents.agent_decision_contracts import (
+    business_research_comparison_decision_contract,
+    business_research_context_decision_contract,
+    business_research_decision_contract,
+    supplied_research_brief_decision_contract,
+)
 from keystone_agents.agent_tool_policy import filter_tools_for_tier
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.business_research_analyst.context import (
     coerce_contact_context as _coerce_contact_context,
 )
@@ -18,6 +26,16 @@ from keystone_agents.business_research_analyst.context import (
 )
 from keystone_agents.business_research_analyst.context import (
     read_fixture_json as _read_fixture_json,
+)
+from keystone_agents.capabilities.tool_scope import (
+    ScopedToolAttachment,
+    ToolScopeMode,
+    attach_tool_scope_receipt,
+    default_tool_tier_for_request,
+    scope_tools_for_request,
+    tool_free_synthesis_attachment,
+    tool_scope_receipt_for_agent,
+    tool_scope_trace_metadata_for_agent,
 )
 from keystone_agents.company_research import (
     build_llm_ready_source_bundle,
@@ -37,8 +55,12 @@ from keystone_agents.models import (
     ResearchSDKInput,
     TypedAgentRunResult,
 )
-from keystone_agents.quality_budget import business_research_quality_budget
 from keystone_agents.run import run_typed_sdk_agent
+from keystone_agents.runtime.tool_call_budget import ToolCallBudgetContract
+from keystone_agents.runtime.tool_execution import (
+    ToolEvidenceGroup,
+    ToolExecutionContract,
+)
 from keystone_agents.schemas.company_profile import (
     DEFAULT_RESEARCH_DATA_POINT_KEYS,
     ClaimEvidenceRecord,
@@ -53,14 +75,19 @@ from keystone_agents.schemas.company_profile import (
 )
 from keystone_agents.schemas.contact_context import ContactRecord, CRMAccountContext
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
-from keystone_agents.schemas.research import ResearchBrief
+from keystone_agents.schemas.research import ResearchBrief, ResearchSourceCitation
+from keystone_agents.schemas.web_source import WebSourceAccess
+from keystone_agents.schemas.work_item import WorkItemSourceRef
 from keystone_agents.sdk import (
     Agent,
     build_sdk_agent,
     compose_direct_instructions,
     compose_instructions,
 )
-from keystone_agents.sdk_run_policy import resolve_sdk_turn_policy
+from keystone_agents.sdk_run_policy import (
+    resolve_sdk_tool_call_limit,
+    resolve_sdk_turn_policy,
+)
 from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
 from keystone_agents.source_enrichment import (
     dedupe_and_rank_source_records,
@@ -100,9 +127,96 @@ from keystone_agents.tools.storage_tool import (
     load_approved_crm_context,
 )
 from keystone_agents.tools.web_structuring_tool import structure_web_data_for_schema
+from keystone_agents.tools.website_extraction_tool import (
+    extract_selected_urls_to_source_bundle,
+    read_web_source_window,
+    scoped_web_source_read_tool,
+    selected_url_extraction_tools,
+)
+from keystone_agents.tools.work_item_source_tool import build_work_item_source_evidence_tool
 
 DEFAULT_CONTACT_FIXTURE = "sample_contact_curebase_approved"
 DEFAULT_CRM_CONTEXT_FIXTURE = "sample_crm_context_curebase"
+
+_BUSINESS_RESEARCH_REQUIRED_REQUEST_TOOLS = (
+    "search_web",
+    "extract_selected_urls_to_source_bundle",
+    "fetch_company_page",
+    "extract_research_claims_from_html",
+    "dedupe_and_rank_sources",
+    "build_source_bundle_for_synthesis",
+    "synthesize_company_profile_from_source_bundle",
+)
+
+
+def _required_business_research_tools_for_request(
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+    """Return only builder-owned helpers required by the validated request."""
+
+    plan = ExecutionIntentAuthority.from_value(manual_request_plan).plan
+    if (
+        plan is not None
+        and plan.expected_artifact_type == "source_summary"
+        and not plan.requires_live_search
+        and plan.ask_shape.permission_state == "read_only"
+        and plan.ask_shape.strict_filter_mode in {"exact", "strict"}
+    ):
+        return ("extract_selected_urls_to_source_bundle", "read_web_source_window")
+    return _BUSINESS_RESEARCH_REQUIRED_REQUEST_TOOLS
+
+
+def _business_research_tool_execution_contract(
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None,
+    *,
+    provider_retrieval_required: bool,
+    attach_tools: bool,
+) -> ToolExecutionContract | None:
+    del manual_request_plan
+    if not provider_retrieval_required or not attach_tools:
+        return None
+    return ToolExecutionContract.required(
+        ToolEvidenceGroup("current_public_research", ("search_web",)),
+        stage="business_research_current_evidence",
+    )
+
+
+def _scope_business_research_tools(
+    tools: list[Any],
+    *,
+    request_text: str,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None,
+    tool_tier: str | int | None,
+    tool_scope_mode: ToolScopeMode | str,
+) -> ScopedToolAttachment:
+    plan = ExecutionIntentAuthority.from_value(manual_request_plan).plan
+    exact_read_tools = ("extract_selected_urls_to_source_bundle", "read_web_source_window")
+    if (
+        plan is not None
+        and _required_business_research_tools_for_request(plan) == exact_read_tools
+        and any(getattr(tool, "name", "") == exact_read_tools[0] for tool in tools)
+    ):
+        # The validated plan owns the exact target. Do not enlarge it from
+        # URLs or old snapshot handles in prose, history, or tool arguments.
+        scoped_pair = dict(zip(
+            exact_read_tools, selected_url_extraction_tools([plan.primary_target]), strict=True,
+        ))
+        tools = [scoped_pair.get(getattr(tool, "name", ""), tool) for tool in tools]
+    resolved_mode = tool_scope_mode
+    if str(tool_scope_mode) == ToolScopeMode.AUTO.value and (
+        request_text or manual_request_plan is not None or tool_tier is not None
+    ):
+        resolved_mode = ToolScopeMode.REQUEST_SCOPED
+    return scope_tools_for_request(
+        "business_research_analyst",
+        tools,
+        manual_request_plan=manual_request_plan,
+        tool_tier=tool_tier,
+        mode=resolved_mode,
+        required_tool_names=_required_business_research_tools_for_request(
+            manual_request_plan
+        ),
+    )
 
 
 def _with_tool_name(func: Any) -> Any:
@@ -202,9 +316,7 @@ def build_company_research_queries(
     queries = [
         *lane_queries,
         *(
-            [
-                f"{normalized_company} {' '.join(request_focus_terms)} official"
-            ]
+            [f"{normalized_company} {' '.join(request_focus_terms)} official"]
             if request_focus_terms
             else []
         ),
@@ -516,6 +628,8 @@ def build_business_research_analyst_agent(
     tool_tier: str | int | None = None,
     attach_tools: bool = True,
     compact_instructions: bool = False,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
+    tool_scope_mode: ToolScopeMode | str = ToolScopeMode.AUTO,
 ) -> Agent:
     """Build the business research analyst agent."""
 
@@ -539,15 +653,18 @@ def build_business_research_analyst_agent(
         )
     )
     instructions = composer(*prompt_files, skill_files=skill_files)
-    return build_sdk_agent(
+    attachment = _scope_business_research_tools(
+        _business_research_analyst_company_profile_tools() if attach_tools else [],
+        request_text=request_text,
+        manual_request_plan=manual_request_plan,
+        tool_tier=tool_tier,
+        tool_scope_mode=tool_scope_mode,
+    )
+    agent = build_sdk_agent(
         name="business_research_analyst",
         instructions=instructions,
         output_type=CompanyProfile,
-        tools=(
-            _business_research_analyst_company_profile_tools(tool_tier=tool_tier)
-            if attach_tools
-            else []
-        ),
+        tools=(list(attachment.tools) if attach_tools else []),
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="business_research_analyst",
@@ -556,6 +673,7 @@ def build_business_research_analyst_agent(
             "with Keystone fit scoring."
         ),
     )
+    return attach_tool_scope_receipt(agent, attachment.scope)
 
 
 def _business_research_analyst_tools(*, tool_tier: str | int | None = None) -> list[Any]:
@@ -575,6 +693,8 @@ def _business_research_analyst_tools(*, tool_tier: str | int | None = None) -> l
             airtable_read_records,
             airtable_write_record,
             search_web,
+            extract_selected_urls_to_source_bundle,
+            read_web_source_window,
             fetch_company_page,
             extract_research_claims_from_html,
             structure_web_data_for_schema,
@@ -618,6 +738,8 @@ def _business_research_analyst_company_profile_tools(
             airtable_read_records,
             airtable_write_record,
             search_web,
+            extract_selected_urls_to_source_bundle,
+            read_web_source_window,
             fetch_company_page,
             extract_research_claims_from_html,
             structure_web_data_for_schema,
@@ -647,7 +769,10 @@ def build_business_research_analyst_focused_brief_agent(
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
     attach_tools: bool = True,
+    web_source_accesses: tuple[WebSourceAccess, ...] = (),
     compact_instructions: bool = False,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
+    tool_scope_mode: ToolScopeMode | str = ToolScopeMode.AUTO,
 ) -> Agent:
     """Build Business Research Analyst for BR-1 focused brief synthesis."""
 
@@ -658,9 +783,7 @@ def build_business_research_analyst_focused_brief_agent(
             include_all=include_all_skills,
             compact=compact_instructions,
         )
-        composer = (
-            compose_direct_instructions if compact_instructions else compose_instructions
-        )
+        composer = compose_direct_instructions if compact_instructions else compose_instructions
         prompt_files = (
             ("keystone_profile.md", "safety_policy.md", "business_research_analyst.md")
             if compact_instructions
@@ -685,11 +808,31 @@ def build_business_research_analyst_focused_brief_agent(
             ),
             shared_prompt_files=("memory_policy.md", "writing_style.md"),
         )
-    return build_sdk_agent(
+    attachment = (
+        _scope_business_research_tools(
+            _business_research_analyst_tools(),
+            request_text=request_text,
+            manual_request_plan=manual_request_plan,
+            tool_tier=tool_tier,
+            tool_scope_mode=tool_scope_mode,
+        )
+        if attach_tools
+        else tool_free_synthesis_attachment(
+            "business_research_analyst",
+            _business_research_analyst_tools(),
+        )
+    )
+    if not attach_tools and web_source_accesses:
+        attachment = _scope_business_research_tools(
+            [scoped_web_source_read_tool(web_source_accesses)],
+            request_text=request_text, manual_request_plan=manual_request_plan,
+            tool_tier=tool_tier, tool_scope_mode=tool_scope_mode,
+        )
+    agent = build_sdk_agent(
         name="business_research_analyst",
         instructions=instructions,
         output_type=CompanyResearchFocusedBrief,
-        tools=_business_research_analyst_tools(tool_tier=tool_tier) if attach_tools else [],
+        tools=list(attachment.tools),
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="business_research_analyst",
@@ -698,6 +841,7 @@ def build_business_research_analyst_focused_brief_agent(
             "partnership or advisory relevance."
         ),
     )
+    return attach_tool_scope_receipt(agent, attachment.scope)
 
 
 def build_business_research_analyst_comparison_agent(
@@ -708,6 +852,8 @@ def build_business_research_analyst_comparison_agent(
     tool_tier: str | int | None = None,
     attach_tools: bool = True,
     compact_instructions: bool = False,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
+    tool_scope_mode: ToolScopeMode | str = ToolScopeMode.AUTO,
 ) -> Agent:
     """Build Business Research Analyst for source-backed company comparison synthesis."""
 
@@ -730,11 +876,18 @@ def build_business_research_analyst_comparison_agent(
         )
     )
     instructions = composer(*prompt_files, skill_files=skill_files)
-    return build_sdk_agent(
+    attachment = _scope_business_research_tools(
+        _business_research_analyst_tools() if attach_tools else [],
+        request_text=request_text,
+        manual_request_plan=manual_request_plan,
+        tool_tier=tool_tier,
+        tool_scope_mode=tool_scope_mode,
+    )
+    agent = build_sdk_agent(
         name="business_research_analyst",
         instructions=instructions,
         output_type=CompanyResearchComparison,
-        tools=_business_research_analyst_tools(tool_tier=tool_tier) if attach_tools else [],
+        tools=list(attachment.tools) if attach_tools else [],
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="business_research_analyst",
@@ -743,6 +896,7 @@ def build_business_research_analyst_comparison_agent(
             "Keystone partnership, advisory, or outreach prioritization decisions."
         ),
     )
+    return attach_tool_scope_receipt(agent, attachment.scope)
 
 
 def build_business_research_analyst_research_brief_agent(
@@ -752,7 +906,11 @@ def build_business_research_analyst_research_brief_agent(
     include_all_skills: bool = False,
     tool_tier: str | int | None = None,
     attach_tools: bool = True,
+    web_source_accesses: tuple[WebSourceAccess, ...] = (),
+    source_evidence: tuple[WorkItemSourceRef, ...] = (),
     compact_instructions: bool = False,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
+    tool_scope_mode: ToolScopeMode | str = ToolScopeMode.AUTO,
 ) -> Agent:
     """Build the broader Business Research Analyst for non-company research briefs."""
 
@@ -775,15 +933,23 @@ def build_business_research_analyst_research_brief_agent(
         )
     )
     instructions = composer(*prompt_files, skill_files=skill_files)
-    return build_sdk_agent(
+    candidates = _business_research_analyst_tools() if attach_tools else []
+    if any(source.evidence_pages for source in source_evidence):
+        candidates.append(build_work_item_source_evidence_tool(source_evidence))
+    if not attach_tools and web_source_accesses:
+        candidates.append(scoped_web_source_read_tool(web_source_accesses))
+    attachment = _scope_business_research_tools(
+        candidates,
+        request_text=request_text,
+        manual_request_plan=manual_request_plan,
+        tool_tier=tool_tier,
+        tool_scope_mode=tool_scope_mode,
+    )
+    agent = build_sdk_agent(
         name="business_research_analyst",
         instructions=instructions,
         output_type=ResearchBrief,
-        tools=(
-            _business_research_analyst_tools(tool_tier=tool_tier)
-            if attach_tools
-            else []
-        ),
+        tools=list(attachment.tools),
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="business_research_analyst",
@@ -792,6 +958,32 @@ def build_business_research_analyst_research_brief_agent(
             "labs, people, topics, Zotero collections, and article collections."
         ),
     )
+    return attach_tool_scope_receipt(agent, attachment.scope)
+
+
+def _supplied_web_source_accesses(typed_input: Any) -> tuple[WebSourceAccess, ...]:
+    """Recover only exact source-bound handles present in the supplied SDK input."""
+    try:
+        packet = json.loads(getattr(typed_input, "source_context", "") or "{}")
+    except (TypeError, ValueError):
+        return ()
+    found: dict[tuple[str, str, str], WebSourceAccess] = {}
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            raw = value.get("web_source_access")
+            if isinstance(raw, Mapping):
+                access = WebSourceAccess.model_validate(raw)
+                if value.get("source_id") and value["source_id"] != access.source_id:
+                    raise ValueError("Web source access does not match its source identity.")
+                found[(access.source_id, access.selected_url, access.snapshot_sha256)] = access
+            for key, child in value.items():
+                if key != "web_source_access":
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+    visit(packet)
+    return tuple(found.values())
 
 
 def focused_brief_context_from_profile(profile: CompanyProfile) -> str:
@@ -822,6 +1014,9 @@ def focused_brief_context_from_profile(profile: CompanyProfile) -> str:
                 "url": source.url,
                 "source_type": source.source_type,
                 "supported_claims": source.supported_claims,
+                "evidence_excerpt": source.evidence_excerpt,
+                "web_source_access": (source.web_source_access.model_dump(mode="json")
+                                      if source.web_source_access else None),
                 "confidence": source.confidence,
             }
             for source in profile.sources
@@ -879,8 +1074,7 @@ def focused_brief_from_profile_fixture(
         customers=data_points.get("customer_segment", "Unknown from supplied sources."),
         traction_signals=" ".join(traction) or "Unknown from supplied sources.",
         leadership=leadership,
-        why_it_matters=profile.fit_summary
-        or "No source-backed Keystone fit inference supplied.",
+        why_it_matters=profile.fit_summary or "No source-backed Keystone fit inference supplied.",
         facts=[
             CompanyBriefFact(
                 text=claim.claim_text,
@@ -1070,38 +1264,73 @@ def run_business_research_analyst_sdk(
     manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
     attach_tools: bool = True,
     compact_instructions: bool = False,
+    provider_retrieval_required: bool | None = None,
 ) -> TypedAgentRunResult[CompanyProfile]:
     """Run Business Research Analyst through the typed SDK harness."""
 
-    resolved_tool_tier = tool_tier or _default_business_research_sdk_tool_tier(
-        typed_input,
-        live=live,
-        manual_request_plan=manual_request_plan,
+    plan = ExecutionIntentAuthority.from_value(manual_request_plan).plan
+    requires_provider_retrieval = (
+        bool(plan and plan.requires_live_search)
+        if provider_retrieval_required is None
+        else bool(provider_retrieval_required)
+    )
+    resolved_tool_tier = tool_tier or (
+        "deep_retrieval"
+        if requires_provider_retrieval
+        else _default_business_research_sdk_tool_tier(
+            typed_input,
+            live=live,
+            manual_request_plan=manual_request_plan,
+        )
     )
     typed_input_for_run = _with_runtime_source_layer_policy(typed_input)
     turn_policy = resolve_sdk_turn_policy(
         "business_research_analyst",
         request_text=skill_request_text(typed_input),
-        live_search=live,
+        live_search=live or requires_provider_retrieval,
         manual_request_plan=manual_request_plan,
         explicit_max_turns=max_turns,
     )
-    return run_typed_sdk_agent(
-        agent=build_business_research_analyst_agent(
-            model=model,
-            request_text=skill_request_text(typed_input),
-            context_flags=context_flags,
-            tool_tier=resolved_tool_tier,
-            attach_tools=attach_tools,
-            compact_instructions=compact_instructions,
-        ),
+    agent = build_business_research_analyst_agent(
+        model=model,
+        request_text=skill_request_text(typed_input),
+        context_flags=context_flags,
+        tool_tier=resolved_tool_tier,
+        attach_tools=attach_tools,
+        compact_instructions=compact_instructions,
+        manual_request_plan=manual_request_plan,
+        tool_scope_mode=ToolScopeMode.REQUEST_SCOPED,
+    )
+    scope_receipt = tool_scope_receipt_for_agent(agent)
+    result = run_typed_sdk_agent(
+        agent=agent,
         typed_input=typed_input_for_run,
         output_type=CompanyProfile,
         run_config=run_config,
         live=live,
         session=session,
         max_turns=turn_policy.max_turns,
+        tool_call_budget_contract=ToolCallBudgetContract(
+            max_total_calls=resolve_sdk_tool_call_limit(
+                "business_research_analyst",
+                request_text=skill_request_text(typed_input),
+                live_search=live or requires_provider_retrieval,
+                manual_request_plan=manual_request_plan,
+            ),
+            stage="business_research_current_evidence",
+        ),
+        trace_metadata=tool_scope_trace_metadata_for_agent(agent),
+        tool_execution_contract=_business_research_tool_execution_contract(
+            manual_request_plan,
+            provider_retrieval_required=requires_provider_retrieval,
+            attach_tools=attach_tools,
+        ),
+        decision_contract=business_research_decision_contract(),
     )
+    request_cache = getattr(result, "request_cache", None)
+    if isinstance(request_cache, dict):
+        request_cache["request_tool_scope"] = scope_receipt
+    return result
 
 
 def run_business_research_analyst_focused_brief_sdk(
@@ -1116,37 +1345,90 @@ def run_business_research_analyst_focused_brief_sdk(
     manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
     attach_tools: bool = True,
     compact_instructions: bool = False,
+    provider_retrieval_required: bool | None = None,
 ) -> TypedAgentRunResult[CompanyResearchFocusedBrief]:
     """Run Business Research Analyst through the SDK for a BR-1 focused brief."""
 
-    resolved_tool_tier = tool_tier or _default_business_research_sdk_tool_tier(
-        typed_input,
-        live=live,
-        manual_request_plan=manual_request_plan,
+    plan = ExecutionIntentAuthority.from_value(manual_request_plan).plan
+    requires_provider_retrieval = (
+        bool(plan and plan.requires_live_search)
+        if provider_retrieval_required is None
+        else bool(provider_retrieval_required)
+    )
+    resolved_tool_tier = tool_tier or (
+        "deep_retrieval"
+        if requires_provider_retrieval
+        else _default_business_research_sdk_tool_tier(
+            typed_input,
+            live=live,
+            manual_request_plan=manual_request_plan,
+        )
     )
     typed_input_for_run = _with_runtime_source_layer_policy(typed_input)
     turn_policy = resolve_sdk_turn_policy(
         "business_research_analyst",
         request_text=skill_request_text(typed_input),
-        live_search=live,
+        live_search=live or requires_provider_retrieval,
         manual_request_plan=manual_request_plan,
         explicit_max_turns=max_turns,
     )
-    return run_typed_sdk_agent(
-        agent=build_business_research_analyst_focused_brief_agent(
-            model=model,
-            request_text=skill_request_text(typed_input),
-            tool_tier=resolved_tool_tier,
-            attach_tools=attach_tools,
-            compact_instructions=compact_instructions,
-        ),
+    agent = build_business_research_analyst_focused_brief_agent(
+        model=model,
+        request_text=skill_request_text(typed_input),
+        tool_tier=resolved_tool_tier,
+        attach_tools=attach_tools,
+        web_source_accesses=_supplied_web_source_accesses(typed_input),
+        compact_instructions=compact_instructions,
+        manual_request_plan=manual_request_plan,
+        tool_scope_mode=ToolScopeMode.REQUEST_SCOPED,
+    )
+    supplied_citations = ()
+    if not attach_tools:
+        try:
+            packet = json.loads(getattr(typed_input, "source_context", "") or "{}")
+        except (TypeError, ValueError):
+            packet = {}
+        supplied_citations = tuple(
+            ResearchSourceCitation(
+                source_id=row["source_id"], title=row.get("title") or row["source_id"],
+                url=row["url"], source_type=row.get("source_type") or "",
+            )
+            for row in packet.get("sources", [])
+            if isinstance(row, Mapping) and row.get("source_id") and row.get("url")
+        ) if isinstance(packet, Mapping) else ()
+    scope_receipt = tool_scope_receipt_for_agent(agent)
+    result = run_typed_sdk_agent(
+        agent=agent,
         typed_input=typed_input_for_run,
         output_type=CompanyResearchFocusedBrief,
         run_config=run_config,
         live=live,
         session=session,
         max_turns=turn_policy.max_turns,
+        tool_call_budget_contract=ToolCallBudgetContract(
+            max_total_calls=resolve_sdk_tool_call_limit(
+                "business_research_analyst",
+                request_text=skill_request_text(typed_input),
+                live_search=live,
+                manual_request_plan=manual_request_plan,
+            ),
+            stage="business_research_focused_brief",
+        ),
+        trace_metadata=tool_scope_trace_metadata_for_agent(agent),
+        tool_execution_contract=_business_research_tool_execution_contract(
+            manual_request_plan,
+            provider_retrieval_required=requires_provider_retrieval,
+            attach_tools=attach_tools,
+        ),
+        decision_contract=(
+            business_research_context_decision_contract(SimpleNamespace(sources=supplied_citations))
+            if supplied_citations else business_research_decision_contract()
+        ),
     )
+    request_cache = getattr(result, "request_cache", None)
+    if isinstance(request_cache, dict):
+        request_cache["request_tool_scope"] = scope_receipt
+    return result
 
 
 def run_business_research_analyst_research_brief_sdk(
@@ -1161,37 +1443,159 @@ def run_business_research_analyst_research_brief_sdk(
     manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
     attach_tools: bool = True,
     compact_instructions: bool = False,
+    provider_retrieval_required: bool | None = None,
+    supplied_sources: tuple[Any, ...] | None = None,
+    source_evidence: tuple[WorkItemSourceRef, ...] = (),
 ) -> TypedAgentRunResult[ResearchBrief]:
     """Run the broader Business Research Analyst through the typed SDK harness."""
 
-    resolved_tool_tier = tool_tier or _default_business_research_sdk_tool_tier(
-        typed_input,
-        live=live,
-        manual_request_plan=manual_request_plan,
+    plan = ExecutionIntentAuthority.from_value(manual_request_plan).plan
+    requires_provider_retrieval = (
+        bool(plan and plan.requires_live_search)
+        if provider_retrieval_required is None
+        else bool(provider_retrieval_required)
+    )
+    resolved_tool_tier = tool_tier or (
+        "deep_retrieval"
+        if requires_provider_retrieval
+        else _default_business_research_sdk_tool_tier(
+            typed_input,
+            live=live,
+            manual_request_plan=manual_request_plan,
+        )
     )
     typed_input_for_run = _with_runtime_source_layer_policy(typed_input)
     turn_policy = resolve_sdk_turn_policy(
         "business_research_analyst",
         request_text=skill_request_text(typed_input),
-        live_search=live,
+        live_search=live or requires_provider_retrieval,
         manual_request_plan=manual_request_plan,
         explicit_max_turns=max_turns,
     )
-    return run_typed_sdk_agent(
-        agent=build_business_research_analyst_research_brief_agent(
-            model=model,
-            request_text=skill_request_text(typed_input),
-            tool_tier=resolved_tool_tier,
-            attach_tools=attach_tools,
-            compact_instructions=compact_instructions,
-        ),
+    agent = build_business_research_analyst_research_brief_agent(
+        model=model,
+        request_text=skill_request_text(typed_input),
+        tool_tier=resolved_tool_tier,
+        attach_tools=attach_tools,
+        web_source_accesses=_supplied_web_source_accesses(typed_input),
+        source_evidence=source_evidence,
+        compact_instructions=compact_instructions,
+        manual_request_plan=manual_request_plan,
+        tool_scope_mode=ToolScopeMode.REQUEST_SCOPED,
+    )
+    scope_receipt = tool_scope_receipt_for_agent(agent)
+    result = run_typed_sdk_agent(
+        agent=agent,
         typed_input=typed_input_for_run,
         output_type=ResearchBrief,
         run_config=run_config,
         live=live,
         session=session,
         max_turns=turn_policy.max_turns,
+        tool_call_budget_contract=ToolCallBudgetContract(
+            max_total_calls=resolve_sdk_tool_call_limit(
+                "business_research_analyst",
+                request_text=skill_request_text(typed_input),
+                live_search=live,
+                manual_request_plan=manual_request_plan,
+            ),
+            stage="business_research_source_comparison",
+        ),
+        trace_metadata=tool_scope_trace_metadata_for_agent(agent),
+        tool_execution_contract=_business_research_tool_execution_contract(
+            manual_request_plan,
+            provider_retrieval_required=requires_provider_retrieval,
+            attach_tools=attach_tools,
+        ),
+        decision_contract=(
+            supplied_research_brief_decision_contract(supplied_sources)
+            if supplied_sources is not None else business_research_decision_contract()
+        ),
     )
+    request_cache = getattr(result, "request_cache", None)
+    if isinstance(request_cache, dict):
+        request_cache["request_tool_scope"] = scope_receipt
+    return result
+
+
+def run_business_research_analyst_comparison_sdk(
+    typed_input: BusinessResearchComparisonSDKInput | str,
+    *,
+    run_config: object | None = None,
+    live: bool = False,
+    model: str | None = None,
+    session: Any | None = None,
+    tool_tier: str | int | None = None,
+    max_turns: int | None = None,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
+    attach_tools: bool = True,
+    compact_instructions: bool = False,
+    provider_retrieval_required: bool | None = None,
+) -> TypedAgentRunResult[CompanyResearchComparison]:
+    """Run an agent-owned, source-bound comparison in one SDK tool loop."""
+
+    plan = ExecutionIntentAuthority.from_value(manual_request_plan).plan
+    requires_provider_retrieval = (
+        bool(plan and plan.requires_live_search)
+        if provider_retrieval_required is None
+        else bool(provider_retrieval_required)
+    )
+    resolved_tool_tier = tool_tier or (
+        "deep_retrieval"
+        if requires_provider_retrieval
+        else _default_business_research_sdk_tool_tier(
+            typed_input,
+            live=live,
+            manual_request_plan=manual_request_plan,
+        )
+    )
+    typed_input_for_run = _with_runtime_source_layer_policy(typed_input)
+    turn_policy = resolve_sdk_turn_policy(
+        "business_research_analyst",
+        request_text=skill_request_text(typed_input),
+        live_search=live or requires_provider_retrieval,
+        manual_request_plan=manual_request_plan,
+        explicit_max_turns=max_turns,
+    )
+    agent = build_business_research_analyst_comparison_agent(
+        model=model,
+        request_text=skill_request_text(typed_input),
+        tool_tier=resolved_tool_tier,
+        attach_tools=attach_tools,
+        compact_instructions=compact_instructions,
+        manual_request_plan=manual_request_plan,
+        tool_scope_mode=ToolScopeMode.REQUEST_SCOPED,
+    )
+    scope_receipt = tool_scope_receipt_for_agent(agent)
+    result = run_typed_sdk_agent(
+        agent=agent,
+        typed_input=typed_input_for_run,
+        output_type=CompanyResearchComparison,
+        run_config=run_config,
+        live=live,
+        session=session,
+        max_turns=turn_policy.max_turns,
+        tool_call_budget_contract=ToolCallBudgetContract(
+            max_total_calls=resolve_sdk_tool_call_limit(
+                "business_research_analyst",
+                request_text=skill_request_text(typed_input),
+                live_search=live,
+                manual_request_plan=manual_request_plan,
+            ),
+            stage="business_research_target_comparison",
+        ),
+        trace_metadata=tool_scope_trace_metadata_for_agent(agent),
+        tool_execution_contract=_business_research_tool_execution_contract(
+            manual_request_plan,
+            provider_retrieval_required=requires_provider_retrieval,
+            attach_tools=attach_tools,
+        ),
+        decision_contract=business_research_comparison_decision_contract(),
+    )
+    request_cache = getattr(result, "request_cache", None)
+    if isinstance(request_cache, dict):
+        request_cache["request_tool_scope"] = scope_receipt
+    return result
 
 
 def _with_runtime_source_layer_policy(
@@ -1247,9 +1651,5 @@ def _default_business_research_sdk_tool_tier(
 ) -> str:
     """Infer a read-only tool tier for default Business Research SDK runs."""
 
-    budget = business_research_quality_budget(
-        request_text=skill_request_text(typed_input),
-        live_search=live,
-        manual_request_plan=manual_request_plan,
-    )
-    return budget.tool_tier or "core_read"
+    del typed_input, live
+    return default_tool_tier_for_request(manual_request_plan)

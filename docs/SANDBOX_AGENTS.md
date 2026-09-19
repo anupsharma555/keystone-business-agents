@@ -6,6 +6,15 @@ OpenAI Sandbox Agents are a future Keystone capability for workspace-centric rev
 
 Sandbox execution is not required for tests. The repository contains import-guarded scaffolding and an explicit execution wrapper in `src/keystone_agents/sandboxing.py`; it builds SDK objects only when the installed `openai-agents` package exposes sandbox classes. If those classes are unavailable, imports still succeed and callers get a clear `SandboxAgentsUnavailable` error only when they request sandbox objects.
 
+Real Unix-local execution also requires an explicit client with host-environment
+inheritance disabled and a conservative variable allowlist. KBA configures that
+policy when the installed SDK supports it; older SDKs retain preview construction
+and injected test runners, but real Unix-local execution fails before the SDK run.
+Provided clients that inherit the full host environment or allow credential
+variables are rejected. Environment filtering does not provide network isolation;
+workloads requiring stronger isolation need a separately reviewed container or
+hosted sandbox configuration.
+
 ## Architecture Boundary
 
 Keep the harness and control plane outside sandbox compute.

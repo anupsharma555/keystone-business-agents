@@ -8,7 +8,7 @@ from typing import Any
 
 _MUTATION_OPERATION = re.compile(
     r"(?:^|_)(?:append|archive|attach|create|delete|label|lifecycle|link|"
-    r"modify|move|post|publish|reconcile|remove|replace|save|send|share|"
+    r"modify|move|post|publish|reconcile|remove|rename|replace|save|send|share|"
     r"trash|update|upload|write)(?:_|$)",
     re.IGNORECASE,
 )
@@ -50,12 +50,20 @@ def receipt_reports_possible_write(receipt: Mapping[str, Any]) -> bool:
         return False
     if receipt.get("provider_write") is True:
         return True
-    if str(receipt.get("approval_reference") or "").strip():
-        return True
-    return any(
+    mutation_operation = any(
         operation_is_mutation(receipt.get(key))
         for key in ("operation", "action", "operation_type", "tool_name")
     )
+    if mutation_operation:
+        return True
+    explicit_read = bool(
+        receipt.get("provider_read") is True
+        or str(receipt.get("operation") or "").strip().lower()
+        in {"read", "search", "query", "list", "get", "inspect", "retrieve", "verify"}
+    )
+    if explicit_read and receipt.get("provider_write") is not True:
+        return False
+    return bool(str(receipt.get("approval_reference") or "").strip())
 
 
 def mutation_tool_names(receipts: Sequence[Mapping[str, Any]]) -> set[str]:

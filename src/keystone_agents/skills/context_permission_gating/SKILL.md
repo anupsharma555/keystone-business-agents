@@ -1,10 +1,11 @@
 ---
 skill_id: context_permission_gating
-skill_version: 2026-05-31.2
+skill_version: 2026-09-11.1
 skill_purpose: Determine whether available context is eligible for the current internal or external use case.
 applies_to:
   - gmail_triage
   - business_research_analyst
+  - rag_retrieval_specialist
   - opportunity_scout
   - outreach_composer
   - airtable_context_agent
@@ -64,8 +65,13 @@ visibility affects analysis, routing, drafting, rendering, or artifact work.
 
 ## Boundaries
 
-- Must not use pending, rejected, private, or unsupported context in outbound
-  copy.
+- Must not use context outside its authorized purpose or audience. A private
+  classification alone does not prohibit an explicitly authorized internal
+  review draft. Pending or rejected permission for the requested use remains
+  blocking; unsupported claims must not become asserted facts.
+- An operator's explicit request to use a named source in a review-thread-only
+  draft supplies that scoped drafting instruction. Acquire and validate the
+  evidence first; do not infer external-use or provider-write approval.
 - Must not treat stored context, Workspace artifacts, or style profiles as
   permission to send, publish, schedule, or update external systems.
 - Must not weaken no-PHI, no-send, or human-review rules.
@@ -86,8 +92,11 @@ visibility affects analysis, routing, drafting, rendering, or artifact work.
   preserved.
 - Approved for external use: may be used only within the explicit approval
   scope and still cannot trigger sends.
-- Pending, rejected, private, unsupported, or unknown: preserve as blocked
-  context or missing approval.
+- Private: preserve the classification and use only within the explicitly
+  authorized purpose and audience; keep external use gated.
+- Pending, rejected, unsupported, or unknown permission: preserve the exact
+  blocker. Missing source content that permitted tools can retrieve is evidence
+  acquisition work, not automatically a missing approval.
 
 ## Tie-Breakers
 

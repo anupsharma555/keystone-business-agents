@@ -16,11 +16,13 @@ def test_vulnerable_dependency_floors_are_constrained() -> None:
     text = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
     for requirement in (
-        '"aiohttp>=3.13.4"',
+        '"aiohttp>=3.14.3"',
         '"orjson>=3.11.6"',
-        '"PyJWT>=2.12.0"',
+        '"pypdf>=6.16.1,<7"',
+        '"PyJWT>=2.13.0"',
         '"python-dotenv>=1.2.2"',
-        '"python-multipart>=0.0.27"',
+        '"python-multipart>=0.0.31"',
+        '"starlette>=1.3.1"',
         '"urllib3>=2.7.0"',
     ):
         assert requirement in text

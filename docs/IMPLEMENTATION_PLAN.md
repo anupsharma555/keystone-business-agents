@@ -1,5 +1,9 @@
 # Keystone Business Agents Implementation Plan
 
+This is the historical V1 scope. The active [V2 implementation plan and proof
+boundaries](KBA_V2_IMPLEMENTATION.md#v2-plan-review) reflect the current architecture,
+verification evidence and next steps. Preserve this document as the original design.
+
 ## Project Purpose
 
 `keystone-business-agents` will provide four internal business agents for Keystone Neuroinformatics LLC. The system should help triage inbound email, research accounts and companies, scout opportunities, and compose draft outreach while preserving strict safety boundaries.

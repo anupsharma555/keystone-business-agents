@@ -6,18 +6,11 @@ import inspect
 from typing import Any
 
 from keystone_agents.agent_registry import AGENT_REGISTRY
+from keystone_agents.planning.composition_admission import CONTEXT_ONLY_RESPONSE_ROUTES
 from keystone_agents.schemas.execution_request import DirectAgentResponse
 from keystone_agents.sdk import build_sdk_agent, load_prompt
 
-_DIRECT_RESPONSE_ROUTES = frozenset(
-    {
-        "chief_of_staff",
-        "business_research_analyst",
-        "opportunity_scout",
-        "outreach_composer",
-        "gmail_triage",
-    }
-)
+_DIRECT_RESPONSE_ROUTES = CONTEXT_ONLY_RESPONSE_ROUTES
 
 
 def build_direct_supplied_response_agent(

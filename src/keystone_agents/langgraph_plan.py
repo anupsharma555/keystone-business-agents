@@ -9,6 +9,7 @@ NodeName = Literal[
     "classify_input",
     "gmail_triage",
     "account_research",
+    "rag_retrieval",
     "opportunity_scoring",
     "outreach_drafting",
     "approval_checkpoint",
@@ -30,6 +31,7 @@ PLANNED_NODES: tuple[NodeName, ...] = (
     "classify_input",
     "gmail_triage",
     "account_research",
+    "rag_retrieval",
     "opportunity_scoring",
     "outreach_drafting",
     "approval_checkpoint",
@@ -41,6 +43,11 @@ PLANNED_NODES: tuple[NodeName, ...] = (
 PLANNED_EDGES: tuple[PlannedEdge, ...] = (
     PlannedEdge("classify_input", "gmail_triage", "input is inbound email"),
     PlannedEdge("classify_input", "account_research", "input is company context"),
+    PlannedEdge(
+        "classify_input",
+        "rag_retrieval",
+        "typed plan explicitly selects vector-store retrieval",
+    ),
     PlannedEdge("classify_input", "opportunity_scoring", "input is scout request"),
     PlannedEdge("gmail_triage", "approval_checkpoint", "draft reply or risk flag exists"),
     PlannedEdge("gmail_triage", "account_research", "relevant company identified"),

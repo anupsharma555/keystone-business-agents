@@ -7,6 +7,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from keystone_agents.schemas.decision_ownership import AgentDecisionRecord
+
 
 class CalendarActionInterpretation(BaseModel):
     """Source-grounded fields proposed by the Calendar interpretation agent."""
@@ -58,6 +60,12 @@ class CalendarActionInterpretation(BaseModel):
     event_reference_time: str = ""
     event_reference_time_source_text: str = ""
     ambiguities: list[str] = Field(default_factory=list)
+    decision: AgentDecisionRecord = Field(
+        default_factory=lambda: AgentDecisionRecord(
+            decision_stage="calendar_action_interpretation",
+            needs_more_context=True,
+        )
+    )
 
     @field_validator(
         "title",

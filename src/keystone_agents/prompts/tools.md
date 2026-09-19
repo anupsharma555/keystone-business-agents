@@ -30,6 +30,27 @@ auditable, and dry-run-safe.
   scheduling, autonomous approval, CRM writes, LinkedIn publishing, or Slack
   posting except approval notifications behind explicit live flags.
 
+## Decision Ownership
+
+Agents own semantic judgment over bounded evidence. Choose which read/query
+tool to call, which returned candidates matter, which candidate best matches
+the operator's request, which alternatives to exclude, whether another
+specialist is needed, and how to communicate the result. Record a concise
+decision rationale and limitations in the agent's structured output when that
+schema provides a decision field.
+
+Python may normalize dates, schemas, lifecycle state, fields, arithmetic, and
+provider responses. It may validate that an agent-selected identity came from
+the exact candidate set the model received, reject a fabricated or
+contradictory choice, enforce permissions and approval scope, and verify a
+provider operation. Python must not silently replace a rejected model choice
+with its own semantic selection. If validation fails, use one bounded repair
+attempt with structured feedback or ask the operator for clarification.
+
+For cross-provider work, one specialist remains the primary action owner.
+Other providers may contribute typed read-only context, but that context never
+grants an additional write, send, or mutation authority.
+
 ## Web Search Query Planning
 
 For live source-backed web research, agents should not default to a single broad
@@ -140,8 +161,12 @@ systems, or open a user-screen browser.
 Agents with `search_web` all use the same shared retrieval contract. The agent
 should decide whether the task needs broad search, deeper search, or source
 verification from the user's natural-language request and the quality of first
-results. It should not choose providers directly or hard-code provider-specific
-branches in the prompt.
+results. The agent should not choose providers directly or invent a provider
+preference. When the operator
+explicitly names SearXNG, OpenAI hosted web search, Exa, Tavily, or Firecrawl,
+preserve that preference: the Python retrieval policy makes it the first lane
+while retaining bounded backup providers before returning a search failure.
+Do not add prompt-specific provider branches.
 
 `search_web` stays inert by default. When live research is explicitly enabled
 for SDK runs and no `SEARCH_PROVIDER` override is set, the Python retrieval
@@ -152,6 +177,13 @@ provider-comparison, formal opportunity, RFP, grant, pilot, procurement, or
 otherwise precision-sensitive requests. Serper remains disabled while credits
 are unavailable and must not run unless `KEYSTONE_SERPER_ENABLED=true` is
 deliberately set after credits are restored.
+
+A provider-specific request selects a preferred first lane, not strict
+single-provider mode. If that lane is unavailable, errors, or cannot meet the
+evidence-quality gate, the shared policy may try configured hosted, local, or
+deepening backups and records every attempted/used provider in retrieval
+telemetry. Apify and Browserless are not live search fallbacks until reviewed
+adapters, flags, credential checks, and source-attribution tests exist.
 
 Use search providers for discovery and search-result recall. Use extraction
 providers such as Trafilatura, Firecrawl, Crawl4AI-style page extraction, or
@@ -291,16 +323,21 @@ Current tools:
   hosted web-search lane, with Exa as capped semantic deepening and Tavily as
   optional deeper-research deepening when configured. Serper is disabled while
   credits are unavailable.
-- `search_opportunity_sources_placeholder`: dry-run opportunity source discovery.
 - `score_opportunity`: deterministic opportunity scoring from type and signals.
-- `handoff_to_business_research_analyst_placeholder`: compatibility-named tool that
-  records Business Research Analyst handoff intent.
-- `save_opportunity_placeholder`: dry-run persistence placeholder.
 - `save_entity_memory`: persist generalized opportunity entity memory for
   companies, people, institutes, labs, conferences, grants, RFPs, funders, and
   other source-backed candidates without outreach or sending.
 - `save_opportunity_memory`: persist source-backed opportunity memory and dedup
   markers without outreach or sending.
+
+Fixture-only compatibility tools are attached only when an offline fixture test
+explicitly requests them: `search_opportunity_sources_placeholder`, the
+source-specific `search_*_sources` wrappers, `load_existing_opportunity_state`,
+`handoff_to_business_research_analyst_placeholder`, and
+`save_opportunity_placeholder`. They are not active/live capabilities and their
+output must not be represented as current provider evidence. Active source
+discovery uses the shared `search_web` provider boundary. Handoff and durable
+pipeline persistence remain deterministic Orchestrator/workflow responsibilities.
 
 Useful future tools:
 

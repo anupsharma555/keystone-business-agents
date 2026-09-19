@@ -10,11 +10,13 @@ from typing import Any
 EMAIL_RE = re.compile(r"\bfrom:|\bto:|\bsubject:|\bmessage-id:|[\w.+-]+@[\w.-]+\.[a-z]{2,}", re.I)
 EMAIL_WORKFLOW_RE = re.compile(
     r"\b(?:gmail|inbox|email\s+threads?|email\s+context|"
+    r"email\s+conversations?|"
     r"my\s+emails?|recent\s+emails?|latest\s+email|unread\s+emails?|"
     r"emails?\s+from|find\s+the\s+(?:latest|most\s+recent)\s+email|"
-    r"(?:find|locate|look\s+up|open|read|review|inspect)\s+"
-    r"(?:the\s+|an?\s+|my\s+|this\s+|that\s+|selected\s+)?"
-    r"(?:email(?!\s+address)|message|email\s+thread)|"
+    r"(?:find|identify|locate|look\s+up|open|read|review|inspect)\s+"
+    r"(?:the\s+|an?\s+|my\s+|this\s+|that\s+|selected\s+|"
+    r"related\s+|matching\s+|associated\s+)?"
+    r"(?:email(?!\s+address)|message|email\s+thread|email\s+conversation)|"
     r"(?:email|message)\s+(?:titled|called|with\s+(?:the\s+)?subject)|"
     r"reply\s+to\s+this\s+email|draft\s+a\s+reply|prepare\s+a\s+reply|"
     r"reply\s+politely|proposed\s+recipient|subject,\s*and\s*body)\b",
@@ -50,6 +52,7 @@ SEND_RE = re.compile(
 NO_SEND_RE = re.compile(
     r"\b(?:do\s+not|don't|dont|never|no)\s+"
     r"(?:auto-?send|send|deliver|post|publish|share|schedule)\b"
+    r"|\bno[- ]send\b"
     r"|\b(?:do\s+not|don't|dont|never)\b[\s\S]{0,160}"
     r"\b(?:auto-?send|send|deliver|post|publish|share|schedule)\b"
     r"|\bdraft[- ]only\b"
@@ -163,7 +166,7 @@ def looks_like_thread_local_draft_request(text: str) -> bool:
     cleaned = " ".join(normalize_match_text(text).lower().split())
     if (
         re.search(
-            r"\b(?:draft|write|compose)\b.{0,100}"
+            r"\b(?:draft|write|compose|give|put|return)\b.{0,100}"
             r"\b(?:reply|response|email|message)\b.{0,80}"
             r"\b(?:here|slack|thread)\b",
             cleaned,
@@ -181,7 +184,7 @@ def looks_like_thread_local_draft_request(text: str) -> bool:
     ):
         return False
     if not re.search(
-        r"\b(thread-local|slack[- ]thread|in this thread|in slack only|"
+        r"\b(thread-local|slack[- ]thread|in this (?:slack )?thread|in slack only|"
         r"(?:here|draft|reply|response)\b.{0,80}\b(?:in|to)\s+(?:this\s+)?"
         r"slack\s+thread|"
         r"(?:write|draft|compose|give|put|return)\b.{0,80}\b"
@@ -197,11 +200,16 @@ def looks_like_thread_local_draft_request(text: str) -> bool:
         re.search(
             r"\b(out of scope|no external|without external|draft only|draft-only|"
             r"(?:in|to)\s+slack\s+only|slack-only|"
+            r"(?:in|to)\s+(?:this\s+)?slack\s+thread\s+only|"
             r"for (?:my )?review|so (?:that )?i can copy|for me to copy|"
             r"(?:i|we)\s+can\s+(?:copy|paste)|"
             r"(?:leave|keep)\s+(?:gmail|inbox|mailbox)\b.{0,50}\b"
             r"(?:as\s+is|as\s+it\s+is|unchanged)|"
+            r"(?:leave|keep)\s+(?:it|the\s+(?:reply|response|copy|draft))\s+"
+            r"(?:here|in\s+(?:this\s+)?(?:slack\s+)?thread|in\s+slack)|"
             r"no\s+(?:gmail\s+|provider\s+)?drafts?|"
+            r"(?:do not|don't|dont)\b.{0,80}\bsend\b.{0,80}\b(?:save|create|write)\b"
+            r".{0,50}\b(?:gmail\s+|provider\s+)?draft|"
             r"do not (?:create|save|write)\b.{0,60}\b(?:gmail\s+|provider\s+)?draft|"
             r"do not\b.{0,100}\b(?:send|modify|change)\b.{0,80}\bmailbox)\b",
             cleaned,

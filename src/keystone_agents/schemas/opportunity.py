@@ -5,12 +5,14 @@ from __future__ import annotations
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_serializer, model_validator
+from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
 from keystone_agents.schemas.company_profile import ClaimEvidenceRecord
+from keystone_agents.schemas.decision_ownership import AgentDecisionRecord
 from keystone_agents.schemas.decision_trace import DecisionTrace
 from keystone_agents.schemas.request_coverage import RequestCoverage
+from keystone_agents.schemas.web_source import WebSourceAccess
 from keystone_agents.source_quality import (
     SourceQualityScore,
     SourceQualitySummary,
@@ -139,11 +141,13 @@ OpportunityStateAction = Literal[
 
 class OpportunitySource(BaseModel):
     source_id: str = ""
+    provider_candidate_id: str = Field(default="", max_length=200)
     title: str
     url: str
     source_type: OpportunitySourceType
     supported_signal: str
     evidence_excerpt: str = ""
+    web_source_access: WebSourceAccess | None = None
     source_quality: SourceQualityScore | None = None
 
     @model_validator(mode="after")
@@ -481,6 +485,12 @@ class OpportunityScoutSynthesis(BaseModel):
     audit_summary: str = Field(min_length=1, max_length=700)
     constraint_relaxation_suggestion: str = Field(default="", max_length=500)
     outreach_generated: bool = False
+    decision: AgentDecisionRecord = Field(
+        default_factory=lambda: AgentDecisionRecord(
+            decision_stage="opportunity_candidate_selection",
+            needs_more_context=True,
+        )
+    )
 
     @model_validator(mode="after")
     def preserve_synthesis_safety(self) -> OpportunityScoutSynthesis:
@@ -494,6 +504,7 @@ class OpportunityScoutSynthesis(BaseModel):
 
 class OpportunityScoutResult(BaseModel):
     topic: str | None = None
+    human_summary: str = Field(default="", max_length=1_200)
     dry_run: bool = True
     search_provider: str = ""
     search_queries: list[str] = Field(default_factory=list)
@@ -515,6 +526,12 @@ class OpportunityScoutResult(BaseModel):
     constraint_relaxation_suggestion: str = ""
     outreach_generated: bool = False
     request_coverage: RequestCoverage = Field(default_factory=RequestCoverage)
+    decision: AgentDecisionRecord = Field(
+        default_factory=lambda: AgentDecisionRecord(
+            decision_stage="opportunity_candidate_selection",
+            needs_more_context=True,
+        )
+    )
 
     @model_validator(mode="after")
     def normalize_result_evidence(self) -> OpportunityScoutResult:
@@ -573,6 +590,53 @@ class OpportunityScoutResult(BaseModel):
     @model_serializer(mode="wrap")
     def serialize_model(self, handler: Any) -> dict[str, Any]:
         return _drop_empty_discovery_metadata(handler(self))
+
+
+class SuppliedOpportunityRecord(OpportunityRecord):
+    """Assessment owns the decision; the host owns absent retrieval metadata."""
+
+    search_lanes: SkipJsonSchema[list[str]] = Field(default_factory=list)
+    search_time_windows: SkipJsonSchema[list[str]] = Field(default_factory=list)
+
+    @field_validator("search_lanes", "search_time_windows")
+    @classmethod
+    def no_retrieval_metadata(cls, value: list[str]) -> list[str]:
+        if value:
+            raise ValueError("Tool-free assessment cannot assert retrieval metadata.")
+        return value
+
+
+class SuppliedOpportunityResult(OpportunityScoutResult):
+    """Phase-specific model schema with the canonical persisted result shape."""
+
+    records: list[SuppliedOpportunityRecord] = Field(default_factory=list)
+    search_provider: SkipJsonSchema[str] = "source-provided"
+    search_queries: SkipJsonSchema[list[str]] = Field(default_factory=list)
+    search_lanes: SkipJsonSchema[list[str]] = Field(default_factory=list)
+    search_time_windows: SkipJsonSchema[list[str]] = Field(default_factory=list)
+    raw_search_result_count: SkipJsonSchema[int] = Field(default=0, ge=0)
+    deduped_candidate_count: SkipJsonSchema[int] = Field(default=0, ge=0)
+
+    @field_validator("search_queries", "search_lanes", "search_time_windows")
+    @classmethod
+    def no_retrieval_metadata(cls, value: list[str]) -> list[str]:
+        if value:
+            raise ValueError("Tool-free assessment cannot assert retrieval metadata.")
+        return value
+
+    @field_validator("raw_search_result_count", "deduped_candidate_count")
+    @classmethod
+    def no_retrieval_counts(cls, value: int) -> int:
+        if value:
+            raise ValueError("Tool-free assessment cannot assert retrieval counts.")
+        return value
+
+    @field_validator("search_provider")
+    @classmethod
+    def supplied_provider_only(cls, value: str) -> str:
+        if value != "source-provided":
+            raise ValueError("Tool-free assessment uses source-provided evidence.")
+        return value
 
 
 def _source_id(source_type: str, value: str) -> str:

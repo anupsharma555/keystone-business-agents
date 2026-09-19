@@ -48,6 +48,17 @@ AGENT_ALIASES: tuple[tuple[RouteName, str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        "rag_retrieval_specialist",
+        "RAG Retrieval Specialist",
+        (
+            "rag retrieval specialist",
+            "rag retrieval",
+            "vector database specialist",
+            "vector db specialist",
+            "semantic retrieval specialist",
+        ),
+    ),
+    (
         "opportunity_scout",
         "Opportunity Scout Agent",
         (

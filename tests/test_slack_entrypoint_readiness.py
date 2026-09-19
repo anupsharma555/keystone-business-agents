@@ -108,7 +108,7 @@ def test_live_slack_evidence_refs_resolve_to_documented_permalink_sections() -> 
 
 
 def test_slack_entrypoint_readiness_budget_is_bounded() -> None:
-    assert sum(case.max_openai_requests for case in SLACK_ENTRYPOINT_READINESS_CASES) == 18
+    assert sum(case.max_openai_requests for case in SLACK_ENTRYPOINT_READINESS_CASES) == 24
     assert sum(case.max_cost_usd for case in SLACK_ENTRYPOINT_READINESS_CASES) == 0.80
 
 
@@ -146,8 +146,23 @@ def test_constraint_probe_request_ceiling_covers_conditional_llm_repair() -> Non
         requested_route="business_research_analyst",
     )
 
-    assert estimate["min"] == 2
-    assert estimate["max"] == case.max_openai_requests == 4
+    assert estimate["min"] == 3
+    assert estimate["max"] == case.max_openai_requests == 10
+    stage_rows = {row["stage"]: row for row in estimate["stage_rows"]}
+    assert stage_rows["business_research_analyst_direct_sdk"]["max_requests"] == 2
+    assert (
+        stage_rows["conditional_business_research_analyst_tool_correction"][
+            "max_requests"
+        ]
+        == 2
+    )
+    assert (
+        stage_rows["conditional_business_research_analyst_decision_repair"][
+            "max_requests"
+        ]
+        == 2
+    )
+    assert "orchestrator_preflight" in estimate["stages"]
     assert "conditional_instruction_following_repair" in estimate["stages"]
 
 

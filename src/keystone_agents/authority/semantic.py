@@ -66,6 +66,22 @@ _PROVIDER_MUTATION_CLAIM_FIELDS = frozenset(
 )
 
 
+def is_read_only_work_item_inspection_plan(value: Any) -> bool:
+    """Return whether durable state is evidence only, not execution authority."""
+
+    authority = ExecutionIntentAuthority.from_value(value)
+    plan = authority.plan
+    if plan is None or plan.intent != "continue_work_item":
+        return False
+    if plan.ask_shape.permission_state != "read_only":
+        return False
+    operations = set(authority.effective_provider_operations(plan.provider_system))
+    return bool(
+        not operations.difference(_READ_ONLY_PROVIDER_OPERATIONS)
+        and plan.side_effect_policy == "draft_or_read_only"
+    )
+
+
 def _is_canonical_source(source: str) -> bool:
     clean_source = str(source or "").strip().lower()
     return clean_source in _CANONICAL_PLAN_SOURCES or clean_source.startswith(
@@ -336,7 +352,6 @@ class ExecutionIntentAuthority:
                 if operation in _READ_ONLY_PROVIDER_OPERATIONS
             )
         return operations
-
     def provider_action_steps(
         self,
         provider: str,
@@ -421,6 +436,50 @@ class ExecutionIntentAuthority:
         )
 
 
+def is_bounded_provider_read_plan(
+    value: Any,
+    *,
+    provider_system: str | None = None,
+    allowed_agents: set[str] | frozenset[str] | None = None,
+    allowed_intents: set[str] | frozenset[str] | None = None,
+) -> bool:
+    """Recognize a complete, side-effect-free provider read contract.
+
+    Canonical source authority remains mandatory for provider mutations. A
+    bounded read is safe to execute from either canonical or compatibility
+    planning state when all typed limits agree: provider, owner, read-only
+    operations, collection scope, item result shape, and permission ceiling.
+    """
+
+    authority = ExecutionIntentAuthority.from_value(value)
+    plan = authority.plan
+    if plan is None or authority.invalid:
+        return False
+    expected_provider = str(provider_system or plan.provider_system).strip()
+    if (
+        not expected_provider
+        or expected_provider == "unspecified"
+        or plan.provider_system != expected_provider
+    ):
+        return False
+    if allowed_agents is not None and plan.target_agent not in allowed_agents:
+        return False
+    read_intents = allowed_intents or frozenset({"context_lookup", "gmail_triage"})
+    if plan.intent not in read_intents:
+        return False
+    operations = set(authority.effective_provider_operations(expected_provider))
+    return bool(
+        operations
+        and operations <= _READ_ONLY_PROVIDER_OPERATIONS
+        and operations & {"read", "search"}
+        and plan.provider_read_scope in {"single_item", "bounded_collection"}
+        and plan.provider_result_mode in {"items", "count", "aggregate"}
+        and plan.ask_shape.permission_state == "read_only"
+        and plan.side_effect_policy == "draft_or_read_only"
+        and not plan.missing_required_information
+    )
+
+
 def coerce_canonical_manual_request_plan(value: Any) -> ManualRequestPlan | None:
     """Return a validated supplied plan without enabling prose fallback."""
 
@@ -434,5 +493,6 @@ __all__ = [
     "StageOutputContract",
     "StageOutputReconciliation",
     "coerce_canonical_manual_request_plan",
+    "is_bounded_provider_read_plan",
     "reconcile_stage_output",
 ]

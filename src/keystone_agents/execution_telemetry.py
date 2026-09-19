@@ -74,6 +74,7 @@ _SAFE_ATTRIBUTE_KEYS = frozenset(
         "event",
         "failure_kind",
         "live",
+        "max_turns",
         "model",
         "model_name",
         "operation",

@@ -1,0 +1,56 @@
+{
+  "schema": "keystone.v2_document_layout_fixture.v1",
+  "fixture_id": "v2_document_layout",
+  "source_id": "layout-page-1",
+  "gold": {
+    "document_id": "synthetic-validation-table-v1",
+    "page": 1,
+    "title": "Synthetic validation summary",
+    "columns": [
+      "Evaluation",
+      "Performed?",
+      "Result"
+    ],
+    "rows": [
+      [
+        "Retrospective development",
+        "Yes",
+        "AUROC 0.91"
+      ],
+      [
+        "External retrospective holdout",
+        "Yes",
+        "AUROC 0.88"
+      ],
+      [
+        "Prospective clinical outcomes",
+        "No",
+        "Not measured"
+      ]
+    ],
+    "footer": "Synthetic fixture only. No real participants, organizations, or patient data."
+  },
+  "gold_sha256": "f3ec1e9bd74b56fb8572bb1f8c1bbb76a681d64b675f07e2944109b0af6456d9",
+  "page_png": "v2_document_layout.png",
+  "page_png_sha256": "91777bbcfd9f09dacb58404e8f286d8813572d48542dd06ea5abc054ce535f79",
+  "page_width": 1500,
+  "page_height": 660,
+  "extracted_text": "Synthetic validation summary\nEvaluation | Performed? | Result\nRetrospective development | Yes | AUROC 0.91\nExternal retrospective holdout | Yes | AUROC 0.88\nProspective clinical outcomes | [cell not extracted] | [cell not extracted]\nSynthetic fixture only.\n",
+  "extracted_text_sha256": "8397e101fe8ca6cf2b1f7d9231b3d350fbd6f1a513f4f208caa2a3c4545f791c",
+  "controlled_omission": {
+    "row": 3,
+    "columns": [
+      2,
+      3
+    ],
+    "values": [
+      "No",
+      "Not measured"
+    ]
+  },
+  "generation": {
+    "script": "scripts/generate_v2_document_layout.py",
+    "pillow_version": "12.3.0"
+  },
+  "proof_boundary": "Deliberately incomplete text extraction; not output from a real OCR provider."
+}

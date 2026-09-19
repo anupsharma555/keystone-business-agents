@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import mimetypes
+import os
 import re
+import stat
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -42,6 +46,7 @@ class LocalFileAttachment:
     kind: str
     size_bytes: int
     input_part: dict[str, Any]
+    checksum_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -97,10 +102,42 @@ class LocalFileInputBundle:
 def local_file_input_bundle_from_text(text: object) -> LocalFileInputBundle:
     """Return OpenAI Responses input parts for explicit safe local file paths."""
 
-    paths = _extract_local_paths(str(text or ""))
+    if not isinstance(text, str):
+        return LocalFileInputBundle((), ())
+    return _local_file_input_bundle_from_paths(_extract_local_paths(text))
+
+
+def local_file_input_bundle_from_operator_input(
+    value: object,
+    *,
+    attachment_paths: Sequence[str | Path] = (),
+) -> LocalFileInputBundle:
+    """Read only operator text or attachment paths admitted by the caller's ingress.
+
+    Structured provider evidence and rendered prompts are not attachment authority.
+    A typed input may preserve the operator's wording in its top-level raw_request;
+    authenticated ingress can also pass attachment_paths independently of that text.
+    """
+
+    if isinstance(value, str):
+        request = value
+    elif isinstance(value, Mapping):
+        request = value.get("raw_request", "")
+    else:
+        request = getattr(value, "raw_request", "")
+    paths = _extract_local_paths(request) if isinstance(request, str) else []
+    paths.extend(Path(path) for path in attachment_paths)
+    return _local_file_input_bundle_from_paths(paths)
+
+
+def _local_file_input_bundle_from_paths(paths: Sequence[Path]) -> LocalFileInputBundle:
     attachments: list[LocalFileAttachment] = []
     diagnostics: list[str] = []
+    seen: set[Path] = set()
     for raw_path in paths:
+        if raw_path in seen:
+            continue
+        seen.add(raw_path)
         try:
             attachment = _attachment_for_path(raw_path)
         except (OSError, ValueError) as exc:
@@ -113,19 +150,16 @@ def local_file_input_bundle_from_text(text: object) -> LocalFileInputBundle:
 def read_supported_local_file(path: str | Path) -> LocalFileBytes:
     """Read a safe explicit local PDF/image path for a bounded live upload."""
 
-    resolved = Path(path).expanduser()
-    if not resolved.is_file():
-        raise ValueError("not a readable file")
+    requested = Path(path).expanduser()
+    _reject_unsafe_path(requested)
+    resolved = requested.resolve(strict=True)
     _reject_unsafe_path(resolved)
     suffix = resolved.suffix.lower()
-    if suffix not in SUPPORTED_EXTENSIONS:
+    if suffix not in SUPPORTED_EXTENSIONS or requested.suffix.lower() != suffix:
         raise ValueError(f"unsupported extension {suffix}")
-    data = resolved.read_bytes()
+    data = _read_local_file_bounded(resolved)
     size = len(data)
-    if size <= 0:
-        raise ValueError("empty file")
-    if size > MAX_LOCAL_INPUT_FILE_BYTES:
-        raise ValueError("file exceeds 50 MB direct input limit")
+    _validate_file_signature(data, suffix)
     return LocalFileBytes(
         path=resolved,
         filename=resolved.name,
@@ -133,6 +167,64 @@ def read_supported_local_file(path: str | Path) -> LocalFileBytes:
         size_bytes=size,
         data=data,
     )
+
+
+def _read_local_file_bounded(path: Path) -> bytes:
+    """Pin canonical parent directories and the file without following new symlinks."""
+
+    if not hasattr(os, "O_NOFOLLOW") or os.open not in os.supports_dir_fd:
+        raise ValueError("safe local-file reads require no-follow directory access")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_fd = os.open(path.anchor, directory_flags)
+    try:
+        for part in path.parts[1:-1]:
+            next_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(
+            path.name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory_fd,
+        )
+    finally:
+        os.close(directory_fd)
+    with os.fdopen(file_fd, "rb") as handle:
+        before = os.fstat(handle.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("not a readable regular file")
+        if before.st_size <= 0:
+            raise ValueError("empty file")
+        if before.st_size > MAX_LOCAL_INPUT_FILE_BYTES:
+            raise ValueError("file exceeds 50 MB direct input limit")
+        data = handle.read(MAX_LOCAL_INPUT_FILE_BYTES + 1)
+        after = os.fstat(handle.fileno())
+    if len(data) > MAX_LOCAL_INPUT_FILE_BYTES:
+        raise ValueError("file exceeds 50 MB direct input limit")
+    if (
+        len(data) != before.st_size
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_ctime_ns != after.st_ctime_ns
+    ):
+        raise ValueError("local file changed while being read")
+    return data
+
+
+def _validate_file_signature(data: bytes, suffix: str) -> None:
+    signatures = {
+        ".pdf": (b"%PDF-",),
+        ".png": (b"\x89PNG\r\n\x1a\n",),
+        ".jpg": (b"\xff\xd8\xff",),
+        ".jpeg": (b"\xff\xd8\xff",),
+        ".gif": (b"GIF87a", b"GIF89a"),
+    }
+    matches = (
+        data.startswith(b"RIFF") and data[8:12] == b"WEBP"
+        if suffix == ".webp"
+        else data.startswith(signatures[suffix])
+    )
+    if not matches:
+        raise ValueError("file signature does not match its supported extension")
 
 
 def _extract_local_paths(text: str) -> list[Path]:
@@ -176,6 +268,7 @@ def _attachment_for_path(path: Path) -> LocalFileAttachment:
         kind=kind,
         size_bytes=local_file.size_bytes,
         input_part=part,
+        checksum_sha256=hashlib.sha256(local_file.data).hexdigest(),
     )
 
 

@@ -10,13 +10,24 @@ ConstraintScope = Literal["unspecified", "answer", "entire_response", "draft_bod
 CountMode = Literal["unspecified", "exact", "maximum", "under", "minimum"]
 
 
-class InterpretedOutputConstraints(BaseModel):
+class OutputScopeBindings(BaseModel):
+    """Semantic bindings only; these fields cannot add counts or permissions."""
+
+    word_scope: ConstraintScope = "unspecified"
+    sentence_scope: ConstraintScope = "unspecified"
+    item_scope: ConstraintScope = "unspecified"
+    source_scope: ConstraintScope = "unspecified"
+
+
+class InterpretedOutputConstraints(OutputScopeBindings):
     """LLM-interpreted response requirements that survive agent handoffs."""
 
     interpretation: str = ""
     scope: ConstraintScope = "unspecified"
     word_count_mode: CountMode = "unspecified"
     word_count: int | None = Field(default=None, ge=1, le=5000)
+    minimum_words: int | None = Field(default=None, ge=1, le=5000)
+    maximum_words: int | None = Field(default=None, ge=1, le=5000)
     sentence_count_mode: CountMode = "unspecified"
     sentence_count: int | None = Field(default=None, ge=1, le=100)
     item_count_mode: CountMode = "unspecified"
@@ -64,6 +75,12 @@ class InterpretedOutputConstraints(BaseModel):
                 "source_url_count is required when source_url_count_mode is explicit"
             )
         if (
+            self.minimum_words is not None
+            and self.maximum_words is not None
+            and self.minimum_words > self.maximum_words
+        ):
+            raise ValueError("minimum_words cannot exceed maximum_words")
+        if (
             self.minimum_items is not None
             and self.maximum_items is not None
             and self.minimum_items > self.maximum_items
@@ -76,6 +93,8 @@ class InterpretedOutputConstraints(BaseModel):
             self.interpretation
             or self.scope != "unspecified"
             or self.word_count_mode != "unspecified"
+            or self.minimum_words is not None
+            or self.maximum_words is not None
             or self.sentence_count_mode != "unspecified"
             or self.item_count_mode != "unspecified"
             or self.minimum_items is not None
@@ -95,6 +114,8 @@ class InterpretedOutputConstraints(BaseModel):
 
         return bool(
             self.word_count_mode != "unspecified"
+            or self.minimum_words is not None
+            or self.maximum_words is not None
             or self.sentence_count_mode != "unspecified"
             or self.item_count_mode != "unspecified"
             or self.minimum_items is not None

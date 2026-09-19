@@ -7,7 +7,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
+from keystone_agents.schemas.decision_ownership import AgentDecisionRecord
 from keystone_agents.schemas.request_coverage import RequestCoverage
+from keystone_agents.schemas.web_source import WebSourceAccess
 from keystone_agents.source_quality import (
     ResearchCompletenessScore,
     SourceQualityScore,
@@ -178,6 +180,7 @@ class SourceRecord(BaseModel):
     """Auditable source supporting one or more company research claims."""
 
     source_id: str = Field(min_length=1)
+    provider_candidate_id: str = Field(default="", max_length=200)
     title: str = Field(min_length=1)
     url: str = Field(min_length=1)
     source_type: Literal[
@@ -197,6 +200,7 @@ class SourceRecord(BaseModel):
     ]
     supported_claims: list[str] = Field(default_factory=list)
     evidence_excerpt: str = ""
+    web_source_access: WebSourceAccess | None = None
     confidence: float = Field(ge=0.0, le=1.0)
     published_at: str | None = None
     source_quality: SourceQualityScore | None = None
@@ -296,6 +300,12 @@ class CompanyResearchFocusedBrief(BaseModel):
     raw_source_content_included: bool = False
     send_enabled: bool = False
     retrieval_diagnostics: SkipJsonSchema[dict[str, Any]] = Field(default_factory=dict)
+    decision: AgentDecisionRecord = Field(
+        default_factory=lambda: AgentDecisionRecord(
+            decision_stage="research_source_selection",
+            needs_more_context=True,
+        )
+    )
 
     @field_validator(
         "company_name",
@@ -405,6 +415,12 @@ class CompanyResearchComparison(BaseModel):
     next_step: str = ""
     requested_output_format: str | None = None
     retrieval_diagnostics: SkipJsonSchema[dict[str, Any]] = Field(default_factory=dict)
+    decision: AgentDecisionRecord = Field(
+        default_factory=lambda: AgentDecisionRecord(
+            decision_stage="research_comparison_selection",
+            needs_more_context=True,
+        )
+    )
 
     @field_validator("decision_goal", "recommendation", "next_step", mode="before")
     @classmethod
@@ -459,6 +475,13 @@ class CompanyProfile(BaseModel):
     risks: list[str] = Field(default_factory=list)
     missing_information: list[str] = Field(default_factory=list)
     request_coverage: RequestCoverage = Field(default_factory=RequestCoverage)
+    retrieval_diagnostics: SkipJsonSchema[dict[str, Any]] = Field(default_factory=dict)
+    decision: AgentDecisionRecord = Field(
+        default_factory=lambda: AgentDecisionRecord(
+            decision_stage="research_source_selection",
+            needs_more_context=True,
+        )
+    )
 
     @property
     def company_name(self) -> str:

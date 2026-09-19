@@ -239,6 +239,13 @@
       "secret": false
     },
     {
+      "category": "orchestration",
+      "default_notes": "Internal parent-generated child reference to an existing active execution journal. Carries identity and compatibility only; never grants provider permission or resets the persisted model budget. Do not configure manually or expose in diagnostics.",
+      "display_safety": "secret",
+      "name": "KEYSTONE_DURABLE_EXECUTION_REFERENCE",
+      "secret": true
+    },
+    {
       "category": "gmail",
       "default_notes": "Requires explicit live mode and credentials.",
       "display_safety": "safe",
@@ -278,6 +285,34 @@
       "default_notes": "Defaults to 2 for opt-in Exa fallback/deepening runs.",
       "display_safety": "safe",
       "name": "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN",
+      "secret": false
+    },
+    {
+      "category": "orchestration",
+      "default_notes": "Generated per request; correlates one immutable parent/child deadline envelope.",
+      "display_safety": "identifier",
+      "name": "KEYSTONE_EXECUTION_DEADLINE_CORRELATION_ID",
+      "secret": false
+    },
+    {
+      "category": "orchestration",
+      "default_notes": "Generated per request; reserves bounded time for terminal rendering and trace flush.",
+      "display_safety": "safe",
+      "name": "KEYSTONE_EXECUTION_FINALIZATION_RESERVE_MS",
+      "secret": false
+    },
+    {
+      "category": "orchestration",
+      "default_notes": "Generated absolute parent safety deadline; child processes may not extend it.",
+      "display_safety": "safe",
+      "name": "KEYSTONE_EXECUTION_HARD_DEADLINE_EPOCH_MS",
+      "secret": false
+    },
+    {
+      "category": "orchestration",
+      "default_notes": "Generated absolute admission deadline for new model, tool, and repair work.",
+      "display_safety": "safe",
+      "name": "KEYSTONE_EXECUTION_SOFT_DEADLINE_EPOCH_MS",
       "secret": false
     },
     {
@@ -743,12 +778,17 @@
       "KEYSTONE_CONTEXT_CONFIG_REPO",
       "KEYSTONE_DEFAULT_MODEL",
       "KEYSTONE_DRY_RUN",
+      "KEYSTONE_DURABLE_EXECUTION_REFERENCE",
       "KEYSTONE_ENABLE_LIVE_GMAIL",
       "KEYSTONE_ENABLE_LIVE_RESEARCH",
       "KEYSTONE_ENABLE_WEBSITE_EXTRACTION",
       "KEYSTONE_EXA_MONTHLY_FREE_REQUEST_LIMIT",
       "KEYSTONE_EXA_SEARCH_FALLBACK",
       "KEYSTONE_EXA_SEARCH_MAX_CALLS_PER_RUN",
+      "KEYSTONE_EXECUTION_DEADLINE_CORRELATION_ID",
+      "KEYSTONE_EXECUTION_FINALIZATION_RESERVE_MS",
+      "KEYSTONE_EXECUTION_HARD_DEADLINE_EPOCH_MS",
+      "KEYSTONE_EXECUTION_SOFT_DEADLINE_EPOCH_MS",
       "KEYSTONE_FIRECRAWL_EXTRACTION_MAX_CALLS_PER_RUN",
       "KEYSTONE_GMAIL_TRIAGE_BASE_URL",
       "KEYSTONE_GMAIL_TRIAGE_MODEL",

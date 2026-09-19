@@ -5,12 +5,21 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from keystone_agents.agent_decision_contracts import outreach_composer_decision_contract
 from keystone_agents.capabilities.profile import (
     RequestCapabilityProfile,
     compile_request_capability_profile,
+)
+from keystone_agents.capabilities.tool_scope import (
+    ToolScopeMode,
+    attach_tool_scope_receipt,
+    scope_tools_for_request,
+    tool_scope_receipt_for_agent,
+    tool_scope_trace_metadata_for_agent,
 )
 from keystone_agents.company_research import research_company_fixture
 from keystone_agents.founder_profile import FounderFitProfile, founder_profile_claims
@@ -53,6 +62,7 @@ from keystone_agents.schemas.company_profile import ClaimEvidenceRecord, Company
 from keystone_agents.schemas.contact_context import ContactRecord, CRMAccountContext
 from keystone_agents.schemas.email_style import EmailStyleProfile
 from keystone_agents.schemas.execution_request import ExecutionEntrypoint
+from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.outreach import (
     ApprovedOutreachDraftingContext,
     CallPrepArtifact,
@@ -1356,14 +1366,8 @@ def compose_outreach_draft_llm_constrained(
         str(context.email_style_profile.source_id)
         if context.email_style_profile is not None
         else "",
-        str(context.outreach_template.template_id)
-        if context.outreach_template is not None
-        else "",
-        *(
-            str(example.source_id)
-            for example in context.example_guidance
-            if example.source_id
-        ),
+        str(context.outreach_template.template_id) if context.outreach_template is not None else "",
+        *(str(example.source_id) for example in context.example_guidance if example.source_id),
     }
     source_ids_used = list(
         dict.fromkeys(
@@ -1382,6 +1386,7 @@ def compose_outreach_draft_llm_constrained(
             "body",
             "linkedin_note",
             "personalization_rationale",
+            "supporting_summary",
             "rationale",
         )
     )
@@ -1427,8 +1432,9 @@ def compose_outreach_draft_llm_constrained(
                 email_body = f"{greeting_prefix}," + email_body[len(title_greeting) :]
                 break
 
+    supporting_summary = str(payload.get("supporting_summary") or "").strip()
     text_for_validation = "\n".join(
-        [email_subject, email_body, linkedin_note, personalization_rationale]
+        [email_subject, email_body, linkedin_note, personalization_rationale, supporting_summary]
     )
     blocked_mentions = _blocked_fact_mentions(text_for_validation, context.blocked_facts)
     if blocked_mentions:
@@ -1488,6 +1494,7 @@ def compose_outreach_draft_llm_constrained(
         email_body=email_body,
         linkedin_note=linkedin_note,
         personalization_rationale=personalization_rationale,
+        supporting_summary=supporting_summary,
         facts_used=facts_used,
         blocked_facts=context.blocked_facts,
         source_ids_used=source_ids_used,
@@ -1513,6 +1520,7 @@ def compose_outreach_draft_llm_constrained(
         unsupported_claims_flagged=[],
         unsupported_claim_explanations=[],
         request_coverage=payload.get("request_coverage") or {},
+        decision=payload.get("decision") or {},
         approval_required=True,
         approval_state="pending",
         approval_scope=ApprovalScope.EXTERNAL_USE.value,
@@ -1540,6 +1548,9 @@ def build_outreach_composer_agent(
     context_flags: Mapping[str, bool] | None = None,
     include_all_skills: bool = False,
     compact_instructions: bool = False,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
+    tool_tier: str | int | None = None,
+    tool_scope_mode: ToolScopeMode | str = ToolScopeMode.AUTO,
 ) -> Agent:
     """Build the outreach composer agent."""
 
@@ -1562,52 +1573,61 @@ def build_outreach_composer_agent(
         )
     )
     instructions = composer(*prompt_files, skill_files=skill_files)
-    return build_sdk_agent(
+    candidate_tools = [
+        load_company_profile,
+        load_research_brief_profile,
+        load_opportunity_record,
+        load_contact_context,
+        load_crm_account_context,
+        load_style_profile,
+        list_local_context_sources,
+        search_local_context,
+        read_local_context_file,
+        list_outreach_template_tool,
+        load_outreach_template_tool,
+        retrieve_outreach_example_guidance,
+        load_email_style_profile,
+        retrieve_memory,
+        retrieve_outreach_examples,
+        check_workflow_duplicate,
+        airtable_get_base_schema,
+        airtable_read_records,
+        airtable_write_record,
+        search_web,
+        structure_web_data_for_schema,
+        load_approved_contact_context,
+        load_approved_crm_context,
+        load_approved_outreach_examples,
+        check_unsupported_claims,
+        build_approved_outreach_drafting_context,
+        compose_outreach_draft_llm_constrained,
+        build_call_prep_artifact,
+        build_follow_up_schedule_record,
+        save_outreach_dedup_memory,
+        learn_email_style_profile,
+        save_initial_outreach_tracking_record,
+        list_outreach_tracking_records,
+        create_approval_queue_item,
+        create_approval_request_placeholder,
+        *google_workspace_tools(),
+    ]
+    resolved_scope_mode = tool_scope_mode
+    if str(tool_scope_mode) == ToolScopeMode.AUTO.value and (
+        request_text or manual_request_plan is not None or tool_tier is not None
+    ):
+        resolved_scope_mode = ToolScopeMode.REQUEST_SCOPED
+    attachment = scope_tools_for_request(
+        "outreach_composer",
+        candidate_tools if include_tools else (),
+        manual_request_plan=manual_request_plan,
+        tool_tier=tool_tier,
+        mode=resolved_scope_mode,
+    )
+    agent = build_sdk_agent(
         name="outreach_composer",
         instructions=instructions,
         output_type=OutreachDraft,
-        tools=(
-            [
-                load_company_profile,
-                load_research_brief_profile,
-                load_opportunity_record,
-                load_contact_context,
-                load_crm_account_context,
-                load_style_profile,
-                list_local_context_sources,
-                search_local_context,
-                read_local_context_file,
-                list_outreach_template_tool,
-                load_outreach_template_tool,
-                retrieve_outreach_example_guidance,
-                load_email_style_profile,
-                retrieve_memory,
-                retrieve_outreach_examples,
-                check_workflow_duplicate,
-                airtable_get_base_schema,
-                airtable_read_records,
-                airtable_write_record,
-                search_web,
-                structure_web_data_for_schema,
-                load_approved_contact_context,
-                load_approved_crm_context,
-                load_approved_outreach_examples,
-                check_unsupported_claims,
-                build_approved_outreach_drafting_context,
-                compose_outreach_draft_llm_constrained,
-                build_call_prep_artifact,
-                build_follow_up_schedule_record,
-                save_outreach_dedup_memory,
-                learn_email_style_profile,
-                save_initial_outreach_tracking_record,
-                list_outreach_tracking_records,
-                create_approval_queue_item,
-                create_approval_request_placeholder,
-                *google_workspace_tools(),
-            ]
-            if include_tools
-            else []
-        ),
+        tools=list(attachment.tools),
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="outreach_composer",
@@ -1616,6 +1636,7 @@ def build_outreach_composer_agent(
             "recommendations from approved source-backed context."
         ),
     )
+    return attach_tool_scope_receipt(agent, attachment.scope)
 
 
 def build_outreach_composer_compact_synthesis_agent(
@@ -1665,9 +1686,10 @@ def build_outreach_composer_compact_synthesis_agent(
             instructions,
             (
                 "Compact synthesis mode: return only company_name, email_subject, "
-                "email_body, linkedin_note, personalization_rationale, source_ids_used, "
+                "email_body, supporting_summary, linkedin_note, personalization_rationale, "
+                "source_ids_used, "
                 "reply_recommended, recommended_next_step, additional_information_needed, "
-                "collaboration_ideas, deferral_reason, and request_coverage. Choose "
+                "collaboration_ideas, deferral_reason, request_coverage, and decision. Choose "
                 "source_ids_used only "
                 "from the approved source IDs in the prompt. Do not include send, approval, "
                 "context, facts_used, or other workflow fields; Python will validate and "
@@ -1768,7 +1790,11 @@ def build_outreach_composer_compact_variant_agent(
                 "company_name, email_subject, email_body, linkedin_note, "
                 "personalization_rationale, and source_ids_used. Use the same "
                 "source_ids_used across all variants, chosen only from approved "
-                "source IDs in the prompt. Do not include send, approval, context, "
+                "source IDs in the prompt. Return one top-level decision record with "
+                "decision_owner=specialist_agent, "
+                "decision_stage=outreach_evidence_selection, the exact shared source "
+                "IDs selected across the variants, and an assessment of every approved "
+                "candidate. Do not include send, approval, context, "
                 "facts_used, or workflow fields; Python will validate and wrap each "
                 "compact payload into the full OutreachDraft schema."
             ),
@@ -1800,14 +1826,15 @@ def run_outreach_composer_sdk(
     attach_tools: bool = True,
     compact_instructions: bool = False,
     entrypoint: ExecutionEntrypoint = "direct_sdk",
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
+    tool_tier: str | int | None = None,
+    tool_scope_mode: ToolScopeMode | str = ToolScopeMode.REQUEST_SCOPED,
 ) -> TypedAgentRunResult[OutreachDraft]:
     """Run Outreach Composer through the typed SDK harness."""
 
     supplied_context_profile = isinstance(typed_input, OutreachComposerSDKInput)
     include_tools = bool(attach_tools and not supplied_context_profile)
-    resolved_compact_instructions = bool(
-        compact_instructions or supplied_context_profile
-    )
+    resolved_compact_instructions = bool(compact_instructions or supplied_context_profile)
     provider_is_gemini = False
     if live and run_config is None:
         from keystone_agents.model_provider import (
@@ -1836,20 +1863,17 @@ def run_outreach_composer_sdk(
         request_text=skill_request_text(typed_input),
         context_flags=context_flags,
         compact_instructions=resolved_compact_instructions,
+        manual_request_plan=manual_request_plan,
+        tool_tier=tool_tier,
+        tool_scope_mode=tool_scope_mode,
     )
     capability_profile = compile_request_capability_profile(
         entrypoint=entrypoint,
         agent=agent,
         execution_shape=(
-            "supplied_context_draft"
-            if supplied_context_profile
-            else "legacy_context_acquisition"
+            "supplied_context_draft" if supplied_context_profile else "legacy_context_acquisition"
         ),
-        prompt_profile=(
-            "outreach_compact"
-            if resolved_compact_instructions
-            else "outreach_full"
-        ),
+        prompt_profile=("outreach_compact" if resolved_compact_instructions else "outreach_full"),
         max_turns=turn_policy.max_turns,
         retrieval_enabled=bool(include_tools),
         provider_operations=(),
@@ -1864,9 +1888,11 @@ def run_outreach_composer_sdk(
         live=live,
         session=session,
         trace_metadata={
-            "capability_profile": capability_profile.receipt(),
+            "capability_profile_fingerprint": capability_profile.profile_fingerprint,
+            **tool_scope_trace_metadata_for_agent(agent),
         },
         max_turns=turn_policy.max_turns,
+        decision_contract=outreach_composer_decision_contract(),
     )
     # TypedAgentRunResult is frozen, but its audit metadata mapping is
     # intentionally mutable so wrappers can add route-specific receipts. Keep
@@ -1874,6 +1900,7 @@ def run_outreach_composer_sdk(
     request_cache = getattr(result, "request_cache", None)
     if isinstance(request_cache, dict):
         request_cache["capability_profile"] = capability_profile.receipt()
+        request_cache["request_tool_scope"] = tool_scope_receipt_for_agent(agent)
     return result
 
 
@@ -1935,12 +1962,37 @@ def run_outreach_composer_constrained_sdk(
         request_text=skill_request_text(typed_input),
         explicit_max_turns=max_turns,
     )
+    decision_context = (
+        "Approved decision context supplied before drafting:\n"
+        + json.dumps(
+            context.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+    )
+    model_input = (
+        replace(
+            typed_input,
+            approved_context="\n\n".join(
+                item
+                for item in (
+                    typed_input.approved_context.strip(),
+                    decision_context,
+                )
+                if item
+            ),
+        )
+        if isinstance(typed_input, OutreachComposerSDKInput)
+        else "\n\n".join(
+            item for item in (str(typed_input or "").strip(), decision_context) if item
+        )
+    )
     compact_result = run_typed_sdk_agent(
         agent=build_outreach_composer_compact_synthesis_agent(
             model=model,
             request_text=skill_request_text(typed_input),
         ),
-        typed_input=typed_input,
+        typed_input=model_input,
         output_type=OutreachLLMDraftPayload,
         run_config=run_config,
         live=live,
@@ -1948,6 +2000,9 @@ def run_outreach_composer_constrained_sdk(
         max_turns=turn_policy.max_turns,
         workflow_name=workflow_name,
         trace_metadata=trace_metadata,
+        decision_contract=outreach_composer_decision_contract(
+            context.allowed_source_ids
+        ),
     )
     compact_payload = compact_result.output.model_dump(mode="json")
     if isinstance(typed_input, OutreachComposerSDKInput):

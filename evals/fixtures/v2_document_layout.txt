@@ -1,0 +1,6 @@
+Synthetic validation summary
+Evaluation | Performed? | Result
+Retrospective development | Yes | AUROC 0.91
+External retrospective holdout | Yes | AUROC 0.88
+Prospective clinical outcomes | [cell not extracted] | [cell not extracted]
+Synthetic fixture only.

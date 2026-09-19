@@ -7,6 +7,10 @@ approval, and audit handling.
 from importlib import import_module
 
 from keystone_agents.tools.announcement_context_tools import (
+    read_preprint_announcement_evidence,
+    read_preprint_announcement_evidence_impl,
+    read_rss_announcement_evidence,
+    read_rss_announcement_evidence_impl,
     retrieve_preprint_announcement_history,
     retrieve_preprint_announcement_history_impl,
     retrieve_rss_announcement_history,
@@ -74,6 +78,14 @@ from keystone_agents.tools.search_provider import (
     SerperSearchProvider,
     build_search_provider,
 )
+from keystone_agents.tools.signal_lifecycle_tools import (
+    advance_signal_lifecycle_checkpoint,
+    advance_signal_lifecycle_checkpoint_impl,
+    inspect_signal_lifecycle,
+    inspect_signal_lifecycle_impl,
+    prepare_signal_lifecycle_checkpoint,
+    prepare_signal_lifecycle_checkpoint_impl,
+)
 from keystone_agents.tools.storage_tool import StorageTool
 from keystone_agents.tools.web_scrape_tool import WebScrapeTool
 from keystone_agents.tools.website_extraction_tool import (
@@ -101,8 +113,18 @@ __all__ = [
     "extract_research_claims_from_html",
     "retrieve_rss_announcement_history",
     "retrieve_rss_announcement_history_impl",
+    "read_rss_announcement_evidence",
+    "read_rss_announcement_evidence_impl",
     "retrieve_preprint_announcement_history",
     "retrieve_preprint_announcement_history_impl",
+    "read_preprint_announcement_evidence",
+    "read_preprint_announcement_evidence_impl",
+    "prepare_signal_lifecycle_checkpoint",
+    "prepare_signal_lifecycle_checkpoint_impl",
+    "inspect_signal_lifecycle",
+    "inspect_signal_lifecycle_impl",
+    "advance_signal_lifecycle_checkpoint",
+    "advance_signal_lifecycle_checkpoint_impl",
     "google_drive_get_file_metadata",
     "google_drive_get_file_metadata_impl",
     "google_drive_search_files",

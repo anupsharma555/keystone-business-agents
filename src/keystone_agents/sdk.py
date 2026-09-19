@@ -14,6 +14,7 @@ import os
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from copy import copy as shallow_copy
 from dataclasses import dataclass, field
 from dataclasses import replace as dataclass_replace
 from functools import wraps
@@ -24,6 +25,10 @@ from typing import Any, Protocol, TypeVar
 
 from pydantic import BaseModel
 
+from keystone_agents.capabilities.catalog import (
+    append_runtime_capability_catalog,
+    instruction_profile_text,
+)
 from keystone_agents.model_provider import (
     ModelConfig,
     TraceConfig,
@@ -31,7 +36,11 @@ from keystone_agents.model_provider import (
     get_model_config,
     get_runtime_agent_model_config,
     get_trace_config,
+    uses_gpt56_cache_controls,
 )
+from keystone_agents.runtime.execution_deadline import current_execution_deadline
+from keystone_agents.runtime.request_budget import current_model_request_budget
+from keystone_agents.runtime.response_terminal import ResponseTerminalObservation
 
 try:
     from agents import (
@@ -70,6 +79,7 @@ try:
     from agents import (
         function_tool as _sdk_function_tool,
     )
+    from agents.lifecycle import RunHooksBase
     from openai import AsyncOpenAI
     from openai.types.shared.reasoning import Reasoning
 except ImportError as exc:  # pragma: no cover - depends on optional local install state.
@@ -80,6 +90,7 @@ except ImportError as exc:  # pragma: no cover - depends on optional local insta
     Reasoning = Any  # type: ignore
     RunConfig = Any  # type: ignore
     RunContextWrapper = Any  # type: ignore
+    RunHooksBase = object  # type: ignore[assignment,misc]
     Runner = Any  # type: ignore
     SessionSettings = Any  # type: ignore
     SQLiteSession = Any  # type: ignore
@@ -150,6 +161,9 @@ _SDK_DATA_HANDLING_PROFILE: ContextVar[SDKDataHandlingProfile | None] = ContextV
     "keystone_sdk_data_handling_profile",
     default=None,
 )
+_RESPONSE_TERMINAL_OBSERVER: ContextVar[Any | None] = ContextVar(
+    "keystone_response_terminal_observer", default=None,
+)
 
 
 @contextmanager
@@ -194,6 +208,10 @@ def agent_with_stable_prompt_cache_key(
     if _prompt_cache_key_from_model_settings(settings):
         return agent
 
+    instructions = instruction_profile_text(agent)
+    if instructions is None:
+        # An arbitrary callable needs run context; do not mint a false static cache identity.
+        return agent
     profile = active_sdk_data_handling_profile()
     key_payload = {
         "version": "keystone.prompt_cache_profile.v1",
@@ -203,7 +221,7 @@ def agent_with_stable_prompt_cache_key(
         "agent_name": str(getattr(agent, "name", "") or ""),
         "model_name": str(model_name or getattr(agent, "model", "") or ""),
         "instructions_sha256": sha256(
-            str(getattr(agent, "instructions", "") or "").encode("utf-8")
+            instructions.encode("utf-8")
         ).hexdigest(),
         "tools": _prompt_cache_tool_payload(getattr(agent, "tools", []) or []),
         "output_schema": _prompt_cache_output_schema(
@@ -227,6 +245,132 @@ def agent_with_stable_prompt_cache_key(
     if isinstance(agent, LocalAgent):
         return dataclass_replace(agent, model_settings=updated_settings)
     return agent
+
+
+def agent_with_isolated_tool_state(agent: AgentLike) -> AgentLike:
+    """Return a run-local agent whose mutable tool state is not shared.
+
+    SDK ``Agent.clone()`` copies the tools list shallowly, so changing a
+    ``FunctionTool`` during one retry can otherwise disable or instrument the
+    module-level tool object used by later agents. Tool callbacks, schemas, and
+    callable enable predicates remain shared by reference; shared tool
+    containers and their mutable guardrail lists are copied for this run.
+    Fresh nested-specialist tools keep their parent-bound identity because their
+    callbacks intentionally disable that exact one-shot child tool.
+    """
+
+    tools = list(getattr(agent, "tools", []) or [])
+    if not tools:
+        return agent
+    isolated_tools: list[Any] = []
+    identity_bound_agent = False
+    for tool in tools:
+        if (
+            getattr(tool, "nested_execution_contract", "")
+            == "validated_child_decision_v1"
+        ):
+            # This run-local Chief tool intentionally closes over itself and its
+            # freshly built parent agent so it can disable one completed child
+            # handoff. Copying either object would sever that replay boundary.
+            identity_bound_agent = True
+            isolated_tools.append(tool)
+            continue
+        isolated_tool = shallow_copy(tool)
+        for attribute in ("tool_input_guardrails", "tool_output_guardrails"):
+            guardrails = getattr(tool, attribute, None)
+            if isinstance(guardrails, list):
+                setattr(isolated_tool, attribute, list(guardrails))
+        isolated_tools.append(isolated_tool)
+
+    isolated_agent = agent if identity_bound_agent else shallow_copy(agent)
+    isolated_agent.tools = isolated_tools
+    return isolated_agent
+
+
+def agent_with_retry_compatible_tool_choice(
+    agent: AgentLike,
+    *,
+    disabled_tool_names: Sequence[str],
+) -> tuple[AgentLike, dict[str, Any] | None]:
+    """Clear a forced tool choice when retry safety disabled that exact tool.
+
+    Completed reads and mutations are disabled before a bounded semantic retry.
+    The Agents SDK omits disabled tools from the provider request, so retaining a
+    named ``tool_choice`` for one of them produces an invalid request before the
+    model can use the replayed evidence. Return a run-attempt clone so the
+    caller's agent configuration remains unchanged.
+    """
+
+    disabled = {
+        str(name).strip() for name in disabled_tool_names if str(name).strip()
+    }
+    if not disabled:
+        return agent, None
+    settings = getattr(agent, "model_settings", None)
+    if settings is None:
+        return agent, None
+    tool_choice = (
+        settings.get("tool_choice")
+        if isinstance(settings, Mapping)
+        else getattr(settings, "tool_choice", None)
+    )
+    if tool_choice is None:
+        return agent, None
+
+    enabled_tool_names = {
+        str(getattr(tool, "name", "") or "").strip()
+        for tool in list(getattr(agent, "tools", []) or [])
+        if str(getattr(tool, "name", "") or "").strip()
+        and getattr(tool, "is_enabled", True) is not False
+    }
+    choice_name = _named_function_tool_choice(tool_choice)
+    clear_choice = bool(choice_name and choice_name in disabled)
+    normalized_choice = str(tool_choice).strip().lower()
+    if not enabled_tool_names and normalized_choice not in {"", "auto", "none"}:
+        # The Agents SDK may normalize a named choice to the sentinel
+        # ``function`` after the first tool turn. Once retry safety disables all
+        # completed tools, retaining any forced choice is invalid even when its
+        # original function name is no longer recoverable.
+        clear_choice = True
+    if not clear_choice:
+        return agent, None
+
+    if isinstance(settings, Mapping):
+        updated_settings: Any = dict(settings)
+        updated_settings["tool_choice"] = None
+    else:
+        updated_settings = dataclass_replace(settings, tool_choice=None)
+    clone = getattr(agent, "clone", None)
+    if callable(clone):
+        updated_agent = clone(model_settings=updated_settings)
+    elif isinstance(agent, LocalAgent):
+        updated_agent = dataclass_replace(agent, model_settings=updated_settings)
+    else:
+        updated_agent = shallow_copy(agent)
+        updated_agent.model_settings = updated_settings
+    return updated_agent, {
+        "schema": "keystone.retry_tool_choice_adjustment.v1",
+        "prior_choice": choice_name or str(tool_choice),
+        "adjusted_choice": "auto",
+        "reason": "forced_tool_disabled_after_completed_operation",
+        "disabled_tool_names": sorted(disabled),
+        "enabled_tool_names": sorted(enabled_tool_names),
+    }
+
+
+def _named_function_tool_choice(tool_choice: Any) -> str:
+    if isinstance(tool_choice, str):
+        value = tool_choice.strip()
+        return "" if value.lower() in {"", "auto", "none", "required"} else value
+    if not isinstance(tool_choice, Mapping):
+        return ""
+    direct_name = str(tool_choice.get("name") or "").strip()
+    if direct_name:
+        return direct_name
+    function = tool_choice.get("function")
+    if isinstance(function, Mapping):
+        return str(function.get("name") or "").strip()
+    return ""
 
 
 def prompt_cache_key_audit_metadata(agent: AgentLike) -> dict[str, Any]:
@@ -664,6 +808,8 @@ class AgentLike(Protocol):
 class LocalAgent:
     """Inert stand-in used only when the OpenAI Agents SDK is unavailable."""
 
+    keystone_runtime_catalog_enabled = True
+
     name: str
     instructions: str
     handoff_description: str | None = None
@@ -702,6 +848,19 @@ class LocalAgentTool:
     agent: Any
     max_turns: int | None = None
     params_json_schema: dict[str, Any] = field(default_factory=dict)
+
+
+if SDKAgent is not None:
+    class _CatalogSDKAgent(SDKAgent):
+        """Keep public instructions intact while refreshing scoped metadata per turn."""
+
+        keystone_runtime_catalog_enabled = True
+
+        async def get_system_prompt(self, run_context: Any) -> str | None:
+            instructions = await super().get_system_prompt(run_context)
+            return append_runtime_capability_catalog(self, str(instructions or ""))
+else:
+    _CatalogSDKAgent = None  # type: ignore[assignment,misc]
 
 
 Agent = SDKAgent or LocalAgent
@@ -1240,7 +1399,7 @@ def build_sdk_agent(
             instructions=instructions,
             handoff_description=handoff_description,
             model=selected_model,
-            model_settings=_cache_friendly_model_settings(model_settings),
+            model_settings=_cache_friendly_model_settings(model_settings, model=selected_model),
             tools=tools_list,
             handoffs=handoffs_list,
             output_type=output_type,
@@ -1248,12 +1407,15 @@ def build_sdk_agent(
             output_guardrails=output_guardrails,
         )
 
-    return Agent(
+    from keystone_agents.agent_registry import AGENT_REGISTRY
+
+    agent_type = _CatalogSDKAgent if name in AGENT_REGISTRY else Agent
+    return agent_type(
         name=name,
         handoff_description=handoff_description,
         instructions=instructions,
         model=selected_model,
-        model_settings=_cache_friendly_model_settings(model_settings),
+        model_settings=_cache_friendly_model_settings(model_settings, model=selected_model),
         tools=sdk_tools_list,
         handoffs=handoffs_list,
         output_type=output_type,
@@ -1298,6 +1460,7 @@ def build_model_settings(
     reasoning_effort: str | None = None,
     verbosity: str | None = None,
     max_tokens: int | None = None,
+    tool_choice: str | None = None,
 ) -> Any | None:
     """Build Agents SDK model settings when the installed SDK supports them."""
 
@@ -1307,6 +1470,7 @@ def build_model_settings(
                 "reasoning": {"effort": reasoning_effort} if reasoning_effort else None,
                 "verbosity": verbosity,
                 "max_tokens": max_tokens,
+                "tool_choice": tool_choice,
             }
         )
     reasoning = Reasoning(effort=reasoning_effort) if reasoning_effort else None
@@ -1315,11 +1479,14 @@ def build_model_settings(
             reasoning=reasoning,
             verbosity=verbosity,
             max_tokens=max_tokens,
+            tool_choice=tool_choice,
         )
     )
 
 
-def _cache_friendly_model_settings(model_settings: Any | None = None) -> Any:
+def _cache_friendly_model_settings(
+    model_settings: Any | None = None, *, model: str | None = None,
+) -> Any:
     """Apply repo-wide cache/cost telemetry defaults to SDK model settings."""
 
     include_usage = _sdk_include_usage_enabled()
@@ -1337,7 +1504,7 @@ def _cache_friendly_model_settings(model_settings: Any | None = None) -> Any:
                 settings["prompt_cache_retention"] = retention
             else:
                 settings.setdefault("prompt_cache_retention", retention)
-        return settings
+        return _gpt56_cache_settings(settings) if uses_gpt56_cache_controls(model) else settings
     settings = model_settings or ModelSettings()
     updates: dict[str, Any] = {}
     if getattr(settings, "include_usage", None) is None:
@@ -1348,7 +1515,26 @@ def _cache_friendly_model_settings(model_settings: Any | None = None) -> Any:
         updates["prompt_cache_retention"] = retention
     elif retention is not None and getattr(settings, "prompt_cache_retention", None) is None:
         updates["prompt_cache_retention"] = retention
-    return dataclass_replace(settings, **updates) if updates else settings
+    settings = dataclass_replace(settings, **updates) if updates else settings
+    return _gpt56_cache_settings(settings) if uses_gpt56_cache_controls(model) else settings
+
+
+def _gpt56_cache_settings(settings: Any) -> Any:
+    """Use reviewed GPT-5.6 controls without changing older models' cache policy.
+
+    https://developers.openai.com/api/docs/guides/prompt-caching
+    No explicit TTL is needed: the model defaults to its supported 30m lifetime.
+    """
+    updates: dict[str, Any] = {"prompt_cache_retention": None, "preserve_raw_usage": True}
+    profile = active_sdk_data_handling_profile()
+    if profile is not None and profile.prompt_cache_retention == "in_memory":
+        # KBA does not insert explicit breakpoints; this prevents implicit writes
+        # for the existing non-persistent private-context profile.
+        updates["prompt_cache_options"] = {"mode": "explicit"}
+    return (
+        {**settings, **updates} if isinstance(settings, Mapping)
+        else dataclass_replace(settings, **updates)
+    )
 
 
 def _sdk_include_usage_enabled() -> bool:
@@ -1377,6 +1563,12 @@ def _live_model_timeout_seconds() -> float:
     except (TypeError, ValueError):
         return DEFAULT_LIVE_MODEL_TIMEOUT_SECONDS
     return max(5.0, value)
+
+
+def live_model_timeout_seconds() -> float:
+    """Return the configured per-request model timeout for deadline headroom."""
+
+    return _live_model_timeout_seconds()
 
 
 def _live_model_max_retries() -> int:
@@ -1439,6 +1631,14 @@ def build_live_run_config(
 
     register_configured_trace_processor()
     provider_kwargs = model_config.openai_provider_kwargs()
+    canary_active = bool(os.environ.get("KEYSTONE_CANARY_ACCEPTANCE_PROFILE"))
+    if canary_active:
+        from keystone_agents.canary_acceptance import validate_live_config
+
+        validate_live_config(model_config.provider, model_config.model, provider_kwargs)
+        run_trace_config = run_trace_config.with_overrides(
+            tracing_disabled=True, trace_include_sensitive_data=False,
+        )
     if (
         not run_trace_config.tracing_disabled
         and model_config.provider == "openai"
@@ -1449,11 +1649,13 @@ def build_live_run_config(
         api_key=provider_kwargs.get("api_key"),
         base_url=provider_kwargs.get("base_url") or None,
         timeout=_live_model_timeout_seconds(),
-        max_retries=_live_model_max_retries(),
+        max_retries=0 if canary_active else _live_model_max_retries(),
     )
+    _observe_client_terminal_responses(openai_client)
     provider = OpenAIProvider(
         openai_client=openai_client,
-        use_responses=provider_kwargs.get("use_responses"),
+        use_responses=True if canary_active else provider_kwargs.get("use_responses"),
+        **({"use_responses_websocket": False} if canary_active else {}),
     )
     return RunConfig(
         model=model_config.model,
@@ -1465,6 +1667,51 @@ def build_live_run_config(
         trace_include_sensitive_data=run_trace_config.trace_include_sensitive_data,
         sandbox=sandbox,
     )
+
+
+def _observe_client_terminal_responses(client: Any) -> None:
+    """Observe only terminal failures on this KBA-owned nonstreaming client."""
+    responses = getattr(client, "responses", None)
+    create = getattr(responses, "create", None)
+    if not callable(create) or getattr(create, "_keystone_terminal_observer", False):
+        return
+
+    @wraps(create)
+    async def create_with_terminal_observation(*args: Any, **kwargs: Any) -> Any:
+        observer = _RESPONSE_TERMINAL_OBSERVER.get()
+        dispatch_receipt = None
+        if os.environ.get("KEYSTONE_CANARY_ACCEPTANCE_PROFILE"):
+            from keystone_agents.canary_acceptance import (
+                guarded_response_kwargs,
+                observe_canary_response_reasoning,
+            )
+
+            kwargs = guarded_response_kwargs(
+                client, args, kwargs, observer=observer,
+            )
+            dispatch_receipt = observer._keystone_canary_dispatches[-1]
+        response = await create(*args, **kwargs)
+        if dispatch_receipt is not None:
+            observe_canary_response_reasoning(
+                response, observer=observer, dispatch_receipt=dispatch_receipt,
+            )
+        if observer is not None and kwargs.get("stream") is not True:
+            observation = ResponseTerminalObservation.from_response(
+                response, max_output_tokens=kwargs.get("max_output_tokens"),
+            )
+            if observation is not None:
+                observer.observe_terminal_response(response, observation)
+        return response
+
+    create_with_terminal_observation._keystone_terminal_observer = True
+    responses.create = create_with_terminal_observation
+    if os.environ.get("KEYSTONE_CANARY_ACCEPTANCE_PROFILE"):
+        async def blocked_chat_completion(*args: Any, **kwargs: Any) -> Any:
+            from keystone_agents.canary_acceptance import CanaryPolicyError
+
+            raise CanaryPolicyError("canary_chat_completions_not_allowed")
+
+        client.chat.completions.create = blocked_chat_completion
 
 
 def _live_config_for_agent(agent: AgentLike, config: ModelConfig | None) -> ModelConfig | None:
@@ -1507,6 +1754,207 @@ def build_local_run_config(
     )
 
 
+_RequestBudgetHooksBase = (
+    RunHooksBase[Any, Any] if _SDK_IMPORT_ERROR is None else object
+)
+
+
+class _ExecutionBoundaryRunHooks(_RequestBudgetHooksBase):
+    """Enforce request and time budgets at SDK model/tool boundaries."""
+
+    def __init__(
+        self,
+        request_ledger: Any | None,
+        deadline_ledger: Any | None,
+        *,
+        capture_usage: bool = False,
+    ) -> None:
+        self._request_ledger = request_ledger
+        self._deadline_ledger = deadline_ledger
+        # Per Runner invocation, never context-wrapper totals or shared context state:
+        # those can include another invocation's usage when an agent calls a child.
+        self._capture_usage = capture_usage
+        self._requests_started = 0
+        self._usage_observations: list[dict[str, int | None]] = []
+        self._terminal_observations: list[dict[str, Any]] = []
+
+    def numeric_usage(self) -> dict[str, Any]:
+        return {
+            "requests_started": self._requests_started,
+            "responses": [dict(item) for item in self._usage_observations],
+        }
+
+    def terminal_diagnostics(self) -> dict[str, Any]:
+        return {
+            "schema": "keystone.response_terminal.v1",
+            "observations": [dict(item) for item in self._terminal_observations],
+        }
+
+    def observe_terminal_response(
+        self, response: Any, observation: ResponseTerminalObservation,
+    ) -> None:
+        if not self._capture_usage or len(self._usage_observations) >= self._requests_started:
+            return
+        # No ModelResponse/on_llm_end exists for this response: the installed SDK
+        # rejects it before conversion. Never inspect its output or error message.
+        self._terminal_observations.append(observation.snapshot())
+        usage = getattr(response, "usage", None)
+        raw_usage = usage if isinstance(usage, Mapping) else (
+            usage.model_dump() if callable(getattr(usage, "model_dump", None)) else None
+        )
+        self._usage_observations.append({
+            "request_ordinal": len(self._usage_observations) + 1,
+            **numeric_sdk_request_usage(usage, raw_usage=raw_usage),
+        })
+
+    def _observe_usage(self, response: Any) -> None:
+        if not self._capture_usage or len(self._usage_observations) >= self._requests_started:
+            # Resuming an SDK interruption can emit an end hook for an old response.
+            return
+        self._usage_observations.append({
+            "request_ordinal": len(self._usage_observations) + 1,
+            **numeric_sdk_request_usage(
+                getattr(response, "usage", None), raw_usage=getattr(response, "raw_usage", None),
+            ),
+        })
+
+    @staticmethod
+    def _agent_name(agent: Any) -> str:
+        return str(getattr(agent, "name", "") or "unknown_agent")
+
+    @staticmethod
+    def _tool_name(tool: Any) -> str:
+        return str(getattr(tool, "name", "") or "unknown_tool")
+
+    async def on_llm_start(
+        self,
+        _context: Any,
+        agent: Any,
+        _system_prompt: str | None,
+        _input_items: list[Any],
+    ) -> None:
+        agent_name = self._agent_name(agent)
+        if os.environ.get("KEYSTONE_CANARY_ACCEPTANCE_PROFILE"):
+            from keystone_agents.canary_acceptance import admit_agent
+
+            admit_agent(agent_name, observer=self)
+        stage = f"{agent_name}:llm_start"
+        from keystone_agents.runtime.durable_execution import current_execution
+
+        if self._deadline_ledger is not None:
+            self._deadline_ledger.admit(stage=stage, boundary="llm")
+        if self._request_ledger is not None:
+            try:
+                self._request_ledger.consume(stage=stage)
+            except Exception:
+                if self._deadline_ledger is not None:
+                    self._deadline_ledger.checkpoint(
+                        stage=stage,
+                        boundary="llm",
+                        phase="cancelled_before_dispatch",
+                    )
+                raise
+        execution = current_execution()
+        if execution is not None:
+            execution.store.reserve_model(execution.execution_id, stage)
+        if self._capture_usage:
+            self._requests_started += 1
+
+    async def on_llm_end(
+        self,
+        _context: Any,
+        agent: Any,
+        _response: Any,
+    ) -> None:
+        self._observe_usage(_response)
+        if self._deadline_ledger is not None:
+            self._deadline_ledger.checkpoint(
+                stage=f"{self._agent_name(agent)}:llm_end",
+                boundary="llm",
+            )
+
+    async def on_tool_start(
+        self,
+        _context: Any,
+        agent: Any,
+        tool: Any,
+    ) -> None:
+        if self._deadline_ledger is not None:
+            self._deadline_ledger.admit(
+                stage=f"{self._agent_name(agent)}:tool:{self._tool_name(tool)}",
+                boundary="tool",
+            )
+
+    async def on_tool_end(
+        self,
+        _context: Any,
+        agent: Any,
+        tool: Any,
+        _result: object,
+    ) -> None:
+        if self._deadline_ledger is not None:
+            self._deadline_ledger.checkpoint(
+                stage=f"{self._agent_name(agent)}:tool:{self._tool_name(tool)}",
+                boundary="tool",
+            )
+
+
+def numeric_sdk_request_usage(usage: Any, *, raw_usage: Any = None) -> dict[str, int | None]:
+    """Keep numeric per-response usage, never equating omitted cache writes to zero."""
+    def value(source: Any, field: str) -> Any:
+        return source.get(field) if isinstance(source, Mapping) else getattr(source, field, None)
+
+    def number(source: Any, field: str) -> int | None:
+        candidate = value(source, field)
+        return candidate if type(candidate) is int and candidate >= 0 else None
+
+    original = isinstance(raw_usage, Mapping)
+    source = raw_usage if original else usage
+    inputs = value(source, "input_tokens_details") or value(source, "prompt_tokens_details")
+    outputs = value(source, "output_tokens_details") or value(source, "completion_tokens_details")
+    cache_writes = number(inputs, "cache_write_tokens")
+    if cache_writes is None:
+        cache_writes = number(source, "cache_write_input_tokens")
+    if not original and cache_writes == 0:
+        # Agents SDK fills missing cache-write details with zero during normalization.
+        cache_writes = None
+    cached = number(inputs, "cached_tokens")
+    if cached is None:
+        cached = number(source, "cached_input_tokens")
+    return {
+        "requests": 1,
+        "input_tokens": number(source, "input_tokens"),
+        "output_tokens": number(source, "output_tokens"),
+        "total_tokens": number(source, "total_tokens"),
+        "cached_input_tokens": cached,
+        "cache_write_input_tokens": cache_writes,
+        "reasoning_output_tokens": number(outputs, "reasoning_tokens"),
+    }
+
+
+def execution_boundary_hooks(*, capture_usage: bool = False) -> Any | None:
+    """Return SDK-valid composite budget hooks when either ledger is active."""
+
+    request_ledger = current_model_request_budget()
+    deadline_ledger = current_execution_deadline()
+    from keystone_agents.runtime.durable_execution import current_execution
+
+    if (
+        not capture_usage
+        and request_ledger is None
+        and deadline_ledger is None
+        and current_execution() is None
+    ):
+        return None
+    return _ExecutionBoundaryRunHooks(request_ledger, deadline_ledger, capture_usage=capture_usage)
+
+
+def model_request_budget_hooks() -> Any | None:
+    """Compatibility entrypoint for the composite SDK boundary hooks."""
+
+    return execution_boundary_hooks()
+
+
 def _run_sync_with_optional_session(
     agent: AgentLike,
     prompt: Any,
@@ -1515,12 +1963,66 @@ def _run_sync_with_optional_session(
     session: Any | None = None,
     max_turns: int | None = None,
 ) -> Any:
+    selected_model = getattr(run_config, "model", None) or getattr(agent, "model", None)
+    if uses_gpt56_cache_controls(selected_model):
+        agent = agent.clone(model_settings=_cache_friendly_model_settings(
+            agent.model_settings, model=selected_model,
+        ))
+        if getattr(run_config, "model_settings", None) is not None:
+            run_config = dataclass_replace(
+                run_config,
+                model_settings=_cache_friendly_model_settings(
+                    run_config.model_settings, model=selected_model,
+                ),
+            )
     kwargs: dict[str, Any] = {"run_config": run_config}
     if session is not None:
         kwargs["session"] = session
     if max_turns is not None:
         kwargs["max_turns"] = max_turns
-    return Runner.run_sync(agent, prompt, **kwargs)
+    boundary_hooks = execution_boundary_hooks(capture_usage=True)
+    if boundary_hooks is not None:
+        kwargs["hooks"] = boundary_hooks
+    observer_token = _RESPONSE_TERMINAL_OBSERVER.set(boundary_hooks)
+    terminal_error: Exception | None = None
+    try:
+        result = Runner.run_sync(agent, prompt, **kwargs)
+    except Exception as exc:
+        if boundary_hooks.terminal_diagnostics()["observations"]:
+            # Terminal transport failures precede the SDK's output privacy
+            # redactor. Preserve its public exception type without error prose,
+            # RunErrorDetails, response objects, or the original exception chain.
+            from agents.exceptions import ModelBehaviorError
+
+            terminal_error = ModelBehaviorError(
+                "Responses API returned a terminal failure; inspect the safe terminal diagnostics."
+            )
+            terminal_error.keystone_response_terminal = boundary_hooks.terminal_diagnostics()
+            _attach_numeric_usage(terminal_error, boundary_hooks.numeric_usage())
+        else:
+            _attach_numeric_usage(exc, boundary_hooks.numeric_usage())
+            raise
+    finally:
+        _RESPONSE_TERMINAL_OBSERVER.reset(observer_token)
+    if terminal_error is not None:
+        # Raise outside the original except block so no provider error is chained.
+        raise terminal_error from None
+    _attach_numeric_usage(result, boundary_hooks.numeric_usage())
+    return result
+
+
+def _attach_numeric_usage(target: Any, usage: Mapping[str, Any]) -> None:
+    try:
+        target.keystone_sdk_numeric_usage = dict(usage)
+    except (AttributeError, TypeError):
+        pass
+
+
+def sdk_numeric_usage_observations(value: Any) -> dict[str, Any]:
+    """Read the content-free numeric snapshot owned by one Runner invocation."""
+
+    snapshot = getattr(value, "keystone_sdk_numeric_usage", None)
+    return dict(snapshot) if isinstance(snapshot, Mapping) else {}
 
 
 def run_sdk_sync(
@@ -1667,4 +2169,9 @@ def run_typed_sdk_sync(
             max_turns=max_turns,
         )
 
-    return raw_result, _coerce_typed_output(raw_result.final_output, output_type)
+    try:
+        output = _coerce_typed_output(raw_result.final_output, output_type)
+    except Exception as exc:
+        _attach_numeric_usage(exc, sdk_numeric_usage_observations(raw_result))
+        raise
+    return raw_result, output

@@ -100,7 +100,11 @@ def test_typed_outreach_sdk_uses_compact_zero_tool_profile_and_records_receipt(
     assert profile["write_enabled"] is False
     assert profile["send_enabled"] is False
     assert profile["profile_fingerprint"]
-    assert captured["trace_metadata"]["capability_profile"] == profile
+    assert (
+        captured["trace_metadata"]["capability_profile_fingerprint"]
+        == profile["profile_fingerprint"]
+    )
+    assert "capability_profile" not in captured["trace_metadata"]
 
 
 def test_legacy_free_form_outreach_input_keeps_existing_tool_surface(
@@ -122,16 +126,20 @@ def test_legacy_free_form_outreach_input_keeps_existing_tool_surface(
         fake_run_typed_sdk_agent,
     )
 
-    run_outreach_composer_sdk(
+    result = run_outreach_composer_sdk(
         "Load the approved context for Example Health before drafting.",
         attach_tools=True,
     )
 
     assert len(captured["agent"].tools) > 0
-    profile = captured["trace_metadata"]["capability_profile"]
+    profile = result.request_cache["capability_profile"]
     assert profile["execution_shape"] == "legacy_context_acquisition"
     assert profile["tool_count"] == len(captured["agent"].tools)
     assert profile["retrieval_enabled"] is True
+    assert captured["trace_metadata"]["capability_profile_fingerprint"] == profile[
+        "profile_fingerprint"
+    ]
+    assert "capability_profile" not in captured["trace_metadata"]
 
 
 def test_profile_cannot_claim_provider_mutation_without_write_authority() -> None:
@@ -221,3 +229,26 @@ def test_unverified_legacy_summary_cannot_compile_reader_promotion() -> None:
     assert receipt.instruction_repair_verified is False
     assert receipt.typed_display_verified is False
     assert receipt.rendered_display_verified is False
+
+
+def test_explicit_unverified_child_cannot_gain_promotion_from_formatting() -> None:
+    receipt = compile_child_result_promotion_receipt(
+        {
+            "status": "completed",
+            "output_type": "SyntheticResult",
+            "send_enabled": False,
+            "user_facing_result_verified": False,
+            "public_result": {
+                "status": "completed",
+                "completion_confirmed": True,
+                "provider_write_attempted": False,
+            },
+        },
+        summary="A format-valid but explicitly unverified result.",
+        instruction_repair_verified=True,
+        typed_display_verified=True,
+    )
+
+    assert receipt.reader_ready is False
+    assert receipt.child_public_result_verified is False
+    assert receipt.verification_basis == ()

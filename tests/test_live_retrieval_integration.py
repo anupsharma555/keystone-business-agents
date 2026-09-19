@@ -1457,6 +1457,84 @@ def test_transient_searxng_runtime_leaves_existing_runtime_open(
     assert calls == []
 
 
+def test_transient_searxng_runtime_yields_to_configured_fallback_on_start_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    monkeypatch.setattr(live_retrieval, "_searxng_endpoint_reachable", lambda _url: False)
+    monkeypatch.setattr(
+        live_retrieval,
+        "_run_searxng_lifecycle_command",
+        lambda command, *, check=True: (_ for _ in ()).throw(
+            RuntimeError(f"SearXNG transient {command} failed")
+        ),
+    )
+
+    with live_retrieval._maybe_transient_searxng_runtime(
+        provider_sequence=("searxng", "agents-web-search"),
+        fallback_provider_sequence=("exa", "tavily"),
+        settings=SimpleNamespace(searxng_base_url="http://127.0.0.1:18080"),
+    ) as metadata:
+        assert metadata["reason"] == "start_failed_fallback_available"
+        assert metadata["fallback_providers"] == [
+            "agents-web-search",
+            "exa",
+            "tavily",
+        ]
+        assert metadata["startup_error_type"] == "RuntimeError"
+
+    assert metadata["started"] is False
+    assert metadata["stopped"] is False
+
+
+def test_transient_searxng_runtime_remains_strict_without_any_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    monkeypatch.setattr(live_retrieval, "_searxng_endpoint_reachable", lambda _url: False)
+    monkeypatch.setattr(
+        live_retrieval,
+        "_run_searxng_lifecycle_command",
+        lambda command, *, check=True: (_ for _ in ()).throw(
+            RuntimeError(f"SearXNG transient {command} failed")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="SearXNG transient start failed"):
+        with live_retrieval._maybe_transient_searxng_runtime(
+            provider_sequence=("searxng",),
+            settings=SimpleNamespace(searxng_base_url="http://127.0.0.1:18080"),
+        ):
+            pass
+
+
+def test_searxng_lifecycle_start_timeout_fails_fast_for_provider_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    captured: dict[str, object] = {}
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        captured["command"] = command
+        captured["timeout"] = kwargs.get("timeout")
+        raise live_retrieval.subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setenv("KEYSTONE_SEARXNG_LIFECYCLE_TIMEOUT_SECONDS", "7.5")
+    monkeypatch.setattr(live_retrieval.subprocess, "run", fake_run)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"start exceeded its 7\.5s startup budget",
+    ):
+        live_retrieval._run_searxng_lifecycle_command("start")
+
+    assert captured["timeout"] == 7.5
+    assert captured["command"][-1] == "start"
+
+
 def test_opportunity_search_provider_can_enable_tavily_deepening(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1619,7 +1697,7 @@ def test_formal_opportunity_search_provider_uses_configured_tavily_deepening(
     assert provider.deepening_provider_sequence == ("tavily",)
 
 
-def test_opportunity_search_provider_skips_hosted_search_with_explicit_non_searxng_primary(
+def test_explicit_search_provider_keeps_hosted_search_as_sequential_backup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import keystone_agents.live_retrieval as live_retrieval
@@ -1646,8 +1724,45 @@ def test_opportunity_search_provider_skips_hosted_search_with_explicit_non_searx
         desired_results=5,
     )
 
-    assert provider.provider_sequence == ("serper",)
+    assert provider.provider_sequence == ("serper", "agents-web-search")
     assert provider.deepening_provider_sequence == ()
+    assert provider.telemetry()["parallel_provider_fanout"] is False
+
+
+@pytest.mark.parametrize(
+    ("request_text", "expected"),
+    [
+        ("Use Exa for this research request.", "exa"),
+        ("Search the web with Tavily for current sources.", "tavily"),
+        ("Try OpenAI hosted web search for this query.", "agents-web-search"),
+        ("Use Firecrawl for search discovery.", "firecrawl"),
+    ],
+)
+def test_natural_search_provider_preference_can_override_default_searxng(
+    request_text: str,
+    expected: str,
+) -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    assert (
+        live_retrieval.resolve_requested_search_provider(
+            request_text=request_text,
+            requested_provider="searxng",
+        )
+        == expected
+    )
+
+
+def test_natural_search_provider_preference_does_not_override_nondefault_cli_choice() -> None:
+    import keystone_agents.live_retrieval as live_retrieval
+
+    assert (
+        live_retrieval.resolve_requested_search_provider(
+            request_text="Use Exa for this research request.",
+            requested_provider="tavily",
+        )
+        == "tavily"
+    )
 
 
 def test_opportunity_scout_os1_live_search_escalates_on_weak_initial_results(

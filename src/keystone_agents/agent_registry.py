@@ -10,27 +10,19 @@ from typing import Any
 from pydantic import BaseModel
 
 from keystone_agents.agent_tool_policy import ToolTier, tool_policy_for_agent, tool_tier_for_name
+from keystone_agents.capabilities.catalog import CATALOG_PROMPT_FILE
 from keystone_agents.schemas.handoff_types import build_handoff_type_contract
 from keystone_agents.schemas.orchestrator import HandoffSpec
 from keystone_agents.skill_sets import AGENT_SKILL_NAMES
 from keystone_agents.specialist_tool_names import specialist_agent_tool_name
 from keystone_agents.tool_availability import runtime_tool_availability_for_agent
-from keystone_agents.tools.internal_data_tools import GOOGLE_WORKSPACE_TOOL_NAMES
+from keystone_agents.tools.internal_data_tools import (
+    GOOGLE_WORKSPACE_DELEGATED_TOOL_NAMES,
+)
 from keystone_agents.tools.zotero_context_tools import ZOTERO_CONTEXT_TOOL_NAMES
 
 AIRTABLE_READ_TOOL_NAMES = ("airtable_get_base_schema", "airtable_read_records")
 AIRTABLE_WRITE_TOOL_NAMES = ("airtable_write_record",)
-GOOGLE_WORKSPACE_READ_TOOL_NAMES = (
-    "google_doc_read",
-    "google_drive_list_folder",
-    "google_drive_search_files",
-    "google_drive_get_file_metadata",
-    "google_slide_deck_read",
-    "presentation_search_local",
-    "presentation_read_local",
-    "google_sheet_list",
-    "google_sheet_read_table",
-)
 WEB_STRUCTURING_TOOL_NAMES = ("structure_web_data_for_schema",)
 PLAYWRIGHT_RESEARCH_TOOL_NAMES = ("render_page",)
 BROWSER_DIAGNOSTIC_TOOL_NAMES = (
@@ -41,6 +33,7 @@ BROWSER_DIAGNOSTIC_TOOL_NAMES = (
 DEFAULT_AGENT_INPUT_SCHEMAS: dict[str, str] = {
     "gmail_triage": "keystone_agents.schemas.context_pack.GmailContextPack",
     "business_research_analyst": "keystone_agents.schemas.context_pack.ResearchContextPack",
+    "rag_retrieval_specialist": "keystone_agents.schemas.context_pack.RAGRetrievalContextPack",
     "opportunity_scout": "keystone_agents.schemas.context_pack.OpportunityContextPack",
     "outreach_composer": "keystone_agents.schemas.context_pack.OutreachContextPack",
     "airtable_context_agent": "keystone_agents.schemas.chief_of_staff.ChiefSpecialistToolInput",
@@ -163,6 +156,7 @@ class AgentSpec:
             "input_schema": self.input_contract_schema,
             "output_schema": self.output_schema,
             "prompt_files": list(self.prompt_files),
+            "shared_runtime_prompt_files": [CATALOG_PROMPT_FILE],
             "skills": list(self.skills),
             "tools": list(self.tools),
             "optional_tools": list(self.optional_tools),
@@ -207,6 +201,9 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         ),
         skills=AGENT_SKILL_NAMES["gmail_triage"],
         tools=(
+            "inspect_gmail_mailbox_schema",
+            "query_gmail_message_summaries",
+            "read_gmail_context",
             "get_gmail_message",
             "apply_gmail_labels",
             "modify_gmail_message_state",
@@ -225,20 +222,31 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             *AIRTABLE_READ_TOOL_NAMES,
             *AIRTABLE_WRITE_TOOL_NAMES,
             *WEB_STRUCTURING_TOOL_NAMES,
-            *GOOGLE_WORKSPACE_TOOL_NAMES,
+            *GOOGLE_WORKSPACE_DELEGATED_TOOL_NAMES,
         ),
-        live_flags_required=("--live-gmail", "--no-dry-run", "--live-sdk"),
+        live_flags_required=(
+            "--live-gmail",
+            "--no-dry-run",
+            "--live-sdk",
+            "KEYSTONE_ENABLE_LIVE_GMAIL=true",
+        ),
         eval_datasets=("evals/static/gmail_triage_cases.json", "evals/local/gmail_triage.jsonl"),
         validation_paths=(
             "tests/test_gmail_triage.py",
+            "tests/test_chief_nested_specialist_decisions.py",
+            "tests/test_gmail_query_tools.py",
+            "tests/test_gmail_source_fidelity.py",
+            "tests/test_gmail_research_evidence_handoff.py",
+            "tests/test_request_tool_scope.py",
             "tests/test_sdk_execution.py",
             "tests/test_request_coverage.py",
             "tests/test_instruction_following.py",
             "tests/test_cli.py",
         ),
         handoff_description=(
-            "Classify inbound email, own exact scoped mailbox-state changes, flag risk, "
-            "and request drafts only."
+            "Search, read, summarize and extract evidence from Gmail messages and threads; "
+            "classify inbound email, own exact scoped mailbox-state changes, flag risk, "
+            "and prepare supported draft-only replies."
         ),
         safety_notes=(
             "Draft-only replies",
@@ -263,31 +271,52 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         ),
         skills=AGENT_SKILL_NAMES["business_research_analyst"],
         tools=(
+            "load_contact_context",
+            "load_crm_account_context",
+            "load_approved_contact_context",
+            "load_approved_crm_context",
             "list_local_context_sources",
             "search_local_context",
             "read_local_context_file",
-            "search_web",
-            "fetch_company_page",
-            "extract_research_claims_from_html",
-            "extract_company_signals",
-            "load_approved_contact_context",
-            "load_approved_crm_context",
             "retrieve_memory",
+            "check_workflow_duplicate",
             *AIRTABLE_READ_TOOL_NAMES,
             *AIRTABLE_WRITE_TOOL_NAMES,
+            "search_web",
+            "fetch_company_page",
+            "extract_selected_urls_to_source_bundle",
+            "read_web_source_window",
+            "extract_research_claims_from_html",
             *WEB_STRUCTURING_TOOL_NAMES,
             *PLAYWRIGHT_RESEARCH_TOOL_NAMES,
             *BROWSER_DIAGNOSTIC_TOOL_NAMES,
-            *GOOGLE_WORKSPACE_TOOL_NAMES,
+            "fetch_linkedin_or_profile_placeholder",
+            "discover_public_company_contacts",
+            "extract_company_signals",
+            "dedupe_and_rank_sources",
+            "build_source_bundle_for_synthesis",
+            "synthesize_company_profile_from_source_bundle",
+            "compare_company_profiles_for_decision",
+            "save_company_profile_memory",
+            "save_retrieval_tool_performance_memory",
+            *GOOGLE_WORKSPACE_DELEGATED_TOOL_NAMES,
         ),
-        live_flags_required=("--live-search", "--no-dry-run", "--live-sdk"),
-        optional_tools=("file_search",),
+        live_flags_required=(
+            "--live-search",
+            "--no-dry-run",
+            "--live-sdk",
+            "live_extraction=true",
+            "KEYSTONE_ENABLE_WEBSITE_EXTRACTION=true",
+        ),
+        optional_tools=("file_search", "read_work_item_source_evidence"),
         eval_datasets=(
             "evals/static/business_research_analyst_cases.json",
             "evals/local/source_attribution.jsonl",
         ),
         validation_paths=(
             "tests/test_business_research_analyst.py",
+            "tests/test_supplied_research_sdk.py",
+            "tests/test_request_tool_scope.py",
             "tests/test_source_triage.py",
             "tests/test_request_coverage.py",
             "tests/test_instruction_following.py",
@@ -300,10 +329,52 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         safety_notes=(
             "Source attribution required",
             "No hallucinated research facts",
+            "Selected-URL extraction is public HTTP(S) only and requires the extraction gate",
             "Hosted file search attaches only with explicit vector store configuration",
             "Local/Zotero context is private unless explicitly approved for external use",
             "CRM/contact context must be approved before use",
             "Google Workspace writes require live flags and approval references",
+        ),
+    ),
+    AgentSpec(
+        route_name="rag_retrieval_specialist",
+        agent_name="RAG Retrieval Specialist",
+        builder=(
+            "keystone_agents.agents.rag_retrieval_specialist:"
+            "build_rag_retrieval_specialist_agent"
+        ),
+        output_schema="keystone_agents.schemas.rag_retrieval.RAGRetrievalResult",
+        prompt_files=(
+            "keystone_profile.md",
+            "safety_policy.md",
+            "tools.md",
+            "rag_retrieval_specialist.md",
+        ),
+        skills=AGENT_SKILL_NAMES["rag_retrieval_specialist"],
+        tools=(),
+        optional_tools=("file_search",),
+        live_flags_required=(
+            "--live-sdk",
+            "KEYSTONE_RAG_RETRIEVAL_SPECIALIST_FILE_SEARCH_VECTOR_STORE_IDS",
+        ),
+        eval_datasets=("evals/local/skill_task_matrix.jsonl",),
+        validation_paths=(
+            "tests/test_rag_retrieval_specialist.py",
+            "tests/test_file_search.py",
+            "tests/test_langgraph_workflow.py",
+            "scripts/run_rag_retrieval.py",
+        ),
+        handoff_description=(
+            "Use only when the operator or typed workflow explicitly requests natural-language "
+            "or semantic retrieval from configured vector stores, including nearest-match and "
+            "single-article lookup."
+        ),
+        safety_notes=(
+            "Read-only vector-store retrieval",
+            "No public web search or fallback to model knowledge",
+            "Live results require an observed hosted file-search call",
+            "No sends, posts, publishing, scheduling, or external writes",
+            "Do not route ordinary questions here unless the specialist is explicitly selected",
         ),
     ),
     AgentSpec(
@@ -316,13 +387,32 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "safety_policy.md",
             "tools.md",
             "opportunity_scout.md",
+            "opportunity_scout_supplied_evidence.md",
             "opportunity_scout_synthesis_compact.md",
         ),
         skills=AGENT_SKILL_NAMES["opportunity_scout"],
         tools=(
+            "list_local_context_sources",
+            "search_local_context",
+            "read_local_context_file",
             "retrieve_memory",
+            "check_workflow_duplicate",
+            *AIRTABLE_READ_TOOL_NAMES,
+            *AIRTABLE_WRITE_TOOL_NAMES,
             "search_web",
+            "extract_selected_urls_to_source_bundle",
+            "read_web_source_window",
+            *PLAYWRIGHT_RESEARCH_TOOL_NAMES,
+            *BROWSER_DIAGNOSTIC_TOOL_NAMES,
+            "extract_research_claims_from_html",
+            "score_opportunity",
+            "save_entity_memory",
+            "save_opportunity_memory",
+            *GOOGLE_WORKSPACE_DELEGATED_TOOL_NAMES,
+        ),
+        optional_tools=(
             "search_opportunity_sources_placeholder",
+            "load_existing_opportunity_state",
             "search_funding_news_sources",
             "search_job_posting_sources",
             "search_clinical_trials_sources",
@@ -331,18 +421,8 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "search_journal_call_sources",
             "search_contract_rfp_sources",
             "search_company_page_sources",
-            "extract_research_claims_from_html",
-            "score_opportunity",
             "handoff_to_business_research_analyst_placeholder",
             "save_opportunity_placeholder",
-            "save_entity_memory",
-            "save_opportunity_memory",
-            *AIRTABLE_READ_TOOL_NAMES,
-            *AIRTABLE_WRITE_TOOL_NAMES,
-            *WEB_STRUCTURING_TOOL_NAMES,
-            *PLAYWRIGHT_RESEARCH_TOOL_NAMES,
-            *BROWSER_DIAGNOSTIC_TOOL_NAMES,
-            *GOOGLE_WORKSPACE_TOOL_NAMES,
         ),
         live_flags_required=("--live-search", "--no-dry-run", "--live-sdk"),
         eval_datasets=(
@@ -353,6 +433,10 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         ),
         validation_paths=(
             "tests/test_opportunity_scout.py",
+            "tests/test_opportunity_supplied_sdk.py",
+            "tests/test_opportunity_supplied_schema.py",
+            "tests/test_opportunity_signal_scoring.py",
+            "tests/test_request_tool_scope.py",
             "tests/test_opportunity_scout_evaluation.py",
             "tests/test_compact_opportunity_assessment.py",
             "tests/test_compact_opportunity_baseline.py",
@@ -368,11 +452,17 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         ),
         safety_notes=(
             "No outreach generation",
+            (
+                "Optional source-search, placeholder handoff, and placeholder persistence "
+                "tools are offline fixture-only and blocked from live SDK runs"
+            ),
             "Closed, expired, stale, irrelevant, or detail-incomplete opportunities are "
             "withheld from final ranking",
             "Deduplicate before prioritizing",
             "Source-backed scoring required",
             "Single supplied-opportunity asks use the compact review-only assessment schema",
+            "Tool-free WorkItem assessment uses SuppliedOpportunityResult, a canonical-result "
+            "subclass that omits host-owned retrieval bookkeeping from the model schema",
             "Google Workspace writes require live flags and approval references",
         ),
     ),
@@ -390,19 +480,40 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         skills=AGENT_SKILL_NAMES["outreach_composer"],
         tools=(
             "load_company_profile",
+            "load_research_brief_profile",
             "load_opportunity_record",
+            "load_contact_context",
+            "load_crm_account_context",
+            "load_style_profile",
+            "list_local_context_sources",
+            "search_local_context",
+            "read_local_context_file",
+            "list_outreach_templates",
+            "load_outreach_template",
+            "retrieve_outreach_example_guidance",
+            "load_email_style_profile",
+            "retrieve_memory",
+            "retrieve_outreach_examples",
+            "check_workflow_duplicate",
+            *AIRTABLE_READ_TOOL_NAMES,
+            *AIRTABLE_WRITE_TOOL_NAMES,
+            "search_web",
+            *WEB_STRUCTURING_TOOL_NAMES,
             "load_approved_contact_context",
             "load_approved_crm_context",
-            "retrieve_memory",
-            "search_web",
+            "load_approved_outreach_examples",
             "check_unsupported_claims",
+            "build_approved_outreach_drafting_context",
+            "compose_outreach_draft_llm_constrained",
+            "build_call_prep_artifact",
+            "build_follow_up_schedule_record",
+            "save_outreach_dedup_memory",
+            "learn_email_style_profile",
             "save_initial_outreach_tracking_record",
             "list_outreach_tracking_records",
             "create_approval_queue_item",
-            *AIRTABLE_READ_TOOL_NAMES,
-            *AIRTABLE_WRITE_TOOL_NAMES,
-            *WEB_STRUCTURING_TOOL_NAMES,
-            *GOOGLE_WORKSPACE_TOOL_NAMES,
+            "create_approval_request_placeholder",
+            *GOOGLE_WORKSPACE_DELEGATED_TOOL_NAMES,
         ),
         live_flags_required=("--live-sdk",),
         eval_datasets=(
@@ -411,12 +522,15 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         ),
         validation_paths=(
             "tests/test_outreach_composer.py",
+            "tests/test_request_tool_scope.py",
             "tests/test_request_coverage.py",
             "tests/test_instruction_following.py",
             "tests/test_cli.py",
         ),
         handoff_description=(
-            "Create draft-only outreach from approved company or opportunity context."
+            "Create unsent outreach from source-backed facts authorized for the requested "
+            "drafting purpose. A private review template can target an organization with "
+            "a placeholder person; external use and provider writes require their own approval."
         ),
         safety_notes=(
             "Draft-only behavior",
@@ -440,6 +554,7 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         skills=AGENT_SKILL_NAMES["airtable_context_agent"],
         tools=(
             "airtable_get_base_schema",
+            "airtable_read_schema_detail",
             "airtable_read_records",
             "airtable_aggregate_records",
             "airtable_write_record",
@@ -455,6 +570,8 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         validation_paths=(
             "tests/test_agent_registry.py",
             "tests/test_chief_of_staff.py",
+            "tests/test_chief_nested_specialist_decisions.py",
+            "tests/test_context_agent_fake_model_matrix.py",
             "tests/test_instruction_following.py",
             "tests/test_cli.py",
         ),
@@ -501,7 +618,9 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "google_drive_list_folder",
             "google_drive_search_files",
             "google_drive_get_file_metadata",
+            "google_drive_media_ocr_read",
             "google_slide_deck_read",
+            "google_slide_deck_write",
             "presentation_search_local",
             "presentation_read_local",
             "presentation_extract_slide_copy_local",
@@ -520,12 +639,20 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "google_sheet_remove_tab",
             "google_sheet_trash",
         ),
-        live_flags_required=("--live-sdk",),
+        live_flags_required=(
+            "--live-sdk",
+            "KEYSTONE_GOOGLE_WORKSPACE_LIVE_READS=true",
+            "GOOGLE_WORKSPACE_WRITES_ENABLED=true",
+            "approval_reference",
+        ),
         eval_datasets=("promptfoo/tests/slack_agent_expansion_15.yaml",),
         validation_paths=(
             "tests/test_agent_registry.py",
             "tests/test_chief_of_staff.py",
             "tests/test_google_doc_test_lifecycle.py",
+            "tests/test_google_workspace_media_and_slides.py",
+            "tests/test_google_workspace_read_contracts.py",
+            "tests/test_context_agent_fake_model_matrix.py",
             "tests/test_presentation_index.py",
             "tests/test_presentation_index_runner.py",
             "tests/test_instruction_following.py",
@@ -539,12 +666,17 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         safety_notes=(
             "Direct writes require live flags and approval references",
             (
+                "Workspace reads require live=true or the configured live-read default; "
+                "writes additionally require GOOGLE_WORKSPACE_WRITES_ENABLED=true"
+            ),
+            (
                 "Marked Doc lifecycle cleanup additionally requires "
                 "KEYSTONE_GOOGLE_WORKSPACE_ALLOW_TEST_LIFECYCLE=true"
             ),
             "No nested live writes",
             "Chief of Staff owns review and approval handoff when this agent is nested",
-            "Drive image/media support is metadata-only until download/OCR tooling is added",
+            "Drive PDF/image OCR is bounded to one exact scoped file and returns no provider bytes",
+            "Slides creation/editing requires exact scope, approval, the Workspace write gate, and provider read-back",
             "Local presentation indexing stores bounded slide text and notes in repo-local SQLite",
             "Return blockers when folder, file, Doc, Sheet, or tab identity is ambiguous",
         ),
@@ -616,12 +748,19 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "rss_context.md",
         ),
         skills=AGENT_SKILL_NAMES["rss_context_agent"],
-        tools=("retrieve_rss_announcement_history",),
+        tools=(
+            "retrieve_rss_announcement_history",
+            "read_rss_announcement_evidence",
+            "inspect_signal_lifecycle",
+            "prepare_signal_lifecycle_checkpoint",
+            "advance_signal_lifecycle_checkpoint",
+        ),
         live_flags_required=("--live-sdk",),
         eval_datasets=("promptfoo/tests/slack_agent_expansion_15.yaml",),
         validation_paths=(
             "tests/test_agent_registry.py",
             "tests/test_announcement_context_tools.py",
+            "tests/test_signal_lifecycle_tools.py",
             "tests/test_instruction_following.py",
             "tests/test_cli.py",
         ),
@@ -631,7 +770,7 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "future-direction guidance."
         ),
         safety_notes=(
-            "Read-only historical context",
+            "Provider context remains read-only; lifecycle mutation is limited to exact local WorkItem checkpoints",
             "No Slack scraping or posting",
             "No local feed mutation",
             "Current external claims still require current source verification",
@@ -650,12 +789,19 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "preprints_context.md",
         ),
         skills=AGENT_SKILL_NAMES["preprints_context_agent"],
-        tools=("retrieve_preprint_announcement_history",),
+        tools=(
+            "retrieve_preprint_announcement_history",
+            "read_preprint_announcement_evidence",
+            "inspect_signal_lifecycle",
+            "prepare_signal_lifecycle_checkpoint",
+            "advance_signal_lifecycle_checkpoint",
+        ),
         live_flags_required=("--live-sdk",),
         eval_datasets=("promptfoo/tests/slack_agent_expansion_15.yaml",),
         validation_paths=(
             "tests/test_agent_registry.py",
             "tests/test_announcement_context_tools.py",
+            "tests/test_signal_lifecycle_tools.py",
             "tests/test_instruction_following.py",
             "tests/test_cli.py",
         ),
@@ -665,7 +811,7 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "signals, and future-direction guidance."
         ),
         safety_notes=(
-            "Read-only historical context",
+            "Provider context remains read-only; lifecycle mutation is limited to exact local WorkItem checkpoints",
             "No Slack scraping or posting",
             "No local feed mutation",
             "Preprints are preliminary and current claims require source verification",
@@ -694,13 +840,17 @@ ORCHESTRATOR_AGENT_SPEC = AgentSpec(
         "read_local_context_file",
         "retrieve_memory",
         "load_pending_approval_items",
+        "inspect_work_item_execution_receipts",
         "search_web",
         "extract_research_claims_from_html",
         *AIRTABLE_READ_TOOL_NAMES,
+        *AIRTABLE_WRITE_TOOL_NAMES,
+        "airtable_upload_attachment",
+        "airtable_create_expense_from_receipt",
         *WEB_STRUCTURING_TOOL_NAMES,
         *PLAYWRIGHT_RESEARCH_TOOL_NAMES,
         *BROWSER_DIAGNOSTIC_TOOL_NAMES,
-        *GOOGLE_WORKSPACE_READ_TOOL_NAMES,
+        *GOOGLE_WORKSPACE_DELEGATED_TOOL_NAMES,
     ),
     optional_tools=(
         "file_search",
@@ -711,6 +861,11 @@ ORCHESTRATOR_AGENT_SPEC = AgentSpec(
     eval_datasets=("evals/local/orchestrator_routing.jsonl", "evals/local/safety_refusals.jsonl"),
     validation_paths=(
         "tests/test_orchestrator.py",
+        "tests/test_orchestrator_supplied_context.py",
+        "tests/test_orchestrator_schema_edge_cases.py",
+        "tests/test_orchestrator_context_only.py",
+        "tests/test_preflight_workflow_authority.py",
+        "tests/test_request_tool_scope.py",
         "tests/test_manual_request_plan.py",
         "tests/test_diverse_ask_acceptance.py",
         "tests/test_handoff_contracts.py",
@@ -718,6 +873,7 @@ ORCHESTRATOR_AGENT_SPEC = AgentSpec(
         "tests/test_orchestrator_preflight_context.py",
         "tests/test_advanced_manager_live_validation.py",
         "tests/test_workflow_runner.py",
+        "tests/test_work_item_receipt_inspection.py",
         "tests/test_slack_action_contract.py",
         "tests/test_slack_agent_actions.py",
         "tests/test_instruction_following.py",
@@ -729,6 +885,7 @@ ORCHESTRATOR_AGENT_SPEC = AgentSpec(
     ),
     safety_notes=(
         "Python safety gates remain authoritative",
+        "Context-only response decisions require completed same-thread evidence and grant no tools",
         "Planner/Orchestrator context is advisory for specialists, not approval",
         "Child handoffs use compact preflight payloads instead of raw Slack state",
         "Manager-loop reviews feed final response synthesis",
@@ -773,7 +930,9 @@ CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
         "list_channel_automation_bindings",
         "summarize_automation_health",
         "list_pending_automation_approvals",
+        "inspect_active_work_item_execution_summary",
         "inspect_active_work_items",
+        "inspect_work_item_execution_receipts",
         "publish_document_report",
         "publish_internal_artifact",
         "publish_table_mirror",
@@ -781,6 +940,9 @@ CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
             "search_web",
             "airtable_get_base_schema",
             "airtable_read_records",
+            "airtable_write_record",
+            "airtable_upload_attachment",
+            "airtable_create_expense_from_receipt",
             "create_google_calendar_event",
             "update_google_calendar_event",
             "delete_google_calendar_event",
@@ -788,18 +950,22 @@ CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
             *WEB_STRUCTURING_TOOL_NAMES,
         *PLAYWRIGHT_RESEARCH_TOOL_NAMES,
         *BROWSER_DIAGNOSTIC_TOOL_NAMES,
-        *GOOGLE_WORKSPACE_READ_TOOL_NAMES,
+        *GOOGLE_WORKSPACE_DELEGATED_TOOL_NAMES,
     ),
     optional_tools=(
         "file_search",
+        "google_drive_media_ocr_read",
         *(specialist_agent_tool_name(spec.route_name) for spec in SPECIALIST_AGENT_SPECS),
     ),
     live_flags_required=("--live-sdk", "KEYSTONE_GOOGLE_CALENDAR_ALLOW_WRITES=true"),
     eval_datasets=(),
     validation_paths=(
         "tests/test_chief_of_staff.py",
+        "tests/test_chief_nested_specialist_decisions.py",
+        "tests/test_request_tool_scope.py",
         "tests/test_calendar_action_interpreter.py",
         "tests/test_google_calendar_tool.py",
+        "tests/test_work_item_receipt_inspection.py",
         "tests/test_cli.py",
         "tests/test_instruction_following.py",
     ),
@@ -854,3 +1020,20 @@ def agent_cards() -> list[dict[str, Any]]:
     """Return JSON-safe cards for docs, dashboards, or CLIs."""
 
     return [spec.to_card() for spec in REGISTERED_AGENT_SPECS]
+
+
+def agent_selection_catalog(route_names: Sequence[str]) -> list[dict[str, Any]]:
+    """Expose bounded role metadata without importing builders or granting tools."""
+
+    return [
+        {
+            "route": route,
+            "name": AGENT_REGISTRY[route].agent_name,
+            "description": AGENT_REGISTRY[route].handoff_description,
+            "registered_tools": list(AGENT_REGISTRY[route].tools),
+            "input_contract": AGENT_REGISTRY[route].input_contract_schema.rsplit(".", 1)[-1],
+            "output_contract": AGENT_REGISTRY[route].output_schema.rsplit(".", 1)[-1],
+        }
+        for route in dict.fromkeys(route_names)
+        if route in AGENT_REGISTRY
+    ]

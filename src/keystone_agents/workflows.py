@@ -12,6 +12,11 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
 
+from keystone_agents.agent_decision_contracts import (
+    business_research_context_decision_contract,
+    opportunity_scout_synthesis_decision_contract,
+    outreach_composer_decision_contract,
+)
 from keystone_agents.agents.business_research_analyst import (
     build_business_research_analyst_agent,
     build_business_research_analyst_focused_brief_agent,
@@ -19,7 +24,9 @@ from keystone_agents.agents.business_research_analyst import (
 )
 from keystone_agents.agents.gmail_triage import build_gmail_triage_agent, run_gmail_triage_fixture
 from keystone_agents.agents.opportunity_scout import (
+    apply_opportunity_scout_synthesis,
     build_opportunity_scout_agent,
+    build_opportunity_scout_synthesis_agent,
     scout_opportunities_fixture,
 )
 from keystone_agents.agents.orchestrator import review_specialist_output, route_request
@@ -48,10 +55,7 @@ from keystone_agents.model_provider import (
     MissingOpenAIAPIKeyError,
     ModelProviderConfigurationError,
 )
-from keystone_agents.models import (
-    OpportunityScoutSDKInput,
-    OutreachComposerSDKInput,
-)
+from keystone_agents.models import OutreachComposerSDKInput
 from keystone_agents.presentation.renderers import render_pipeline_report
 from keystone_agents.run import run_retrieved_sdk_synthesis
 from keystone_agents.schemas.approval import (
@@ -78,6 +82,7 @@ from keystone_agents.schemas.opportunity import (
 )
 from keystone_agents.schemas.opportunity import (
     OpportunityScoutResult,
+    OpportunityScoutSynthesis,
     OpportunitySource,
 )
 from keystone_agents.schemas.orchestrator import OrchestratorOutputReview, OrchestratorResult
@@ -638,29 +643,54 @@ def _synthesize_weekly_opportunity_scout(
     def retrieve() -> OpportunityScoutResult:
         return scout_result
 
-    def normalize(result: OpportunityScoutResult) -> OpportunityScoutSDKInput:
+    def normalize(result: OpportunityScoutResult) -> str:
+        records = []
+        for record in result.records[: max(1, min(5, max_opportunities))]:
+            records.append(
+                {
+                    "record_key": record.canonical_entity_key or record.company_name,
+                    "company_name": record.company_name,
+                    "entity_name": record.entity_name,
+                    "opportunity_type": record.opportunity_type,
+                    "priority_score": record.priority_score,
+                    "why_now_signal": record.why_now_signal,
+                    "keystone_fit_reason": record.keystone_fit_reason,
+                    "recommended_next_step": record.recommended_next_step,
+                    "missing_evidence": record.missing_evidence,
+                    "research_needed": record.research_needed,
+                    "sources": [
+                        {
+                            "source_id": source.source_id,
+                            "title": source.title,
+                            "url": source.url,
+                            "supported_signal": source.supported_signal,
+                        }
+                        for source in record.sources
+                    ],
+                }
+            )
         payload = {
-            "topic": result.topic,
-            "records": result.records,
-            "source_bundles": result.source_bundles,
+            "operator_request": topic,
+            "max_results": max_opportunities,
+            "retrieval_hint": jsonable(retrieval_hint),
+            "verified_records": records,
             "audit_notes": result.audit_notes,
             "constraint_relaxation_suggestion": result.constraint_relaxation_suggestion,
         }
-        return OpportunityScoutSDKInput(
-            topic=topic,
-            max_results=max_opportunities,
-            context=(
-                "Approved retrieved opportunity context for weekly human review:\n"
-                f"{json.dumps(jsonable(payload), ensure_ascii=True, sort_keys=True)}"
-            ),
-            retrieval_hint=retrieval_hint,
+        return (
+            "Approved retrieved opportunity evidence for weekly human review. "
+            "Return compact decisions only; do not call tools or create outreach.\n"
+            f"{json.dumps(jsonable(payload), ensure_ascii=True, sort_keys=True)}"
         )
 
+    agent = build_opportunity_scout_synthesis_agent(max_results=max_opportunities)
+
     outcome = run_retrieved_sdk_synthesis(
-        agent=build_opportunity_scout_agent(),
-        output_type=OpportunityScoutResult,
+        agent=agent,
+        output_type=OpportunityScoutSynthesis,
         retrieve=retrieve,
         normalize=normalize,
+        finalize_output=apply_opportunity_scout_synthesis,
         input_summary=f"weekly opportunity SDK synthesis for {topic}",
         input_audit_payload={
             "topic": topic,
@@ -671,6 +701,9 @@ def _synthesize_weekly_opportunity_scout(
         live=True,
         save=False,
         model_label="sdk-live",
+        decision_contract=lambda raw, _typed_input: (
+            opportunity_scout_synthesis_decision_contract(raw)
+        ),
     )
     synthesized = outcome.final_output
     expected_count = min(len(scout_result.records), max_opportunities)
@@ -695,7 +728,10 @@ def _synthesize_weekly_company_brief(
     """Use Business Research Analyst SDK synthesis for the company brief shown to humans."""
 
     outcome = run_retrieved_sdk_synthesis(
-        agent=build_business_research_analyst_focused_brief_agent(),
+        agent=build_business_research_analyst_focused_brief_agent(
+            request_text="Synthesize the supplied verified company profile into an internal brief.",
+            attach_tools=False,
+        ),
         output_type=CompanyResearchFocusedBrief,
         retrieve=lambda: company_profile,
         normalize=lambda profile: focused_brief_input_from_profile(profile),
@@ -709,6 +745,9 @@ def _synthesize_weekly_company_brief(
         live=True,
         save=False,
         model_label="sdk-live",
+        decision_contract=lambda raw, _typed_input: (
+            business_research_context_decision_contract(raw)
+        ),
     )
     return outcome.final_output
 
@@ -784,13 +823,13 @@ def _synthesize_weekly_outreach_draft(
         live=True,
         save=False,
         model_label="sdk-live",
+        decision_contract=outreach_composer_decision_contract(
+            approved_context.allowed_source_ids
+        ),
     )
     compact_payload = jsonable(outcome.final_output)
     if not isinstance(compact_payload, dict):
         raise RuntimeError("Weekly outreach SDK synthesis did not return a JSON object.")
-    source_ids_used = compact_payload.get("source_ids_used")
-    if isinstance(source_ids_used, list) and "keystone_profile" not in source_ids_used:
-        compact_payload["source_ids_used"] = [*source_ids_used, "keystone_profile"]
     draft = compose_outreach_draft_llm_constrained(
         approved_context=approved_context,
         llm_draft_payload=compact_payload,

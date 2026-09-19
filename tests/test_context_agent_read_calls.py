@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from types import ModuleType
 from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request
 
 import pytest
@@ -16,6 +17,7 @@ from keystone_agents.tools.internal_data_tools import (
     airtable_aggregate_records_impl,
     airtable_get_base_schema,
     airtable_read_records,
+    airtable_read_schema_detail,
     google_doc_read,
     google_drive_get_file_metadata,
     google_drive_list_folder,
@@ -52,8 +54,19 @@ def test_airtable_context_read_tools_return_bounded_context_packets() -> None:
             max_records=7,
         )
     )
+    detail = _loads(
+        airtable_read_schema_detail(
+            base_id="app_dry_run",
+            read_mode="field_detail",
+            table_id="tblExample",
+            field_id="fldExample",
+        )
+    )
 
     assert schema["status"] == "dry-run"
+    assert schema["provider"] == "airtable"
+    assert schema["operation"] == "read_schema"
+    assert schema["provider_read"] is False
     assert schema["send_enabled"] is False
     assert schema["request"]["method"] == "GET"  # type: ignore[index]
     assert schema["schema"]["base_name"] == "2026 Finance & Tax Tracker"  # type: ignore[index]
@@ -69,6 +82,11 @@ def test_airtable_context_read_tools_return_bounded_context_packets() -> None:
     assert records["request"]["params"]["filterByFormula"] == (  # type: ignore[index]
         "{Promptfoo case id} = 'case_1'"
     )
+    assert detail["status"] == "dry-run"
+    assert detail["operation"] == "read_schema_detail"
+    assert detail["table_id"] == "tblExample"
+    assert detail["field_id"] == "fldExample"
+    assert detail["send_enabled"] is False
 
 
 def test_airtable_read_tools_honor_live_read_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -82,14 +100,29 @@ def test_airtable_read_tools_honor_live_read_default(monkeypatch: pytest.MonkeyP
         captured["records"] = bool(kwargs.get("live"))
         return {"status": "captured", "send_enabled": False}
 
+    def fake_detail_impl(**kwargs: object) -> dict[str, object]:
+        captured["detail"] = bool(kwargs.get("live"))
+        return {"status": "captured", "send_enabled": False}
+
     monkeypatch.setattr(internal_data_tools, "airtable_get_base_schema_impl", fake_schema_impl)
     monkeypatch.setattr(internal_data_tools, "airtable_read_records_impl", fake_records_impl)
+    monkeypatch.setattr(
+        internal_data_tools,
+        "airtable_read_schema_detail_impl",
+        fake_detail_impl,
+    )
     monkeypatch.setenv(internal_data_tools.AIRTABLE_LIVE_READS_ENV, "true")
 
     _loads(airtable_get_base_schema(base_name="2026 Finance & Tax Tracker"))
+    _loads(
+        airtable_read_schema_detail(
+            table_id="tblExample",
+            field_id="fldExample",
+        )
+    )
     _loads(airtable_read_records(table="Business Income", max_records=1))
 
-    assert captured == {"schema": True, "records": True}
+    assert captured == {"schema": True, "detail": True, "records": True}
 
 
 def test_airtable_context_finance_base_name_uses_finance_alias(
@@ -213,6 +246,384 @@ def test_airtable_aggregate_records_is_schema_first_period_bounded_and_exact(
     assert "matching_record_summaries" not in result
 
 
+@pytest.mark.parametrize("amount_index", [1, 22])
+def test_airtable_aggregate_resolves_complete_schema_independent_of_field_order(
+    monkeypatch: pytest.MonkeyPatch,
+    amount_index: int,
+) -> None:
+    config = {
+        "base_id": "appSynthetic",
+        "base_name": "Synthetic source",
+        "access_token": "synthetic-not-secret",
+        "default_view": "",
+        "default_table": "Evidence",
+        "allowed_tables": ["Evidence"],
+        "base_alias": "",
+    }
+    fields = [
+        {"id": "fldDate", "name": "Date", "type": "date"},
+        *[
+            {
+                "id": f"fldFiller{index:02d}",
+                "name": f"Filler {index:02d}",
+                "type": "singleLineText",
+            }
+            for index in range(21)
+        ],
+    ]
+    fields.insert(
+        amount_index,
+        {
+            "id": "fldAmount",
+            "name": "Amount",
+            "type": "currency",
+            "options": {"precision": 2, "symbol": "$"},
+        },
+    )
+    schema_payload = {
+        "tables": [
+            {
+                "id": "tblEvidence",
+                "name": "Evidence",
+                "primaryFieldId": "fldDate",
+                "fields": fields,
+            }
+        ]
+    }
+    records_payload = {
+        "records": [
+            {"id": "recZero", "fields": {"Date": "2026-04-04", "Amount": 0}},
+            {
+                "id": "recNegative",
+                "fields": {"Date": "2026-04-05", "Amount": -4.5},
+            },
+        ]
+    }
+
+    def provider(request: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        return schema_payload if "/meta/" in str(request["url"]) else records_payload
+
+    monkeypatch.setattr(internal_data_tools, "_airtable_base_config", lambda **_: config)
+    monkeypatch.setattr(internal_data_tools, "_airtable_send", provider)
+
+    result = airtable_aggregate_records_impl(
+        table="Evidence",
+        amount_field="Amount",
+        date_field="Date",
+        year=2026,
+        max_records=10,
+        live=True,
+    )
+
+    assert result["status"] == "success"
+    assert result["total"] == "-4.50"
+    assert result["display_total"] == "-$4.50"
+    assert result["verified"] is True
+    assert result["schema_resolution"]["complete"] is True  # type: ignore[index]
+    assert result["schema_resolution"]["field_count"] == 23  # type: ignore[index]
+    assert result["schema_resolution"]["source_snapshot_sha256"]  # type: ignore[index]
+    assert result["schema_resolution"]["detail_page_count"] == 1  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    (
+        "field_type",
+        "options",
+        "amount",
+        "total",
+        "exact_total",
+        "display_total",
+        "unit_kind",
+    ),
+    [
+        (
+            "currency",
+            {"symbol": "$", "precision": 2},
+            1.25,
+            "1.25",
+            "1.25",
+            "$1.25",
+            "currency_symbol",
+        ),
+        (
+            "currency",
+            {"symbol": "£", "precision": 2},
+            1.25,
+            "1.25",
+            "1.25",
+            "£1.25",
+            "currency_symbol",
+        ),
+        (
+            "number",
+            {"precision": 4},
+            1.2345,
+            "1.2345",
+            "1.2345",
+            "1.2345",
+            "unitless_number",
+        ),
+        (
+            "number",
+            {"precision": 2},
+            1.2345,
+            "1.23",
+            "1.2345",
+            "1.23",
+            "unitless_number",
+        ),
+    ],
+)
+def test_airtable_aggregate_preserves_source_unit_and_precision(
+    monkeypatch: pytest.MonkeyPatch,
+    field_type: str,
+    options: dict[str, object],
+    amount: float,
+    total: str,
+    exact_total: str,
+    display_total: str,
+    unit_kind: str,
+) -> None:
+    config = {
+        "base_id": "appSynthetic",
+        "base_name": "Synthetic source",
+        "access_token": "synthetic-not-secret",
+        "default_view": "",
+        "default_table": "Evidence",
+        "allowed_tables": ["Evidence"],
+        "base_alias": "",
+    }
+    schema_payload = {
+        "tables": [
+            {
+                "id": "tblEvidence",
+                "name": "Evidence",
+                "primaryFieldId": "fldDate",
+                "fields": [
+                    {"id": "fldDate", "name": "Date", "type": "date"},
+                    {
+                        "id": "fldAmount",
+                        "name": "Amount",
+                        "type": field_type,
+                        "options": options,
+                    },
+                ],
+            }
+        ]
+    }
+    records_payload = {
+        "records": [
+            {
+                "id": "recSource",
+                "fields": {"Date": "2026-04-05", "Amount": amount},
+            }
+        ]
+    }
+
+    def provider(request: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        return schema_payload if "/meta/" in str(request["url"]) else records_payload
+
+    monkeypatch.setattr(internal_data_tools, "_airtable_base_config", lambda **_: config)
+    monkeypatch.setattr(internal_data_tools, "_airtable_send", provider)
+
+    result = airtable_aggregate_records_impl(
+        table="Evidence",
+        amount_field="Amount",
+        date_field="Date",
+        year=2026,
+        max_records=10,
+        include_matching_records=True,
+        expected_total="1.2311" if exact_total != total else "",
+        live=True,
+    )
+
+    assert result["status"] == "success"
+    assert result["verified"] is True
+    assert result["total"] == total
+    assert result["exact_total"] == exact_total
+    assert result["result_scope"]["total"] == exact_total  # type: ignore[index]
+    assert result["display_total"] == display_total
+    assert result["currency"] == ""
+    assert result["unit"]["kind"] == unit_kind  # type: ignore[index]
+    assert result["unit"]["symbol"] == str(options.get("symbol") or "")  # type: ignore[index]
+    assert result["unit"]["precision"] == options["precision"]  # type: ignore[index]
+    assert result["verification"]["unit_source_verified"] is True  # type: ignore[index]
+    assert result["verification"]["prior_total_match"] is (  # type: ignore[index]
+        False if exact_total != total else None
+    )
+    assert display_total in result["matching_record_summaries"][0]["value"]  # type: ignore[index]
+
+
+def test_airtable_aggregate_blocks_incomplete_or_unknown_schema_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = {
+        "base_id": "appSynthetic",
+        "base_name": "Synthetic source",
+        "access_token": "synthetic-not-secret",
+        "default_view": "",
+        "default_table": "Evidence",
+        "allowed_tables": ["Evidence"],
+        "base_alias": "",
+    }
+    fields = [
+        {"id": "fldDate", "name": "Date", "type": "date"},
+        *[
+            {
+                "id": f"fldFiller{index:02d}",
+                "name": f"Filler {index:02d}",
+                "type": "singleLineText",
+            }
+            for index in range(44)
+        ],
+        {
+            "id": "fldAmount",
+            "name": "Amount",
+            "type": "futureProviderType",
+            "options": {"enabled": False, "count": 0},
+        },
+    ]
+    schema_payload = {
+        "tables": [
+            {
+                "id": "tblEvidence",
+                "name": "Evidence",
+                "primaryFieldId": "fldDate",
+                "fields": fields,
+            }
+        ]
+    }
+    record_read_attempted = False
+
+    def provider(request: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        nonlocal record_read_attempted
+        if "/meta/" in str(request["url"]):
+            return schema_payload
+        record_read_attempted = True
+        return {"records": []}
+
+    monkeypatch.setattr(internal_data_tools, "_airtable_base_config", lambda **_: config)
+    monkeypatch.setattr(internal_data_tools, "_airtable_send", provider)
+    monkeypatch.setattr(internal_data_tools, "AIRTABLE_SCHEMA_RESOLUTION_MAX_PAGES", 1)
+
+    capped = airtable_aggregate_records_impl(
+        table="Evidence",
+        amount_field="Amount",
+        date_field="Date",
+        year=2026,
+        live=True,
+    )
+
+    assert capped["status"] == "blocked"
+    assert capped["reason"] == "schema_resolution_incomplete"
+    assert capped["schema_resolution"]["status"] == "page_limit_reached"  # type: ignore[index]
+    assert record_read_attempted is False
+
+    monkeypatch.setattr(internal_data_tools, "AIRTABLE_SCHEMA_RESOLUTION_MAX_PAGES", 100)
+    unknown = airtable_aggregate_records_impl(
+        table="Evidence",
+        amount_field="Amount",
+        date_field="Date",
+        year=2026,
+        live=True,
+    )
+
+    assert unknown["status"] == "blocked"
+    assert unknown["reason"] == "requested_field_semantics_unsupported"
+    assert unknown["unsupported_fields"] == ["Amount"]
+    assert record_read_attempted is False
+
+
+@pytest.mark.parametrize(
+    ("second_amount", "expected_status", "expected_verified"),
+    [(10, "success", True), (20, "blocked", None)],
+)
+def test_airtable_aggregate_deduplicates_stable_records_and_blocks_conflicts(
+    monkeypatch: pytest.MonkeyPatch,
+    second_amount: int,
+    expected_status: str,
+    expected_verified: bool | None,
+) -> None:
+    config = {
+        "base_id": "appSynthetic",
+        "base_name": "Synthetic source",
+        "access_token": "synthetic-not-secret",
+        "default_view": "",
+        "default_table": "Evidence",
+        "allowed_tables": ["Evidence"],
+        "base_alias": "",
+    }
+    schema_payload = {
+        "tables": [
+            {
+                "id": "tblEvidence",
+                "name": "Evidence",
+                "primaryFieldId": "fldDate",
+                "fields": [
+                    {"id": "fldDate", "name": "Date", "type": "date"},
+                    {
+                        "id": "fldAmount",
+                        "name": "Amount",
+                        "type": "currency",
+                        "options": {"precision": 2, "symbol": "$"},
+                    },
+                ],
+            }
+        ]
+    }
+
+    def provider(request: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        if "/meta/" in str(request["url"]):
+            return schema_payload
+        params = request.get("params")
+        later = isinstance(params, dict) and bool(params.get("offset"))
+        payload: dict[str, object] = {
+            "records": [
+                {
+                    "id": "recSame",
+                    "fields": {
+                        "Date": "2026-04-05",
+                        "Amount": second_amount if later else 10,
+                    },
+                }
+            ]
+        }
+        if not later:
+            payload["offset"] = "second-page"
+        return payload
+
+    monkeypatch.setattr(internal_data_tools, "_airtable_base_config", lambda **_: config)
+    monkeypatch.setattr(internal_data_tools, "_airtable_send", provider)
+
+    read = internal_data_tools.airtable_read_records_impl(
+        table="Evidence",
+        max_records=10,
+        fetch_all=True,
+        live=True,
+    )
+    result = airtable_aggregate_records_impl(
+        table="Evidence",
+        amount_field="Amount",
+        date_field="Date",
+        year=2026,
+        max_records=10,
+        live=True,
+    )
+
+    assert read["content_complete"] is (second_amount == 10)
+    assert read["truncated"] is (second_amount != 10)
+    assert read["pagination"]["status"] == (  # type: ignore[index]
+        "complete" if second_amount == 10 else "record_identity_conflict"
+    )
+    assert result["status"] == expected_status
+    if expected_verified is True:
+        assert result["total"] == "10.00"
+        assert result["verified"] is True
+    else:
+        assert result["reason"] == "record_identity_conflict"
+        assert result["conflicting_record_ids"] == ["recSame"]
+
+
 def test_airtable_aggregate_projects_verified_matching_records(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -288,17 +699,13 @@ def test_airtable_aggregate_projects_verified_matching_records(
         {
             "key": "Course registration",
             "value": (
-                "Merchant: Alpha Learning; Date of Expense: 2026-06-20; "
-                "Total Expenses: $100.10"
+                "Merchant: Alpha Learning; Date of Expense: 2026-06-20; Total Expenses: 100.10"
             ),
             "note": "Estimated Tax Periods: Q3",
         },
         {
             "key": "Software subscription",
-            "value": (
-                "Merchant: Beta Tools; Date of Expense: 2026-07-01; "
-                "Total Expenses: $20.20"
-            ),
+            "value": ("Merchant: Beta Tools; Date of Expense: 2026-07-01; Total Expenses: 20.20"),
             "note": "Estimated Tax Periods: 3",
         },
     ]
@@ -459,6 +866,7 @@ def test_google_workspace_context_read_tools_return_drive_docs_sheets_metadata()
     assert metadata["status"] == "dry-run"
     assert metadata["file_id"] == "file123"
     assert "imageMediaMetadata" in metadata["metadata_fields"]  # type: ignore[operator]
+    assert "owners.displayName" in metadata["metadata_fields"]  # type: ignore[operator]
     assert "does not download file bytes" in " ".join(metadata["notes"])  # type: ignore[arg-type]
 
     assert doc["status"] == "dry-run"
@@ -474,7 +882,9 @@ def test_google_workspace_context_read_tools_return_drive_docs_sheets_metadata()
     assert sheet["send_enabled"] is False
 
 
-def test_google_workspace_read_tools_honor_live_read_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_google_workspace_read_tools_honor_live_read_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     captured: dict[str, bool] = {}
 
     def fake_folder_impl(*args: object, live: bool = False, **kwargs: object) -> dict[str, object]:
@@ -485,7 +895,9 @@ def test_google_workspace_read_tools_honor_live_read_default(monkeypatch: pytest
         captured["search"] = live
         return {"status": "captured", "send_enabled": False}
 
-    def fake_metadata_impl(*args: object, live: bool = False, **kwargs: object) -> dict[str, object]:
+    def fake_metadata_impl(
+        *args: object, live: bool = False, **kwargs: object
+    ) -> dict[str, object]:
         captured["metadata"] = live
         return {"status": "captured", "send_enabled": False}
 
@@ -493,17 +905,23 @@ def test_google_workspace_read_tools_honor_live_read_default(monkeypatch: pytest
         captured["doc"] = live
         return {"status": "captured", "send_enabled": False}
 
-    def fake_sheet_list_impl(*args: object, live: bool = False, **kwargs: object) -> dict[str, object]:
+    def fake_sheet_list_impl(
+        *args: object, live: bool = False, **kwargs: object
+    ) -> dict[str, object]:
         captured["sheet_list"] = live
         return {"status": "captured", "send_enabled": False}
 
-    def fake_sheet_read_impl(*args: object, live: bool = False, **kwargs: object) -> dict[str, object]:
+    def fake_sheet_read_impl(
+        *args: object, live: bool = False, **kwargs: object
+    ) -> dict[str, object]:
         captured["sheet_read"] = live
         return {"status": "captured", "send_enabled": False}
 
     monkeypatch.setattr(internal_data_tools, "google_drive_list_folder_impl", fake_folder_impl)
     monkeypatch.setattr(internal_data_tools, "google_drive_search_files_impl", fake_search_impl)
-    monkeypatch.setattr(internal_data_tools, "google_drive_get_file_metadata_impl", fake_metadata_impl)
+    monkeypatch.setattr(
+        internal_data_tools, "google_drive_get_file_metadata_impl", fake_metadata_impl
+    )
     monkeypatch.setattr(internal_data_tools, "google_doc_read_impl", fake_doc_impl)
     monkeypatch.setattr(internal_data_tools, "google_sheet_list_impl", fake_sheet_list_impl)
     monkeypatch.setattr(internal_data_tools, "google_sheet_read_table_impl", fake_sheet_read_impl)
@@ -658,6 +1076,73 @@ def test_zotero_api_metadata_can_plan_latest_top_level_item_read() -> None:
     assert api["send_enabled"] is False
 
 
+def test_zotero_api_metadata_supports_tagged_multi_item_presence_only_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Response:
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(
+                [
+                    {
+                        "key": "NEWEST",
+                        "data": {
+                            "title": "Newest tagged item",
+                            "abstractNote": "Private abstract body one.",
+                            "dateAdded": "2026-08-02T10:00:00Z",
+                        },
+                    },
+                    {
+                        "key": "SECOND",
+                        "data": {
+                            "title": "Second tagged item",
+                            "abstractNote": "",
+                            "dateAdded": "2026-08-01T10:00:00Z",
+                        },
+                    },
+                ]
+            ).encode("utf-8")
+
+    captured: dict[str, object] = {}
+
+    def _urlopen(request: Request, timeout: int) -> _Response:
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        return _Response()
+
+    monkeypatch.setenv("ZOTERO_API_KEY", "test-key")
+    monkeypatch.setattr("keystone_agents.tools.zotero_context_tools.urlopen", _urlopen)
+
+    api = _loads(
+        zotero_read_api_metadata(
+            library_id="12345",
+            tag="digital phenotyping",
+            limit=2,
+            selection_count=2,
+            sort="dateAdded",
+            direction="desc",
+            top_level_only=True,
+            include_abstract_text=False,
+            live=True,
+        )
+    )
+
+    query = parse_qs(urlparse(str(captured["url"])).query)
+    assert query["tag"] == ["digital phenotyping"]
+    assert query["limit"] == ["2"]
+    assert api["item_count"] == 2
+    assert api["selection_count"] == 2
+    assert api["items"][0]["data"]["abstractPresent"] is True  # type: ignore[index]
+    assert api["items"][1]["data"]["abstractPresent"] is False  # type: ignore[index]
+    assert "abstractNote" not in api["items"][0]["data"]  # type: ignore[operator,index]
+    assert "Private abstract body" not in json.dumps(api)
+
+
 def test_zotero_api_metadata_selects_first_ordered_item_with_stored_abstract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -774,9 +1259,7 @@ def test_zotero_api_metadata_recovers_stale_configured_user_library_id(
 
     assert payload["status"] == "success"
     assert payload["selected_item_title"] == "Authorized library item"
-    assert payload["library_id_resolution"] == (
-        "api_key_current_user_after_configured_403"
-    )
+    assert payload["library_id_resolution"] == ("api_key_current_user_after_configured_403")
     assert len(calls) == 3
 
 
@@ -815,9 +1298,9 @@ def test_zotero_api_metadata_requires_verified_user_library_access_on_recovery(
             return None
 
         def read(self) -> bytes:
-            return json.dumps(
-                {"userID": 24680, "access": {"user": {"library": False}}}
-            ).encode("utf-8")
+            return json.dumps({"userID": 24680, "access": {"user": {"library": False}}}).encode(
+                "utf-8"
+            )
 
     def _urlopen(request: Request, timeout: int) -> _Response:
         assert timeout == 30

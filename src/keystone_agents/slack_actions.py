@@ -20,6 +20,7 @@ from keystone_agents.eval_runtime_diagnostics import (
     slack_eval_blocker_diagnostics,
     slack_eval_child_step_summary,
 )
+from keystone_agents.instruction_following import canonical_source_url
 from keystone_agents.langgraph_workflow import (
     advance_work_item_manager_loop_with_optional_langgraph,
 )
@@ -30,9 +31,16 @@ from keystone_agents.planning.compatibility import (
     infer_manual_request_plan,
     live_search_allowed_for_execution,
 )
+from keystone_agents.planning.composition_admission import (
+    explicit_signal_source_selection,
+)
+from keystone_agents.schemas.composition_admission import (
+    SignalSourceInterpretation,
+    VerifiedSignalContext,
+)
 from keystone_agents.schemas.execution_request import ContinuationObjectReference
 from keystone_agents.schemas.manual_request_plan import ManualProviderResultSetScope
-from keystone_agents.schemas.work_item import WorkflowRunRequest
+from keystone_agents.schemas.work_item import WorkflowRunRequest, WorkItemSourceRef
 from keystone_agents.sdk_sessions import build_sdk_session, resolve_sdk_session_spec
 from keystone_agents.slack_action_contract import (
     KBA_EVAL_ORCHESTRATOR_JUDGE,
@@ -649,7 +657,7 @@ def handle_run_agent_interaction(
     context_dir: str | Path = DEFAULT_SLACK_CONTEXT_DIR,
     live_search: bool = False,
     live_sdk: bool = False,
-    max_results: int = 3,
+    max_results: int | None = None,
     thread_messages: list[dict[str, Any]] | None = None,
     thread_fetch_error: str = "",
     feedback_callback: Callable[[str, dict[str, Any]], None] | None = None,
@@ -776,7 +784,8 @@ def handle_run_agent_interaction(
         orchestrator_preflight = run_orchestrator_preflight(
             submission.requested_task,
             requested_agent=deterministic_plan.requested_agent,
-            live_manual_plan=live_sdk,
+            live_manual_plan=False,
+            live_orchestrator=live_sdk,
             session=preflight_session,
             database_url=database_url,
             workflow_state=orchestrator_workflow_state_from_slack_context(
@@ -840,7 +849,8 @@ def handle_run_agent_interaction(
                 database_url=database_url,
                 live_search=live_search,
                 live_sdk=live_sdk,
-                max_results=max_results,
+                max_results=3 if max_results is None else max_results,
+                max_results_explicit=max_results is not None,
                 context_file_path=context_file_path,
                 manual_request_plan=manual_request_plan,
                 orchestrator_preflight=compact_orchestrator_preflight_payload(
@@ -2005,6 +2015,18 @@ def orchestrator_workflow_state_from_slack_context(
     )
     if prior_result_scope is not None:
         state["prior_provider_result_scope"] = prior_result_scope.model_dump(mode="json")
+    signal_context, signal_history = signal_context_resolution_for_slack_thread(
+        channel_id=context.channel_id,
+        thread_ts=context.thread_ts,
+        database_url=database_url,
+        team_id=context.team_id,
+        before_request_ts=context.selected_message_ts,
+        request_text=request_text,
+    )
+    if signal_history:
+        state["signal_run_history"] = signal_history
+    if signal_context is not None:
+        attach_verified_signal_context_to_workflow_state(state, signal_context)
     if _should_include_channel_automation_context(request_text):
         automations = _channel_automation_context(
             context,
@@ -2285,6 +2307,152 @@ def latest_verified_provider_objects_for_slack_thread(
     return tuple(references)
 
 
+def latest_verified_signal_context_for_slack_thread(
+    *,
+    channel_id: str,
+    thread_ts: str,
+    database_url: str | None,
+    team_id: str = "",
+    before_request_ts: str = "",
+    request_text: str = "",
+) -> VerifiedSignalContext | None:
+    """Resolve the newest or explicitly selected older signal in one thread."""
+
+    context, _history = signal_context_resolution_for_slack_thread(
+        team_id=team_id,
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+        before_request_ts=before_request_ts,
+        database_url=database_url,
+        request_text=request_text,
+    )
+    return context
+
+
+def signal_context_resolution_for_slack_thread(
+    *,
+    channel_id: str,
+    thread_ts: str,
+    database_url: str | None,
+    team_id: str = "",
+    before_request_ts: str = "",
+    request_text: str = "",
+) -> tuple[VerifiedSignalContext | None, list[dict[str, Any]]]:
+    """Resolve signal evidence without hiding a newer incomplete signal result."""
+
+    rows = [
+        row
+        for row in _causal_slack_thread_agent_runs(
+            team_id=team_id,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            before_request_ts=before_request_ts,
+            database_url=database_url,
+        )
+        if str(row.get("agent_name") or "").strip()
+        in {"rss_context_agent", "preprints_context_agent"}
+    ]
+    if not rows:
+        return None, []
+    contexts = [_verified_signal_context_from_agent_run(row) for row in rows]
+    history = [
+        _signal_run_history_entry(row, verified_context=context)
+        for row, context in zip(rows, contexts, strict=True)
+    ]
+    latest = history[0]
+    for index, context in enumerate(contexts):
+        if context is None:
+            continue
+        selected_ids, explicit_reference, mismatch = explicit_signal_source_selection(
+            context,
+            texts=(request_text,),
+        )
+        if not explicit_reference or mismatch or not selected_ids:
+            continue
+        selected_id_set = set(selected_ids)
+        update: dict[str, Any] = {
+            "selected_sources": [
+                source
+                for source in context.selected_sources
+                if source.source_id in selected_id_set
+            ],
+            "source_dates": {
+                source_id: published_at
+                for source_id, published_at in context.source_dates.items()
+                if source_id in selected_id_set
+            },
+            "interpretations": [
+                item
+                for item in context.interpretations
+                if item.source_id in selected_id_set
+            ],
+        }
+        if index > 0:
+            update.update(
+                {
+                    "selection_basis": "explicit_older_signal",
+                    "newer_signal_run_id": str(latest.get("id") or ""),
+                    "newer_signal_status": str(latest.get("status") or ""),
+                    "newer_signal_request_ts": str(latest.get("request_ts") or ""),
+                    "limitations": [
+                        *context.limitations,
+                        (
+                            "A newer same-thread signal run exists; this older source "
+                            "was retained only because the operator selected its exact "
+                            "ID or URL."
+                        ),
+                    ],
+                }
+            )
+        context = context.model_copy(update=update)
+        return context, history
+    if contexts[0] is not None:
+        return contexts[0], history
+    return None, history
+
+
+def _signal_run_history_entry(
+    row: dict[str, Any],
+    *,
+    verified_context: VerifiedSignalContext | None,
+) -> dict[str, Any]:
+    payload = _agent_run_output_payload(row)
+    public_result = payload.get("public_result")
+    public_status = (
+        str(public_result.get("status") or "").strip().lower()
+        if isinstance(public_result, dict)
+        else ""
+    )
+    provenance = payload.get("slack_run_provenance")
+    request_ts = (
+        str(provenance.get("request_ts") or "").strip()
+        if isinstance(provenance, dict)
+        else ""
+    )
+    return {
+        "id": str(row.get("id") or ""),
+        "route": str(row.get("agent_name") or "").strip(),
+        "status": public_status or str(row.get("status") or "").strip().lower(),
+        "persistence_status": str(row.get("status") or "").strip().lower(),
+        "completion_confirmed": bool(
+            isinstance(public_result, dict)
+            and public_result.get("completion_confirmed") is True
+        ),
+        "request_ts": request_ts,
+        "thread_correlation": "same_thread",
+        "verified_context_available": verified_context is not None,
+    }
+
+
+def attach_verified_signal_context_to_workflow_state(
+    state: dict[str, Any],
+    context: VerifiedSignalContext,
+) -> None:
+    """Attach trusted evidence without reordering the thread's prior-run chronology."""
+
+    state["verified_signal_context"] = context.model_dump(mode="json")
+
+
 def _trusted_slack_thread_agent_runs(
     *,
     team_id: str,
@@ -2294,6 +2462,29 @@ def _trusted_slack_thread_agent_runs(
     database_url: str | None,
 ) -> list[dict[str, Any]]:
     """Return verified live rows ordered by Slack request time, not completion."""
+
+    return [
+        row
+        for row in _causal_slack_thread_agent_runs(
+            team_id=team_id,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            before_request_ts=before_request_ts,
+            database_url=database_url,
+        )
+        if str(row.get("status") or "").strip().lower() == "success"
+    ]
+
+
+def _causal_slack_thread_agent_runs(
+    *,
+    team_id: str,
+    channel_id: str,
+    thread_ts: str,
+    before_request_ts: str,
+    database_url: str | None,
+) -> list[dict[str, Any]]:
+    """Return validated non-dry same-thread rows in causal Slack order."""
 
     wanted_team = str(team_id or "").strip()
     wanted_channel = str(channel_id or "").strip()
@@ -2313,8 +2504,6 @@ def _trusted_slack_thread_agent_runs(
     matched: list[tuple[tuple[int, int], int, dict[str, Any]]] = []
     for row in rows:
         if bool(row.get("dry_run")):
-            continue
-        if str(row.get("status") or "").strip().lower() != "success":
             continue
         payload = _agent_run_output_payload(row)
         provenance = payload.get("slack_run_provenance")
@@ -2402,6 +2591,291 @@ def _verified_provider_objects_from_agent_run(
     return tuple(references[:8])
 
 
+def _verified_signal_context_from_agent_run(
+    row: dict[str, Any],
+) -> VerifiedSignalContext | None:
+    """Project provider-owned evidence plus separately labeled model interpretation."""
+
+    if bool(row.get("dry_run")):
+        return None
+    if str(row.get("status") or "").strip().lower() != "success":
+        return None
+    route = str(row.get("agent_name") or "").strip()
+    tool_name = {
+        "rss_context_agent": "retrieve_rss_announcement_history",
+        "preprints_context_agent": "retrieve_preprint_announcement_history",
+    }.get(route)
+    if tool_name is None:
+        return None
+    payload = _agent_run_output_payload(row)
+    provenance = payload.get("slack_run_provenance")
+    source_request_ts = (
+        str(provenance.get("request_ts") or "").strip()
+        if isinstance(provenance, dict)
+        else ""
+    )
+    if _slack_timestamp_key(source_request_ts) is None:
+        return None
+    public_result = payload.get("public_result")
+    if not isinstance(public_result, dict):
+        return None
+    public_status = str(public_result.get("status") or "").strip().lower()
+    if (
+        public_result.get("completion_confirmed") is not True
+        or public_status not in {"verified", "completed", "recovered"}
+    ):
+        return None
+    output = payload.get("output")
+    if not isinstance(output, dict):
+        return None
+    decision = output.get("decision")
+    if not isinstance(decision, dict):
+        return None
+    selected_ids = [
+        str(value or "").strip()
+        for value in decision.get("selected_candidate_ids") or []
+        if str(value or "").strip()
+    ]
+    retrieved_ids = [
+        str(value or "").strip()
+        for value in output.get("retrieved_item_ids") or []
+        if str(value or "").strip()
+    ]
+    if (
+        not selected_ids
+        or decision.get("decision_owner") != "specialist_agent"
+        or decision.get("decision_stage") != "signal_relevance_selection"
+        or decision.get("needs_more_context") is True
+        or set(selected_ids) != set(retrieved_ids)
+        or len(selected_ids) != len(set(selected_ids))
+    ):
+        return None
+    request_cache = payload.get("_sdk_request_cache")
+    if not isinstance(request_cache, dict):
+        return None
+    decision_run = payload.get("internal_decision_ownership")
+    if not isinstance(decision_run, dict):
+        decision_run = request_cache.get("decision_ownership")
+    validator = (
+        decision_run.get("validator_outcome")
+        if isinstance(decision_run, dict)
+        else None
+    )
+    if not isinstance(validator, dict) or validator.get("status") != "accepted":
+        return None
+    evidence = request_cache.get("signal_decision_evidence")
+    candidate_by_id = _verified_persisted_signal_candidates(
+        evidence,
+        tool_name=tool_name,
+        selected_ids=selected_ids,
+    )
+    if candidate_by_id is None:
+        return None
+    if not set(selected_ids).issubset(candidate_by_id):
+        return None
+    article_by_id = {
+        str(article.get("feed_item_id") or "").strip(): article
+        for article in output.get("articles") or []
+        if isinstance(article, dict) and str(article.get("feed_item_id") or "").strip()
+    }
+    if set(article_by_id) != set(selected_ids):
+        return None
+    sources: list[WorkItemSourceRef] = []
+    source_dates: dict[str, str] = {}
+    interpretations: list[SignalSourceInterpretation] = []
+    limitations: list[str] = []
+    for selected_id in selected_ids:
+        article = article_by_id[selected_id]
+        candidate = candidate_by_id[selected_id]
+        if not _signal_article_identity_matches_provider(article, candidate):
+            return None
+        title = _clean_text(candidate.get("title"), max_chars=300)
+        url = _clean_text(candidate.get("url"), max_chars=1200)
+        published_at = _clean_text(candidate.get("published_at"), max_chars=80)
+        supported_claim = _clean_text(candidate.get("summary"), max_chars=500)
+        evidence_status = _clean_text(candidate.get("evidence_status"), max_chars=80)
+        source_basis = _clean_text(candidate.get("source_basis"), max_chars=700)
+        evidence_notes = [
+            _clean_text(value, max_chars=500)
+            for value in candidate.get("evidence_notes") or []
+            if _clean_text(value, max_chars=500)
+        ]
+        limitations.extend(evidence_notes)
+        if evidence_status and evidence_status != "article_extracted":
+            limitations.append(f"Provider evidence status: {evidence_status}.")
+        source_dates[selected_id] = published_at
+        sources.append(
+            WorkItemSourceRef(
+                source_id=selected_id,
+                provider_candidate_id=selected_id,
+                title=title,
+                url=url,
+                source_type=(
+                    "preprints_historical_context"
+                    if route == "preprints_context_agent"
+                    else "rss_historical_context"
+                ),
+                supported_claim=supported_claim,
+                provider=route,
+                extraction_status=evidence_status or "verified_signal_history",
+                key_facts=[
+                    value
+                    for value in (
+                        source_basis,
+                        *evidence_notes,
+                    )
+                    if value
+                ],
+                evidence_excerpt=supported_claim,
+            )
+        )
+        interpretations.append(
+            SignalSourceInterpretation(
+                source_id=selected_id,
+                model_summary=article.get("summary"),
+                detailed_summary=article.get("detailed_summary"),
+                selection_reason=article.get("selection_reason"),
+                relevance_to_keystone=article.get("relevance_to_keystone"),
+                limitations=[
+                    *list(article.get("limitations") or []),
+                    *list(decision.get("limitations") or []),
+                    *list(output.get("evidence_gaps") or []),
+                ],
+            )
+        )
+    try:
+        return VerifiedSignalContext(
+            source_run_id=str(row.get("id") or ""),
+            source_route=route,
+            verification_status="verified",
+            public_result_status=public_status,
+            source_request_ts=source_request_ts,
+            selected_sources=sources,
+            source_dates=source_dates,
+            limitations=list(dict.fromkeys(limitations)),
+            interpretations=interpretations,
+        )
+    except ValueError:
+        return None
+
+
+def _verified_persisted_signal_candidates(
+    value: object,
+    *,
+    tool_name: str,
+    selected_ids: list[str] | tuple[str, ...],
+) -> dict[str, dict[str, Any]] | None:
+    """Validate the production persisted provider-candidate evidence envelope."""
+
+    if not isinstance(value, dict):
+        return None
+    evidence = dict(value)
+    fingerprint = str(evidence.pop("evidence_fingerprint", "") or "").strip()
+    canonical = json.dumps(
+        evidence,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    tool_call_count = evidence.get("tool_call_count")
+    result_counts = evidence.get("tool_result_item_counts")
+    reformulation = evidence.get("bounded_reformulation")
+    bounded_reads_valid = bool(
+        type(tool_call_count) is int
+        and tool_call_count in {1, 2}
+        and evidence.get("model_tool_call_count") == tool_call_count
+        and evidence.get("tool_output_count") == tool_call_count
+    )
+    if bounded_reads_valid and tool_call_count == 2:
+        bounded_reads_valid = bool(
+            isinstance(result_counts, list)
+            and len(result_counts) == 2
+            and all(type(count) is int and count >= 0 for count in result_counts)
+            and result_counts[0] == 0
+            and result_counts[1] > 0
+            and isinstance(reformulation, dict)
+            and reformulation.get("used") is True
+            and reformulation.get("valid") is True
+        )
+    elif bounded_reads_valid and (
+        result_counts is not None or reformulation is not None
+    ):
+        bounded_reads_valid = bool(
+            isinstance(result_counts, list)
+            and len(result_counts) == 1
+            and type(result_counts[0]) is int
+            and result_counts[0] > 0
+            and isinstance(reformulation, dict)
+            and reformulation.get("used") is False
+            and reformulation.get("valid") is True
+        )
+    if (
+        evidence.get("schema") != "keystone.signal_decision_evidence.v1"
+        or evidence.get("source") != "first_attempt_model_called_history_tool"
+        or evidence.get("tool_name") != tool_name
+        or not bounded_reads_valid
+        or int(evidence.get("blocked_tool_call_count") or 0) != 0
+        or int(evidence.get("unresolved_tool_call_count") or 0) != 0
+        or evidence.get("raw_provider_payload_retained") is not False
+        or fingerprint != hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    ):
+        return None
+    candidates = evidence.get("candidates")
+    candidate_ids = [
+        str(item or "").strip()
+        for item in evidence.get("candidate_ids") or []
+        if str(item or "").strip()
+    ]
+    if (
+        not isinstance(candidates, list)
+        or int(evidence.get("candidate_count") or 0) != len(candidates)
+        or not candidate_ids
+        or len(candidate_ids) != len(set(candidate_ids))
+    ):
+        return None
+    candidate_by_id: dict[str, dict[str, Any]] = {}
+    selected_id_set = set(selected_ids)
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            return None
+        candidate_id = str(candidate.get("candidate_id") or "").strip()
+        title = _clean_text(candidate.get("title"), max_chars=300)
+        url = _clean_text(candidate.get("url"), max_chars=1200)
+        published_at = _clean_text(candidate.get("published_at"), max_chars=80)
+        summary = _clean_text(candidate.get("summary"), max_chars=1400)
+        if not candidate_id or candidate_id in candidate_by_id:
+            return None
+        if candidate_id in selected_id_set and (
+            not title
+            or not canonical_source_url(url)
+            or not published_at
+            or not summary
+        ):
+            return None
+        candidate_by_id[candidate_id] = candidate
+    if set(candidate_by_id) != set(candidate_ids):
+        return None
+    return candidate_by_id
+
+
+def _signal_article_identity_matches_provider(
+    article: dict[str, Any],
+    candidate: dict[str, Any],
+) -> bool:
+    """Require model-carried identity fields to agree with provider evidence."""
+
+    text_fields = ("title", "published_at", "source")
+    if any(
+        _clean_text(article.get(field), max_chars=300)
+        != _clean_text(candidate.get(field), max_chars=300)
+        for field in text_fields
+    ):
+        return False
+    return canonical_source_url(article.get("url")) == canonical_source_url(
+        candidate.get("url")
+    )
+
+
 def _verified_provider_result_scope_from_agent_run(
     row: dict[str, Any],
 ) -> ManualProviderResultSetScope | None:
@@ -2481,6 +2955,8 @@ def _verified_provider_result_scope_from_agent_run(
         result_scope = raw_scope if isinstance(raw_scope, dict) else {}
         item_refs = result_scope.get("item_refs")
         refs = item_refs if isinstance(item_refs, list) else []
+        raw_unit = result_scope.get("unit") or receipt.get("unit")
+        unit = raw_unit if isinstance(raw_unit, dict) else {}
         return ManualProviderResultSetScope(
             source_run_id=str(row.get("id") or ""),
             provider_system="airtable",
@@ -2515,9 +2991,18 @@ def _verified_provider_result_scope_from_agent_run(
             aggregate_total=str(
                 result_scope.get("total") or receipt.get("total") or ""
             ),
+            aggregate_display_total=str(
+                result_scope.get("display_total")
+                or receipt.get("display_total")
+                or ""
+            ),
             aggregate_currency=str(
                 result_scope.get("currency") or receipt.get("currency") or ""
             ),
+            aggregate_unit_kind=str(unit.get("kind") or ""),
+            aggregate_unit_symbol=str(unit.get("symbol") or ""),
+            aggregate_unit_precision=unit.get("precision"),
+            aggregate_unit_source=str(unit.get("source") or ""),
             item_refs=refs,
             complete=not bool(receipt.get("truncated")),
             verified=True,

@@ -280,7 +280,7 @@ def test_existing_lock_blocks_automation_before_child_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lock_file = tmp_path / "automation.lock"
-    lock_file.write_text("pid=123\n", encoding="utf-8")
+
     monkeypatch.setattr(
         automation,
         "run_isolated_child_process",
@@ -289,7 +289,7 @@ def test_existing_lock_blocks_automation_before_child_run(
         ),
     )
 
-    with pytest.raises(SystemExit, match="Automation lock already exists"):
+    with automation.LockFile(lock_file), pytest.raises(SystemExit, match="Automation lock is held"):
         automation.main(
             [
                 "--no-health-preflight",

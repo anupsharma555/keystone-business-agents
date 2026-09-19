@@ -738,3 +738,33 @@ def test_gmail_context_pack_hydrates_reply_memory_from_thread_metadata(tmp_path)
     assert pack.ready is True
     assert pack.outreach_style_examples[0].title == "Reply style feedback"
     assert pack.approval_history_refs[0].title == "Prior Gmail approval"
+
+
+def test_model_view_removes_exact_mirrors_but_preserves_authority_and_unique_context():
+    item = WorkItem(
+        title="Review a selected message", kind=WorkItemKind.GMAIL_THREAD,
+        current_route=WorkItemRoute.OUTREACH_COMPOSER,
+        sources=[WorkItemSourceRef(source_id="selected", url="https://example.test/source",
+                                  evidence_excerpt="Selected evidence " * 100)],
+    )
+    pack = build_outreach_context_pack(item)
+    before = pack.model_dump(mode="json")
+    pack.summary["unique_note"] = "An unresolved contradiction must remain visible."
+    pack.summary["facts"] = [{"claim": "Unapproved context must not silently disappear."}]
+    view = pack.without_duplicate_context()
+    assert type(view) is type(pack)
+    assert view.source_refs == pack.source_refs and view.retrieved_sources == []
+    assert "sources" not in view.summary and "target" not in view.summary
+    assert view.summary["facts"] == pack.summary["facts"]
+    assert view.summary["unique_note"] == pack.summary["unique_note"]
+    assert view.approval_gates == pack.approval_gates
+    assert view.readiness_gates == pack.readiness_gates
+    assert view.allowed_claims == pack.allowed_claims
+    assert view.missing_requirements == pack.missing_requirements
+    assert pack.model_dump(mode="json")["source_refs"] == before["source_refs"]
+    assert "sources" in pack.summary and pack.retrieved_sources == pack.source_refs
+    # A different version of retrieved evidence is not an exact duplicate.
+    pack.retrieved_sources = [
+        pack.source_refs[0].model_copy(update={"evidence_excerpt": "Correction"})
+    ]
+    assert pack.without_duplicate_context().retrieved_sources == pack.retrieved_sources

@@ -6,19 +6,26 @@ import argparse
 import inspect
 import json
 import re
+import sys
+import time as time_module
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import replace
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from email.utils import parseaddr
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from keystone_agents.agents.gmail_triage import (
+    GmailAgentDecisionError,
     build_gmail_contact_lookup_agent,
     build_gmail_priority_grouping_agent,
     build_gmail_triage_agent,
     email_fixture_to_envelope,
     load_email_fixture,
     run_gmail_triage_fixture,
+    run_gmail_triage_sdk,
     triage_gmail_message_envelope,
 )
 from keystone_agents.cli_orchestrator_review import (
@@ -57,17 +64,24 @@ from keystone_agents.gmail_triage.draft_actions import (
     resolve_unique_gmail_draft,
 )
 from keystone_agents.gmail_triage.execution_plan import extract_gmail_subject_hint
+from keystone_agents.gmail_triage.priority_grouping import (
+    rank_gmail_candidates_for_request,
+)
 from keystone_agents.model_provider import get_runtime_agent_model_config
 from keystone_agents.models import (
     DEFAULT_GMAIL_PRIORITY_GROUPING_REQUEST,
     GmailPriorityGroupingSDKInput,
     GmailTriageSDKInput,
 )
+from keystone_agents.operator_failures import known_exception_to_operator_failure
 from keystone_agents.orchestrator.preflight_context import (
     apply_orchestrator_preflight_to_args,
     attach_orchestrator_preflight_payload,
+    load_specialist_execution_context_from_env,
     orchestrator_preflight_context_text,
 )
+from keystone_agents.presentation.public_result import attach_execution_public_result
+from keystone_agents.presentation.renderers import render_gmail_selected_answer
 from keystone_agents.reporting import (
     build_gmail_priority_grouping_test_pack_payload,
     render_gmail_priority_grouping_test_pack_report,
@@ -75,7 +89,11 @@ from keystone_agents.reporting import (
     render_orchestrator_output_review,
     to_json,
 )
-from keystone_agents.run import run_retrieved_sdk_synthesis
+from keystone_agents.run import (
+    SDKSynthesisOutcome,
+    run_retrieved_sdk_synthesis,
+    sdk_run_failure_metadata,
+)
 from keystone_agents.schemas.approval import ApprovalScope, ApprovalState
 from keystone_agents.schemas.email_triage import (
     EmailTriageResult,
@@ -314,6 +332,121 @@ def _relaxed_gmail_subject_query(subject: str) -> str:
     return " ".join(f"subject:{token}" for token in distinctive)
 
 
+_EVENT_TIMEZONE_OFFSETS = {
+    "EDT": timezone(timedelta(hours=-4)),
+    "EST": timezone(timedelta(hours=-5)),
+    "PDT": timezone(timedelta(hours=-7)),
+    "PST": timezone(timedelta(hours=-8)),
+    "CDT": timezone(timedelta(hours=-5)),
+    "CST": timezone(timedelta(hours=-6)),
+    "MDT": timezone(timedelta(hours=-6)),
+    "MST": timezone(timedelta(hours=-7)),
+    "UTC": UTC,
+}
+
+
+def _request_event_start(
+    request_text: str,
+    *,
+    now: datetime | None = None,
+) -> datetime | None:
+    """Resolve a natural event selector to an Eastern start instant."""
+
+    source = " ".join(str(request_text or "").replace("’", "'").split())
+    if not re.search(r"\b(?:interview|meeting|event|call|appointment)\b", source, re.I):
+        return None
+    time_match = re.search(
+        r"\b(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"
+        r"(?P<meridiem>a\.?m\.?|p\.?m\.?)\b",
+        source,
+        re.I,
+    )
+    if time_match is None:
+        return None
+    eastern = ZoneInfo("America/New_York")
+    local_now = now.astimezone(eastern) if now is not None else datetime.now(eastern)
+    event_date: date | None = None
+    if re.search(r"\btomorrow(?:'s)?\b", source, re.I):
+        event_date = local_now.date() + timedelta(days=1)
+    else:
+        date_match = re.search(
+            r"\b(?:mon|tue|wed|thu|fri|sat|sun)?\w*\s*"
+            r"(?P<month>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|"
+            r"may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|"
+            r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+"
+            r"(?P<day>\d{1,2})(?:st|nd|rd|th)?(?:,\s*(?P<year>\d{4}))?",
+            source,
+            re.I,
+        )
+        if date_match is not None:
+            year = int(date_match.group("year") or local_now.year)
+            month = datetime.strptime(date_match.group("month")[:3], "%b").month
+            event_date = date(year, month, int(date_match.group("day")))
+    if event_date is None:
+        return None
+    hour = int(time_match.group("hour")) % 12
+    if time_match.group("meridiem").lower().startswith("p"):
+        hour += 12
+    minute = int(time_match.group("minute") or 0)
+    return datetime.combine(event_date, time(hour, minute), tzinfo=eastern)
+
+
+def _subject_event_start(subject: str) -> datetime | None:
+    """Parse a Calendar-style Gmail subject and normalize its start instant."""
+
+    match = re.search(
+        r"\b(?P<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
+        r"(?P<day>\d{1,2}),\s*(?P<year>\d{4})\s+"
+        r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"
+        r"(?P<meridiem>am|pm)\s*-.*?\((?P<timezone>[A-Z]{3})\)",
+        str(subject or ""),
+        re.I,
+    )
+    if match is None:
+        return None
+    timezone_name = match.group("timezone").upper()
+    source_timezone = _EVENT_TIMEZONE_OFFSETS.get(timezone_name)
+    if source_timezone is None:
+        return None
+    hour = int(match.group("hour")) % 12
+    if match.group("meridiem").lower() == "pm":
+        hour += 12
+    value = datetime(
+        int(match.group("year")),
+        datetime.strptime(match.group("month").title(), "%b").month,
+        int(match.group("day")),
+        hour,
+        int(match.group("minute") or 0),
+        tzinfo=source_timezone,
+    )
+    return value.astimezone(ZoneInfo("America/New_York"))
+
+
+def _exact_schedule_thread_id(
+    request_text: str,
+    summaries: list[GmailThreadSummaryResult],
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Select one non-canceled Gmail thread whose event start matches exactly."""
+
+    requested_start = _request_event_start(request_text, now=now)
+    if requested_start is None:
+        return ""
+    matches: list[str] = []
+    for summary in summaries:
+        subject = str(summary.subject or "")
+        if re.search(r"\b(?:cancel(?:ed|led)|declined|deleted)\b", subject, re.I):
+            continue
+        candidate_start = _subject_event_start(subject)
+        if candidate_start is None:
+            continue
+        if candidate_start == requested_start:
+            matches.append(summary.thread_id)
+    unique = list(dict.fromkeys(item for item in matches if item))
+    return unique[0] if len(unique) == 1 else ""
+
+
 def _resolve_live_sdk_message_refs(
     gmail: Any,
     *,
@@ -360,15 +493,134 @@ def _resolve_live_sdk_message_refs(
     if not refs and relaxed_query and relaxed_query != query:
         refs = search(None, relaxed_query, "all_mail_relaxed_subject")
     if len(refs) > 1:
+        # Search recall is not the same as target ambiguity. Read a small,
+        # deduplicated candidate set and let the Gmail selection specialist
+        # rank sanitized thread evidence against the complete current request.
+        # Provider identity remains bound in Python and no write is possible in
+        # this phase.
+        thread_summaries: list[GmailThreadSummaryResult] = []
+        for ref in refs:
+            thread_id = str(ref.get("threadId") or ref.get("id") or "").strip()
+            if not thread_id:
+                continue
+            thread_summaries.append(
+                _thread_summary_result_from_payload(
+                    thread=gmail.get_thread(thread_id),
+                    source_label=label or "ALL_MAIL",
+                    query=query,
+                )
+            )
+        schedule_thread_id = _exact_schedule_thread_id(request_text, thread_summaries)
+        if schedule_thread_id:
+            selected_refs = [
+                ref
+                for ref in refs
+                if str(ref.get("threadId") or ref.get("id") or "").strip()
+                == schedule_thread_id
+            ]
+            if len(selected_refs) == 1:
+                attempts.append(
+                    {
+                        "scope": "exact_schedule_match",
+                        "query": query,
+                        "candidate_count": len(refs),
+                        "selected_count": 1,
+                        "selection_reason": "timezone_normalized_event_start",
+                    }
+                )
+                return selected_refs, {
+                    "provider": "gmail",
+                    "operation": "resolve_message_for_draft_reply",
+                    "query": query,
+                    "attempts": attempts,
+                    "candidate_count": len(refs),
+                    "selected_count": 1,
+                    "selection_reason": "timezone_normalized_event_start",
+                    "candidate_ranking_used": False,
+                    "provider_read": True,
+                    "provider_write": False,
+                }
+        ranking = rank_gmail_candidates_for_request(
+            operator_request=request_text,
+            summaries=thread_summaries,
+            live_sdk=True,
+        )
+        ranked_items = sorted(
+            (
+                item
+                for item in ranking.result.candidates
+                if item.disposition == "candidate"
+            ),
+            key=lambda item: (item.needs_reply, item.relevance_score),
+            reverse=True,
+        )
+        selected_thread_id = ""
+        selection_reason = ""
+        if len(ranking.ranked_thread_ids) == 1:
+            selected_thread_id = ranking.ranked_thread_ids[0]
+            selection_reason = "single_semantic_candidate"
+        elif ranked_items:
+            top = ranked_items[0]
+            runner_up = ranked_items[1] if len(ranked_items) > 1 else None
+            margin = top.relevance_score - (
+                runner_up.relevance_score if runner_up is not None else 0.0
+            )
+            if top.needs_reply and top.relevance_score >= 0.85 and margin >= 0.20:
+                message_to_thread = {
+                    str(payload.get("id") or "").strip(): str(
+                        payload.get("threadId") or ""
+                    ).strip()
+                    for payload in ranking.candidate_payloads
+                }
+                selected_thread_id = message_to_thread.get(top.message_id, "")
+                selection_reason = "high_confidence_semantic_margin"
+        if selected_thread_id:
+            selected_refs = [
+                ref
+                for ref in refs
+                if str(ref.get("threadId") or ref.get("id") or "").strip()
+                == selected_thread_id
+            ]
+            if len(selected_refs) == 1:
+                attempts.append(
+                    {
+                        "scope": "semantic_candidate_ranking",
+                        "query": query,
+                        "candidate_count": len(refs),
+                        "selected_count": 1,
+                        "selection_reason": selection_reason,
+                    }
+                )
+                return selected_refs, {
+                    "provider": "gmail",
+                    "operation": "resolve_message_for_draft_reply",
+                    "query": query,
+                    "attempts": attempts,
+                    "candidate_count": len(refs),
+                    "selected_count": 1,
+                    "selection_reason": selection_reason,
+                    "candidate_ranking_used": True,
+                    "provider_read": True,
+                    "provider_write": False,
+                }
+        attempts.append(
+            {
+                "scope": "semantic_candidate_ranking",
+                "query": query,
+                "candidate_count": len(refs),
+                "selected_count": 0,
+                "selection_reason": "insufficient_unique_evidence",
+            }
+        )
         raise GmailTargetResolutionError(
             _gmail_target_block_payload(
                 reason_code="gmail_target_ambiguous",
                 human_summary=(
-                    "I found more than one plausible Gmail message after bounded "
-                    "read-only subject matching, so I did not guess which thread to use."
+                    "I read and ranked the bounded Gmail matches, but more than one "
+                    "conversation remained plausible, so I did not guess which thread to use."
                 ),
                 clarification_request=(
-                    "Add the sender or approximate date, or choose a different exact subject."
+                    "Add the sender, meeting time, or exact subject to identify one thread."
                 ),
                 query=query,
                 attempts=attempts,
@@ -853,6 +1105,15 @@ def _run_sdk_synthesis(
     style_context = _style_profile_context(email_style_profile)
     founder_context = founder_drafting_context(founder_fit_profile)
     preflight_context = orchestrator_preflight_context_text(args)
+    if args.live_gmail and not args.update_draft:
+        return _run_agent_owned_live_gmail_synthesis(
+            args,
+            run_config=run_config,
+            live=live,
+            style_context=style_context,
+            founder_context=founder_context,
+            preflight_context=preflight_context,
+        )
     retrieval_diagnostics: dict[str, Any] = {}
 
     resolved_draft: dict[str, Any] = {}
@@ -916,9 +1177,9 @@ def _run_sdk_synthesis(
 
     def normalize(envelope: GmailMessageEnvelope) -> GmailTriageSDKInput:
         typed_input = GmailTriageSDKInput.from_envelope(envelope)
-        request_context = "\n\n".join(item for item in (args.request, preflight_context) if item)
-        if request_context:
-            typed_input = replace(typed_input, request=request_context)
+        typed_input = replace(
+            typed_input, request=str(args.request or ""), advisory_context=preflight_context,
+        )
         if style_context or founder_context:
             return replace(
                 typed_input,
@@ -1007,13 +1268,279 @@ def _run_sdk_synthesis(
     return payload
 
 
+def _run_agent_owned_live_gmail_synthesis(
+    args: argparse.Namespace,
+    *,
+    run_config: Any | None,
+    live: bool,
+    style_context: str,
+    founder_context: str,
+    preflight_context: str,
+) -> dict[str, Any]:
+    """Let Gmail Triage query, read, rank, and decide inside one SDK loop."""
+
+    continuation_message_id, continuation_thread_id = _verified_gmail_continuation_identity(
+        load_specialist_execution_context_from_env()
+    )
+    typed_input = GmailTriageSDKInput(
+        subject="",
+        body="",
+        request=str(args.request or "").strip(),
+        advisory_context=preflight_context,
+        message_id=continuation_message_id,
+        thread_id=continuation_thread_id,
+        email_style_profile=style_context,
+        founder_fit_context=founder_context,
+        gmail_query_hint=(
+            ""
+            if continuation_message_id or continuation_thread_id
+            else str(args.gmail_query or "").strip()
+        ),
+        triage_limitations=[
+            "No message was preselected by Python; Gmail Triage owns bounded query, "
+            "candidate reading, selection, reply relevance, and draft wording."
+        ],
+    )
+    started_at = time_module.time()
+    selected_contexts = []
+    result = run_gmail_triage_sdk(
+        typed_input,
+        run_config=run_config,
+        live=live,
+        attach_tools=True,
+        compact_instructions=args.compact_instructions,
+        manual_request_plan=getattr(args, "manual_request_plan", None),
+        provider_selection_required=not bool(
+            continuation_message_id or continuation_thread_id
+        ),
+        provider_context_read_required=bool(
+            continuation_message_id or continuation_thread_id
+        ),
+        repair_invalid_selection=True,
+        selected_context_callback=selected_contexts.append,
+    )
+    if run_config is not None:
+        model_provider = "local"
+        model_name = str(getattr(run_config, "model", "") or "sdk-local")
+        model_run_mode = "local_sdk"
+    else:
+        model_config = get_runtime_agent_model_config("gmail_triage")
+        model_provider = model_config.provider
+        model_name = model_config.model
+        model_run_mode = "live_sdk" if live else "sdk"
+    outcome = SDKSynthesisOutcome(
+        agent_name="gmail_triage",
+        raw_context={
+            "mode": "agent_owned_provider_selection",
+            "preacquired_provider_context": False,
+        },
+        typed_input=typed_input,
+        result=result,
+        storage={},
+        audit_notes=(
+            (
+                "Gmail Triage returned no selected conversation and requested more context."
+                if result.final_output.decision.needs_more_context else
+                "Gmail Triage called bounded Gmail tools and selected the conversation."
+            ),
+            "Python validated the decision against the actual query/read evidence.",
+            "No deterministic helper selected or substituted a Gmail candidate.",
+            "No email was sent.",
+        ),
+        model_provider=model_provider,
+        model_name=model_name,
+        model_run_mode=model_run_mode,
+        usage=result.usage,
+        cost=result.cost,
+        budget_guard=result.budget_guard,
+        request_cache=result.request_cache,
+        execution_telemetry=result.execution_telemetry,
+        started_at_unix=started_at,
+        ended_at_unix=time_module.time(),
+    )
+    payload = sdk_synthesis_payload(
+        outcome,
+        include_provider_cost_window=args.include_provider_cost_window,
+        provider_cost_window_seconds=args.provider_cost_window_seconds,
+        openai_cost_project_id=args.openai_cost_project_id,
+    )
+    decision_telemetry = result.request_cache.get("decision_ownership")
+    if isinstance(decision_telemetry, dict):
+        payload["decision_ownership"] = decision_telemetry
+    tool_execution = result.request_cache.get("tool_execution")
+    if isinstance(tool_execution, dict):
+        payload["tool_execution"] = tool_execution
+    payload["tool_receipts"] = list(result.tool_receipts)
+    _repair_gmail_triage_output_hygiene(payload)
+    if not result.final_output.decision.needs_more_context:
+        payload["human_summary"] = render_gmail_selected_answer(
+            result.final_output,
+            selected_context=selected_contexts[-1] if selected_contexts else None,
+        )
+    if result.final_output.decision.needs_more_context:
+        evidence = decision_telemetry if isinstance(decision_telemetry, dict) else {}
+        no_matches = (
+            evidence.get("candidate_count") == 0
+            and evidence.get("query_provider_read_performed") is True
+            and int(evidence.get("query_output_count") or 0) > 0
+        )
+        payload.update(
+            {
+                "status": "needs_input",
+                "block_kind": ("gmail_search_no_matches" if no_matches else
+                               "gmail_agent_requested_more_context"),
+                "human_summary": (
+                    "Gmail returned no messages for the bounded searches performed; "
+                    "the requested email has not been read. Review the query filters "
+                    "against the clues already supplied before retrying. "
+                    "No Gmail data was changed."
+                    if no_matches else
+                    "Gmail could not select the requested conversation from the available "
+                    "evidence without guessing. No Gmail data was changed."
+                ),
+            }
+        )
+    if args.create_draft and not result.final_output.decision.needs_more_context:
+        draft_result = _create_verified_sdk_reply_draft(args, outcome)
+        payload["gmail_draft_result"] = draft_result
+        payload["side_effects"] = {
+            "gmail_draft_created": bool(draft_result.get("verification", {}).get("passed")),
+            "gmail_draft_updated": False,
+            "email_sent": False,
+            "send_enabled": False,
+            "approval_reference": str(args.approval_reference),
+        }
+    elif args.create_draft:
+        payload["gmail_draft_result"] = {
+            "status": "blocked",
+            "reason_code": "gmail_selection_needs_input",
+            "verification": {"passed": False},
+            "sent": False,
+            "send_enabled": False,
+        }
+        payload["side_effects"] = {
+            "gmail_draft_created": False,
+            "gmail_draft_updated": False,
+            "email_sent": False,
+            "send_enabled": False,
+            "approval_reference": str(args.approval_reference),
+        }
+    if args.orchestrator_review:
+        payload["orchestrator_review"] = build_cli_orchestrator_review(
+            args,
+            run_config_factory=ORCHESTRATOR_REVIEW_RUN_CONFIG_FACTORY,
+            agent_name="gmail_triage",
+            output=result.final_output,
+            request_summary=_orchestrator_review_request_summary(
+                args,
+                fallback="gmail agent-owned triage",
+            ),
+            run_type="live SDK" if live else "local SDK",
+        )
+    attach_orchestrator_preflight_payload(payload, args)
+    attach_execution_public_result(payload)
+    if args.save:
+        payload["storage"] = {
+            "agent_run": _save_agent_owned_gmail_run(
+                args,
+                payload=payload,
+                model_provider=model_provider,
+                model_name=model_name,
+                live=live,
+            )
+        }
+    return payload
+
+
+def _save_agent_owned_gmail_run(
+    args: argparse.Namespace,
+    *,
+    payload: Mapping[str, Any],
+    model_provider: str,
+    model_name: str,
+    live: bool,
+) -> dict[str, Any]:
+    """Persist the canonical terminal result after decision validation and rendering."""
+
+    public_result = payload.get("public_result")
+    public_mapping = public_result if isinstance(public_result, Mapping) else {}
+    status = str(public_mapping.get("status") or payload.get("status") or "blocked").strip()
+    error = str(public_mapping.get("failure_summary") or "").strip() or None
+    stored_output = {str(key): value for key, value in payload.items() if key != "storage"}
+    return StorageTool(args.database_url).save_agent_run(
+        agent_name="gmail_triage",
+        input_payload={
+            "request": str(args.request or ""),
+            "live_gmail": True,
+            "gmail_query_hint": str(args.gmail_query or ""),
+            "agent_owned_selection": True,
+        },
+        input_summary=str(args.request or "gmail agent-owned triage")[:500],
+        output=stored_output,
+        model=(f"{model_provider}:{model_name}" if model_provider else model_name),
+        dry_run=not live,
+        status=status,
+        error=error,
+    )
+
+
+def _verified_gmail_continuation_identity(
+    execution_context: Mapping[str, Any] | None,
+) -> tuple[str, str]:
+    """Return one exact active Gmail identity from bounded continuation context."""
+
+    if not isinstance(execution_context, Mapping):
+        return "", ""
+    values = execution_context.get("verified_provider_objects")
+    if not isinstance(values, list | tuple):
+        return "", ""
+    candidates: list[tuple[str, str]] = []
+    for value in values:
+        if not isinstance(value, Mapping):
+            continue
+        if (
+            str(value.get("provider_system") or "") != "gmail"
+            or str(value.get("verification_status") or "") != "verified"
+            or str(value.get("lifecycle_state") or "") != "active"
+        ):
+            continue
+        object_type = str(value.get("object_type") or "")
+        object_id = str(value.get("object_id") or "").strip()
+        scope = value.get("provider_scope")
+        scope = scope if isinstance(scope, Mapping) else {}
+        message_id = str(scope.get("message_id") or "").strip()
+        thread_id = str(scope.get("thread_id") or "").strip()
+        if object_type == "gmail_message":
+            message_id = object_id or message_id
+        elif object_type == "gmail_thread":
+            thread_id = object_id or thread_id
+        elif object_type == "gmail_draft":
+            continue
+        if message_id or thread_id:
+            candidates.append((message_id, thread_id))
+    unique = list(dict.fromkeys(candidates))
+    return unique[0] if len(unique) == 1 else ("", "")
+
+
 def _create_verified_sdk_reply_draft(
     args: argparse.Namespace,
     outcome: Any,
 ) -> dict[str, Any]:
     envelope = outcome.raw_context
     if not isinstance(envelope, GmailMessageEnvelope):
-        raise SystemExit("Gmail draft creation requires one resolved Gmail message.")
+        selected_message_id = str(outcome.final_output.message_id or "").strip()
+        selected_thread_id = str(outcome.final_output.thread_id or "").strip()
+        if not selected_message_id:
+            raise SystemExit("Gmail draft creation requires one agent-selected message.")
+        message = GmailTool(live=True).get_message(selected_message_id)
+        if not message.get("id"):
+            message["id"] = selected_message_id
+        envelope = _thread_enriched_live_envelope(GmailTool(live=True), message)
+        if selected_thread_id and envelope.thread_id != selected_thread_id:
+            raise SystemExit(
+                "The selected Gmail message no longer belongs to the agent-selected thread; "
+                "no draft was created."
+            )
     draft_reply = str(outcome.final_output.draft_reply or "").strip()
     if not draft_reply:
         raise SystemExit(
@@ -2060,8 +2587,56 @@ def main() -> int:
         except GmailTargetResolutionError as exc:
             payload = exc.payload
             attach_orchestrator_preflight_payload(payload, args)
+        except GmailAgentDecisionError as exc:
+            model_config = get_runtime_agent_model_config("gmail_triage")
+            decision_live = bool(getattr(args, "live_sdk", False))
+            payload = {
+                "mode": "sdk-synthesis",
+                "agent_name": "gmail_triage",
+                "dry_run": not decision_live,
+                "live_sdk": decision_live,
+                "sdk_run_invoked": True,
+                "model": {
+                    "provider": model_config.provider,
+                    "name": model_config.model,
+                    "run_mode": "live_sdk" if decision_live else "sdk",
+                },
+                "status": "blocked",
+                "block_kind": "gmail_agent_decision_validation_failed",
+                "send_enabled": False,
+                "human_summary": (
+                    "Gmail Triage could not produce one provider-bound selection after "
+                    "the allowed repair attempt, so it did not guess or create a draft."
+                ),
+                "decision_ownership": exc.telemetry,
+                "output": {
+                    "summary": (
+                        "The Gmail candidate decision did not pass identity validation."
+                    ),
+                    "send_enabled": False,
+                    "draft_created": False,
+                },
+            }
+            _attach_gmail_decision_block_evidence(payload, exc)
+            attach_orchestrator_preflight_payload(payload, args)
+            attach_execution_public_result(payload)
+            if args.save:
+                payload["storage"] = {
+                    "agent_run": _save_agent_owned_gmail_run(
+                        args,
+                        payload=payload,
+                        model_provider=model_config.provider,
+                        model_name=model_config.model,
+                        live=decision_live,
+                    )
+                }
         except RuntimeError as exc:
-            raise SystemExit(str(exc)) from exc
+            if not sdk_run_failure_metadata(exc):
+                raise SystemExit(str(exc)) from exc
+            return _handle_uncaught_exception(
+                exc,
+                ["--json"] if args.json else sys.argv[1:],
+            )
         if args.markdown and not args.json:
             lines = [
                 "# Gmail SDK Synthesis",
@@ -2418,5 +2993,89 @@ def main() -> int:
     return 0
 
 
+def _handle_uncaught_exception(exc: Exception, argv: list[str] | None = None) -> int:
+    """Emit one audit-safe Gmail failure envelope instead of losing SDK evidence."""
+
+    failure = known_exception_to_operator_failure(exc, context="Gmail Triage run")
+    sdk_failure = sdk_run_failure_metadata(exc)
+    if "--json" in set(argv or []):
+        payload: dict[str, Any] = {
+            "status": "failed",
+            "agent_name": "gmail_triage",
+            "send_enabled": False,
+            "draft_created": False,
+            "sent": False,
+            "output": {
+                "failure": failure.to_dict(),
+                "summary": failure.summary,
+                "next_step": failure.next_step,
+                "send_enabled": False,
+            },
+        }
+        if sdk_failure:
+            payload.update(
+                {
+                    "sdk_failure": sdk_failure,
+                    "usage": sdk_failure.get("usage") or {},
+                    "cost": sdk_failure.get("cost") or {},
+                    "request_cache": sdk_failure.get("request_cache") or {},
+                    "tool_execution": sdk_failure.get("tool_execution") or {},
+                    "tool_receipts": list(sdk_failure.get("tool_receipts") or []),
+                    "execution_telemetry": sdk_failure.get("execution_telemetry") or {},
+                }
+            )
+            request_cache = payload["request_cache"]
+            if isinstance(request_cache, Mapping):
+                decision = request_cache.get("decision_ownership")
+                if isinstance(decision, Mapping):
+                    payload["decision_ownership"] = dict(decision)
+                request_budget = request_cache.get(
+                    "model_request_budget",
+                    request_cache.get("request_budget"),
+                )
+                if isinstance(request_budget, Mapping):
+                    payload["request_budget"] = dict(request_budget)
+        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+    print(failure.summary, file=sys.stderr)
+    print(f"Reason: {failure.reason}", file=sys.stderr)
+    print(f"Next step: {failure.next_step}", file=sys.stderr)
+    return 1
+
+
+def _attach_gmail_decision_block_evidence(
+    payload: dict[str, Any],
+    exc: GmailAgentDecisionError,
+) -> None:
+    """Preserve audit-safe tool and model evidence for a normal decision block."""
+
+    result = exc.result
+    if result is None:
+        return
+    request_cache = dict(result.request_cache or {})
+    request_cache["decision_ownership"] = dict(exc.telemetry)
+    payload.update(
+        {
+            "usage": dict(result.usage or {}),
+            "cost": dict(result.cost or {}),
+            "budget_guard": dict(result.budget_guard or {}),
+            "request_cache": request_cache,
+            "tool_receipts": list(result.tool_receipts or []),
+            "execution_telemetry": dict(result.execution_telemetry or {}),
+        }
+    )
+    tool_execution = request_cache.get("tool_execution")
+    if isinstance(tool_execution, Mapping):
+        payload["tool_execution"] = dict(tool_execution)
+    request_budget = request_cache.get(
+        "model_request_budget",
+        request_cache.get("request_budget"),
+    )
+    if isinstance(request_budget, Mapping):
+        payload["request_budget"] = dict(request_budget)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        raise SystemExit(_handle_uncaught_exception(exc, sys.argv[1:])) from exc

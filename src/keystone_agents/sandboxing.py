@@ -7,6 +7,7 @@ them when a caller provides an explicit local test runner or sets `live=True`.
 
 from __future__ import annotations
 
+import inspect
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
@@ -31,6 +32,7 @@ from keystone_agents.sdk import (
     UnixLocalSandboxClient,
     WebSearchTool,
     build_live_run_config,
+    model_request_budget_hooks,
     validate_sandbox_sdk_available,
     validate_web_search_sdk_available,
 )
@@ -38,6 +40,14 @@ from keystone_agents.sdk import (
 DEFAULT_SANDBOX_AGENT_NAME = "keystone_sandbox_workspace_reviewer"
 DEFAULT_SANDBOX_WORKFLOW_NAME = "Keystone sandbox workspace review"
 DEFAULT_SEARCH_REVIEW_WORKFLOW_NAME = "Keystone sandbox search review"
+SAFE_SANDBOX_HOST_ENVIRONMENT = frozenset(
+    {
+        "PATH", "LANG", "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES",
+        "LC_MONETARY", "LC_NUMERIC", "LC_TIME", "TZ", "TERM", "TMPDIR",
+        "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+        "UV_PYTHON", "NO_COLOR", "FORCE_COLOR", "CI",
+    }
+)
 DEFAULT_TASK_INSTRUCTIONS = (
     "Review only the files mounted for this Keystone run. Keep approvals, live "
     "integration decisions, and artifact release in the host harness. Write any "
@@ -537,7 +547,7 @@ def build_unix_local_sandbox_run_config(
         trace_include_sensitive_data=trace_include_sensitive_data,
     )
     sandbox_config = SandboxRunConfig(
-        client=client or UnixLocalSandboxClient(),
+        client=client if client is not None else _build_scoped_unix_local_client(),
         manifest=manifest,
     )
     return RunConfig(
@@ -549,6 +559,41 @@ def build_unix_local_sandbox_run_config(
         tracing_disabled=trace_config.tracing_disabled,
         trace_include_sensitive_data=trace_config.trace_include_sensitive_data,
     )
+
+
+def _build_scoped_unix_local_client() -> Any:
+    parameters = inspect.signature(UnixLocalSandboxClient).parameters
+    if "inherit_host_environment" in parameters:
+        return UnixLocalSandboxClient(
+            inherit_host_environment=False,
+            host_environment_allowlist=SAFE_SANDBOX_HOST_ENVIRONMENT,
+        )
+    # Old SDKs may still construct previews and use injected fake runners.
+    # Real execution is rejected below until environment isolation is supported.
+    return UnixLocalSandboxClient()
+
+
+def _validate_unix_local_execution_environment(run_config: Any) -> None:
+    client = getattr(getattr(run_config, "sandbox", None), "client", None)
+    if client is None:
+        raise SandboxAgentsUnavailable(
+            "Real sandbox execution requires an explicit sandbox client; "
+            "an implicit host-environment client is not permitted."
+        )
+    if UnixLocalSandboxClient is None or not isinstance(client, UnixLocalSandboxClient):
+        return
+    # The SDK currently exposes no public policy accessor. Its private allowlist
+    # is None when inheriting the host environment, including on older releases.
+    # Fail closed if this compatibility boundary changes rather than run unsafely.
+    allowlist = getattr(client, "_host_environment_allowlist", None)
+    if not isinstance(allowlist, set | frozenset) or not allowlist.issubset(
+        SAFE_SANDBOX_HOST_ENVIRONMENT
+    ):
+        raise SandboxAgentsUnavailable(
+            "Unix-local sandbox execution requires SDK environment isolation with "
+            "a conservative host-variable allowlist. Preview and injected test runners "
+            "remain available; host credential inheritance is not permitted."
+        )
 
 
 def build_unix_local_sandbox_setup(
@@ -588,7 +633,9 @@ def build_unix_local_sandbox_setup(
 def _run_with_sdk_runner(agent: Any, prompt: str, run_config: Any) -> Any:
     """Call the SDK runner with a sandbox run config."""
 
-    return Runner.run_sync(agent, prompt, run_config=run_config)
+    _validate_unix_local_execution_environment(run_config)
+    hooks = model_request_budget_hooks()
+    return Runner.run_sync(agent, prompt, run_config=run_config, hooks=hooks)
 
 
 def _sandbox_result_notes(

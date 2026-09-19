@@ -5,6 +5,7 @@ skill_purpose: Handle failed, empty, malformed, stale, or partial tool results w
 applies_to:
   - gmail_triage
   - business_research_analyst
+  - rag_retrieval_specialist
   - opportunity_scout
   - outreach_composer
   - airtable_context_agent

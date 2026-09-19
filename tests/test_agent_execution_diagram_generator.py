@@ -41,23 +41,29 @@ def test_request_sequence_separates_semantic_interpretation_from_execution_shape
     for expected in (
         ORCHESTRATOR_AGENT_SPEC.agent_name,
         CHIEF_OF_STAFF_AGENT_SPEC.agent_name,
-        "Resolve uncertainty intelligently",
-        "Infer safe defaults",
-        "clarify only material ambiguity",
-        "Bounded single owner or stateful / multi-owner",
-        "DIRECT / SINGLE-OWNER PATH",
-        "WORKITEM / LANGGRAPH PATH",
-        "Verified provider or workflow receipt",
-        "one reviewed answer",
+        "rankdir=LR",
+        "splines=ortho",
+        "1  Preserve the operator request",
+        "2  Orchestrator Agent",
+        "3  Python validates the envelope",
+        "4  Choose execution shape",
+        "5  Context specialists stage typed evidence only when needed in A or B",
+        "6A  Owning specialist reasons",
+        "6B  Chief / manager + owning specialist",
+        "7  Provider / tool result",
+        "8  Reconcile decision + receipt",
+        "9  Render one answer",
+        "SQLite business state ≠ graph checkpoint proof",
     ):
         assert expected in dot
     for spec in SPECIALIST_AGENT_SPECS:
         assert spec.agent_name in dot
 
     numbered_labels = re.findall(r'label="(\d+(?:[AB])?[^"]*)"', dot)
-    assert numbered_labels
-    assert dot.index("entry -> interpret") < dot.index("interpret -> uncertainty")
-    assert dot.index("interpret -> uncertainty") < dot.index("gates -> backend")
+    assert len(numbered_labels) >= 9
+    assert dot.index("entry -> interpret") < dot.index("interpret -> gates")
+    assert dot.index("interpret -> gates") < dot.index("gates -> backend")
+    assert 'label="' not in dot[dot.index("  entry -> interpret;") :]
 
 
 @pytest.mark.skipif(not langgraph_available(), reason="optional LangGraph is not installed")
@@ -70,39 +76,45 @@ def test_integrated_architecture_connects_sequence_context_direct_and_graph_view
     )
 
     for expected in (
-        "one natural-language request, two execution shapes",
-        "numbered arrows show request order",
-        f"{len(topology.nodes)} compiled nodes",
-        f"{len(topology.edges)} compiled edges",
-        "NATURAL-LANGUAGE CONTROL PLANE",
-        "OPTIONAL READ / CONTEXT STAGING",
-        "DIRECT / BOUNDED SINGLE-OWNER",
-        "WORKITEM / LANGGRAPH RUNTIME",
-        "TOOLS, PROVIDERS, AND VERIFIED STATE",
-        "REVIEW, RENDER, AND FEEDBACK",
-        "Resolve uncertainty intelligently",
-        "same caller/thread",
-        "Base, table, field, and record evidence",
-        "Drive, Docs, and Sheets evidence",
-        "Library, collection, and item evidence",
-        "Feed and article evidence",
-        "Preprint and article evidence",
+        "clear conceptual overview",
+        "request → interpretation → selected path → verified evidence → answer",
+        "UNDERSTAND AND AUTHORIZE",
+        "EXECUTION PATHS — CONTEXT OPTIONAL",
+        "REASON → VERIFY → ANSWER",
+        "DIRECT / SINGLE OWNER",
+        "WORKITEM / OPTIONAL LANGGRAPH",
+        "OPTIONAL CONTEXT — ONLY WHEN NEEDED",
+        "No graph implied",
+        "manager loop • approval pause • resume",
+        "graph checkpoint proof is separate",
+        "SELECTED SPECIALIST REASONS",
+        "Attached tools ≠ actual tool calls",
+        "SDK tool call + output • workflow helper/read",
+        "pre-acquired verified context",
+        "permission • exact scope • read-back • receipt",
     ):
         assert expected in dot
-    for node in topology.nodes:
-        assert node in dot
     for spec in SPECIALIST_AGENT_SPECS:
         assert spec.agent_name in dot
 
+    for literal_runtime_detail in (
+        "normalize_request",
+        "stage_airtable_context",
+        "manager_loop_finalize",
+        "run_unsupported_route",
+    ):
+        assert literal_runtime_detail not in dot
+
     for earlier, later in (
-        ("entry -> payload", "payload -> orchestrator"),
-        ("payload -> orchestrator", "orchestrator -> context_resolution"),
-        ("shape -> graph_control", "graph_control -> graph_workitem"),
-        ("graph_workitem -> graph_context", "graph_context -> graph_agents"),
-        ("providers -> receipt", "receipt -> review"),
-        ("receipt -> review", "review -> render"),
+        ("request -> orchestrator", "orchestrator -> gates"),
+        ("orchestrator -> gates", "gates -> choose"),
+        ("choose -> direct", "direct -> specialist"),
+        ("choose -> workitem", "workitem -> specialist"),
+        ("specialist -> evidence", "evidence -> review"),
+        ("evidence -> review", "review -> answer"),
     ):
         assert dot.index(earlier) < dot.index(later)
+    assert "workitem -> workitem" in dot
 
 
 @pytest.mark.skipif(not langgraph_available(), reason="optional LangGraph is not installed")
@@ -114,8 +126,9 @@ def test_topology_contains_every_compiled_runtime_node_and_edge() -> None:
         generated_date="2026-07-18",
     )
 
-    assert len(topology.nodes) == 20
-    assert len(topology.edges) == 72
+    assert len(topology.nodes) == 21
+    assert "run_rag_retrieval" in topology.nodes
+    assert len(topology.edges) == 78
     for node in topology.nodes:
         assert f'"{node}" [' in dot
     for edge in topology.edges:
@@ -127,12 +140,20 @@ def test_topology_contains_every_compiled_runtime_node_and_edge() -> None:
         "Airtable context agent",
         "Google Workspace context agent",
         "Business Research Analyst",
+        "RAG Retrieval Specialist",
         "Opportunity Scout",
         "Gmail Triage",
         "Outreach Composer",
         "Chief of Staff manager",
         "approval_checkpoint",
         "manager_loop_continue",
+        "dashed = compiled conditional choice",
+        "context stages are conditional",
+        "next stage loop",
+        "approval required",
+        "pause / resume boundary",
+        "2 — CONTEXT STAGING",
+        "4 — FINALIZE / LOOP / APPROVAL",
     ):
         assert expected in dot
 

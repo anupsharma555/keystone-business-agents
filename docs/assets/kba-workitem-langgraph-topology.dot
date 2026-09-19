@@ -1,19 +1,19 @@
 digraph kba_workitem_langgraph_topology {
-  graph [rankdir=TB, bgcolor="#f8fafc", pad="0.35", nodesep="0.28", ranksep="0.58", splines=polyline, newrank=true, concentrate=true, fontname="Arial", fontsize=22, labelloc=t, label="Executable KBA WorkItem / LangGraph topology\nGenerated 2026-07-20 from build_work_item_langgraph().get_graph() • 20 nodes • 72 edges"];
+  graph [rankdir=TB, bgcolor="#f8fafc", pad="0.35", nodesep="0.28", ranksep="0.58", splines=polyline, newrank=true, concentrate=true, fontname="Arial", fontsize=22, labelloc=t, label="Compiled executable KBA WorkItem / LangGraph topology\nGenerated 2026-09-18 from build_work_item_langgraph().get_graph() • 21 nodes • 78 edges • dashed = compiled conditional choice • context stages are conditional\nnode presence does not imply named-route dispatch; display labels annotate unchanged runtime edges"];
   node [shape=box, style="rounded,filled", color="#94a3b8", fillcolor="#ffffff", fontname="Arial", fontsize=10, margin="0.12,0.08"];
   edge [fontname="Arial", fontsize=8, arrowsize=0.55];
 
   subgraph cluster_control {
-    label="1 — REQUEST CONTROL + CANONICAL STATE"; color="#fdba74"; fontcolor="#9a3412"; style="rounded,dashed";
+    label="1 — CONTROL + WORKITEM STATE"; color="#fdba74"; fontcolor="#9a3412"; fontsize=13; labeljust=l; margin=24; style="rounded,dashed";
     "__start__" [label="START", shape="oval", fillcolor="#f1f5f9", color="#64748b"];
     "normalize_request" [label="normalize_request\nPreserve raw ask + bounded context", fillcolor="#f5f3ff", color="#7c3aed"];
-    "orchestrator_preflight" [label="orchestrator_preflight\nLLM interpretation, safe defaults, route advice", fillcolor="#fff7ed", color="#ea580c", penwidth="2.0"];
+    "orchestrator_preflight" [label="orchestrator_preflight\nAgent-owned route/workflow decision + safe defaults", fillcolor="#fff7ed", color="#ea580c", penwidth="2.0"];
     "state_followup" [label="state_followup\nAnswer state-only follow-up or continue", fillcolor="#f5f3ff", color="#7c3aed"];
     "prepare_work_item" [label="prepare_work_item\nCanonical WorkItem + typed context pack", fillcolor="#f5f3ff", color="#7c3aed"];
   }
 
   subgraph cluster_context {
-    label="2 — READ-ONLY CONTEXT STAGING"; color="#7dd3fc"; fontcolor="#075985"; style="rounded,dashed";
+    label="2 — CONTEXT STAGING"; color="#7dd3fc"; fontcolor="#075985"; fontsize=13; labeljust=r; margin=24; style="rounded,dashed";
     "stage_airtable_context" [label="stage_airtable_context\nAirtable context agent", fillcolor="#f0f9ff", color="#0284c7"];
     "stage_feed_context" [label="stage_feed_context\nRSS + Preprints context agents", fillcolor="#f0f9ff", color="#0284c7"];
     "stage_google_workspace_context" [label="stage_google_workspace_context\nGoogle Workspace context agent", fillcolor="#f0f9ff", color="#0284c7"];
@@ -21,18 +21,19 @@ digraph kba_workitem_langgraph_topology {
   }
 
   subgraph cluster_specialists {
-    label="3 — SDK SPECIALISTS / CHIEF MANAGER"; color="#86efac"; fontcolor="#166534"; style="rounded,dashed";
+    label="3 — SPECIALISTS / CHIEF"; color="#86efac"; fontcolor="#166534"; fontsize=13; labeljust=l; margin=24; style="rounded,dashed";
     "run_business_research" [label="run_business_research\nBusiness Research Analyst", fillcolor="#ecfdf5", color="#16a34a"];
     "run_chief_of_staff" [label="run_chief_of_staff\nChief of Staff manager", fillcolor="#ecfdf5", color="#16a34a"];
     "run_gmail_triage" [label="run_gmail_triage\nGmail Triage", fillcolor="#ecfdf5", color="#16a34a"];
     "run_opportunity_scout" [label="run_opportunity_scout\nOpportunity Scout", fillcolor="#ecfdf5", color="#16a34a"];
     "run_outreach_composer" [label="run_outreach_composer\nOutreach Composer", fillcolor="#ecfdf5", color="#16a34a"];
+    "run_rag_retrieval" [label="run_rag_retrieval\nRAG Retrieval Specialist", fillcolor="#ecfdf5", color="#16a34a"];
     "run_unsupported_route" [label="run_unsupported_route\nUseful blocker + next safe action", fillcolor="#ecfdf5", color="#16a34a"];
   }
 
   subgraph cluster_lifecycle {
-    label="4 — FINALIZE, LOOP, OR CHECKPOINT"; color="#c4b5fd"; fontcolor="#5b21b6"; style="rounded,dashed";
-    "finalize_step" [label="finalize_step\nValidate result + update canonical state", fillcolor="#f5f3ff", color="#7c3aed"];
+    label="4 — FINALIZE / LOOP / APPROVAL"; color="#c4b5fd"; fontcolor="#5b21b6"; fontsize=13; labeljust=l; margin=24; style="rounded,dashed";
+    "finalize_step" [label="finalize_step\nValidate decision/tool evidence + update canonical state", fillcolor="#f5f3ff", color="#7c3aed"];
     "manager_loop_continue" [label="manager_loop_continue\nAdvance another planned stage", fillcolor="#eef2ff", color="#4f46e5"];
     "manager_loop_finalize" [label="manager_loop_finalize\nCompose terminal graph result", fillcolor="#eef2ff", color="#4f46e5"];
     "approval_checkpoint" [label="approval_checkpoint\nPause before gated next action", fillcolor="#fffbeb", color="#d97706", penwidth="2.0"];
@@ -43,15 +44,15 @@ digraph kba_workitem_langgraph_topology {
   { rank=same; "run_business_research"; "run_opportunity_scout"; "run_gmail_triage"; "run_outreach_composer"; "run_chief_of_staff"; "run_unsupported_route"; }
 
   "__start__" -> "normalize_request" [color="#475569", penwidth="1.25"];
-  "approval_checkpoint" -> "__end__" [color="#d97706", penwidth="1.25"];
+  "approval_checkpoint" -> "__end__" [color="#d97706", penwidth="1.25", label="pause / resume boundary"];
   "finalize_step" -> "__end__" [style="dashed", color="#d97706", penwidth="0.8", label="done"];
-  "finalize_step" -> "approval_checkpoint" [style="dashed", color="#d97706", penwidth="0.8"];
-  "finalize_step" -> "manager_loop_continue" [style="dashed", color="#d97706", penwidth="0.8"];
-  "finalize_step" -> "manager_loop_finalize" [style="dashed", color="#d97706", penwidth="0.8"];
+  "finalize_step" -> "approval_checkpoint" [style="dashed", color="#d97706", penwidth="0.8", label="approval required"];
+  "finalize_step" -> "manager_loop_continue" [style="dashed", color="#d97706", penwidth="0.8", label="continue"];
+  "finalize_step" -> "manager_loop_finalize" [style="dashed", color="#d97706", penwidth="0.8", label="finish"];
   "finalize_step" -> "stage_airtable_context" [style="dashed", color="#d97706", penwidth="0.8"];
   "finalize_step" -> "stage_google_workspace_context" [style="dashed", color="#d97706", penwidth="0.8"];
-  "manager_loop_continue" -> "prepare_work_item" [color="#475569", penwidth="1.25", constraint="false"];
-  "manager_loop_finalize" -> "__end__" [color="#475569", penwidth="1.25"];
+  "manager_loop_continue" -> "prepare_work_item" [color="#475569", penwidth="1.25", label="next stage loop", constraint="false"];
+  "manager_loop_finalize" -> "__end__" [color="#475569", penwidth="1.25", label="terminal"];
   "normalize_request" -> "orchestrator_preflight" [color="#475569", penwidth="1.25"];
   "orchestrator_preflight" -> "state_followup" [color="#475569", penwidth="1.25"];
   "prepare_work_item" -> "run_business_research" [style="dashed", color="#94a3b8", penwidth="0.8"];
@@ -59,6 +60,7 @@ digraph kba_workitem_langgraph_topology {
   "prepare_work_item" -> "run_gmail_triage" [style="dashed", color="#94a3b8", penwidth="0.8"];
   "prepare_work_item" -> "run_opportunity_scout" [style="dashed", color="#94a3b8", penwidth="0.8"];
   "prepare_work_item" -> "run_outreach_composer" [style="dashed", color="#94a3b8", penwidth="0.8"];
+  "prepare_work_item" -> "run_rag_retrieval" [style="dashed", color="#94a3b8", penwidth="0.8"];
   "prepare_work_item" -> "run_unsupported_route" [style="dashed", color="#94a3b8", penwidth="0.8"];
   "prepare_work_item" -> "stage_airtable_context" [style="dashed", color="#94a3b8", penwidth="0.8"];
   "prepare_work_item" -> "stage_feed_context" [style="dashed", color="#94a3b8", penwidth="0.8"];
@@ -69,6 +71,7 @@ digraph kba_workitem_langgraph_topology {
   "run_gmail_triage" -> "finalize_step" [color="#22c55e", penwidth="1.25"];
   "run_opportunity_scout" -> "finalize_step" [color="#22c55e", penwidth="1.25"];
   "run_outreach_composer" -> "finalize_step" [color="#22c55e", penwidth="1.25"];
+  "run_rag_retrieval" -> "finalize_step" [color="#22c55e", penwidth="1.25"];
   "run_unsupported_route" -> "finalize_step" [color="#22c55e", penwidth="1.25"];
   "stage_airtable_context" -> "approval_checkpoint" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_airtable_context" -> "run_business_research" [style="dashed", color="#38bdf8", penwidth="0.8"];
@@ -76,6 +79,7 @@ digraph kba_workitem_langgraph_topology {
   "stage_airtable_context" -> "run_gmail_triage" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_airtable_context" -> "run_opportunity_scout" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_airtable_context" -> "run_outreach_composer" [style="dashed", color="#38bdf8", penwidth="0.8"];
+  "stage_airtable_context" -> "run_rag_retrieval" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_airtable_context" -> "run_unsupported_route" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_airtable_context" -> "stage_airtable_context" [style="dashed", color="#38bdf8", penwidth="0.8", constraint="false"];
   "stage_airtable_context" -> "stage_feed_context" [style="dashed", color="#38bdf8", penwidth="0.8"];
@@ -86,6 +90,7 @@ digraph kba_workitem_langgraph_topology {
   "stage_feed_context" -> "run_gmail_triage" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_feed_context" -> "run_opportunity_scout" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_feed_context" -> "run_outreach_composer" [style="dashed", color="#38bdf8", penwidth="0.8"];
+  "stage_feed_context" -> "run_rag_retrieval" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_feed_context" -> "run_unsupported_route" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_feed_context" -> "stage_airtable_context" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_feed_context" -> "stage_feed_context" [style="dashed", color="#38bdf8", penwidth="0.8", constraint="false"];
@@ -97,6 +102,7 @@ digraph kba_workitem_langgraph_topology {
   "stage_google_workspace_context" -> "run_gmail_triage" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_google_workspace_context" -> "run_opportunity_scout" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_google_workspace_context" -> "run_outreach_composer" [style="dashed", color="#38bdf8", penwidth="0.8"];
+  "stage_google_workspace_context" -> "run_rag_retrieval" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_google_workspace_context" -> "run_unsupported_route" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_google_workspace_context" -> "stage_airtable_context" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_google_workspace_context" -> "stage_feed_context" [style="dashed", color="#38bdf8", penwidth="0.8"];
@@ -107,6 +113,7 @@ digraph kba_workitem_langgraph_topology {
   "stage_zotero_context" -> "run_gmail_triage" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_zotero_context" -> "run_opportunity_scout" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_zotero_context" -> "run_outreach_composer" [style="dashed", color="#38bdf8", penwidth="0.8"];
+  "stage_zotero_context" -> "run_rag_retrieval" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_zotero_context" -> "run_unsupported_route" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_zotero_context" -> "stage_airtable_context" [style="dashed", color="#38bdf8", penwidth="0.8"];
   "stage_zotero_context" -> "stage_feed_context" [style="dashed", color="#38bdf8", penwidth="0.8"];

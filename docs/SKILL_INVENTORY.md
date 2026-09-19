@@ -35,6 +35,8 @@ bypass source, approval, cost, dry-run, no-send, or no-write gates.
 | Skill | Disposition | Notes |
 | --- | --- | --- |
 | `kba-agent-contract-change` | Update now | Kept as the contract-change entrypoint; refreshed reference map for LangGraph/WorkItem ownership and route-boundary checks. |
+| `kba-agent-run-diagnosis` | Keep | General run reconstruction across entrypoint, semantic state, tools, provider receipts, validation, rendering, per-attempt Slack continuity, loaded Slack runtime freshness, and missing evidence; it remains read-only unless a separate action is authorized. |
+| `kba-propagate-agent-fixes` | Keep | Applies one evidence-backed repair at the earliest shared KBA boundary, audits analogous agents and direct/orchestrated paths, and requires cross-path regression proof before claiming the defect is generalized. |
 | `kba-eval-readiness-triage` | Keep | Still owns Promptfoo, Slack eval readiness, trace summaries, route compaction, and no-live SDK eval safety. |
 | `kba-live-sdk-smoke-and-cost` | Keep | Still owns `KEYSTONE_OPENAI_API_KEY`, live SDK smoke, rate-limit, trace, request-cache, and cost telemetry guidance. |
 | `kba-new-agent` | Update now | Kept as the novel-agent workflow; refreshed to include optional LangGraph backend policy while preserving Orchestrator-first execution. |
@@ -65,6 +67,7 @@ bypass source, approval, cost, dry-run, no-send, or no-write gates.
 | `preprints_context_specialist_contracts` | Keep | Current preprint context contract supports the allowlisted linked discovery-store read in SQLite read-only mode and blocks unsupported claims. |
 | `prior_work_and_duplicate_checking` | Keep | Current prior-work contract avoids brittle duplicate blockers. |
 | `request_to_specialist_brief` | Keep | Current brief-expansion contract preserves raw request, route authority, and permission gates. |
+| `rag_retrieval_specialist_contracts` | Keep | Explicit, read-only hosted corpus retrieval with ranked source identity, grounded claims, abstention, and no web fallback. |
 | `rss_context_specialist_contracts` | Keep | Current RSS context contract supports the explicitly live-gated structured Slack history read while blocking posting, modification, and browser-scraping overreach. |
 | `source_triage_decision` | Keep | Current source-selection contract aligns with live-search, extraction, source gaps, and cost-aware deepen/broaden behavior. |
 | `structured_output_quality_review` | Keep | Current final-output review contract preserves schema, source, approval, and action-state checks. |

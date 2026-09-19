@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
+from keystone_agents.schemas.decision_ownership import AgentDecisionRecord
 from keystone_agents.schemas.operational_context import HumanWorkContext
 from keystone_agents.schemas.request_coverage import RequestCoverage
 
@@ -202,6 +203,74 @@ class GmailAttachmentMetadata(BaseModel):
         return list(dict.fromkeys(value.strip() for value in values if value.strip()))
 
 
+class GmailQuotationEvidence(BaseModel):
+    """One bounded quotation retained separately from the latest-sender triage view."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    quote_kind: Literal["editorial_source", "reply_history", "ambiguous"]
+    text: str = Field(default="", max_length=4_000)
+    attribution: str = Field(default="", max_length=500)
+    attribution_status: Literal[
+        "not_applicable",
+        "explicit",
+        "inferred_reply_marker",
+        "unknown",
+    ] = "unknown"
+    truncated: bool = False
+
+    @field_validator("text", "attribution")
+    @classmethod
+    def normalize_source_text(cls, value: str) -> str:
+        return value.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+class GmailBodyEvidence(BaseModel):
+    """One sanitized MIME representation with source-order and quotation evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    part_path: str = Field(min_length=1, max_length=120)
+    mime_type: str = Field(min_length=1, max_length=160)
+    container_mime_type: str = Field(default="", max_length=160)
+    alternative_group: str = Field(default="", max_length=120)
+    representation: Literal["plain", "html", "other_text"]
+    role: Literal[
+        "single_representation",
+        "selected_triage_view",
+        "alternate_representation",
+        "coexisting_section",
+    ]
+    direct_text: str = Field(default="", max_length=6_000)
+    triage_text: str = Field(default="", max_length=6_000)
+    source_text: str = Field(default="", max_length=8_000)
+    quotations: list[GmailQuotationEvidence] = Field(default_factory=list, max_length=20)
+    structure_annotations: bool = False
+    content_complete: bool = True
+    truncated: bool = False
+    limitations: list[str] = Field(default_factory=list, max_length=10)
+
+    @field_validator(
+        "part_path",
+        "mime_type",
+        "container_mime_type",
+        "alternative_group",
+    )
+    @classmethod
+    def normalize_identity_text(cls, value: str) -> str:
+        return " ".join(value.split()).strip()
+
+    @field_validator("direct_text", "triage_text", "source_text")
+    @classmethod
+    def normalize_body_text(cls, value: str) -> str:
+        return value.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    @field_validator("limitations")
+    @classmethod
+    def normalize_limitations(cls, values: list[str]) -> list[str]:
+        return list(dict.fromkeys(value.strip() for value in values if value.strip()))
+
+
 class GmailMessageEnvelope(BaseModel):
     """Sanitized, LLM-ready Gmail message context."""
 
@@ -217,6 +286,11 @@ class GmailMessageEnvelope(BaseModel):
     snippet: str = ""
     prior_labels: list[str] = Field(default_factory=list)
     normalized_body: str = ""
+    body_evidence: list[GmailBodyEvidence] = Field(default_factory=list, max_length=8)
+    body_content_status: Literal["complete", "partial", "conflicting", "empty"] = (
+        "complete"
+    )
+    body_content_complete: bool = True
     extracted_links: list[GmailLinkRecord] = Field(default_factory=list)
     attachment_metadata: list[GmailAttachmentMetadata] = Field(default_factory=list)
     thread_summary: str = ""
@@ -263,6 +337,15 @@ class EmailTriageResult(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     priority: EmailPriority = "normal"
     summary: str = ""
+    operator_answer: str = Field(
+        default="", max_length=6000,
+        description=(
+            "Direct answer to the Gmail-owned operator questions using the read evidence, "
+            "including "
+            "reply status and the recommended next step when asked. Keep the neutral "
+            "message summary separate and any proposed email copy in draft_reply."
+        ),
+    )
     thread_summary: str = ""
     thread_context: str = ""
     reasoning: str
@@ -287,6 +370,7 @@ class EmailTriageResult(BaseModel):
     requires_human_review: bool = True
     human_work_context: HumanWorkContext = Field(default_factory=HumanWorkContext)
     request_coverage: RequestCoverage = Field(default_factory=RequestCoverage)
+    decision: AgentDecisionRecord = Field(default_factory=AgentDecisionRecord)
 
     @field_validator(
         "subject",
@@ -302,10 +386,12 @@ class EmailTriageResult(BaseModel):
         "normalized_body",
     )
     @classmethod
-    def reject_em_dash(cls, value: str | None) -> str | None:
-        if value is not None and "\u2014" in value:
-            raise ValueError("Email triage output must not contain em dashes.")
-        return value
+    def normalize_em_dash(cls, value: str | None) -> str | None:
+        # Typography is a presentation constraint, not a reason to discard an
+        # otherwise valid provider-backed result. Normalize model output at the
+        # schema boundary so a quoted operator request or email snippet cannot
+        # turn a successful Gmail read into a parse failure.
+        return value.replace("\u2014", "-") if value is not None else None
 
     @field_validator("suspicious_signals", "triage_limitations", "prior_labels")
     @classmethod
@@ -322,6 +408,57 @@ class EmailTriageResult(BaseModel):
 
 
 EmailTriage = EmailTriageResult
+
+
+class GmailSelectedSelectionRepair(BaseModel):
+    """One validator repair that commits to a provider-bound Gmail result."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    resolution: Literal["selected"] = "selected"
+    triage_result: EmailTriageResult
+
+
+class GmailNeedsMoreContextRepair(BaseModel):
+    """One validator repair that explicitly declines to select a Gmail object."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    resolution: Literal["needs_more_context"] = "needs_more_context"
+    reasoning: str = Field(min_length=1, max_length=2_000)
+    limitations: list[str] = Field(default_factory=list, max_length=12)
+    requested_context: list[str] = Field(default_factory=list, max_length=8)
+
+    @field_validator("reasoning", mode="before")
+    @classmethod
+    def normalize_reasoning(cls, value: object) -> str:
+        return " ".join(str(value or "").replace("\u2014", "-").split())
+
+    @field_validator("limitations", "requested_context", mode="before")
+    @classmethod
+    def normalize_lists(cls, value: object) -> list[str]:
+        values = value if isinstance(value, list | tuple | set) else [value]
+        return list(
+            dict.fromkeys(
+                " ".join(str(item or "").replace("\u2014", "-").split())
+                for item in values
+                if str(item or "").strip()
+            )
+        )
+
+
+GmailSelectionRepairBranch = Annotated[
+    GmailSelectedSelectionRepair | GmailNeedsMoreContextRepair,
+    Field(discriminator="resolution"),
+]
+
+
+class GmailSelectionRepairResult(BaseModel):
+    """Mutually exclusive repair shape chosen by Gmail Triage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repair: GmailSelectionRepairBranch
 
 
 class GmailThreadSummaryMessage(BaseModel):

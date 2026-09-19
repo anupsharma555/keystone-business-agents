@@ -16,8 +16,8 @@ def test_matrix_has_one_diverse_and_deterministic_case_per_major_agent() -> None
 
     assert report["status"] == "complete"
     assert report["structurally_complete"] is True
-    assert report["case_count"] == 22
-    assert report["agent_count"] == 11
+    assert report["case_count"] == 2 * len(AGENT_REGISTRY)
+    assert report["agent_count"] == len(AGENT_REGISTRY)
     assert report["missing_route_family_pairs"] == []
     assert report["unexpected_routes"] == []
     assert report["duplicate_case_ids"] == []
@@ -42,9 +42,31 @@ def test_each_matrix_row_has_explicit_execution_and_failure_boundaries() -> None
 def test_automated_rows_expose_unique_executable_pytest_nodes() -> None:
     nodeids = automated_proof_nodeids()
 
-    assert len(nodeids) == 23
+    assert len(nodeids) == 29
     assert len(nodeids) == len(set(nodeids))
     assert all(nodeid.startswith("tests/") and "::" in nodeid for nodeid in nodeids)
+
+
+def test_rag_rows_require_retrieval_grounding_and_unavailable_corpus_proofs() -> None:
+    rows = {
+        case.ask_family: case
+        for case in DIVERSE_ASK_ACCEPTANCE_CASES
+        if case.expected_route == "rag_retrieval_specialist"
+    }
+    prefix = "tests/test_rag_retrieval_specialist.py::"
+
+    assert set(rows) == {"diverse", "deterministic"}
+    assert all(row.allowed_tool_tier == "read_only" for row in rows.values())
+    assert all(row.coverage_status == "automated" for row in rows.values())
+    assert {
+        prefix + "test_live_wrapper_requires_file_search_evidence",
+        prefix + "test_grounded_claims_must_reference_retained_matches",
+        prefix + "test_not_found_cannot_retain_off_topic_matches_or_claims",
+    } <= set(rows["diverse"].proof_refs)
+    assert {
+        prefix + "test_live_wrapper_fails_before_model_without_vector_store",
+        prefix + "test_fixture_does_not_claim_retrieval",
+    } <= set(rows["deterministic"].proof_refs)
 
 
 def test_automated_coverage_cannot_be_claimed_without_proof() -> None:

@@ -108,6 +108,23 @@ def clean_signals(signals: list[str]) -> list[str]:
     return list(dict.fromkeys(signal.strip() for signal in signals if signal.strip()))
 
 
+def _weighted_signals(signals: list[str]) -> list[str]:
+    """Return only existing canonical signal labels, once each.
+
+    Free-text observations stay in the source record for model interpretation;
+    their presence or wording is not itself positive weighted business evidence.
+    """
+
+    canonical = {signal.casefold(): signal for signal in SIGNAL_WEIGHTS}
+    return list(
+        dict.fromkeys(
+            canonical[signal.strip().casefold()]
+            for signal in signals
+            if signal.strip().casefold() in canonical
+        )
+    )
+
+
 def _has_any_signal(signals: list[str], needles: set[str]) -> bool:
     lowered = {signal.lower() for signal in signals}
     return any(needle.lower() in lowered for needle in needles)
@@ -162,7 +179,7 @@ def _source_confidence_component(summary: SourceQualitySummary | None) -> int:
 
 
 def _urgency_component(signals: list[str]) -> int:
-    signal_weight = sum(SIGNAL_WEIGHTS.get(signal, 6) for signal in signals)
+    signal_weight = sum(SIGNAL_WEIGHTS[signal] for signal in signals)
     return bounded_score(42 + signal_weight * 1.1 + len(signals) * 2)
 
 
@@ -192,7 +209,7 @@ def score_from_signals(
 ) -> OpportunityScoreBreakdown:
     """Score an opportunity candidate from normalized signal text and source quality."""
 
-    clean = clean_signals(signals)
+    clean = _weighted_signals(signals)
     relevance = _relevance_component(clean, opportunity_type)
     keystone_fit = _keystone_fit_component(clean, opportunity_type)
     source_confidence = _source_confidence_component(source_quality_summary)
@@ -221,7 +238,8 @@ def score_from_signals(
         rationale=(
             f"Priority {priority}/100 from relevance {relevance}, Keystone fit "
             f"{keystone_fit}, source confidence {source_confidence}, urgency {urgency}, "
-            f"and next-action clarity {next_action_clarity}."
+            f"and next-action clarity {next_action_clarity}; "
+            f"{len(clean)} recognized weighted signals."
         ),
         component_rationales=[
             f"Relevance {relevance}/100 based on {opportunity_type} and source signals.",
@@ -243,8 +261,17 @@ def outside_consulting_likelihood(
     breakdown: OpportunityScoreBreakdown,
     *,
     signal_count: int,
+    signals: list[str] | None = None,
 ) -> int:
-    """Estimate outside consulting fit from opportunity score components."""
+    """Estimate consulting fit using recognized signals when evidence is available.
+
+    ``signal_count`` is retained for callers using the legacy count-only API.
+    Production scoring supplies the original signals so observations cannot add
+    an unverified count bonus on top of the component scores.
+    """
+
+    if signals is not None:
+        signal_count = len(_weighted_signals(signals))
 
     return bounded_score(
         average_score(
@@ -267,11 +294,11 @@ def keystone_fit_reason(
 ) -> str:
     """Explain Keystone fit in source-reviewable language."""
 
-    signal_text = ", ".join(signals) if signals else "no named signals"
+    signal_text = ", ".join(_weighted_signals(signals)) or "none"
     return (
         f"{opportunity_type} opportunity scored {breakdown.keystone_fit_score}/100 "
-        "for Keystone fit because the signals touch clinical AI, neuroscience, "
-        f"behavioral health, evidence generation, or clinical research operations: {signal_text}."
+        "for type-based Keystone alignment. Recognized weighted signals: "
+        f"{signal_text}. Free-text observations do not add scoring weight."
     )
 
 

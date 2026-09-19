@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
@@ -32,6 +33,21 @@ _RECOVERABLE_PROVIDER_EXCEPTIONS = (
     TimeoutError,
     ConnectionError,
 )
+
+_NATURAL_SEARCH_PROVIDER_REQUEST_RE = re.compile(
+    r"\b(?:use|using|via|through|with|prefer|try|search(?:\s+the\s+web)?\s+"
+    r"(?:with|using|via))\s+(?:the\s+)?(?P<provider>"
+    r"openai\s+(?:hosted\s+)?web\s+search|agents(?:[-\s]+)web(?:[-\s]+)search|"
+    r"hosted\s+web\s+search|searxng|exa|tavily|firecrawl|serper)\b",
+    re.I,
+)
+_SEARCH_PROVIDER_ALIASES = {
+    "openai hosted web search": SearchProviderName.AGENTS_WEB_SEARCH.value,
+    "openai web search": SearchProviderName.AGENTS_WEB_SEARCH.value,
+    "agents web search": SearchProviderName.AGENTS_WEB_SEARCH.value,
+    "agents-web-search": SearchProviderName.AGENTS_WEB_SEARCH.value,
+    "hosted web search": SearchProviderName.AGENTS_WEB_SEARCH.value,
+}
 
 _AGGREGATOR_DOMAINS = frozenset(
     {
@@ -88,6 +104,43 @@ _RECENCY_TERMS = (
     "days ago",
     "2026",
     "2025",
+)
+_COMPANY_RELEVANCE_STOP_TERMS = frozenset(
+    {
+        "about",
+        "another",
+        "anything",
+        "based",
+        "business",
+        "check",
+        "claim",
+        "company",
+        "credible",
+        "evidence",
+        "find",
+        "first",
+        "from",
+        "here",
+        "into",
+        "link",
+        "look",
+        "openai",
+        "only",
+        "public",
+        "read",
+        "report",
+        "research",
+        "results",
+        "save",
+        "search",
+        "source",
+        "start",
+        "tell",
+        "their",
+        "those",
+        "verify",
+        "with",
+    }
 )
 _SCOUT_ROLE_REQUEST_TERMS = (
     " role ",
@@ -499,6 +552,35 @@ def build_provider_sequence(
     return tuple(_dedupe_sequence(providers))
 
 
+def resolve_requested_search_provider(
+    *,
+    request_text: str,
+    requested_provider: str | None,
+) -> str | None:
+    """Resolve one operator-named provider without weakening configured policy.
+
+    A natural preference may replace the ordinary SearXNG default. A deliberate
+    non-default CLI or environment selection remains authoritative. Multiple
+    provider names are treated as ambiguous and leave the configured choice
+    unchanged; provider comparison is handled by the retrieval-depth policy.
+    """
+
+    explicit = str(requested_provider or "").strip().lower().replace("_", "-")
+    matches = {
+        _SEARCH_PROVIDER_ALIASES.get(
+            " ".join(match.group("provider").lower().replace("-", " ").split()),
+            match.group("provider").lower(),
+        )
+        for match in _NATURAL_SEARCH_PROVIDER_REQUEST_RE.finditer(request_text or "")
+    }
+    if len(matches) != 1:
+        return explicit or None
+    natural = next(iter(matches))
+    if explicit not in {"", SearchProviderName.SEARXNG.value}:
+        return explicit
+    return natural
+
+
 def build_provider_use_ladder(
     *,
     request_text: str = "",
@@ -816,13 +898,26 @@ def assess_company_search_quality(
         agent_name="business_research_analyst",
         request_text=request_text,
     )
-    result_count, unique_domain_count, duplicate_ratio = _result_stats(results)
-    official_source_present = _official_source_present(results, company_url=company_url)
-    linkedin_source_present = _linkedin_source_present(results)
-    primary_source_count = _primary_source_count(results, company_url=company_url)
-    recent_signal_count = _recent_signal_count(results)
-    source_coverage = assess_source_coverage(
+    relevant_results = filter_company_search_results_for_entity(
         results,
+        company_name=company_name,
+        company_url=company_url,
+        request_text=request_text,
+    )
+    rejected_entity_mismatches = max(0, len(results) - len(relevant_results))
+    result_count, unique_domain_count, duplicate_ratio = _result_stats(relevant_results)
+    official_source_present = _official_source_present(
+        relevant_results,
+        company_url=company_url,
+    )
+    linkedin_source_present = _linkedin_source_present(relevant_results)
+    primary_source_count = _primary_source_count(
+        relevant_results,
+        company_url=company_url,
+    )
+    recent_signal_count = _recent_signal_count(relevant_results)
+    source_coverage = assess_source_coverage(
+        relevant_results,
         expected_lanes=required_source_lanes_for_company(
             company_url=company_url,
             request_text=request_text,
@@ -832,6 +927,10 @@ def assess_company_search_quality(
 
     reasons: list[str] = list(hint.reasons)
     needs_precision = False
+    if rejected_entity_mismatches:
+        reasons.append(
+            f"excluded {rejected_entity_mismatches} same-name or off-target search result(s)"
+        )
     if result_count < 4:
         needs_precision = True
         reasons.append("too few live search results")
@@ -884,6 +983,45 @@ def assess_company_search_quality(
         missing_source_lanes=source_coverage.missing_lanes,
         source_coverage=source_coverage.to_dict(),
     )
+
+
+def filter_company_search_results_for_entity(
+    results: Sequence[Any],
+    *,
+    company_name: str,
+    company_url: str | None = None,
+    request_text: str = "",
+) -> list[Any]:
+    """Exclude same-name search collisions before company synthesis and quality scoring."""
+
+    company_tokens = _search_identity_terms(company_name)
+    if not company_tokens:
+        return list(results)
+    company_phrase = " ".join(company_tokens)
+    official_domain = _normalized_netloc(company_url) if company_url else ""
+    focus_terms = {
+        term
+        for term in _search_identity_terms(request_text)
+        if term not in company_tokens and term not in _COMPANY_RELEVANCE_STOP_TERMS
+    }
+    admitted: list[Any] = []
+    for result in results:
+        mapping = _result_mapping(result)
+        if official_domain and _domain(mapping) == official_domain:
+            admitted.append(result)
+            continue
+        haystack = " ".join(
+            str(mapping.get(key) or "")
+            for key in ("title", "snippet", "content", "url", "link")
+        )
+        haystack_terms = set(_search_identity_terms(haystack))
+        normalized_haystack = " ".join(_search_identity_terms(haystack))
+        exact_identity = company_phrase in normalized_haystack
+        if not exact_identity:
+            continue
+        if len(company_tokens) > 1 or not focus_terms or focus_terms & haystack_terms:
+            admitted.append(result)
+    return admitted
 
 
 def assess_opportunity_search_quality(
@@ -1069,6 +1207,44 @@ def merge_search_results(*result_groups: Sequence[Any]) -> list[Any]:
             seen.add(key)
             merged.append(result)
     return merged
+
+
+def _bounded_provider_diverse_results(
+    results: Sequence[Any],
+    *,
+    num_results: int,
+    provider_order: Sequence[str],
+) -> list[Any]:
+    """Bound model-visible candidates while retaining one result per productive lane."""
+
+    merged = merge_search_results(results)
+    if not merged:
+        return []
+
+    selected: list[Any] = []
+    selected_ids: set[int] = set()
+    for provider_name in _dedupe_sequence(provider_order):
+        normalized_provider = provider_name.strip().lower()
+        for result in merged:
+            mapping = _result_mapping(result)
+            result_provider = str(
+                mapping.get("source") or mapping.get("provider") or ""
+            ).strip().lower()
+            if result_provider != normalized_provider:
+                continue
+            selected.append(result)
+            selected_ids.add(id(result))
+            break
+
+    effective_limit = max(max(int(num_results), 1), len(selected))
+    for result in merged:
+        if len(selected) >= effective_limit:
+            break
+        if id(result) in selected_ids:
+            continue
+        selected.append(result)
+        selected_ids.add(id(result))
+    return selected[:effective_limit]
 
 
 class HybridSearchProvider:
@@ -1299,9 +1475,17 @@ class HybridSearchProvider:
             )
         if last_error is not None:
             self._provider_error_fallback_used = True
+        bounded = _bounded_provider_diverse_results(
+            merged,
+            num_results=request.num_results,
+            provider_order=(
+                *self._provider_sequence,
+                *self._deepening_provider_sequence,
+            ),
+        )
         with self._lock:
-            self._all_results.extend(merged)
-        return merged
+            self._all_results.extend(bounded)
+        return bounded
 
     @staticmethod
     def _provider_search(provider: Any, request: SearchRequest) -> list[Any]:
@@ -1747,6 +1931,14 @@ def _result_mapping(result: Any) -> dict[str, Any]:
         "url": getattr(result, "url", ""),
         "snippet": getattr(result, "snippet", ""),
     }
+
+
+def _search_identity_terms(value: str) -> tuple[str, ...]:
+    return tuple(
+        term
+        for term in re.findall(r"[a-z0-9]+", str(value or "").lower())
+        if len(term) >= 3
+    )
 
 
 def _url(mapping: dict[str, Any]) -> str:

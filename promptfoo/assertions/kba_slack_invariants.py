@@ -197,6 +197,17 @@ def grade_output(output: str, context: dict[str, Any]) -> dict[str, Any]:
         if route not in set(payload.get("workflow") or []):
             failures.append(f"workflow missing route: {route}")
 
+    required_workflow_order = _string_list(vars_.get("required_workflow_order"))
+    actual_workflow = [str(route) for route in payload.get("workflow") or []]
+    if required_workflow_order and not _contains_ordered_routes(
+        actual_workflow,
+        required_workflow_order,
+    ):
+        failures.append(
+            "workflow route order mismatch: "
+            f"actual={actual_workflow!r}, required={required_workflow_order!r}"
+        )
+
     if _bool_or_none(vars_.get("require_final_synthesis")) is True and not payload.get(
         "final_synthesis_executed"
     ):
@@ -290,6 +301,13 @@ def _bool_or_none(value: Any) -> bool | None:
         if lowered in {"false", "no", "0"}:
             return False
     return None
+
+
+def _contains_ordered_routes(actual: list[str], required: list[str]) -> bool:
+    """Return whether every required route appears in the declared relative order."""
+
+    cursor = iter(actual)
+    return all(any(candidate == route for candidate in cursor) for route in required)
 
 
 def _authoritative_invocation_flags(payload: dict[str, Any]) -> tuple[bool, bool]:

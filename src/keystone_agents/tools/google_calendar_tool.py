@@ -20,6 +20,7 @@ from keystone_agents.provider_read import (
     current_provider_read_context,
     record_provider_read_result,
 )
+from keystone_agents.receipts.journal import durable_provider_tool, record_provider_observation
 from keystone_agents.sdk import function_tool
 from keystone_agents.tools.gmail_tool import GmailTool
 
@@ -711,6 +712,7 @@ def read_google_calendar_window_impl(
     return result
 
 
+@durable_provider_tool("create_google_calendar_event")
 def create_google_calendar_event_impl(
     title: str,
     start_date: str,
@@ -747,7 +749,8 @@ def create_google_calendar_event_impl(
         else _all_day_dates(clean_date)
     )
     expected_start = str(dates["start"].get("dateTime") or dates["start"].get("date") or "")
-    event_id = _deterministic_event_id(clean_calendar, clean_title, expected_start, approval)
+    expected_end = str(dates["end"].get("dateTime") or dates["end"].get("date") or "")
+    event_id = _deterministic_event_id(clean_calendar, clean_title, expected_start)
     recurrence = _daily_recurrence(clean_date, end_date) if repeat_each_day else []
     payload = _event_payload(
         clean_title,
@@ -760,14 +763,72 @@ def create_google_calendar_event_impl(
     if not live:
         return _preview("create", clean_calendar, event_id, payload, approval)
     _require_live_write_gate()
+    existing = calendar.get_event(clean_calendar, event_id)
+    if not existing.get("_not_found") and str(
+        existing.get("status") or "confirmed"
+    ).lower() != "cancelled":
+        verification = _event_verification(
+            existing,
+            event_id=event_id,
+            title=clean_title,
+            expected_start=expected_start,
+            expected_end=expected_end,
+            all_day=not timed,
+            timezone=clean_timezone,
+            description=description,
+            recurrence=recurrence,
+        )
+        if not verification["passed"]:
+            raise GoogleCalendarError(
+                "A Calendar event already occupies the deterministic request identity "
+                "but its provider fields differ. No second event was created."
+            )
+        html_link = str(existing.get("htmlLink") or "")
+        return {
+            "status": "success",
+            "operation": "create_calendar_event",
+            "provider": "google_calendar",
+            "provider_read": True,
+            "provider_write": False,
+            "provider_mutated": False,
+            "calendar_id": clean_calendar,
+            "event_id": event_id,
+            "html_link": html_link,
+            "provider_link": html_link,
+            "title": clean_title,
+            "start_date": clean_date,
+            "end_date": _iso_date(end_date) if end_date.strip() else "",
+            "start_time": start_time.strip(),
+            "end_time": end_time.strip(),
+            "all_day": not timed,
+            "repeat_each_day": bool(recurrence),
+            "timezone": clean_timezone,
+            "description_present": bool(description.strip()),
+            "approval_reference": approval,
+            "already_existed": True,
+            "provider_request_attempt_count": 1,
+            "provider_request_success_count": 1,
+            "verification": verification,
+            "verified": True,
+            "complete": True,
+            "live": True,
+            "send_enabled": False,
+        }
     created = calendar.create_event(clean_calendar, event_id, payload)
+    record_provider_observation({
+        "status": "observed", "provider": "google_calendar", "operation": "create_calendar_event",
+        "calendar_id": clean_calendar, "event_id": event_id, "provider_write": True,
+        "verification": {"passed": False, "status": "pending_readback"},
+    })
     verified = calendar.get_event(clean_calendar, event_id)
     verification = _event_verification(
         verified,
         event_id=event_id,
         title=clean_title,
         expected_start=expected_start,
+        expected_end=expected_end,
         all_day=not timed,
+        timezone=clean_timezone,
         description=description,
         recurrence=recurrence,
     )
@@ -775,6 +836,10 @@ def create_google_calendar_event_impl(
     return {
         "status": "success" if verification["passed"] else "verification_failed",
         "operation": "create_calendar_event",
+        "provider": "google_calendar",
+        "provider_read": True,
+        "provider_write": True,
+        "provider_mutated": True,
         "calendar_id": clean_calendar,
         "event_id": event_id,
         "html_link": html_link,
@@ -789,11 +854,18 @@ def create_google_calendar_event_impl(
         "timezone": clean_timezone,
         "description_present": bool(description.strip()),
         "approval_reference": approval,
+        "already_existed": False,
+        "provider_request_attempt_count": 3,
+        "provider_request_success_count": 3,
         "verification": verification,
+        "verified": bool(verification["passed"]),
+        "complete": bool(verification["passed"]),
+        "live": True,
         "send_enabled": False,
     }
 
 
+@durable_provider_tool("update_google_calendar_event")
 def update_google_calendar_event_impl(
     event_id: str,
     *,
@@ -859,6 +931,11 @@ def update_google_calendar_event_impl(
             description.strip(),
         )
     calendar.update_event(clean_calendar, clean_event_id, changes)
+    record_provider_observation({
+        "status": "observed", "provider": "google_calendar", "operation": "update_calendar_event",
+        "calendar_id": clean_calendar, "event_id": clean_event_id, "provider_write": True,
+        "verification": {"passed": False, "status": "pending_readback"},
+    })
     verified = calendar.get_event(clean_calendar, clean_event_id)
     expected_title = str(changes.get("summary") or before.get("summary") or "")
     expected_start_payload = changes.get("start") or before.get("start") or {}
@@ -878,13 +955,19 @@ def update_google_calendar_event_impl(
         event_id=clean_event_id,
         title=expected_title,
         expected_start=expected_start,
+        expected_end=expected_end,
         all_day=expected_all_day,
+        timezone=clean_timezone,
         description=expected_description,
     )
     html_link = str(verified.get("htmlLink") or "")
     return {
         "status": "success" if verification["passed"] else "verification_failed",
         "operation": "update_calendar_event",
+        "provider": "google_calendar",
+        "provider_read": True,
+        "provider_write": True,
+        "provider_mutated": True,
         "calendar_id": clean_calendar,
         "event_id": clean_event_id,
         "html_link": html_link,
@@ -898,11 +981,17 @@ def update_google_calendar_event_impl(
         "description_present": bool(expected_description),
         "description_mode": "append" if append_description else "replace",
         "approval_reference": approval,
+        "provider_request_attempt_count": 3,
+        "provider_request_success_count": 3,
         "verification": verification,
+        "verified": bool(verification["passed"]),
+        "complete": bool(verification["passed"]),
+        "live": True,
         "send_enabled": False,
     }
 
 
+@durable_provider_tool("delete_google_calendar_event")
 def delete_google_calendar_event_impl(
     event_id: str,
     *,
@@ -924,24 +1013,38 @@ def delete_google_calendar_event_impl(
     if before.get("_not_found"):
         raise GoogleCalendarError("Exact Calendar event was not found for deletion.")
     calendar.delete_event(clean_calendar, clean_event_id)
+    record_provider_observation({
+        "status": "observed", "provider": "google_calendar", "operation": "delete_calendar_event",
+        "calendar_id": clean_calendar, "event_id": clean_event_id, "provider_write": True,
+        "verification": {"passed": False, "status": "pending_readback"},
+    })
     after = calendar.get_event(clean_calendar, clean_event_id)
     cancelled = str(after.get("status") or "").strip().lower() == "cancelled"
     absent = bool(after.get("_not_found") or cancelled)
     return {
         "status": "success" if absent else "verification_failed",
         "operation": "delete_calendar_event",
+        "provider": "google_calendar",
+        "provider_read": True,
+        "provider_write": True,
+        "provider_mutated": True,
         "calendar_id": clean_calendar,
         "event_id": clean_event_id,
         "provider_link": str(before.get("htmlLink") or ""),
         "title": str(before.get("summary") or ""),
         "start_date": str((before.get("start") or {}).get("date") or ""),
         "approval_reference": approval,
+        "provider_request_attempt_count": 3,
+        "provider_request_success_count": 3,
         "verification": {
             "status": "verified" if absent else "verification_failed",
             "passed": absent,
             "event_absent_after": absent,
             "event_cancelled_after": cancelled,
         },
+        "verified": absent,
+        "complete": absent,
+        "live": True,
         "send_enabled": False,
     }
 
@@ -1240,10 +1343,13 @@ def _deterministic_event_id(
     calendar_id: str,
     title: str,
     start_date: str,
-    approval_reference: str,
 ) -> str:
+    identity = (
+        f"{calendar_id.strip().casefold()}|"
+        f"{' '.join(title.split()).casefold()}|{start_date}"
+    )
     digest = hashlib.sha256(
-        f"{calendar_id}|{title}|{start_date}|{approval_reference}".encode()
+        identity.encode()
     ).hexdigest()
     return f"kba{digest[:40]}"
 
@@ -1397,17 +1503,27 @@ def _event_verification(
     event_id: str,
     title: str,
     expected_start: str,
+    expected_end: str,
     all_day: bool,
+    timezone: str,
     description: str,
     recurrence: list[str] | None = None,
 ) -> dict[str, Any]:
+    start_payload = event.get("start") or {}
+    end_payload = event.get("end") or {}
+    boundary_key = "date" if all_day else "dateTime"
     checks = {
         "event_id_match": str(event.get("id") or "") == event_id,
         "title_match": str(event.get("summary") or "") == title,
-        "start_match": str(
-            (event.get("start") or {}).get("date" if all_day else "dateTime") or ""
-        )
-        == expected_start,
+        "start_match": str(start_payload.get(boundary_key) or "") == expected_start,
+        "end_match": str(end_payload.get(boundary_key) or "") == expected_end,
+        "all_day_match": bool(start_payload.get("date")) == all_day
+        and bool(end_payload.get("date")) == all_day,
+        "timezone_match": all_day
+        or (
+            str(start_payload.get("timeZone") or "") == timezone
+            and str(end_payload.get("timeZone") or "") == timezone
+        ),
         "description_match": str(event.get("description") or "") == description.strip(),
         "recurrence_match": list(event.get("recurrence") or []) == list(recurrence or []),
     }

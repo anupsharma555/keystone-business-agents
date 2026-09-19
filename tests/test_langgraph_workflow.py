@@ -36,6 +36,7 @@ from keystone_agents.schemas.chief_of_staff import (
     ChiefOfStaffResult,
     ChiefOfStaffRouteRecommendation,
 )
+from keystone_agents.schemas.company_profile import SourceRecord
 from keystone_agents.schemas.weekly_ops import WeeklyOpsAssemblyInput
 from keystone_agents.schemas.work_item import (
     UserFacingSummaryAuthority,
@@ -51,7 +52,12 @@ from keystone_agents.schemas.work_item import (
     WorkItemStatus,
     WorkItemTarget,
 )
+from keystone_agents.source_enrichment import SourceBundle
 from keystone_agents.storage.sqlite_store import SQLiteStore
+from keystone_agents.tools.website_extraction_tool import (
+    SelectedUrlExtractionDiagnostic,
+    SelectedUrlSourceBundleResult,
+)
 from keystone_agents.weekly_ops_packet import build_weekly_ops_source_bundle
 from keystone_agents.work_items import (
     apply_slack_approval_to_work_item_gate,
@@ -59,6 +65,30 @@ from keystone_agents.work_items import (
     set_next_action,
 )
 
+
+@pytest.fixture
+def supplied_company_research_note(tmp_path):
+    """Company evidence separate from the structural context-stage fixtures."""
+    import json
+
+    packet = {
+        "schema": "keystone.work_item.source_bundle.v1", "supplied_material_only": True,
+        "target": {"name": "Example Health", "object_type": "company"},
+        "sources": [{
+            "source_id": "supplied-company-workflow-note",
+            "title": "Synthetic company workflow evidence",
+            "url": "https://example.test/synthetic-workflow-note",
+            "provider": "operator_supplied", "source_type": "user_provided",
+            "extraction_status": "supplied_material",
+            "evidence_excerpt": (
+                "The company supplied 37 synthetic workflow observations for retrospective "
+                "validation. No prospective performance or deployment benefit was measured."
+            ),
+        }],
+    }
+    path = tmp_path / "company-research-note.json"
+    path.write_text(json.dumps(packet))
+    return path
 
 def _database_url(tmp_path: Path) -> str:
     return f"sqlite:///{tmp_path / 'langgraph_workflow.db'}"
@@ -1131,7 +1161,7 @@ def test_langgraph_preserves_supplied_note_across_automatic_research_opportunity
     ] == [("business_research_analyst", "opportunity_scout")]
 
 
-def test_natural_cos_decision_brief_completes_planned_graph_without_post_checkpoint(
+def test_natural_cos_decision_brief_does_not_follow_planner_without_chief_handoff(
     tmp_path: Path,
 ) -> None:
     request_text = (
@@ -1171,42 +1201,26 @@ def test_natural_cos_decision_brief_completes_planned_graph_without_post_checkpo
         event for event in events if event.event_type == "langgraph_orchestration"
     )
 
-    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
-    assert result.status == WorkItemStatus.DONE
-    outreach = result.work_item.artifact_refs[-1]
-    research = next(
-        artifact
-        for artifact in result.work_item.artifact_refs
-        if artifact.artifact_type == "company_profile"
-    )
-    opportunity = next(
-        artifact
-        for artifact in result.work_item.artifact_refs
-        if artifact.artifact_type == "opportunity"
-    )
-    assert research.metadata["source_provided"] is True
-    assert "care-navigation software" in research.summary
-    assert opportunity.metadata["source_provided"] is True
-    assert outreach.artifact_type == "outreach_draft"
-    assert outreach.metadata["internal_slack_copy"] is True
-    assert result.human_summary.startswith("*Recommendation:*")
-    assert "*What the supplied note supports:*" in result.human_summary
-    assert "*Most important validation gap:*" in result.human_summary
+    assert result.route == WorkItemRoute.CHIEF_OF_STAFF
+    assert result.status == WorkItemStatus.BLOCKED
+    assert [artifact.artifact_type for artifact in result.work_item.artifact_refs] == [
+        "chief_of_staff_plan"
+    ]
+    assert [blocker.code for blocker in result.blockers] == [
+        "manager_loop_research_not_completed"
+    ]
     assert "care-navigation software" in result.human_summary
-    assert result.human_summary.count("*Next safe action:*") == 1
     assert "Email draft" not in result.human_summary
     assert "Hi," not in result.human_summary
     assert "fixture://" not in result.human_summary
-    assert graph_event.metadata["checkpoint_required"] is False
-    assert "approval_checkpoint" not in graph_event.metadata["node_path"]
+    assert "run_business_research" not in graph_event.metadata["node_path"]
+    assert "run_opportunity_scout" not in graph_event.metadata["node_path"]
+    assert "run_outreach_composer" not in graph_event.metadata["node_path"]
     assert [
         (event.metadata["from_route"], event.metadata["to_route"])
         for event in events
         if event.event_type == "planned_workflow_handoff"
-    ] == [
-        ("business_research_analyst", "opportunity_scout"),
-        ("opportunity_scout", "outreach_composer"),
-    ]
+    ] == []
     assert all(
         artifact.metadata.get("external_write_performed") is not True
         and artifact.metadata.get("send_enabled") is not True
@@ -1214,7 +1228,7 @@ def test_natural_cos_decision_brief_completes_planned_graph_without_post_checkpo
     )
 
 
-def test_resumable_approved_facts_internal_slack_recommendation_is_not_external_outreach(
+def test_resumable_approved_facts_stays_with_chief_without_model_handoff(
     tmp_path: Path,
 ) -> None:
     request_text = (
@@ -1248,15 +1262,15 @@ def test_resumable_approved_facts_internal_slack_recommendation_is_not_external_
         max_steps=4,
     )
 
-    internal_artifact = result.work_item.artifact_refs[-1]
     blocker_codes = {blocker.code for blocker in result.work_item.blockers}
 
     assert result.status == WorkItemStatus.DONE
+    assert result.route == WorkItemRoute.CHIEF_OF_STAFF
     assert result.work_item.id.startswith("wi_")
-    assert internal_artifact.metadata["internal_slack_copy"] is True
+    assert [artifact.artifact_type for artifact in result.work_item.artifact_refs] == [
+        "chief_of_staff_plan"
+    ]
     assert "outreach_requires_approved_context" not in blocker_codes
-    assert result.human_summary.startswith("*Recommendation:*")
-    assert "*Most important validation gap:*" in result.human_summary
     assert "Northstar Care" in result.human_summary
     assert "referral-navigation software" in result.human_summary
     assert "track this as a resumable" not in result.human_summary.lower()
@@ -1265,7 +1279,7 @@ def test_resumable_approved_facts_internal_slack_recommendation_is_not_external_
     assert "Email draft" not in result.human_summary
 
 
-def test_short_human_cos_stateful_review_completes_same_graph_contract(
+def test_short_human_cos_stateful_review_requires_chief_owned_handoff(
     tmp_path: Path,
 ) -> None:
     request_text = (
@@ -1299,32 +1313,15 @@ def test_short_human_cos_stateful_review_completes_same_graph_contract(
         "outreach_composer",
     ]
     assert result.status == WorkItemStatus.DONE
-    assert result.route == WorkItemRoute.OUTREACH_COMPOSER
-    research = next(
-        artifact
-        for artifact in result.work_item.artifact_refs
-        if artifact.artifact_type == "company_profile"
-    )
-    opportunity = next(
-        artifact
-        for artifact in result.work_item.artifact_refs
-        if artifact.artifact_type == "opportunity"
-    )
-    assert research.metadata["source_provided"] is True
-    assert opportunity.metadata["source_provided"] is True
-    assert research.metadata["source_refs"][0]["key_facts"] == [
-        "Northstar Care sells referral-navigation software but has no audited outcomes."
+    assert result.route == WorkItemRoute.CHIEF_OF_STAFF
+    assert [artifact.artifact_type for artifact in result.work_item.artifact_refs] == [
+        "chief_of_staff_plan"
     ]
-    assert result.work_item.artifact_refs[-1].metadata["internal_slack_copy"] is True
     assert (
         result.user_facing_summary_authority
         == UserFacingSummaryAuthority.REVIEWABLE
     )
-    assert result.human_summary.startswith("*Recommendation:*")
-    assert "*Most important validation gap:*" in result.human_summary
-    assert "Track this review" not in result.human_summary
-    assert "*Answer:*" not in result.human_summary
-    assert "*Detailed Summary:*" not in result.human_summary
+    assert "Northstar Care" in result.human_summary
     assert "Email draft" not in result.human_summary
     assert all(
         artifact.metadata.get("external_write_performed") is not True
@@ -1336,6 +1333,8 @@ def test_short_human_cos_stateful_review_completes_same_graph_contract(
 def test_langgraph_goal_based_cos_internal_slack_uses_live_synthesis(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_opportunity_fake_sdk,
+    supplied_research_fake_sdk,
 ) -> None:
     request_text = (
         "CoS, using the approved Northstar Behavioral Analytics packet, review what "
@@ -1368,13 +1367,13 @@ def test_langgraph_goal_based_cos_internal_slack_uses_live_synthesis(
                     "*Recommendation:*\nPrioritize a bounded evaluation-design review.\n\n"
                     "*Most important validation gap:*\nVerify measured outcomes and the "
                     "decision owner.\n\n*Sources:*\n"
-                    "fixture://graph-source/company-brief"
+                    "https://example.test/graph-source/company-brief"
                 ),
                 "linkedin_note": "",
                 "personalization_rationale": (
                     "Used only the supplied company packet and retained source."
                 ),
-                "source_ids_used": ["fixture:graph-source:company-brief"],
+                "source_ids_used": ["supplied:graph-source:company-brief"],
                 "reply_recommended": True,
                 "recommended_next_step": "Confirm the evaluation decision and owner.",
                 "additional_information_needed": [
@@ -1428,7 +1427,7 @@ def test_langgraph_goal_based_cos_internal_slack_uses_live_synthesis(
                     "Verify measured outcomes and the decision owner.\n\n"
                     "*Next safe action:*\n"
                     "Confirm the evaluation decision and owner.\n\n"
-                    "*Sources:*\nfixture://graph-source/company-brief"
+                    "*Sources:*\nhttps://example.test/graph-source/company-brief"
                 ),
                 "audit_notes": [
                     *result.audit_notes,
@@ -1453,16 +1452,27 @@ def test_langgraph_goal_based_cos_internal_slack_uses_live_synthesis(
         fake_terminal_review,
     )
 
+    import json
+
+    packet = json.loads((
+        Path(__file__).parent / "fixtures" / "graph_research_to_draft_source_bundle.json"
+    ).read_text())
+    for source in packet["sources"]:
+        source["source_id"] = source["source_id"].replace("fixture:", "supplied:")
+        source["url"] = source["url"].replace("fixture://", "https://example.test/")
+        source["provider"] = "operator_supplied"
+    for fact in packet["facts"]:
+        fact["source_ids"] = [
+            value.replace("fixture:", "supplied:") for value in fact["source_ids"]
+        ]
+    context_path = tmp_path / "supplied-source-packet.json"
+    context_path.write_text(json.dumps(packet))
     database_url = _database_url(tmp_path)
     result = advance_work_item_manager_loop_with_optional_langgraph(
         WorkflowRunRequest(
             request_text=request_text,
             database_url=database_url,
-            context_file_path=str(
-                Path(__file__).parent
-                / "fixtures"
-                / "graph_research_to_draft_source_bundle.json"
-            ),
+            context_file_path=str(context_path),
             requested_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
             manual_request_plan=plan.model_dump(mode="json"),
             live_sdk=True,
@@ -1474,6 +1484,7 @@ def test_langgraph_goal_based_cos_internal_slack_uses_live_synthesis(
     )
 
     outreach = result.work_item.artifact_refs[-1]
+    assert len(supplied_research_fake_sdk) == 1
     assert captured["sdk_calls"] == 1
     assert captured["final_review_calls"] == 1
     assert "Internal Slack recommendation mode" in str(
@@ -1482,7 +1493,7 @@ def test_langgraph_goal_based_cos_internal_slack_uses_live_synthesis(
     assert "Internal Slack recommendation mode" in str(captured["approved_context"])
     assert result.route == WorkItemRoute.OUTREACH_COMPOSER
     assert "Prioritize a bounded evaluation-design review." in result.human_summary
-    assert "fixture://graph-source/company-brief" in result.human_summary
+    assert "https://example.test/graph-source/company-brief" in result.human_summary
     assert "Confirm the evaluation decision and owner." in result.human_summary
     assert "exploratory reply" not in result.human_summary
     assert outreach.metadata["internal_slack_copy"] is True
@@ -2240,11 +2251,23 @@ def test_backend_selected_manager_loop_uses_graph_for_rss_opportunity_artifact_p
                 "measurement workflows."
             ),
             evidence=[
+                *[
+                    AnnouncementFeedEvidence(
+                        kind="search",
+                        title=f"Background {index}",
+                        url=f"https://example.org/background/{index}",
+                        snippet="Background context only.",
+                    )
+                    for index in range(3)
+                ],
                 AnnouncementFeedEvidence(
                     kind="article",
                     title="Partnership source",
                     url="https://example.org/behavioral-ai-partnership",
-                    snippet="The announcement describes a behavioral health AI partnership.",
+                    snippet=(
+                        "Late qualification: the partnership is NOT externally validated "
+                        "and remains a single-site pilot."
+                    ),
                     source="trafilatura",
                     status="success",
                     char_count=900,
@@ -2403,7 +2426,11 @@ def test_backend_selected_manager_loop_uses_graph_for_preprints_zotero_research_
 def test_backend_selected_manager_loop_uses_graph_for_chief_context_business_research(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_research_fake_sdk,
 ) -> None:
+    supplied_research_fake_sdk.source_predicate = lambda source: (
+        source["source_type"].endswith("_historical_context")
+    )
     database_url = _database_url(tmp_path)
     monkeypatch.delenv("KNI_BUSINESS_AGENTS_LANGGRAPH", raising=False)
     monkeypatch.delenv("KEYSTONE_WORKITEM_LANGGRAPH", raising=False)
@@ -2483,10 +2510,10 @@ def test_backend_selected_manager_loop_uses_graph_for_chief_context_business_res
             save=True,
             live_sdk=True,
             live_search=False,
-            manual_request_plan={
-                "source": "test",
-                "target_agent": "chief_of_staff",
-                "intent": "internal_review_handoff",
+                manual_request_plan={
+                    "source": "test",
+                    "target_agent": "chief_of_staff",
+                    "intent": "internal_review_handoff",
                 "primary_target": "Example Health",
             },
         ),
@@ -2519,7 +2546,7 @@ def test_backend_selected_manager_loop_uses_graph_for_chief_context_business_res
         "chief_of_staff_plan",
         "rss_context_summary",
         "zotero_context_summary",
-        "company_profile",
+        "research_brief",
     } <= artifact_types
     assert {"rss_context_agent", "zotero_context_agent"} <= source_providers
     assert [step["route"] for step in completion_event.metadata["steps"]] == [
@@ -2527,6 +2554,14 @@ def test_backend_selected_manager_loop_uses_graph_for_chief_context_business_res
         WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
     ]
     assert completion_event.metadata["send_enabled"] is False
+
+    assert len(supplied_research_fake_sdk) == 1
+    research_input = supplied_research_fake_sdk[0]["model_input"]
+    assert "selected_artifacts" in research_input
+    assert "zotero_context_summary" in research_input
+    assert (
+        "A remote patient monitoring vendor announced an AI validation workflow." in research_input
+    )
 
 
 def test_backend_selected_manager_loop_uses_graph_for_chief_research_airtable_plan(
@@ -2586,10 +2621,10 @@ def test_backend_selected_manager_loop_uses_graph_for_chief_research_airtable_pl
             save=True,
             live_sdk=True,
             live_search=False,
-            manual_request_plan={
-                "source": "test",
-                "target_agent": "chief_of_staff",
-                "intent": "internal_review_handoff",
+                manual_request_plan={
+                    "source": "test",
+                    "target_agent": "chief_of_staff",
+                    "intent": "internal_review_handoff",
                 "primary_target": "Example Health",
             },
         ),
@@ -2644,6 +2679,7 @@ def test_backend_selected_manager_loop_uses_graph_for_chief_research_airtable_pl
     assert not any(event.event_type == "langgraph_manager_loop_completed" for event in events)
 
 
+@pytest.mark.usefixtures("fake_supplied_gmail_sdk", "supplied_research_fake_sdk")
 def test_backend_selected_manager_loop_uses_graph_for_chief_context_gmail_research(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2744,7 +2780,7 @@ def test_backend_selected_manager_loop_uses_graph_for_chief_context_gmail_resear
         "chief_of_staff_plan",
         "google_workspace_context_summary",
         "gmail_triage_report",
-        "company_profile",
+        "research_brief",
     } <= artifact_types
     assert "google_workspace_context_agent" in source_providers
     assert [step["route"] for step in completion_event.metadata["steps"]] == [
@@ -2756,6 +2792,7 @@ def test_backend_selected_manager_loop_uses_graph_for_chief_context_gmail_resear
     assert completion_event.metadata["external_writes_enabled"] is False
 
 
+@pytest.mark.usefixtures("fake_supplied_gmail_sdk")
 def test_backend_selected_manager_loop_uses_graph_for_chief_gmail_research(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3177,7 +3214,12 @@ def test_langgraph_structured_chief_durable_handoff_respects_advisory_only_reque
 def test_langgraph_uses_structured_chief_context_handoff_without_prose_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_research_fake_sdk,
+    supplied_company_research_note,
 ) -> None:
+    supplied_research_fake_sdk.source_predicate = lambda source: (
+        source["source_id"] == "supplied-company-workflow-note"
+    )
     database_url = _database_url(tmp_path)
 
     def fake_run_chief_of_staff_sdk(
@@ -3237,6 +3279,7 @@ def test_langgraph_uses_structured_chief_context_handoff_without_prose_marker(
                 "schedule, publish, create drafts, or write externally."
             ),
             database_url=database_url,
+            context_file_path=str(supplied_company_research_note),
             save=True,
             live_sdk=True,
             live_search=False,
@@ -3268,7 +3311,7 @@ def test_langgraph_uses_structured_chief_context_handoff_without_prose_marker(
     assert {
         "chief_of_staff_plan",
         "airtable_context_summary",
-        "company_profile",
+        "research_brief",
     } <= artifact_types
     assert "airtable_context_agent" in source_providers
     assert outcome.node_path == [
@@ -3292,11 +3335,31 @@ def test_langgraph_uses_structured_chief_context_handoff_without_prose_marker(
         for event in events
     )
 
+    assert len(supplied_research_fake_sdk) == 1
+    research_input = supplied_research_fake_sdk[0]["model_input"]
+    assert "37 synthetic workflow observations" in research_input
+    assert "selected_artifacts" in research_input
+    import json
+
+    source_context = supplied_research_fake_sdk[0]["typed_input"].source_context
+    context = json.loads(source_context)["context_pack"]
+    staged_types = {artifact["artifact_type"] for artifact in context["selected_artifacts"]}
+    assert {"airtable_context_summary"} <= staged_types
+    research_artifact = next(artifact for artifact in outcome.result.work_item.artifact_refs
+                             if artifact.artifact_type == "research_brief")
+    assert research_artifact.metadata["research_brief"]["source_ids_used"] == [
+        "supplied-company-workflow-note"
+    ]
+
 
 def test_langgraph_uses_structured_chief_feed_and_zotero_context_handoffs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_research_fake_sdk,
 ) -> None:
+    supplied_research_fake_sdk.source_predicate = lambda source: (
+        source["source_type"].endswith("_historical_context")
+    )
     database_url = _database_url(tmp_path)
     store = SQLiteStore(database_url)
     store.save_announcement_feed_item(
@@ -3408,7 +3471,7 @@ def test_langgraph_uses_structured_chief_feed_and_zotero_context_handoffs(
         "chief_of_staff_plan",
         "preprints_context_summary",
         "zotero_context_summary",
-        "company_profile",
+        "research_brief",
     } <= artifact_types
     assert {"preprints_context_agent", "zotero_context_agent"} <= source_providers
     assert outcome.node_path == [
@@ -3433,10 +3496,17 @@ def test_langgraph_uses_structured_chief_feed_and_zotero_context_handoffs(
         and event.actor in {"preprints_context_agent", "zotero_context_agent"}
     ] == ["preprints_context_agent", "zotero_context_agent"]
 
+    assert len(supplied_research_fake_sdk) == 1
+    research_input = supplied_research_fake_sdk[0]["model_input"]
+    assert "selected_artifacts" in research_input
+    assert "zotero_context_summary" in research_input
+    assert "A preprint discusses outcomes-evidence workflow needs." in research_input
+
 
 def test_specific_chief_ask_compares_prior_state_and_backend_graph_context_edges(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_opportunity_fake_sdk,
 ) -> None:
     request_text = (
         "@KNI chief of staff NeuroFlow has been coming up in recent announcements "
@@ -3629,6 +3699,7 @@ def test_specific_chief_ask_compares_prior_state_and_backend_graph_context_edges
 def test_natural_chief_research_opportunity_sample_outreach_reaches_approval_graph(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_opportunity_fake_sdk,
 ) -> None:
     request_text = (
         "@KNI chief of staff NeuroFlow has been coming up as a "
@@ -3675,6 +3746,71 @@ def test_natural_chief_research_opportunity_sample_outreach_reaches_approval_gra
         workflow_runner,
         "_maybe_synthesize_user_facing_response",
         lambda result, **_kwargs: result,
+    )
+
+    def fake_run_retrieved_sdk_synthesis(**kwargs: object) -> object:
+        context = kwargs["retrieve"]()  # type: ignore[index,operator]
+        approved_context = context["approved_context"]
+        source_ids = list(approved_context.allowed_source_ids)
+
+        class Outcome:
+            final_output = {
+                "company_name": "NeuroFlow",
+                "email_subject": "Internal review: NeuroFlow",
+                "email_body": (
+                    "*Recommendation:*\nTreat NeuroFlow as a candidate for a bounded "
+                    "KNI advisory review, not outreach yet.\n\n"
+                    "*Most important validation gap:*\nVerify the payer-partnership and "
+                    "outcomes-evidence signals in the retained sources.\n\n"
+                    "*Next safe action:*\nReview the source-backed gaps before any "
+                    "outreach."
+                ),
+                "linkedin_note": "",
+                "personalization_rationale": (
+                    "Used only the source-backed context visible to Outreach Composer."
+                ),
+                "source_ids_used": source_ids,
+                "reply_recommended": True,
+                "recommended_next_step": (
+                    "Review the source-backed gaps before any outreach."
+                ),
+                "additional_information_needed": [
+                    "Verification of the payer-partnership and outcomes-evidence signals."
+                ],
+                "decision": {
+                    "decision_owner": "specialist_agent",
+                    "decision_stage": "outreach_evidence_selection",
+                    "selected_candidate_ids": source_ids,
+                    "candidate_assessments": [
+                        {
+                            "candidate_id": source_id,
+                            "disposition": "selected",
+                            "rationale": (
+                                "The source is part of the approved WorkItem context."
+                            ),
+                        }
+                        for source_id in source_ids
+                    ],
+                    "reasoning": (
+                        "Selected only evidence supplied in the approved WorkItem context."
+                    ),
+                    "limitations": [
+                        "Thread-local copy only; no external outreach was performed."
+                    ],
+                    "needs_more_context": False,
+                },
+            }
+            usage = {"requests": 1}
+            cost = {}
+            request_cache = {}
+            execution_telemetry = {}
+
+        return Outcome()
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "run_retrieved_sdk_synthesis",
+        fake_run_retrieved_sdk_synthesis,
     )
 
     def run_variant(
@@ -3792,6 +3928,7 @@ def test_natural_chief_research_opportunity_sample_outreach_reaches_approval_gra
 def test_backend_selected_manager_loop_uses_graph_for_chief_opportunity_outreach_checkpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_opportunity_fake_sdk,
 ) -> None:
     database_url = _database_url(tmp_path)
     monkeypatch.delenv("KNI_BUSINESS_AGENTS_LANGGRAPH", raising=False)
@@ -3812,6 +3949,13 @@ def test_backend_selected_manager_loop_uses_graph_for_chief_opportunity_outreach
                 recommended_route=ChiefOfStaffRouteRecommendation(
                     workflow_type="research-direction-review",
                     target_channel="current thread",
+                ),
+                durable_handoff=ChiefDurableHandoff(
+                    agent=WorkItemRoute.OPPORTUNITY_SCOUT.value,
+                    rationale=(
+                        "Opportunity Scout should evaluate the supplied pilot context "
+                        "before any draft-only outreach step."
+                    ),
                 ),
                 approval_required=True,
                 audit_notes=[],
@@ -3846,11 +3990,12 @@ def test_backend_selected_manager_loop_uses_graph_for_chief_opportunity_outreach
             save=True,
             live_sdk=True,
             live_search=False,
-            manual_request_plan={
-                "source": "test",
-                "target_agent": "chief_of_staff",
-                "intent": "internal_review_handoff",
-                "primary_target": "Harbor Pediatrics",
+                manual_request_plan={
+                    "source": "test",
+                    "target_agent": "chief_of_staff",
+                    "workflow": ["opportunity_scout", "outreach_composer"],
+                    "intent": "internal_review_handoff",
+                    "primary_target": "Harbor Pediatrics",
             },
         ),
         max_steps=4,
@@ -3985,6 +4130,123 @@ def test_langgraph_manager_loop_routes_opportunity_to_outreach_gate_when_request
         "outreach_requires_approved_context"
     ]
     assert not graph_completion
+
+
+def test_deferred_cartwheel_graph_uses_one_work_item_and_withholds_bad_fixture_draft(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    selected_url = "https://www.cartwheelcare.org/"
+    request_text = (
+        "Please use one WorkItem to identify one pilot opportunity for KNI from "
+        "Cartwheel's public homepage, research the company using only that page, "
+        "then prepare a 70-word outreach draft for internal review. Show the URL. "
+        "Do not send or save the draft, and do not look beyond this page: "
+        f"{selected_url}"
+    )
+    plan = infer_manual_request_plan(request_text, requested_agent="orchestrator")
+    extraction_calls: list[dict[str, object]] = []
+
+    def fake_selected_url_bundle(**kwargs: object) -> SelectedUrlSourceBundleResult:
+        extraction_calls.append(dict(kwargs))
+        source = SourceRecord(
+            source_id="selected-url:cartwheel-homepage",
+            title="Cartwheel",
+            url=selected_url,
+            source_type="company_site",
+            supported_claims=[
+                "Cartwheel describes school-partnered mental health services.",
+                "The homepage describes care coordination with school communities.",
+            ],
+            evidence_excerpt=(
+                "Cartwheel describes school-partnered mental health services and care "
+                "coordination with school communities."
+            ),
+            confidence=0.9,
+        )
+        return SelectedUrlSourceBundleResult(
+            mode="dry_run",
+            company_name="Cartwheel",
+            selected_url_count=1,
+            extracted_source_count=1,
+            source_bundle=SourceBundle(
+                company_name="Cartwheel",
+                company_url=selected_url,
+                sources=[source],
+                claim_candidates=source.supported_claims,
+            ),
+            diagnostics=[
+                SelectedUrlExtractionDiagnostic(
+                    source_id=source.source_id,
+                    selected_url=selected_url,
+                    resolved_url=selected_url,
+                    provider="mock-trafilatura",
+                    status="success",
+                    extraction_strategy="provider_mock",
+                    included_in_bundle=True,
+                    text_length=len(source.evidence_excerpt),
+                    claim_count=2,
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "build_selected_url_source_bundle",
+        fake_selected_url_bundle,
+    )
+    database_url = _database_url(tmp_path)
+
+    outcome = run_work_item_langgraph(
+        WorkflowRunRequest(
+            request_text=request_text,
+            database_url=database_url,
+            save=True,
+            live_sdk=False,
+            live_search=False,
+            manual_request_plan=plan.model_dump(mode="json"),
+        ),
+        manager_loop=True,
+        max_manager_steps=5,
+    )
+
+    store = SQLiteStore(database_url)
+    events = store.list_work_item_events(outcome.result.work_item.id)
+    selected_url_events = [
+        event for event in events if event.event_type == "selected_url_extraction_completed"
+    ]
+
+    assert len(extraction_calls) == 1
+    assert extraction_calls[0]["selected_urls"] == [selected_url]
+    assert extraction_calls[0]["live_extraction"] is False
+    assert len(selected_url_events) == 1
+    assert selected_url_events[0].metadata["selected_urls"] == [selected_url]
+    assert selected_url_events[0].metadata["broad_search_performed"] is False
+    assert selected_url_events[0].metadata["external_write_performed"] is False
+    assert selected_url in {source.url for source in outcome.result.work_item.sources}
+    assert all(
+        not source.url.startswith("fixture://")
+        for source in outcome.result.work_item.sources
+    )
+    assert "run_opportunity_scout" in outcome.node_path
+    assert "run_business_research" in outcome.node_path
+    assert "run_outreach_composer" in outcome.node_path
+    assert store.count("work_items") == 1
+    assert store.count("outreach_drafts") == 1
+    draft_row = store.fetch_all("outreach_drafts")[0]
+    assert draft_row["email_subject"] == ""
+    assert draft_row["email_body"] == ""
+    assert outcome.result.artifact_refs[0].artifact_type == "outreach_recommendation"
+    assert outcome.result.route == WorkItemRoute.OUTREACH_COMPOSER
+    assert outcome.result.status == WorkItemStatus.DONE
+    assert outcome.checkpoint_required is False
+    assert any(
+        "withheld optional reply copy" in note
+        for note in outcome.result.work_item.audit_notes
+    )
+    assert not any(
+        event.event_type == "outbound_send_completed" for event in events
+    )
 
 
 def test_chief_owned_read_context_plan_runs_chief_after_cli_prefix_is_removed(
@@ -4436,6 +4698,7 @@ def test_langgraph_storage_events_render_final_run_report(
 def test_langgraph_manager_loop_runs_chief_managed_business_research_edge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_research_fake_sdk,
 ) -> None:
     database_url = _database_url(tmp_path)
 
@@ -4519,7 +4782,8 @@ def test_langgraph_manager_loop_runs_chief_managed_business_research_edge(
         "finalize_step",
         "manager_loop_finalize",
     ]
-    assert {"chief_of_staff_plan", "company_profile"} <= artifact_types
+    assert {"chief_of_staff_plan", "research_brief"} <= artifact_types
+    assert len(supplied_research_fake_sdk) == 1
     assert [step["route"] for step in graph_completion.metadata["steps"]] == [
         WorkItemRoute.CHIEF_OF_STAFF.value,
         WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
@@ -4528,6 +4792,7 @@ def test_langgraph_manager_loop_runs_chief_managed_business_research_edge(
     assert "Example Health" in outcome.result.human_summary
 
 
+@pytest.mark.usefixtures("fake_supplied_gmail_sdk")
 def test_langgraph_chief_gmail_triage_can_handoff_to_business_research(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4644,6 +4909,7 @@ def test_langgraph_chief_gmail_triage_can_handoff_to_business_research(
 def test_langgraph_chief_research_opportunity_no_draft_stops_before_outreach(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_opportunity_fake_sdk,
 ) -> None:
     database_url = _database_url(tmp_path)
 
@@ -4761,7 +5027,11 @@ def test_langgraph_chief_research_opportunity_no_draft_stops_before_outreach(
 def test_langgraph_runs_chief_before_selected_context_agents_and_business_research(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_research_fake_sdk,
 ) -> None:
+    supplied_research_fake_sdk.source_predicate = lambda source: (
+        source["source_type"].endswith("_historical_context")
+    )
     database_url = _database_url(tmp_path)
     store = SQLiteStore(database_url)
     store.save_announcement_feed_item(
@@ -4881,7 +5151,7 @@ def test_langgraph_runs_chief_before_selected_context_agents_and_business_resear
         "chief_of_staff_plan",
         "rss_context_summary",
         "zotero_context_summary",
-        "company_profile",
+        "research_brief",
     } <= artifact_types
     assert {"rss_context_agent", "zotero_context_agent"} <= source_providers
     assert [event.actor for event in context_events] == [
@@ -4893,6 +5163,14 @@ def test_langgraph_runs_chief_before_selected_context_agents_and_business_resear
         WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
     ]
     assert graph_completion.metadata["send_enabled"] is False
+
+    assert len(supplied_research_fake_sdk) == 1
+    research_input = supplied_research_fake_sdk[0]["model_input"]
+    assert "selected_artifacts" in research_input
+    assert "zotero_context_summary" in research_input
+    assert (
+        "A remote patient monitoring vendor announced an AI validation workflow." in research_input
+    )
 
 
 def test_langgraph_runs_chief_to_business_research_to_workspace_approval_plan(
@@ -5136,7 +5414,12 @@ def test_langgraph_runs_chief_to_business_research_to_airtable_approval_plan(
 def test_langgraph_runs_chief_selected_airtable_context_before_business_research(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_research_fake_sdk,
+    supplied_company_research_note,
 ) -> None:
+    supplied_research_fake_sdk.source_predicate = lambda source: (
+        source["source_id"] == "supplied-company-workflow-note"
+    )
     database_url = _database_url(tmp_path)
 
     def fake_run_chief_of_staff_sdk(
@@ -5184,6 +5467,7 @@ def test_langgraph_runs_chief_selected_airtable_context_before_business_research
                 "system mutation."
             ),
             database_url=database_url,
+            context_file_path=str(supplied_company_research_note),
             save=True,
             live_sdk=True,
             live_search=False,
@@ -5230,7 +5514,7 @@ def test_langgraph_runs_chief_selected_airtable_context_before_business_research
     assert {
         "chief_of_staff_plan",
         "airtable_context_summary",
-        "company_profile",
+        "research_brief",
     } <= artifact_types
     assert "airtable_write_plan" not in artifact_types
     assert "airtable_context_agent" in source_providers
@@ -5250,14 +5534,35 @@ def test_langgraph_runs_chief_selected_airtable_context_before_business_research
     assert graph_completion.metadata["send_enabled"] is False
     assert (
         graph_completion.metadata["stop_reason"]
-        == "stopped after one specialist step; no multi-step workflow was requested"
+        == "stopped because the next action did not require a distinct specialist"
     )
+
+    assert len(supplied_research_fake_sdk) == 1
+    research_input = supplied_research_fake_sdk[0]["model_input"]
+    assert "37 synthetic workflow observations" in research_input
+    assert "selected_artifacts" in research_input
+    import json
+
+    source_context = supplied_research_fake_sdk[0]["typed_input"].source_context
+    context = json.loads(source_context)["context_pack"]
+    staged_types = {artifact["artifact_type"] for artifact in context["selected_artifacts"]}
+    assert {"airtable_context_summary"} <= staged_types
+    research_artifact = next(artifact for artifact in outcome.result.work_item.artifact_refs
+                             if artifact.artifact_type == "research_brief")
+    assert research_artifact.metadata["research_brief"]["source_ids_used"] == [
+        "supplied-company-workflow-note"
+    ]
 
 
 def test_langgraph_runs_chief_selected_workspace_context_before_business_research(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_research_fake_sdk,
+    supplied_company_research_note,
 ) -> None:
+    supplied_research_fake_sdk.source_predicate = lambda source: (
+        source["source_id"] == "supplied-company-workflow-note"
+    )
     database_url = _database_url(tmp_path)
 
     def fake_run_chief_of_staff_sdk(
@@ -5305,6 +5610,7 @@ def test_langgraph_runs_chief_selected_workspace_context_before_business_researc
                 "sharing, sends, posts, scheduling, publication, or external system mutation."
             ),
             database_url=database_url,
+            context_file_path=str(supplied_company_research_note),
             save=True,
             live_sdk=True,
             live_search=False,
@@ -5351,7 +5657,7 @@ def test_langgraph_runs_chief_selected_workspace_context_before_business_researc
     assert {
         "chief_of_staff_plan",
         "google_workspace_context_summary",
-        "company_profile",
+        "research_brief",
     } <= artifact_types
     assert "google_workspace_artifact_plan" not in artifact_types
     assert "google_workspace_context_agent" in source_providers
@@ -5369,6 +5675,22 @@ def test_langgraph_runs_chief_selected_workspace_context_before_business_researc
         WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
     ]
     assert graph_completion.metadata["send_enabled"] is False
+
+    assert len(supplied_research_fake_sdk) == 1
+    research_input = supplied_research_fake_sdk[0]["model_input"]
+    assert "37 synthetic workflow observations" in research_input
+    assert "selected_artifacts" in research_input
+    import json
+
+    source_context = supplied_research_fake_sdk[0]["typed_input"].source_context
+    context = json.loads(source_context)["context_pack"]
+    staged_types = {artifact["artifact_type"] for artifact in context["selected_artifacts"]}
+    assert {"google_workspace_context_summary"} <= staged_types
+    research_artifact = next(artifact for artifact in outcome.result.work_item.artifact_refs
+                             if artifact.artifact_type == "research_brief")
+    assert research_artifact.metadata["research_brief"]["source_ids_used"] == [
+        "supplied-company-workflow-note"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -5418,6 +5740,8 @@ def test_langgraph_runs_chief_selected_workspace_context_before_business_researc
 def test_langgraph_preserves_pre_context_and_post_specialist_approval_plan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_research_fake_sdk,
+    supplied_company_research_note,
     context_request: str,
     expected_node: str,
     expected_summary_artifact: str,
@@ -5426,6 +5750,9 @@ def test_langgraph_preserves_pre_context_and_post_specialist_approval_plan(
     gate_scope: str,
     target_system: str,
 ) -> None:
+    supplied_research_fake_sdk.source_predicate = lambda source: (
+        source["source_id"] == "supplied-company-workflow-note"
+    )
     database_url = _database_url(tmp_path)
 
     def fake_run_chief_of_staff_sdk(
@@ -5471,6 +5798,7 @@ def test_langgraph_preserves_pre_context_and_post_specialist_approval_plan(
                 "externally."
             ),
             database_url=database_url,
+            context_file_path=str(supplied_company_research_note),
             save=True,
             live_sdk=True,
             live_search=False,
@@ -5517,7 +5845,7 @@ def test_langgraph_preserves_pre_context_and_post_specialist_approval_plan(
     ]
     assert {
         "chief_of_staff_plan",
-        "company_profile",
+        "research_brief",
         expected_summary_artifact,
         expected_plan_artifact,
     } <= artifact_types
@@ -5539,11 +5867,33 @@ def test_langgraph_preserves_pre_context_and_post_specialist_approval_plan(
     ].count(expected_provider) == 2
     assert not graph_completion
 
+    assert len(supplied_research_fake_sdk) == 1
+    research_input = supplied_research_fake_sdk[0]["model_input"]
+    assert "37 synthetic workflow observations" in research_input
+    assert "selected_artifacts" in research_input
+    import json
+
+    source_context = supplied_research_fake_sdk[0]["typed_input"].source_context
+    context = json.loads(source_context)["context_pack"]
+    staged_types = {artifact["artifact_type"] for artifact in context["selected_artifacts"]}
+    assert {expected_summary_artifact} <= staged_types
+    assert expected_plan_artifact not in staged_types
+    research_artifact = next(artifact for artifact in outcome.result.work_item.artifact_refs
+                             if artifact.artifact_type == "research_brief")
+    assert research_artifact.metadata["research_brief"]["source_ids_used"] == [
+        "supplied-company-workflow-note"
+    ]
+
 
 def test_langgraph_stages_multiple_read_only_context_lanes_before_specialist(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_research_fake_sdk,
+    supplied_company_research_note,
 ) -> None:
+    supplied_research_fake_sdk.source_predicate = lambda source: (
+        source["source_id"] == "supplied-company-workflow-note"
+    )
     database_url = _database_url(tmp_path)
 
     def fake_run_chief_of_staff_sdk(
@@ -5591,6 +5941,7 @@ def test_langgraph_stages_multiple_read_only_context_lanes_before_specialist(
                 "update sheets, send, post, publish, schedule, or write externally."
             ),
             database_url=database_url,
+            context_file_path=str(supplied_company_research_note),
             save=True,
             live_sdk=True,
             live_search=False,
@@ -5634,7 +5985,7 @@ def test_langgraph_stages_multiple_read_only_context_lanes_before_specialist(
         "chief_of_staff_plan",
         "airtable_context_summary",
         "google_workspace_context_summary",
-        "company_profile",
+        "research_brief",
     } <= artifact_types
     assert "airtable_write_plan" not in artifact_types
     assert "google_workspace_artifact_plan" not in artifact_types
@@ -5644,6 +5995,22 @@ def test_langgraph_stages_multiple_read_only_context_lanes_before_specialist(
         WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
     ]
     assert graph_completion.metadata["send_enabled"] is False
+
+    assert len(supplied_research_fake_sdk) == 1
+    research_input = supplied_research_fake_sdk[0]["model_input"]
+    assert "37 synthetic workflow observations" in research_input
+    assert "selected_artifacts" in research_input
+    import json
+
+    source_context = supplied_research_fake_sdk[0]["typed_input"].source_context
+    context = json.loads(source_context)["context_pack"]
+    staged_types = {artifact["artifact_type"] for artifact in context["selected_artifacts"]}
+    assert {"airtable_context_summary", "google_workspace_context_summary"} <= staged_types
+    research_artifact = next(artifact for artifact in outcome.result.work_item.artifact_refs
+                             if artifact.artifact_type == "research_brief")
+    assert research_artifact.metadata["research_brief"]["source_ids_used"] == [
+        "supplied-company-workflow-note"
+    ]
 
 
 def test_langgraph_preserves_weekly_slack_gmail_completed_run_packet_for_chief(
@@ -5841,6 +6208,7 @@ def test_langgraph_preserves_weekly_slack_gmail_completed_run_packet_for_chief(
 def test_langgraph_runs_chief_selected_business_context_before_opportunity_scout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_opportunity_fake_sdk,
     context_request: str,
     expected_node: str,
     expected_artifact: str,
@@ -5969,6 +6337,7 @@ def test_langgraph_runs_chief_selected_business_context_before_opportunity_scout
 def test_langgraph_stages_concrete_quarterly_finance_context_before_bd_priority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_opportunity_fake_sdk,
 ) -> None:
     database_url = _database_url(tmp_path)
     finance_source_id = "airtable:finance_tax_tracker:Q3-2026"
@@ -6123,6 +6492,7 @@ def test_langgraph_stages_concrete_quarterly_finance_context_before_bd_priority(
 def test_langgraph_slack_airtable_read_only_smoke_does_not_stage_write_plan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_opportunity_fake_sdk,
 ) -> None:
     database_url = _database_url(tmp_path)
 
@@ -6292,6 +6662,7 @@ def test_langgraph_slack_airtable_read_only_smoke_does_not_stage_write_plan(
         ),
     ],
 )
+@pytest.mark.usefixtures("fake_supplied_gmail_sdk")
 def test_langgraph_runs_chief_selected_business_context_before_gmail_triage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6453,6 +6824,7 @@ def test_langgraph_runs_chief_selected_business_context_before_gmail_triage(
         ),
     ],
 )
+@pytest.mark.usefixtures("fake_supplied_gmail_sdk", "supplied_research_fake_sdk")
 def test_langgraph_chief_context_backed_gmail_can_handoff_to_business_research(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6564,7 +6936,7 @@ def test_langgraph_chief_context_backed_gmail_can_handoff_to_business_research(
         "chief_of_staff_plan",
         expected_artifact,
         "gmail_triage_report",
-        "company_profile",
+        "research_brief",
     } <= artifact_types
     assert excluded_artifact not in artifact_types
     assert expected_provider in source_providers
@@ -6594,6 +6966,7 @@ def test_langgraph_chief_context_backed_gmail_can_handoff_to_business_research(
 def test_langgraph_manager_loop_runs_chief_to_opportunity_to_outreach_checkpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supplied_opportunity_fake_sdk,
 ) -> None:
     database_url = _database_url(tmp_path)
 
@@ -6612,6 +6985,13 @@ def test_langgraph_manager_loop_runs_chief_to_opportunity_to_outreach_checkpoint
                 recommended_route=ChiefOfStaffRouteRecommendation(
                     workflow_type="research-direction-review",
                     target_channel="current thread",
+                ),
+                durable_handoff=ChiefDurableHandoff(
+                    agent=WorkItemRoute.OPPORTUNITY_SCOUT.value,
+                    rationale=(
+                        "Opportunity Scout should evaluate the supplied pilot context "
+                        "before any draft-only outreach step."
+                    ),
                 ),
                 approval_required=True,
                 audit_notes=[],
@@ -6646,11 +7026,12 @@ def test_langgraph_manager_loop_runs_chief_to_opportunity_to_outreach_checkpoint
             save=True,
             live_sdk=True,
             live_search=False,
-            manual_request_plan={
-                "source": "test",
-                "target_agent": "chief_of_staff",
-                "intent": "internal_review_handoff",
-                "primary_target": "Harbor Pediatrics",
+                manual_request_plan={
+                    "source": "test",
+                    "target_agent": "chief_of_staff",
+                    "workflow": ["opportunity_scout", "outreach_composer"],
+                    "intent": "internal_review_handoff",
+                    "primary_target": "Harbor Pediatrics",
             },
         ),
         manager_loop=True,
@@ -6960,11 +7341,23 @@ def test_langgraph_stages_rss_context_before_opportunity_scout(
                 "measurement workflows."
             ),
             evidence=[
+                *[
+                    AnnouncementFeedEvidence(
+                        kind="search",
+                        title=f"Background {index}",
+                        url=f"https://example.org/background/{index}",
+                        snippet="Background context only.",
+                    )
+                    for index in range(3)
+                ],
                 AnnouncementFeedEvidence(
                     kind="article",
                     title="Partnership source",
                     url="https://example.org/behavioral-ai-partnership",
-                    snippet="The announcement describes a behavioral health AI partnership.",
+                    snippet=(
+                        "Late qualification: the partnership is NOT externally validated "
+                        "and remains a single-site pilot."
+                    ),
                     source="trafilatura",
                     status="success",
                     char_count=900,
@@ -7026,6 +7419,12 @@ def test_langgraph_stages_rss_context_before_opportunity_scout(
     )
     assert rss_sources[0].url == "https://example.org/behavioral-ai-partnership"
     assert rss_sources[0].extraction_status == "article_extracted"
+    assert "NOT externally validated" in rss_sources[0].evidence_excerpt
+    assert any(
+        "NOT externally validated" in str(read.get("text") or "")
+        for read in rss_artifact.metadata["selected_evidence_reads"]
+    )
+    assert rss_artifact.metadata["selected_evidence_coverage"]["complete"] is True
     assert (
         outcome.result.work_item.target.metadata["rss_context_handoff"]["agent_name"]
         == "rss_context_agent"

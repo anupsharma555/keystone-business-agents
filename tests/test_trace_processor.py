@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import keystone_agents.run as sdk_run
 from keystone_agents.trace_processor import (
     KeystoneEvalTraceProcessor,
+    _observed_sdk_activity,
     record_sdk_run_summary_trace_event,
     register_configured_trace_processor,
 )
@@ -123,6 +124,20 @@ def test_trace_processor_redacts_unsafe_scalar_fields(tmp_path) -> None:
 
 def test_sdk_run_summary_trace_event_is_joinable_and_redacted(tmp_path) -> None:
     database_path = tmp_path / "evals.sqlite"
+    request_cache = {
+        "static_prefix_sha256": "a" * 64,
+        "dynamic_prompt_sha256": "b" * 64,
+        "tool_names_sha256": "c" * 64,
+        "tool_count": 3,
+        "max_turns": 2,
+        "max_turns_source": "quality_budget",
+        "session_scope": "work_item",
+        "session_source": "env",
+        "session_id_hash": "abc123def456",
+        "session_history_mode": "recent_items",
+        "session_history_limit": 8,
+        "session_truncation_configured": True,
+    }
 
     row_id = record_sdk_run_summary_trace_event(
         agent_name="business_research_analyst",
@@ -131,20 +146,7 @@ def test_sdk_run_summary_trace_event_is_joinable_and_redacted(tmp_path) -> None:
         run_mode="live_sdk",
         model_provider="openai",
         model_name="gpt-5.4-mini",
-        request_cache={
-            "static_prefix_sha256": "a" * 64,
-            "dynamic_prompt_sha256": "b" * 64,
-            "tool_names_sha256": "c" * 64,
-            "tool_count": 3,
-            "max_turns": 2,
-            "max_turns_source": "quality_budget",
-            "session_scope": "work_item",
-            "session_source": "env",
-            "session_id_hash": "abc123def456",
-            "session_history_mode": "recent_items",
-            "session_history_limit": 8,
-            "session_truncation_configured": True,
-        },
+        request_cache=request_cache,
         usage={
             "available": True,
             "requests": 2,
@@ -247,7 +249,9 @@ def test_sdk_run_summary_trace_event_is_joinable_and_redacted(tmp_path) -> None:
     assert metadata["retrieval"]["search_provider_sequence"] == ["searxng", "agents-web-search"]
     assert metadata["cost"]["sdk_estimated_cost_usd"] == 0.0042
     assert metadata["approval"]["send_enabled"] is False
+    assert metadata["side_effects"]["external_write_state"] == "not_performed"
     assert metadata["side_effects"]["external_write_performed"] is False
+    assert metadata["side_effects"]["external_write_evidence_available"] is True
     assert metadata["diagnostic_summary"]["has_model_metadata"] is True
     assert metadata["diagnostic_summary"]["has_tool_metadata"] is True
     assert metadata["diagnostic_summary"]["has_retrieval_metadata"] is True
@@ -257,12 +261,96 @@ def test_sdk_run_summary_trace_event_is_joinable_and_redacted(tmp_path) -> None:
     assert metadata["cost_summary"]["estimated_usd"] == 0.0042
     assert metadata["redaction"]["raw_prompt_included"] is False
     assert metadata["redaction"]["raw_response_included"] is False
+    storage_link = request_cache["trace_summary"]
+    assert storage_link["schema"] == "keystone.sdk_trace_storage_link.v1"
+    assert storage_link["event_id"] == row_id
+    assert storage_link["trace_id"] == "run_abc"
+    assert storage_link["group_id"] == "case_123"
+    assert storage_link["model_tool_calls"][0]["name"] == "search_web"
+    assert len(storage_link["model_tool_calls"][0]["call_id_fingerprint"]) == 64
+    assert storage_link["handoff_count"] == 1
+    assert storage_link["raw_arguments_retained"] is False
+    assert storage_link["raw_outputs_retained"] is False
     assert "raw model prompt" not in serialized
     assert "private query" not in serialized
     assert "private answer" not in serialized
     assert "sk-" not in serialized
     summary = summarize_eval_trace_events(database_path=database_path)
     assert summary["diagnostic_category_counts"] == []
+
+
+def test_sdk_run_summary_persists_redacted_nested_specialist_custom_data(tmp_path) -> None:
+    database_path = tmp_path / "nested-evidence.sqlite"
+    private_id = "provider-private-record-001"
+    private_reasoning = "Choose the provider record containing private details."
+    raw_result = {
+        "new_items": [
+            {
+                "type": "tool_call_output_item",
+                "custom_data": {
+                    "keystone_nested_specialist_execution": {
+                        "route_name": "airtable_context_agent",
+                        "tool_name": "airtable_context_agent_as_specialist_tool",
+                        "tool_call_id": "private-call-id",
+                        "execution_state": "executed_nested_specialist",
+                        "nested_execution_mode": "live_read_only",
+                        "provider_write_executed": False,
+                        "candidate_universe": [private_id],
+                        "selected_identity_fingerprints": [private_id],
+                        "decision_ownership": {
+                            "decision_owner": "specialist_agent",
+                            "decision_stage": "airtable_record_selection",
+                            "attempts": [
+                                {
+                                    "attempt": 1,
+                                    "candidate_ids": [private_id],
+                                    "selected_candidate_ids": [private_id],
+                                    "reasoning": private_reasoning,
+                                    "validator_outcome": {
+                                        "status": "accepted",
+                                        "reason_code": "selection_verified",
+                                    },
+                                }
+                            ],
+                        },
+                        "receipts": [
+                            {
+                                "provider": "airtable",
+                                "record_id": private_id,
+                                "status": "success",
+                            }
+                        ],
+                        "handoff": {
+                            "state": "executed",
+                            "consumption_status": "returned_to_chief_model",
+                            "terminal_status": "completed",
+                        },
+                    }
+                },
+            }
+        ]
+    }
+
+    record_sdk_run_summary_trace_event(
+        agent_name="chief_of_staff",
+        route="chief_of_staff",
+        run_mode="live_sdk",
+        live=True,
+        request_cache={},
+        raw_result=raw_result,
+        database_path=database_path,
+    )
+
+    metadata = list_eval_trace_events(database_path=database_path)[0]["metadata"]
+    nested = metadata["nested_specialist_executions"][0]
+    serialized = str(metadata)
+    assert nested["origin"] == "sdk_tool_call_output_custom_data"
+    assert nested["decision_attempts"][0]["validator_status"] == "accepted"
+    assert nested["handoff"]["consumption_status"] == "returned_to_chief_model"
+    assert nested["raw_sensitive_values_retained"] is False
+    assert private_id not in serialized
+    assert private_reasoning not in serialized
+    assert "private-call-id" not in serialized
 
 
 def test_sdk_run_summary_trace_event_classifies_failures_for_trace_analysis(tmp_path) -> None:
@@ -354,6 +442,68 @@ def test_sdk_run_summary_trace_event_classifies_failures_for_trace_analysis(tmp_
         "approval_gate",
         "orchestrator_feedback",
     }
+
+
+def test_sdk_tool_trace_pairs_failed_output_with_one_named_call() -> None:
+    observed = _observed_sdk_activity(
+        {
+            "new_items": [
+                {
+                    "type": "tool_call_item",
+                    "call_id": "call-1",
+                    "name": "search_web",
+                },
+                {
+                    "type": "tool_call_output_item",
+                    "call_id": "call-1",
+                    "output": '{"status":"failed"}',
+                },
+            ]
+        }
+    )
+
+    assert observed["tool_call_count"] == 1
+    assert observed["failed_tool_call_count"] == 1
+    assert observed["tool_call_counts"] == {"search_web": 1}
+    assert observed["tool_call_summary"] == [
+        {"name": "search_web", "count": 1, "failed_count": 1, "status": "failed"}
+    ]
+
+
+def test_sdk_tool_trace_pairs_output_before_call_and_counts_repeated_calls() -> None:
+    observed = _observed_sdk_activity(
+        {
+            "new_items": [
+                {
+                    "type": "tool_call_output_item",
+                    "call_id": "call-1",
+                    "output": {"status": "success"},
+                },
+                {
+                    "type": "tool_call_item",
+                    "call_id": "call-1",
+                    "raw_item": {"name": "search_web"},
+                },
+                {
+                    "type": "tool_call_item",
+                    "call_id": "call-2",
+                    "tool_name": "search_web",
+                },
+                {
+                    "type": "tool_call_output_item",
+                    "call_id": "call-2",
+                    "output": {"status": "success"},
+                },
+            ]
+        }
+    )
+
+    assert observed["tool_call_count"] == 2
+    assert observed["failed_tool_call_count"] == 0
+    assert observed["tool_call_counts"] == {"search_web": 2}
+    assert observed["tool_call_summary"] == [
+        {"name": "search_web", "count": 2, "failed_count": 0, "status": "success"}
+    ]
 
 
 def test_trace_diagnostic_trends_group_categories_by_day(tmp_path) -> None:

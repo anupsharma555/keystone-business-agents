@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from keystone_agents.capabilities.catalog import instruction_profile_text
 from keystone_agents.schemas.execution_request import ExecutionEntrypoint
 
 
@@ -51,6 +52,155 @@ class RequestCapabilityProfile(BaseModel):
         """Return the stable JSON receipt stored with SDK request metadata."""
 
         return self.model_dump(mode="json")
+
+
+class RuntimeOwnerScope(BaseModel):
+    """One owner and its safe, effective read/tool scope for route selection."""
+
+    model_config = ConfigDict(frozen=True)
+
+    route: str
+    tool_names: tuple[str, ...] = ()
+    source_kinds: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_owner_scope(self) -> RuntimeOwnerScope:
+        if not self.route.strip():
+            raise ValueError("runtime owner scope requires a route")
+        if len(set(self.tool_names)) != len(self.tool_names):
+            raise ValueError("runtime owner tool names must be unique")
+        if len(set(self.source_kinds)) != len(self.source_kinds):
+            raise ValueError("runtime owner source kinds must be unique")
+        return self
+
+
+class EffectiveRuntimeRouteScope(BaseModel):
+    """Safe route-time view of an active restrictive runtime profile.
+
+    This deliberately excludes paths, digests, credentials, source contents,
+    budgets, and any preferred or gold route.  It tells the Orchestrator what
+    is currently available; the Orchestrator still owns the semantic choice.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    schema_name: str = "keystone.effective_runtime_route_scope.v1"
+    restriction_active: bool = True
+    scope_source: str
+    owner_scopes: tuple[RuntimeOwnerScope, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_runtime_scope(self) -> EffectiveRuntimeRouteScope:
+        routes = tuple(owner.route for owner in self.owner_scopes)
+        if len(set(routes)) != len(routes):
+            raise ValueError("runtime owner routes must be unique")
+        if not self.scope_source.strip():
+            raise ValueError("runtime scope requires a safe source label")
+        return self
+
+    @property
+    def permitted_routes(self) -> tuple[str, ...]:
+        return tuple(owner.route for owner in self.owner_scopes)
+
+    def prompt_payload(
+        self,
+        *,
+        route_candidates: Iterable[str],
+        unavailable_requested_owner: str = "",
+    ) -> dict[str, Any]:
+        """Return only scope details relevant to the current candidate universe."""
+
+        candidates = tuple(dict.fromkeys(str(route).strip() for route in route_candidates))
+        candidate_set = set(candidates)
+        owners = [
+            owner.model_dump(mode="json")
+            for owner in self.owner_scopes
+            if owner.route in candidate_set
+        ]
+        return {
+            "schema_name": self.schema_name,
+            "restriction_active": self.restriction_active,
+            "scope_source": self.scope_source,
+            "permitted_routes": [
+                route for route in candidates if route in set(self.permitted_routes)
+            ],
+            "owner_scopes": owners,
+            "unavailable_requested_owner": unavailable_requested_owner,
+        }
+
+
+def compile_runtime_route_scope(
+    *,
+    scope_source: str,
+    allowed_agents: Iterable[object],
+    allowed_function_tools: Mapping[str, Iterable[object]] | None = None,
+    source_kinds_by_agent: Mapping[str, Iterable[object]] | None = None,
+) -> EffectiveRuntimeRouteScope:
+    """Compile a generic, model-visible scope from an authoritative runtime ceiling."""
+
+    tool_map = allowed_function_tools or {}
+    source_map = source_kinds_by_agent or {}
+    routes = tuple(
+        dict.fromkeys(
+            str(agent or "").strip()
+            for agent in allowed_agents
+            if str(agent or "").strip()
+        )
+    )
+    owners = tuple(
+        RuntimeOwnerScope(
+            route=route,
+            tool_names=tuple(
+                dict.fromkeys(
+                    str(name or "").strip()
+                    for name in tool_map.get(route, ())
+                    if str(name or "").strip()
+                )
+            ),
+            source_kinds=tuple(
+                dict.fromkeys(
+                    str(kind or "").strip()
+                    for kind in source_map.get(route, ())
+                    if str(kind or "").strip()
+                )
+            ),
+        )
+        for route in routes
+    )
+    return EffectiveRuntimeRouteScope(
+        scope_source=str(scope_source or "").strip(),
+        owner_scopes=owners,
+    )
+
+
+def active_runtime_route_scope() -> EffectiveRuntimeRouteScope | None:
+    """Return the active canary ceiling as safe route-time metadata, if present."""
+
+    # Import lazily so ordinary agent construction does not load acceptance
+    # runtime machinery or create a capability-profile import cycle.
+    from keystone_agents.canary_acceptance import load_profile
+
+    profile = load_profile()
+    if profile is None or not profile.enabled:
+        return None
+    source_kinds_by_agent: dict[str, tuple[str, ...]] = {}
+    if profile.is_public_preprint_scenario:
+        source_kinds_by_agent["preprints_context_agent"] = (
+            "local_saved_preprint_history",
+        )
+    else:
+        source_kinds_by_agent["gmail_triage"] = (
+            "authenticated_read_only_mailbox",
+        )
+    return compile_runtime_route_scope(
+        scope_source="reviewed_acceptance_profile",
+        allowed_agents=sorted(profile.allowed_agents),
+        allowed_function_tools={
+            agent: sorted(profile.allowed_function_tools(agent))
+            for agent in profile.allowed_agents
+        },
+        source_kinds_by_agent=source_kinds_by_agent,
+    )
 
 
 class ChildResultPromotionReceipt(BaseModel):
@@ -108,7 +258,11 @@ def compile_request_capability_profile(
 ) -> RequestCapabilityProfile:
     """Compile an exact, entrypoint-neutral effective profile from an SDK agent."""
 
-    instructions = str(getattr(agent, "instructions", "") or "")
+    instructions = instruction_profile_text(agent)
+    if instructions is None:
+        raise ValueError(
+            "A dynamic instruction callable needs an explicit static instruction base."
+        )
     tool_names = tuple(
         dict.fromkeys(
             str(getattr(tool, "name", "") or getattr(tool, "__name__", "")).strip()
@@ -183,6 +337,7 @@ def compile_child_result_promotion_receipt(
     clean_summary = str(summary or "").strip()
     status = str(child_payload.get("status") or "completed").strip().lower()
     send_enabled = bool(child_payload.get("send_enabled"))
+    explicitly_unverified = child_result_explicitly_unverified(child_payload)
     public_result = child_payload.get("public_result")
     public_mapping = public_result if isinstance(public_result, Mapping) else {}
     child_public_result_verified = bool(
@@ -216,14 +371,15 @@ def compile_child_result_promotion_receipt(
     basis: list[str] = []
     if child_public_result_verified:
         basis.append("verified_child_public_result")
-    if instruction_repair_verified:
+    if instruction_repair_verified and not explicitly_unverified:
         basis.append("validated_instruction_repair")
-    if typed_display_verified:
+    if typed_display_verified and not explicitly_unverified:
         basis.append("typed_display_contract")
-    if rendered_display_verified:
+    if rendered_display_verified and not explicitly_unverified:
         basis.append("mirrored_child_display_contract")
     reader_ready = bool(
         clean_summary
+        and not explicitly_unverified
         and not send_enabled
         and status not in {"blocked", "clarification_required", "failed", "needs_input"}
         and (not provider_write_attempted or provider_receipt_verified is True)
@@ -247,13 +403,24 @@ def compile_child_result_promotion_receipt(
     )
 
 
+def child_result_explicitly_unverified(child_payload: Mapping[str, Any]) -> bool:
+    """Keep an explicit child verification failure authoritative across adapters."""
+
+    return child_payload.get("user_facing_result_verified") is False
+
+
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 __all__ = [
     "ChildResultPromotionReceipt",
+    "EffectiveRuntimeRouteScope",
     "RequestCapabilityProfile",
+    "RuntimeOwnerScope",
+    "active_runtime_route_scope",
     "compile_child_result_promotion_receipt",
+    "child_result_explicitly_unverified",
     "compile_request_capability_profile",
+    "compile_runtime_route_scope",
 ]

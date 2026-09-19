@@ -9,6 +9,7 @@ from keystone_agents.schemas.manual_request_plan import (
     AskShapePolicy,
     ManualRequestPlan,
 )
+from keystone_agents.sdk_run_policy import resolve_sdk_tool_call_limit
 
 
 def _plan(*, ask_shape: AskShapePolicy, requires_live_search: bool = True) -> ManualRequestPlan:
@@ -78,6 +79,24 @@ def test_canonical_standard_live_research_defaults_to_balanced() -> None:
     assert budget.mode == QualityMode.BALANCED
     assert budget.enable_context_deepening is True
     assert budget.max_seconds == 120
+
+
+def test_research_quality_tool_call_budget_is_an_enforced_runtime_limit() -> None:
+    plan = _plan(ask_shape=AskShapePolicy(evidence_depth="standard"))
+
+    budget = business_research_quality_budget(
+        request_text="Research the target.",
+        live_search=True,
+        manual_request_plan=plan,
+    )
+    runtime_limit = resolve_sdk_tool_call_limit(
+        "business_research_analyst",
+        request_text="Research the target.",
+        live_search=True,
+        manual_request_plan=plan,
+    )
+
+    assert runtime_limit == budget.max_tool_calls == 12
 
 
 def test_explicit_mode_remains_authoritative_over_canonical_plan() -> None:

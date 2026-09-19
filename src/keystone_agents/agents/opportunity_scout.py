@@ -11,10 +11,20 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
-from keystone_agents.agent_tool_policy import filter_tools_for_tier
+from keystone_agents.agent_decision_contracts import opportunity_scout_decision_contract
+from keystone_agents.authority.semantic import ExecutionIntentAuthority
+from keystone_agents.capabilities.tool_scope import (
+    ToolScopeMode,
+    attach_tool_scope_receipt,
+    default_tool_tier_for_request,
+    scope_tools_for_request,
+    tool_free_synthesis_attachment,
+    tool_scope_receipt_for_agent,
+    tool_scope_trace_metadata_for_agent,
+)
 from keystone_agents.guardrails import keystone_guardrails, keystone_tool_guardrail_kwargs
 from keystone_agents.models import OpportunityScoutSDKInput, TypedAgentRunResult
 from keystone_agents.opportunity_scout.scoring import (
@@ -54,8 +64,13 @@ from keystone_agents.opportunity_scout.state import (
 from keystone_agents.opportunity_scout.state import (
     state_items_from_payload as _state_items_from_payload,
 )
-from keystone_agents.quality_budget import opportunity_scout_quality_budget
 from keystone_agents.run import run_typed_sdk_agent
+from keystone_agents.runtime.decision_validation import AgentDecisionContract
+from keystone_agents.runtime.tool_call_budget import ToolCallBudgetContract
+from keystone_agents.runtime.tool_execution import (
+    ToolEvidenceGroup,
+    ToolExecutionContract,
+)
 from keystone_agents.schemas.decision_trace import DecisionTrace
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.opportunity import (
@@ -71,6 +86,7 @@ from keystone_agents.schemas.opportunity import (
     OpportunitySourceBundle,
     OpportunityStateDecision,
     OpportunityType,
+    SuppliedOpportunityResult,
 )
 from keystone_agents.schemas.opportunity_search_plan import OpportunitySearchPlan
 from keystone_agents.sdk import (
@@ -81,7 +97,10 @@ from keystone_agents.sdk import (
     compose_instructions,
     function_tool,
 )
-from keystone_agents.sdk_run_policy import resolve_sdk_turn_policy
+from keystone_agents.sdk_run_policy import (
+    resolve_sdk_tool_call_limit,
+    resolve_sdk_turn_policy,
+)
 from keystone_agents.skill_sets import select_agent_skill_names, skill_request_text
 from keystone_agents.source_quality import (
     score_source_quality,
@@ -127,13 +146,15 @@ from keystone_agents.tools.search_provider import (
     build_search_provider,
 )
 from keystone_agents.tools.serper_tool import search_web
-from keystone_agents.tools.web_structuring_tool import structure_web_data_for_schema
 from keystone_agents.tools.website_extraction_tool import (
     WebsiteExtractionBudget,
     WebsiteExtractionError,
     WebsiteExtractionResult,
+    extract_selected_urls_to_source_bundle,
     extract_website_content,
     extract_website_content_with_fallbacks,
+    project_web_source,
+    read_web_source_window,
     website_extraction_budget,
     website_extraction_provider_sequence,
 )
@@ -147,6 +168,46 @@ LIVE_SEARCH_QUERIES: tuple[str, ...] = (
     "neurotechnology company clinical validation psychiatry",
     "CNS biotech precision psychiatry biomarker trial",
 )
+OPPORTUNITY_FIXTURE_ONLY_TOOL_NAMES = frozenset(
+    {
+        "search_opportunity_sources_placeholder",
+        "load_existing_opportunity_state",
+        "search_funding_news_sources",
+        "search_job_posting_sources",
+        "search_clinical_trials_sources",
+        "search_grant_sources",
+        "search_conference_publication_sources",
+        "search_journal_call_sources",
+        "search_contract_rfp_sources",
+        "search_company_page_sources",
+        "handoff_to_business_research_analyst_placeholder",
+        "save_opportunity_placeholder",
+    }
+)
+
+_OPPORTUNITY_SCOUT_REQUIRED_RESEARCH_TOOLS = (
+    "search_web",
+    "extract_research_claims_from_html",
+    "score_opportunity",
+)
+
+
+def _required_opportunity_scout_tools_for_request(
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+    """Keep supplied-fact comparisons tool-light while preserving discovery."""
+
+    plan = ExecutionIntentAuthority.from_value(manual_request_plan).plan
+    if (
+        plan is not None
+        and plan.intent == "opportunity_search"
+        and plan.expected_artifact_type == "opportunity_record"
+        and not plan.requires_live_search
+        and plan.ask_shape.permission_state == "read_only"
+        and "comparison-format" in plan.constraints
+    ):
+        return ("score_opportunity",)
+    return _OPPORTUNITY_SCOUT_REQUIRED_RESEARCH_TOOLS
 JOB_POSTING_URL_MARKERS = ("/jobs", "/job/", "/careers", "/positions", "/openings")
 JOB_POSTING_TEXT_MARKERS = (
     "we're hiring",
@@ -1009,6 +1070,7 @@ def _source_from_hit(hit: dict[str, Any], signal: str) -> OpportunitySource:
         source_type=source_quality.source_type,
         supported_signal=signal,
         evidence_excerpt=str(hit.get("verified_excerpt") or "")[:1000],
+        web_source_access=hit.get("web_source_access"),
         source_quality=source_quality,
     )
 
@@ -1610,7 +1672,7 @@ def _topic_search_context(topic: str | None) -> str:
     cleaned = " ".join(str(topic or "").split()).strip()
     if not cleaned:
         return core
-    lowered = cleaned.lower()
+    lowered = re.sub(r"[-_/]+", " ", cleaned.lower())
     if "digital health" in lowered and "opportunit" in lowered:
         return (
             "digital health behavioral health clinical AI evidence generation "
@@ -1625,17 +1687,25 @@ def _topic_search_context(topic: str | None) -> str:
             "clinical ai",
             "clinical research",
             "digital biomarkers",
+            "neuroinformatics",
+            "neuroscience",
             "trial technology",
             "medical director",
             "advisory",
             "consulting",
             "partnership",
+            "small business",
+            "grant",
+            "pilot",
+            "rfp",
+            "procurement",
         )
         for phrase in keyword_phrases:
             if phrase in lowered:
                 terms.append(phrase)
         if terms:
             return " ".join(dict.fromkeys([*terms, core]))
+        return core
     return f"{cleaned} {core}"
 
 
@@ -5807,6 +5877,12 @@ def _verify_source_hits(
                 if text:
                     excerpt = _opportunity_verification_excerpt(text)
                     enriched["verified_excerpt"] = excerpt
+                    # This relevance-selected excerpt is not an exact prefix.
+                    # Start saved-source continuation at zero so no text is skipped.
+                    _, access = project_web_source(
+                        extraction, selected_url=url, max_chars=0,
+                    )
+                    enriched["web_source_access"] = access.model_dump(mode="json")
                     review_claims: list[str] = []
                     if (
                         agent_html_review_enabled()
@@ -5865,6 +5941,7 @@ def _verify_source_hits(
                         key: enriched[key]
                         for key in (
                             "verified_excerpt",
+                            "web_source_access",
                             "agent_html_review_claims",
                             "signal",
                             "signals",
@@ -6259,6 +6336,7 @@ def _records_from_hits(
         outside_likelihood = estimate_outside_consulting_likelihood(
             score_breakdown,
             signal_count=len(signals),
+            signals=signals,
         )
         handoff = should_handoff_to_business_research_analyst(
             breakdown=score_breakdown,
@@ -6897,6 +6975,7 @@ def score_opportunity_impl(
     outside_consulting_likelihood = estimate_outside_consulting_likelihood(
         score_breakdown,
         signal_count=len(signals),
+        signals=signals,
     )
     return json.dumps(
         {
@@ -7586,38 +7665,8 @@ def opportunity_scout_markdown(result: OpportunityScoutResult) -> str:
     return "\n".join(lines)
 
 
-def build_opportunity_scout_agent(
-    model: str | None = None,
-    *,
-    request_text: str = "",
-    context_flags: Mapping[str, bool] | None = None,
-    include_all_skills: bool = False,
-    tool_tier: str | int | None = None,
-    attach_tools: bool = True,
-    compact_instructions: bool = False,
-) -> Agent:
-    """Build the opportunity scout agent."""
-
-    skill_files = select_agent_skill_names(
-        "opportunity_scout",
-        request_text=request_text,
-        context_flags=context_flags,
-        include_all=include_all_skills,
-        compact=compact_instructions,
-    )
-    composer = compose_direct_instructions if compact_instructions else compose_instructions
-    prompt_files = (
-        ("keystone_profile.md", "safety_policy.md", "opportunity_scout.md")
-        if compact_instructions
-        else (
-            "keystone_profile.md",
-            "safety_policy.md",
-            "tools.md",
-            "opportunity_scout.md",
-        )
-    )
-    instructions = composer(*prompt_files, skill_files=skill_files)
-    tools = [
+def _opportunity_scout_active_tools() -> list[Any]:
+    return [
         list_local_context_sources,
         search_local_context,
         read_local_context_file,
@@ -7627,10 +7676,67 @@ def build_opportunity_scout_agent(
         airtable_read_records,
         airtable_write_record,
         search_web,
-        structure_web_data_for_schema,
+        extract_selected_urls_to_source_bundle,
+        read_web_source_window,
         render_page,
         capture_browser_diagnostics,
         summarize_rendered_page_diagnostics,
+        extract_research_claims_from_html,
+        score_opportunity,
+        save_entity_memory,
+        save_opportunity_memory,
+        *google_workspace_tools(),
+    ]
+
+
+def build_opportunity_scout_agent(
+    model: str | None = None,
+    *,
+    request_text: str = "",
+    context_flags: Mapping[str, bool] | None = None,
+    include_all_skills: bool = False,
+    tool_tier: str | int | None = None,
+    attach_tools: bool = True,
+    include_fixture_tools: bool = False,
+    compact_instructions: bool = False,
+    manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
+    tool_scope_mode: ToolScopeMode | str = ToolScopeMode.AUTO,
+    instruction_profile: Literal["discovery", "supplied_evidence"] = "discovery",
+) -> Agent:
+    """Build the scout with active tools and optional offline fixture scaffolding."""
+
+    if instruction_profile not in {"discovery", "supplied_evidence"}:
+        raise ValueError("Unknown Opportunity instruction profile.")
+    if instruction_profile == "supplied_evidence":
+        if attach_tools or include_fixture_tools:
+            raise ValueError(
+                "The supplied-evidence instruction profile requires a tool-free agent."
+            )
+        instructions = compose_direct_instructions(
+            "keystone_profile.md", "safety_policy.md", "opportunity_scout_supplied_evidence.md",
+        )
+    else:
+        skill_files = select_agent_skill_names(
+            "opportunity_scout",
+            request_text=request_text,
+            context_flags=context_flags,
+            include_all=include_all_skills,
+            compact=compact_instructions,
+        )
+        composer = compose_direct_instructions if compact_instructions else compose_instructions
+        prompt_files = (
+            ("keystone_profile.md", "safety_policy.md", "opportunity_scout.md")
+            if compact_instructions
+            else (
+                "keystone_profile.md",
+                "safety_policy.md",
+                "tools.md",
+                "opportunity_scout.md",
+            )
+        )
+        instructions = composer(*prompt_files, skill_files=skill_files)
+    active_tools = _opportunity_scout_active_tools()
+    fixture_tools = [
         search_opportunity_sources_placeholder,
         load_existing_opportunity_state,
         search_funding_news_sources,
@@ -7641,21 +7747,38 @@ def build_opportunity_scout_agent(
         search_journal_call_sources,
         search_contract_rfp_sources,
         search_company_page_sources,
-        extract_research_claims_from_html,
-        score_opportunity,
         handoff_to_business_research_analyst_placeholder,
         save_opportunity_placeholder,
-        save_entity_memory,
-        save_opportunity_memory,
-        *google_workspace_tools(),
     ]
-    if tool_tier is not None:
-        tools = filter_tools_for_tier("opportunity_scout", tools, tool_tier)
-    return build_sdk_agent(
+    tools = [*active_tools, *(fixture_tools if include_fixture_tools else [])]
+    resolved_scope_mode = tool_scope_mode
+    if include_fixture_tools:
+        # This flag is an explicit offline-test capability. The live runtime
+        # rejects it before building the agent.
+        resolved_scope_mode = ToolScopeMode.FULL
+    elif str(tool_scope_mode) == ToolScopeMode.AUTO.value and (
+        request_text or manual_request_plan is not None or tool_tier is not None
+    ):
+        resolved_scope_mode = ToolScopeMode.REQUEST_SCOPED
+    attachment = scope_tools_for_request(
+        "opportunity_scout",
+        tools if attach_tools else [],
+        manual_request_plan=manual_request_plan,
+        tool_tier=tool_tier,
+        mode=resolved_scope_mode,
+        required_tool_names=_required_opportunity_scout_tools_for_request(
+            manual_request_plan
+        ),
+    )
+    agent = build_sdk_agent(
         name="opportunity_scout",
         instructions=instructions,
-        output_type=OpportunityScoutResult,
-        tools=tools if attach_tools else [],
+        output_type=(
+            SuppliedOpportunityResult
+            if instruction_profile == "supplied_evidence"
+            else OpportunityScoutResult
+        ),
+        tools=list(attachment.tools),
         guardrails=keystone_guardrails(),
         model=model,
         policy_agent_name="opportunity_scout",
@@ -7664,6 +7787,7 @@ def build_opportunity_scout_agent(
             "without generating outreach."
         ),
     )
+    return attach_tool_scope_receipt(agent, attachment.scope)
 
 
 def build_opportunity_scout_synthesis_agent(
@@ -7679,7 +7803,11 @@ def build_opportunity_scout_synthesis_agent(
         "opportunity_scout_synthesis_compact.md",
         shared_prompt_files=("memory_policy.md", "writing_style.md"),
     )
-    return build_sdk_agent(
+    attachment = tool_free_synthesis_attachment(
+        "opportunity_scout",
+        _opportunity_scout_active_tools(),
+    )
+    agent = build_sdk_agent(
         name="opportunity_scout",
         instructions=instructions,
         output_type=OpportunityScoutSynthesis,
@@ -7697,6 +7825,7 @@ def build_opportunity_scout_synthesis_agent(
             "running tools, search, outreach, or writes."
         ),
     )
+    return attach_tool_scope_receipt(agent, attachment.scope)
 
 
 def apply_opportunity_scout_synthesis(
@@ -7753,6 +7882,7 @@ def apply_opportunity_scout_synthesis(
     merged = retrieved.model_copy(
         update={
             "records": selected_records,
+            "human_summary": synthesis.audit_summary,
             "audit_notes": list(
                 dict.fromkeys(
                     [
@@ -7767,6 +7897,7 @@ def apply_opportunity_scout_synthesis(
                 or retrieved.constraint_relaxation_suggestion
             ),
             "outreach_generated": False,
+            "decision": synthesis.decision,
         },
         deep=True,
     )
@@ -7817,38 +7948,96 @@ def run_opportunity_scout_sdk(
     max_turns: int | None = None,
     manual_request_plan: ManualRequestPlan | Mapping[str, Any] | None = None,
     attach_tools: bool = True,
+    include_fixture_tools: bool = False,
     compact_instructions: bool = False,
+    provider_retrieval_required: bool | None = None,
+    decision_contract: AgentDecisionContract | None = None,
+    instruction_profile: Literal["discovery", "supplied_evidence"] = "discovery",
 ) -> TypedAgentRunResult[OpportunityScoutResult]:
-    """Run Opportunity Scout through the typed SDK harness."""
+    """Run the Scout while preventing fixture-only tools from entering live profiles."""
 
-    resolved_tool_tier = tool_tier or _default_opportunity_scout_sdk_tool_tier(
-        typed_input,
-        live=live,
-        manual_request_plan=manual_request_plan,
+    if live and include_fixture_tools:
+        raise ValueError("Opportunity fixture-only tools cannot be attached to a live SDK run.")
+
+    plan = ExecutionIntentAuthority.from_value(manual_request_plan).plan
+    requires_provider_retrieval = (
+        bool(plan and plan.requires_live_search)
+        if provider_retrieval_required is None
+        else bool(provider_retrieval_required)
+    )
+    if instruction_profile == "supplied_evidence" and requires_provider_retrieval:
+        raise ValueError("Supplied-evidence assessment cannot require provider retrieval.")
+    resolved_tool_tier = tool_tier or (
+        "deep_retrieval"
+        if requires_provider_retrieval
+        else _default_opportunity_scout_sdk_tool_tier(
+            typed_input,
+            live=live,
+            manual_request_plan=manual_request_plan,
+        )
     )
     turn_policy = resolve_sdk_turn_policy(
         "opportunity_scout",
         request_text=skill_request_text(typed_input),
-        live_search=live,
+        live_search=live or requires_provider_retrieval,
         manual_request_plan=manual_request_plan,
         explicit_max_turns=max_turns,
     )
-    return run_typed_sdk_agent(
-        agent=build_opportunity_scout_agent(
-            model=model,
-            request_text=skill_request_text(typed_input),
-            context_flags=context_flags,
-            tool_tier=resolved_tool_tier,
-            attach_tools=attach_tools,
-            compact_instructions=compact_instructions,
-        ),
+    # Prompt compaction reduces input size; it must not reduce the model's tool-loop
+    # opportunity. The central quality budget remains authoritative for search,
+    # optional deepening, deterministic scoring, and final synthesis.
+    initial_max_turns = turn_policy.max_turns
+    agent = build_opportunity_scout_agent(
+        model=model,
+        request_text=skill_request_text(typed_input),
+        context_flags=context_flags,
+        tool_tier=resolved_tool_tier,
+        attach_tools=attach_tools,
+        include_fixture_tools=include_fixture_tools,
+        compact_instructions=compact_instructions,
+        manual_request_plan=manual_request_plan,
+        tool_scope_mode=ToolScopeMode.REQUEST_SCOPED,
+        instruction_profile=instruction_profile,
+    )
+    scope_receipt = tool_scope_receipt_for_agent(agent)
+    result = run_typed_sdk_agent(
+        agent=agent,
         typed_input=typed_input,
         output_type=OpportunityScoutResult,
         run_config=run_config,
         live=live,
         session=session,
-        max_turns=turn_policy.max_turns,
+        max_turns=initial_max_turns,
+        tool_call_budget_contract=ToolCallBudgetContract(
+            max_total_calls=resolve_sdk_tool_call_limit(
+                "opportunity_scout",
+                request_text=skill_request_text(typed_input),
+                live_search=live or requires_provider_retrieval,
+                manual_request_plan=manual_request_plan,
+            ),
+            stage="opportunity_scout_current_evidence",
+        ),
+        tool_correction_max_turns=min(initial_max_turns, 2),
+        decision_repair_max_turns=1,
+        trace_metadata=tool_scope_trace_metadata_for_agent(agent),
+        tool_execution_contract=(
+            ToolExecutionContract.required(
+                ToolEvidenceGroup("current_opportunity_search", ("search_web",)),
+                ToolEvidenceGroup(
+                    "deterministic_opportunity_score",
+                    ("score_opportunity",),
+                ),
+                stage="opportunity_scout_current_evidence",
+            )
+            if requires_provider_retrieval and attach_tools
+            else None
+        ),
+        decision_contract=decision_contract or opportunity_scout_decision_contract(),
     )
+    request_cache = getattr(result, "request_cache", None)
+    if isinstance(request_cache, dict):
+        request_cache["request_tool_scope"] = scope_receipt
+    return result
 
 
 def _default_opportunity_scout_sdk_tool_tier(
@@ -7859,9 +8048,9 @@ def _default_opportunity_scout_sdk_tool_tier(
 ) -> str:
     """Infer a read-only tool tier for default Opportunity Scout SDK runs."""
 
-    budget = opportunity_scout_quality_budget(
-        request_text=skill_request_text(typed_input),
-        live_search=live,
-        manual_request_plan=manual_request_plan,
-    )
-    return budget.tool_tier or "core_read"
+    del typed_input, live
+    if _required_opportunity_scout_tools_for_request(manual_request_plan) == (
+        "score_opportunity",
+    ):
+        return "deep_retrieval"
+    return default_tool_tier_for_request(manual_request_plan)

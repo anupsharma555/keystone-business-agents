@@ -103,6 +103,16 @@ _UNSUPPORTED_CLAIM_PATTERNS = (
         r"clients|case studies|track record)\b",
         re.IGNORECASE,
     ),
+    re.compile(
+        r"\b(?:physician|clinician|provider|founder|patient|member|peer|family|"
+        r"community)[- ]led\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:nonprofit|not-for-profit|for-profit|venture-backed|"
+        r"private-equity-backed|publicly traded|minority-owned|woman-owned)\b",
+        re.IGNORECASE,
+    ),
 )
 _NEGATED_UNSUPPORTED_CLAIM_CONTEXT_RE = re.compile(
     r"\b(?:do not|don't|never|must not|avoid|without|absent|forbidden)\b[^.\n]{0,140}$",
@@ -118,6 +128,22 @@ _SECRET_PATTERNS = (
         re.IGNORECASE,
     ),
 )
+
+
+def redact_secret_like_text(value: object) -> str:
+    """Redact credential-shaped fragments before bounded evidence reaches a model.
+
+    Read-only provider projections can legitimately contain copied meeting URLs or
+    quoted configuration text with token-like query parameters.  The generic tool
+    guardrail must still block an unredacted secret, but a provider adapter may use
+    this helper to preserve the surrounding nonsensitive evidence instead of
+    discarding the complete read result.
+    """
+
+    redacted = str(value or "")
+    for pattern in _SECRET_PATTERNS:
+        redacted = pattern.sub("[redacted secret-like value]", redacted)
+    return redacted
 _SEND_LIKE_PATTERNS = (
     re.compile(r"\bsend_email\b", re.IGNORECASE),
     re.compile(r"\bgmail\.users\.messages\.send\b", re.IGNORECASE),
@@ -151,6 +177,10 @@ _SEND_LIKE_SCAN_SKIP_KEYS = {
     "safety_policy",
 }
 _OUTREACH_CLAIM_AGENT_NAMES = {"outreach_composer"}
+_APPROVED_EVIDENCE_INPUT_MARKERS = (
+    "Approved source-backed context:",
+    "Approved source-backed comparison context:",
+)
 
 
 def stringify_payload(value: Any) -> str:
@@ -249,14 +279,23 @@ def assess_unsupported_outreach_claims(
 ) -> tuple[str, ...]:
     """Return unsupported outreach claim snippets not present in profile or caller context."""
 
-    allowed_context = _profile_and_context(input_context).lower()
+    allowed_context = _profile_and_context(input_context)
+
+    def affirmatively_supported(claim: str) -> bool:
+        for occurrence in re.finditer(re.escape(claim), allowed_context, re.IGNORECASE):
+            if not _NEGATED_UNSUPPORTED_CLAIM_CONTEXT_RE.search(
+                allowed_context[: occurrence.start()]
+            ):
+                return True
+        return False
+
     flagged: list[str] = []
     for pattern in _UNSUPPORTED_CLAIM_PATTERNS:
         for match in pattern.finditer(text):
             claim = match.group(0)
             if _NEGATED_UNSUPPORTED_CLAIM_CONTEXT_RE.search(text[: match.start()]):
                 continue
-            if claim.lower() not in allowed_context:
+            if not affirmatively_supported(claim):
                 flagged.append(claim)
     return tuple(dict.fromkeys(flagged))
 
@@ -329,6 +368,71 @@ def assess_text_guardrails(
         risk_flags=tuple(risk_flags),
         reasons=tuple(reasons),
         draft_policy=draft_policy,
+    )
+
+
+def _assess_public_source_text_guardrails(text: str) -> GuardrailAssessment:
+    """Scan already-admitted public evidence without treating its prose as advice."""
+
+    risk_flags: list[str] = []
+    reasons: list[str] = []
+    if any(pattern.search(text) for pattern in _PHI_PATTERNS):
+        risk_flags.append("possible_phi")
+        reasons.append("possible PHI or patient-specific content")
+    if any(pattern.search(text) for pattern in _SECRET_PATTERNS):
+        risk_flags.append("secret")
+        reasons.append("secret-like content")
+    return GuardrailAssessment(
+        allowed=not risk_flags,
+        manual_review_required=bool(risk_flags),
+        risk_flags=tuple(dict.fromkeys(risk_flags)),
+        reasons=tuple(dict.fromkeys(reasons)),
+        draft_policy="no_substantive_reply" if risk_flags else "normal",
+    )
+
+
+def assess_input_guardrails(text: str) -> GuardrailAssessment:
+    """Assess operator intent separately from labeled, already-admitted evidence.
+
+    Public research often contains words such as ``treatment plan`` or
+    ``prescribe`` as descriptive source material. Those words must not turn a
+    safe summarization request into a request for professional advice. The
+    evidence portion still receives the public-source PHI and secret scan used
+    at the extraction boundary.
+    """
+
+    cleaned = str(text or "")
+    marker_offsets = [
+        (cleaned.find(marker), marker)
+        for marker in _APPROVED_EVIDENCE_INPUT_MARKERS
+        if marker in cleaned
+    ]
+    if not marker_offsets:
+        return assess_text_guardrails(cleaned, check_outreach_claims=False)
+    offset, marker = min(marker_offsets, key=lambda item: item[0])
+    request_text = cleaned[:offset]
+    evidence_text = cleaned[offset + len(marker) :]
+    request_assessment = assess_text_guardrails(
+        request_text,
+        check_outreach_claims=False,
+    )
+    evidence_assessment = _assess_public_source_text_guardrails(evidence_text)
+    risk_flags = tuple(
+        dict.fromkeys((*request_assessment.risk_flags, *evidence_assessment.risk_flags))
+    )
+    reasons = tuple(
+        dict.fromkeys((*request_assessment.reasons, *evidence_assessment.reasons))
+    )
+    return GuardrailAssessment(
+        allowed=request_assessment.allowed and evidence_assessment.allowed,
+        manual_review_required=bool(risk_flags),
+        risk_flags=risk_flags,
+        reasons=reasons,
+        draft_policy=(
+            "no_substantive_reply"
+            if not evidence_assessment.allowed
+            else request_assessment.draft_policy
+        ),
     )
 
 
@@ -478,22 +582,8 @@ def enforce_public_source_output_guardrails(tool_name: str, output: Any) -> Any:
     """Allow public source evidence while still blocking secrets and PHI."""
 
     text = f"tool_name: {tool_name}\n{stringify_payload(output)}"
-    risk_flags: list[str] = []
-    reasons: list[str] = []
-    if any(pattern.search(text) for pattern in _PHI_PATTERNS):
-        risk_flags.append("possible_phi")
-        reasons.append("possible PHI or patient-specific content")
-    if any(pattern.search(text) for pattern in _SECRET_PATTERNS):
-        risk_flags.append("secret")
-        reasons.append("secret-like content")
-    if risk_flags:
-        assessment = GuardrailAssessment(
-            allowed=False,
-            manual_review_required=True,
-            risk_flags=tuple(dict.fromkeys(risk_flags)),
-            reasons=tuple(dict.fromkeys(reasons)),
-            draft_policy="no_substantive_reply",
-        )
+    assessment = _assess_public_source_text_guardrails(text)
+    if not assessment.allowed:
         raise ToolGuardrailViolation(_tool_rejection_message(tool_name, assessment))
     return output
 
@@ -524,10 +614,7 @@ def keystone_input_guardrail(
     agent: Agent,
     input: str | list[Any],
 ) -> GuardrailFunctionOutput:
-    assessment = assess_text_guardrails(
-        stringify_payload(input),
-        check_outreach_claims=False,
-    )
+    assessment = assess_input_guardrails(stringify_payload(input))
     return GuardrailFunctionOutput(
         output_info={"risk_flags": assessment.risk_flags, "reasons": assessment.reasons},
         tripwire_triggered=not assessment.allowed,

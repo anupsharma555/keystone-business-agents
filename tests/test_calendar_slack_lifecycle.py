@@ -83,6 +83,9 @@ def test_six_ask_slack_calendar_lifecycle_preserves_exact_object_and_thread(
         "start_date": "2026-09-15",
         "start_time": "14:35",
         "end_time": "15:05",
+        "timezone": "America/New_York",
+        "all_day": False,
+        "repeat_each_day": False,
         "description": "Synthetic KBA fresh-thread continuity validation.",
         "deleted": False,
     }
@@ -125,6 +128,11 @@ def test_six_ask_slack_calendar_lifecycle_preserves_exact_object_and_thread(
             "verification": {
                 "status": "verified",
                 "passed": True,
+                "start_match": True,
+                "end_match": True,
+                "all_day_match": True,
+                "timezone_match": True,
+                "recurrence_match": True,
                 "description_match": True,
             },
             "send_enabled": False,
@@ -153,6 +161,10 @@ def test_six_ask_slack_calendar_lifecycle_preserves_exact_object_and_thread(
             "verification": {
                 "status": "verified",
                 "passed": True,
+                "start_match": True,
+                "end_match": True,
+                "all_day_match": True,
+                "timezone_match": True,
                 "description_match": True,
             },
             "send_enabled": False,

@@ -52,7 +52,7 @@ def retrieve_memory(
     approved_only: bool = True,
     database_url: str | None = None,
 ) -> str:
-    """Retrieve approved, prompt-safe local memory without live API calls."""
+    """Retrieve eligible, prompt-safe current memory without live API calls."""
 
     records = StorageTool(
         database_url=database_url or database_url_from_env(),

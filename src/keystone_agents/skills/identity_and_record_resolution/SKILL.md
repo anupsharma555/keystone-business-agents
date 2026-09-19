@@ -5,6 +5,7 @@ skill_purpose: Normalize and compare business entities and workflow records with
 applies_to:
   - gmail_triage
   - business_research_analyst
+  - rag_retrieval_specialist
   - opportunity_scout
   - outreach_composer
   - airtable_context_agent

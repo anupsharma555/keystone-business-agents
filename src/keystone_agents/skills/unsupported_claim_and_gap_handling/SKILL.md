@@ -5,6 +5,7 @@ skill_purpose: Preserve unsupported claims and missing evidence instead of filli
 applies_to:
   - gmail_triage
   - business_research_analyst
+  - rag_retrieval_specialist
   - opportunity_scout
   - outreach_composer
   - preprints_context_agent

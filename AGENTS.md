@@ -61,6 +61,18 @@ large route-specific execution schemas for every new natural-language request.
 Planner rationale belongs in compact trace/event metadata and should describe
 the assumptions, missing context, selected capability, and next safe action.
 
+All evidence that can materially change a model-owned decision must be visible
+to that model before it decides. Supplied-context paths must serialize the raw
+request, bounded candidate identities, normalized evidence, required cross-provider
+context, and applicable limitations into the specialist input. Tool-loop paths may
+discover candidates after the first turn, but the provider tool response must enter
+the same model loop before selection. Python may normalize context before the run,
+validate identities and permissions afterward, and return structured feedback for
+one repair attempt; it must not insert missing substantive evidence, replace the
+agent's selected candidate, or make an invalid output appear grounded after the
+decision. A supplied-context run whose declared decision identities are absent from
+the actual model-visible input must fail before making a model request.
+
 Agent capabilities should be schema-first and tool-general, not narrow
 deterministic lanes for individual natural-language requests. Deterministic
 intent classification is acceptable when it is a bounded routing hint, safety
@@ -535,6 +547,15 @@ matching `SKILL.md` before touching repo files.
 - `codex-skills/kba-operational-validation/SKILL.md`: use when coordinating
   realistic direct-agent, WorkItem/LangGraph, provider-lifecycle, live API,
   and Slack acceptance evidence across agent families.
+- `codex-skills/kba-agent-run-diagnosis/SKILL.md`: use when reconstructing a
+  failed, partial, confusing, or apparently tool-free KBA run across entrypoint,
+  agents, canonical state, tool admission/execution, provider receipts,
+  validation, rendering, Slack continuity, loaded-runtime freshness,
+  persistence, and missing evidence.
+- `codex-skills/kba-propagate-agent-fixes/SKILL.md`: use after a diagnosed KBA
+  defect has an authorized fix and the same root cause must be audited and
+  repaired across analogous agents, direct and orchestrated paths, shared
+  tools, receipts, recovery, validation, and Slack presentation.
 
 ## Agent Improvement Test Pack
 

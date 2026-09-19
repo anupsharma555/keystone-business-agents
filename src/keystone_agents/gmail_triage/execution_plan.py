@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from keystone_agents.authority.semantic import ExecutionIntentAuthority
 from keystone_agents.gmail_triage.relationship_query import (
+    associated_gmail_query,
     known_contact_gmail_query,
     looks_like_known_contact_relationship,
 )
@@ -60,7 +61,10 @@ def resolve_gmail_execution_plan(
     payload["provider_operations"] = list(
         authority.effective_provider_operations("gmail")
     )
-    return _gmail_execution_plan_from_semantic_plan(payload)
+    return _gmail_execution_plan_from_semantic_plan(
+        payload,
+        request_text=request_text,
+    )
 
 
 def _gmail_execution_plan_not_authorized(
@@ -89,6 +93,8 @@ def _gmail_execution_plan_not_authorized(
 
 def _gmail_execution_plan_from_semantic_plan(
     plan: Mapping[str, object],
+    *,
+    request_text: str | None = None,
 ) -> GmailExecutionPlan:
     operations = [
         str(item or "").strip().lower()
@@ -112,6 +118,7 @@ def _gmail_execution_plan_from_semantic_plan(
     raw_ask_shape = plan.get("ask_shape")
     ask_shape = raw_ask_shape if isinstance(raw_ask_shape, Mapping) else {}
     permission_state = str(ask_shape.get("permission_state") or "")
+    output_form = str(ask_shape.get("output_form") or "")
     if permission_state == "read_only":
         operations = [
             operation
@@ -140,6 +147,8 @@ def _gmail_execution_plan_from_semantic_plan(
         and str(result_scope.get("provider_system") or "") == "gmail"
         and str(result_scope.get("provider_read_scope") or "") == "bounded_collection"
     )
+    raw_request = " ".join(str(request_text or "").split()).strip().lower()
+    exact_single_message = _single_message_request(raw_request)
 
     common = {
         "source": "llm_manual_plan",
@@ -205,18 +214,44 @@ def _gmail_execution_plan_from_semantic_plan(
         )
     if (
         expected_artifact == "outreach_draft"
+        or output_form == "draft"
         or draft_policy not in {"", "no_drafts_requested"}
         or "outreach_composer" in workflow
     ):
+        collection_selection = bool(
+            not exact_single_message
+            and (
+                str(plan.get("provider_read_scope") or "") == "bounded_collection"
+                or target_type == "gmail_message_collection"
+                or desired_count > 1
+            )
+        )
+        selection_limit = (
+            max(1, min(4, desired_count))
+            if desired_count_explicit
+            else (4 if collection_selection else 1)
+        )
         return GmailExecutionPlan(
             **common,
             operation="draft_reply",
-            read_scope="thread" if target_type == "gmail_thread" else "message",
-            max_messages=1,
+            read_scope=(
+                "collection"
+                if collection_selection
+                else ("thread" if target_type == "gmail_thread" else "message")
+            ),
+            max_messages=selection_limit,
             source_label="INBOX",
             create_gmail_drafts=False,
             draft_replies_in_output=True,
-            candidate_helpers=["gmail_single_message_read", "gmail_triage_sdk"],
+            candidate_helpers=(
+                [
+                    "query_gmail_message_summaries",
+                    "read_gmail_context",
+                    "gmail_triage_sdk",
+                ]
+                if collection_selection
+                else ["gmail_single_message_read", "gmail_triage_sdk"]
+            ),
             artifact_policy="draft_text_in_output",
             side_effect_policy="read_only_or_draft_only",
         )
@@ -290,10 +325,52 @@ def _gmail_execution_plan_from_semantic_plan(
             source_label="INBOX",
             candidate_helpers=["gmail_thread_summary"],
         )
+    collection_selection = bool(
+        not exact_single_message
+        and (
+            str(plan.get("provider_read_scope") or "") == "bounded_collection"
+            or target_type == "gmail_message_collection"
+            or desired_count > 1
+        )
+    )
     if (
-        str(plan.get("provider_read_scope") or "") == "bounded_collection"
-        or desired_count > 1
+        collection_selection
+        and _candidate_selection_request(raw_request)
+        and not _multi_message_output_request(raw_request)
     ):
+        reply_copy = _draft_requested(raw_request)
+        return GmailExecutionPlan(
+            **{
+                **common,
+                "rationale": (
+                    "The canonical plan authorizes a bounded Gmail read, while the full "
+                    "operator request asks Gmail Triage to choose one candidate. The "
+                    "specialist must compare provider evidence inside its tool loop."
+                ),
+            },
+            operation="draft_reply" if reply_copy else "candidate_selection",
+            read_scope="collection",
+            max_messages=(
+                max(1, min(4, desired_count))
+                if desired_count_explicit
+                else 4
+            ),
+            source_label="INBOX",
+            create_gmail_drafts=False,
+            draft_replies_in_output=True,
+            candidate_helpers=[
+                "query_gmail_message_summaries",
+                "read_gmail_context",
+                "gmail_triage_sdk",
+            ],
+            artifact_policy=(
+                "draft_text_in_output"
+                if reply_copy
+                else "agent_selected_result_in_output"
+            ),
+            side_effect_policy="read_only_or_draft_only",
+        )
+    if collection_selection:
         draft_replies = draft_policy not in {"", "no_drafts_requested"}
         return GmailExecutionPlan(
             **common,
@@ -416,10 +493,12 @@ def infer_gmail_execution_plan(
     explicit_lookback_days = _lookback_days(lowered)
     lookback_days = explicit_lookback_days or 3
     subject_hint = extract_gmail_subject_hint(text)
+    association_query = associated_gmail_query(text)
     query_terms = _query_terms(text)
     query = (
         _date_scope_query(lowered, lookback_days)
-        if explicit_lookback_days is not None or not subject_hint
+        if explicit_lookback_days is not None
+        or (not subject_hint and not association_query)
         else ""
     )
     if query_terms:
@@ -498,7 +577,22 @@ def infer_gmail_execution_plan(
             ],
         )
 
-    if _priority_grouping_request(lowered):
+    priority_grouping = _priority_grouping_request(lowered)
+    multi_message_output = _multi_message_output_request(lowered)
+    explicit_candidate_selection = _candidate_selection_request(lowered)
+    agent_owned_candidate_selection = bool(
+        explicit_candidate_selection
+        or (
+            priority_grouping
+            and _draft_requested(lowered)
+            and not multi_message_output
+        )
+    )
+    agent_owned_reply_selection = bool(
+        agent_owned_candidate_selection and _draft_requested(lowered)
+    )
+
+    if priority_grouping and not agent_owned_candidate_selection:
         priority_query = _date_scope_query(lowered, lookback_days)
         collection_read = looks_like_gmail_collection_read(lowered)
         draft_replies = _draft_requested(lowered)
@@ -526,6 +620,32 @@ def infer_gmail_execution_plan(
                 "Request asks for recent Gmail threads/messages to be ranked and summarized; "
                 "use broad bounded retrieval before relevance filtering so Gmail search "
                 "AND semantics do not hide relevant threads."
+            ),
+        )
+
+    if agent_owned_candidate_selection and not _draft_requested(lowered):
+        return GmailExecutionPlan(
+            source=source,
+            operation="candidate_selection",
+            read_scope="collection",
+            lookback_days=lookback_days,
+            max_messages=4,
+            gmail_query=query,
+            source_label="INBOX",
+            create_gmail_drafts=False,
+            draft_replies_in_output=True,
+            live_read_required=True,
+            candidate_helpers=[
+                "query_gmail_message_summaries",
+                "read_gmail_context",
+                "gmail_triage_sdk",
+            ],
+            artifact_policy="agent_selected_result_in_output",
+            side_effect_policy="read_only_or_draft_only",
+            rationale=(
+                "The request names one desired conversation or outcome, not a multi-item "
+                "inbox digest. Gmail Triage must compare bounded candidates inside its "
+                "tool loop instead of using legacy priority grouping."
             ),
         )
 
@@ -580,19 +700,36 @@ def infer_gmail_execution_plan(
         return GmailExecutionPlan(
             source=source,
             operation="draft_reply",
-            read_scope=read_scope,
+            read_scope="collection" if agent_owned_reply_selection else read_scope,
             lookback_days=lookback_days,
-            max_messages=1,
+            max_messages=4 if agent_owned_reply_selection else 1,
             gmail_query=query,
             source_label="INBOX",
             create_gmail_drafts=create_provider_draft,
             draft_replies_in_output=True,
             live_read_required=True,
-            candidate_helpers=[
-                "gmail_single_message_read",
-                "gmail_triage_sdk",
-                *(["gmail_verified_reply_draft_create"] if create_provider_draft else []),
-            ],
+            candidate_helpers=(
+                [
+                    "query_gmail_message_summaries",
+                    "read_gmail_context",
+                    "gmail_triage_sdk",
+                    *(
+                        ["gmail_verified_reply_draft_create"]
+                        if create_provider_draft
+                        else []
+                    ),
+                ]
+                if agent_owned_reply_selection
+                else [
+                    "gmail_single_message_read",
+                    "gmail_triage_sdk",
+                    *(
+                        ["gmail_verified_reply_draft_create"]
+                        if create_provider_draft
+                        else []
+                    ),
+                ]
+            ),
             artifact_policy=(
                 "create_verified_gmail_draft" if create_provider_draft else "draft_text_in_output"
             ),
@@ -632,7 +769,8 @@ def _single_message_request(lowered: str) -> bool:
         return False
     return bool(
         re.search(
-            r"\b(?:latest|newest|most\s+recent)\s+(?:gmail\s+)?(?:email|message)\b",
+            r"\b(?:latest|newest|most\s+recent)\s+"
+            r"(?:gmail\s+)?(?:email|message|note|mail)\b",
             lowered,
         )
     )
@@ -659,6 +797,88 @@ def _priority_grouping_request(lowered: str) -> bool:
         re.search(r"\b(?:summarize|summary|review|recap)\b", lowered)
         and re.search(r"\b(?:emails|messages|inbox)\b", lowered)
         and re.search(r"\b(?:today|this\s+morning|this\s+afternoon)\b", lowered)
+    )
+
+
+def _multi_message_output_request(lowered: str) -> bool:
+    """Return whether the requested artifact contains multiple classified items.
+
+    A bounded collection read does not itself mean the operator wants an inbox
+    digest. When the requested outcome is one selected conversation and one
+    conditional reply, Gmail Triage must compare candidates inside its tool loop.
+    Keep the legacy batch grouping path only for explicit multi-item artifacts.
+    """
+
+    actionable = positive_capability_text(lowered).lower()
+    if re.search(r"\btop\s+\d{1,2}\b", actionable):
+        return True
+    if re.search(
+        r"\b(?:group|bucket|categori[sz]e|sort|prioriti[sz]e)\b.{0,50}"
+        r"\b(?:emails|messages|threads|conversations|inbox)\b",
+        actionable,
+    ):
+        return True
+    if re.search(
+        r"\b(?:emails|messages|threads|conversations)\b.{0,50}"
+        r"\b(?:each|every)\b|\b(?:each|every)\b.{0,50}"
+        r"\b(?:email|message|thread|conversation)\b",
+        actionable,
+    ):
+        return True
+    if re.search(
+        r"\b(?:what|which)\s+(?:emails|messages|threads|conversations)\b",
+        actionable,
+    ):
+        return True
+    if re.search(
+        r"\b(?:review|summari[sz]e|recap)\b.{0,60}"
+        r"\b(?:emails|messages|threads|conversations|inbox|priorities)\b",
+        actionable,
+    ):
+        return True
+    if re.search(
+        r"\b(?:needs?\s+(?:me|my\s+attention)|needs?\s+attention)\b.{0,60}"
+        r"\b(?:can\s+wait|what\s+can\s+wait)\b",
+        actionable,
+    ):
+        return True
+    return bool(re.search(r"\bdraft\s+replies\b", actionable))
+
+
+def _candidate_selection_request(lowered: str) -> bool:
+    """Return whether Gmail Triage must choose one item from plausible candidates."""
+
+    actionable = positive_capability_text(lowered).lower()
+    candidate_noun = bool(
+        re.search(
+            r"\b(?:email|message|thread|conversation|mail|invitation|invite)\b",
+            actionable,
+        )
+    )
+    if not candidate_noun:
+        return False
+    if re.search(r"\bwhich\s+one\b", actionable):
+        return True
+    if re.search(
+        r"\b(?:pick|select|choose|distinguish|compare|resolve)\b.{0,45}"
+        r"\b(?:email|message|thread|conversation|mail|invitation|invite)\b"
+        r"|\b(?:email|message|thread|conversation|mail|invitation|invite)\b.{0,45}"
+        r"\b(?:pick|select|choose|distinguish|compare|resolve)\b",
+        actionable,
+    ):
+        return True
+    if re.search(
+        r"\b(?:active|current|right|correct|associated|matching)\b.{0,35}"
+        r"\b(?:email|message|thread|conversation|invitation|invite)\b",
+        actionable,
+    ):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:email|message|thread|conversation|invitation|invite)\b.{0,35}"
+            r"\b(?:rather\s+than|instead\s+of|not\s+the)\b",
+            actionable,
+        )
     )
 
 
@@ -699,22 +919,23 @@ def _inline_context_request(lowered: str) -> bool:
 
 def _draft_requested(lowered: str) -> bool:
     actionable = positive_capability_text(lowered).lower()
-    return any(marker in actionable for marker in ("draft", "reply", "respond"))
+    return any(
+        marker in actionable
+        for marker in ("draft", "reply", "respond", "response")
+    )
 
 
 def _provider_draft_write_requested(lowered: str) -> bool:
-    if re.search(
-        r"\b(?:do not|don't|dont)\b[^.!?]{0,120}"
-        r"\b(?:create|save|write|add)\b[^.!?]{0,40}\b(?:gmail\s+)?draft\b",
-        lowered,
-    ):
-        return False
+    actionable = " ".join(positive_capability_text(lowered).lower().split())
     return bool(
         re.search(
             r"\b(?:create|save|write|add)\b.{0,30}\b(?:gmail\s+)?draft\b",
-            lowered,
+            actionable,
         )
-        or re.search(r"\b(?:save|put)\b.{0,25}\b(?:in|to)\s+gmail\b", lowered)
+        or re.search(
+            r"\b(?:save|put)\b.{0,25}\b(?:in|to)\s+gmail\b",
+            actionable,
+        )
     )
 
 
@@ -807,6 +1028,13 @@ def _query_terms(text: str) -> str:
     subject_query = _gmail_subject_query_term(text)
     if subject_query:
         terms.append(subject_query)
+    relationship_query = _contact_lookup_query(text)
+    if relationship_query:
+        terms.append(relationship_query)
+    else:
+        association_query = associated_gmail_query(text)
+        if association_query:
+            terms.append(association_query)
     if "keystone" in lowered:
         terms.append("Keystone")
     if "opportunit" in lowered:

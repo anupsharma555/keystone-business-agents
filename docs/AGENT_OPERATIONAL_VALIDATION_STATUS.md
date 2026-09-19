@@ -14,6 +14,45 @@ Status vocabulary:
 - **Blocked:** the required context/provider state is currently absent.
 - **N/A:** the dimension does not apply to that control-plane or read-only agent.
 
+## 2026-08-05 Airtable Receipt Create And Attachment
+
+The direct Airtable Context Agent receipt lifecycle is **Proven live for one
+bounded Business Expenses create**. The first post-routing run selected the
+correct composite tool but failed safely before any provider write because the
+deterministic PDF fallback mislabeled a booking-platform legal footer as the
+vendor and selected the hotel stay date instead of the document timestamp.
+Independent Airtable inspection found zero matching records after that failure.
+
+The shared repair preserves receipt intent after Slack removes the explicit
+agent-name prefix and makes booking-confirmation extraction prefer the merchant
+after the confirmation line plus a leading document timestamp. Focused planner,
+tool-admission, parser, and receipt gates pass 535 tests with one optional skip.
+A provider-schema/no-write preview mapped the receipt to Business Expenses with
+Date of Expense `2026-08-05`, Amount `618.00`, Total Expenses `762.75`, and the
+exact PDF attachment field. The first live create then exposed a semantic defect:
+model receipt normalization overwrote the deterministic period `3` with `Q3`
+without first checking the existing period values in the base.
+
+The next serial Slack run called `airtable_create_expense_from_receipt` and
+completed one create, one attachment upload, and provider read-back. Independent
+exact-ID verification found one record with the expected vendor, date, amount,
+total, and one `application/pdf` attachment named
+`BRI-Conference-reservation-receipt.pdf` with 159,066 bytes. The incorrect
+period was on that same record; there was no duplicate expense.
+
+The shared Airtable write boundary now normalizes quarter labels to the base's
+canonical numeric values and reads existing period values before a live expense
+create or update. This protects both Airtable Context Agent and Chief of Staff
+because they use the same write tool. One approved ATC update changed only the
+same record's period from `Q3` to `3`. The model called schema read, exact-record
+read, and write successfully, but Slack initially reported a max-turn failure
+before final synthesis. Exact provider read-back and refreshed Airtable UI both
+prove period `3`, one preserved attachment, no `Q3` group, and an unchanged
+22-record count. The direct business-write budget now reserves four model turns:
+schema, record selection, mutation, and final synthesis. That completion fix is
+offline-proven; no second live mutation was made. Latency and concise output
+remain separate optimization boundaries.
+
 ## 2026-07-29 Five-Call Calendar Semantic Contract Slice
 
 The latest bounded Slack slice is **Partial and not merge-ready**. Exactly five
@@ -1168,6 +1207,7 @@ closing the stale-WorkItem issue.
 | Orchestrator | Proven across direct and graph entrypoints; the corrected source-bundle CLI selected deterministic preflight plus the WorkItem/LangGraph path live | N/A control plane | Proven for bounded supplied-material orchestration into one specialist SDK synthesis | N/A | Target/source identity, typed handoffs, conditional approval, request ceiling, usage receipt, and no-write boundary pass offline and live. The real Slack graph completes Gmail → Research → Outreach with provider IDs internal and one updated-in-place reply | Direct Business Research, the connector-backed graph, direct Zotero, and the exact natural-ask constraint probe all have live Slack evidence, so current readiness is 4/4. |
 | Chief of Staff | Proven offline for manager ownership and structured handoffs; complete Calendar CRUD asks use a direct deterministic fast path | Partial: typed context lanes and agents-as-tools are covered with fakes; live Calendar CRUD and joined Gmail→Calendar execution are proven without graph/model overhead | Calendar execution intentionally needs no model. The joined Gmail path locally selected and extracted one unique future deadline with time while blocking multiple-date ambiguity | Proven live: dedicated KBA OAuth plus all-day and timed create/update/delete contracts; joined Gmail selection created/read back/deleted one marked timed event and verified absence; natural title-based modification works without an event ID in the ask | Joined run inspected one bounded Gmail candidate, retained only hashed source/participant identities, preserved July 24 at 23:59 in `America/New_York`, sent no invitations, modified no Gmail state, and used zero OpenAI requests | Reuse Calendar and joined Gmail evidence. Private weekly-packet synthesis remains outside the Codex launch path until a trusted operator/MAM/ZDR/local-model boundary is available. |
 | Gmail Triage | Proven live for selected-thread interpretation, today-only grouping, same-session revision, sent-style comparison, and exact natural create/update wording | Model reasoning over bounded batches/thread is proven; connector reads, reversible drafts, bounded `SENT`, draft resolution, derived-slide attachment selection, and the dedicated synthetic send tool pass | Selected-thread, batch, continuation, style, and joined create/revision quality pass. The joined runs retain exact synthetic identity, approved facts, approval state, concise copy, and `Sincerely, Anup` | Live provider lifecycles cover marked draft CRUD, derived-slide attachment CRUD, one authorized synthetic send, natural model create/update cleanup, and a selected provider thread → Outreach → verified Gmail draft → exact cleanup handoff | The ANU-192 joined pass used one successful `gpt-5.4-mini` request, 34,034 input/166 output tokens, no retry, and a `$0.0262725` estimate. Exact draft read-back and absence verification passed; no send occurred and the sanitized receipt omits recipient/body content | Primary Gmail R/W/M and the selected-thread Outreach provider-draft bridge are complete. Reuse existing evidence; no second test send, style comparison, or joined lifecycle is needed. |
+| RAG Retrieval Specialist | Explicit named-agent and dedicated graph routing proven offline | Configured hosted file_search only; missing configuration blocks live calls | Semantic and single-article live retrieval succeeded in the initial task; synthetic contracts prove source-linked claims and abstention | Direct hosted retrieval has bounded evidence; graph execution and routing have fixture proof | Read-only; two-search accounting; no public web or provider writes | Negative-path live reproof remains open under ANU-371 after an invalid structured response. No universal live graph or continuation claim. |
 | Business Research Analyst | Proven for single, comparison, research-to-Doc, public-contact, and current-funding asks; supplied-material graph routing passes live | Agent-selected source deduplication/ranking is proven with a fake SDK model. Public contact combines first-party reads with bounded Exa corroboration; funding validation combines one Exa discovery request with deterministic entity/date filtering before one no-tool synthesis | Latest-article synthesis, Zotero-to-NeuroFlow relevance, three-company comparison, NeuroFlow research-to-Doc, current commercial-contact selection, and Headway funding relevance all pass | Direct official-source extraction covers NeuroFlow, Headway, and Spring Health plus Zotero/Crossref metadata. Headway funding retained five correct-company sources and rejected unrelated Headway entities | Headway pass used one model request, 33,491 input/1,473 output tokens, zero retries/tools, and `$0.03174675` estimate. It correctly treated the July 2024 round as 718-day-old background, not fresh opportunity evidence. Source-publication dates now override Exa crawl dates. No draft/send/write occurred | Direct, fixed-source graph, comparison, research-to-Doc, public-contact, and freshness-sensitive funding proofs pass. Reuse them; new live search needs a materially different freshness question and new API allowance if model synthesis is required. |
 | Opportunity Scout | Proven offline for source-provided filtering/ranking and live over a recovered exact two-page packet | Agent-selected deterministic scoring is proven with a fake SDK model; the final supplied-source run used explicit no-tool mode with `tool_count=0`, no search, and no writes | Proven live for the bounded Hack for Humanity assessment: correct event type, unknown geography, upcoming timing, conditional prototype/portfolio fit, missing eligibility, and explicit non-consulting/non-revenue/non-cash boundaries | Direct extraction plus a persisted exact packet and live-model judgment prove the current public opportunity path; no connector lifecycle applies | PASS after offline revalidation of two overly literal acceptance checks. Record, bundle, and result each normalize the two first-party Devpost pages to one independent domain; search metadata is empty. One request, 38,883 tokens, `$0.04699725` maintained estimate, no retry/tool/search/outreach/write | Reuse this proof. Next Opportunity work should be a materially different current-source or graph job, not another same-packet normalization rerun. |
 | Outreach Composer | Proven offline for approved-context drafting/revision and live for fixed-source graph, direct compact revision, and selected Gmail-thread drafting | Agent-selected unsupported-claim validation is proven with a fake SDK model; supplied-context no-tool mode is explicit. The joined live bridge consumes one unique dual-marked Gmail `SENT` thread, uses bounded source IDs and an approved aggregate style profile, then hands exact copy to deterministic Gmail draft execution | Proven direct live for source-backed revision and joined live for a natural receipt-confirmation follow-up with one CTA, no invented relationship, and exact `Sincerely, Anup` signoff | Selected provider-thread identity, model draft, exact approved Gmail create/read-back, marker-gated delete, and absence verification all pass without persisting recipient or draft copy | Four serial learning requests were used: two exposed a redundant literal-test-language validator, one exposed style-profile IDs being misclassified as factual sources, and the post-fix request passed with 34,034 input/166 output tokens and a `$0.0262725` estimate. No run sent email; only the passing run created a draft, which was deleted and confirmed absent | ANU-192's remaining joined provider proof is complete. Keep style/template/example IDs advisory while continuing to reject unknown factual sources; reuse this pass. |
@@ -1661,7 +1701,7 @@ effects. No fixture result can mark the pending live row complete.
   request plus two capped hosted-search requests cost an estimated `$0.054459`.
 - The connector-backed Gmail graph passes with WorkItem
   `wi_b8a3b23a97ed41a5804f4c56c7b3f852` and Slack permalink
-  `https://as-xkn6329.slack.com/archives/C0ASJ6QU1FX/p1783802711400939`.
+  `[private Slack evidence retained locally]`.
   It completed Gmail -> Research -> Outreach over four messages, kept provider
   identity internal, treated resolved scheduling as historical, and returned a
   model-judged KNI collaboration recommendation. Because no immediate reply was
@@ -1837,20 +1877,20 @@ a completed opportunity answer, so Slack-visible response quality is currently
 **FAIL at the execution/transport layer** rather than merely weak at synthesis:
 
 - Broad run 1 (`sbar_b2b2ad44beb148be87e665f11ded988f`,
-  `https://as-xkn6329.slack.com/archives/C0ASJ6QU1FX/p1783875420058549`)
+  `[private Slack evidence retained locally]`)
   blocked before any model call because the redundant live manual planner plus
   Scout turn policy estimated nine requests against the ceiling of eight.
 - Broad run 2 (`sbar_a9719b1dab954303a647cacea93e4547`,
-  `https://as-xkn6329.slack.com/archives/C0ASJ6QU1FX/p1783875604291279`)
+  `[private Slack evidence retained locally]`)
   exposed that the specialist child received only `Quality` as its topic. The
   malformed in-scope child was terminated to stop further API use.
 - Broad run 3 (`sbar_f35b83ecedb64079a33ec5b450ead1a0`,
-  `https://as-xkn6329.slack.com/archives/C0ASJ6QU1FX/p1783875844397919`)
+  `[private Slack evidence retained locally]`)
   received the complete raw request and no duplicate planner, but exceeded the
   child execution window during live retrieval. Its Slack run row remained
   stale in `running` after both child processes exited.
 - Precise grant run 4 (`sbar_fb343231765447818243256b162ff8a1`,
-  `https://as-xkn6329.slack.com/archives/C0ASJ6QU1FX/p1783876137266479`)
+  `[private Slack evidence retained locally]`)
   also received the complete raw request and correctly stayed in the grant-only
   plan, but timed out waiting for a live provider. Slack updated the root status
   to a useful failure while leaving a separate later `Still Running` notice in
@@ -2038,7 +2078,7 @@ official action path, fit, evidence, caveats, and suggested review. Its 172-test
 offline acceptance gate passes.
 
 A human-authored broad professional-development Slack proof then completed at
-`https://as-xkn6329.slack.com/archives/C0ASJ6QU1FX/p1783895108867709`.
+`[private Slack evidence retained locally]`.
 It requested up to three current remote workshops, certifications, or networking
 communities and returned one verified current result rather than padding: the
 official Johns Hopkins AI in Healthcare certificate, with remote access, a
@@ -2861,7 +2901,7 @@ Unknown addresses, unknown messages, and ambiguous thread matches still fail.
 
 Slack API, the stored run record, and Computer inspection show the same terminal
 failure. An independent read-only Gmail connector search confirmed that the
-connected `wisegrow05@gmail.com` mailbox contains the relevant direct
+connected `operator@example.test` mailbox contains the relevant direct
 correspondence; no Gmail write occurred. OpenAI Admin Usage recorded two model
 requests, 31,296 input tokens, and 920 output tokens in the exact run window.
 The first request was the planner and the second was the Gmail specialist.
@@ -3318,6 +3358,203 @@ Live Slack latency and paid-model cache behavior remain unproven; the five-ask
 Calendar acceptance batch still requires a fresh explicit cost allowance.
 The complete no-API repository gate passes 4,791 tests with one intentional
 skip; Ruff and `git diff --check` pass.
+
+### 2026-08-02 eight-gap local implementation checkpoint
+
+This checkpoint is local-only. No commit, push, pull request, deployment, Slack
+post, Gmail mutation, Google Workspace mutation, or other provider write was
+performed. The final offline gate passes 5,087 tests with one intentional skip;
+the deterministic local eval pack passes 59 of 59 cases; repository-wide Ruff
+and `git diff --check` pass.
+
+| Gap | Current evidence-backed state | Live or deployment boundary |
+| --- | --- | --- |
+| Bidirectional registry/tool parity | Registered default builders and `AgentSpec.tools` now match in both directions. Optional and conditional tools are separately declared, including fixture-only Opportunity tools and Chief's conditional Drive OCR. Validation paths name the request-scope coverage. | Agent cards describe the capability ceiling; each run's scope receipt describes the smaller effective toolbox. |
+| Request-scoped tool organization | Only canonical semantic plans can admit elevated tool families. Raw wording, explicit tiers, and heuristic compatibility plans cannot. Direct wrappers and the generic retrieval/synthesis harness persist a full scope receipt in request cache plus a compact trace fingerprint. Weekly Opportunity and company-brief synthesis now use zero tools while their receipts retain the 42-plus candidate ceiling and show a 100% reduction. | Compare trace-selected tools, latency, and answer quality in later live operating runs; no further paid run was made for this final patch. |
+| Opportunity fixture containment | Twelve source-specific search, handoff, and persistence placeholders are declared as optional offline fixtures. Default and canonical active builds omit them, and live SDK execution rejects `include_fixture_tools=true`. | A custom caller that bypasses the supported SDK wrapper remains outside the supported runtime contract. |
+| RSS/Preprints trigger, deduplication, and checkpointing | `keystone.signal_trigger.v1` enters the real WorkItem path; trigger admission is persisted before context artifacts or `DONE`; canonical item/revision identity suppresses duplicate or older work; partial failure and restart reuse completed stages and exact artifacts. Local SQLite admissions are serialized across processes. | The scheduler/Slack producer must still supply the typed trigger through `external_context`. Real repeated-source, provider-failure, process-restart, duplicate-outbound, and Slack-rendering acceptance remain pending. Multi-host execution needs database-level uniqueness/transactions rather than the single-host advisory lock. |
+| Chief/Orchestrator receipt inspection | Both agents have a read-only exact-WorkItem inspector. It verifies route and artifact provenance, reports completed provider/lifecycle stages that must not repeat, preserves blockers and approval precedence, and exposes only `work_item_id` to the model. | Agent-selected inspection during a real failed provider WorkItem remains pending. Standalone recovery files without a WorkItem association are intentionally outside this inspector. |
+| Bounded Gmail schema/query tools | Gmail exposes a mailbox schema, a maximum-20 message-summary query, and exact message/thread context without full bodies or recipient headers. Live reads require both `live=true` and `KEYSTONE_ENABLE_LIVE_GMAIL=true`; missing or mismatched provider message/thread identity fails closed. | Authenticated mailbox selection, trace, latency, and provider-read proof remain pending for a later bounded read-only run. Gmail attachment metadata is visible, but generic attachment-body/PDF acquisition is not yet implemented. |
+| Selected-URL extraction/source bundles | Business Research owns a typed 1-8 URL tool with public-URL validation, bounded excerpts, shared managed-provider budget, per-URL partial-failure diagnostics, final URL/source identity, and typed source-bundle output. Trafilatura checks redirects before following them. Crawl4AI is no longer an automatic fallback and is blocked unless explicitly enabled for a controlled experimental eval. | DNS validation is not connected-peer pinned, managed Firecrawl is a provider trust boundary, and Crawl4AI must add private-address request interception before production promotion. |
+| Drive OCR and safe Slides creation/editing | Google Workspace owns bounded Drive PDF/image OCR with account/folder/file/MIME checks, chunked byte caps, page/character caps, local extraction/OCR, hashes, and no returned bytes. Slides create/replace/append requires exact scope, approval, the write gate, staged content read-back, provider revision control, compensation, and final identity/content verification. | Live Google proof remains pending. OCR decoded-image/raster resource enforcement and a full provider failure lifecycle should receive dedicated live hardening before broad use. |
+
+PDF ownership is intentionally layered:
+
+- Google Workspace Context directly owns Drive PDF/image OCR and Slides read/write.
+- Chief of Staff owns guarded local KNI PDF reading and receives Drive OCR only
+  for an exact canonical Workspace `read` or `verify` plan.
+- Zotero owns one exact parent/attachment PDF read; Airtable owns only the
+  finance receipt extraction lane, not general PDF question answering.
+- Gmail, Business Research, Opportunity, Outreach, and Orchestrator do not
+  receive raw Drive OCR. Gmail and Airtable need source-specific exact
+  attachment acquisition before shared PDF interpretation. Orchestrator routes
+  the work instead of reading the PDF itself.
+- Explicit safe local file input to a live model is a separate transport layer,
+  not a registered function-tool capability.
+
+An earlier bounded model-only diagnostic slice used seven of the authorized ten
+requests and then stopped. It recorded seven successful `gpt-5.4-mini` requests,
+zero tool calls, zero retries, zero external writes, and a local pricing estimate
+of $0.132585. Repeating the same Business Research input produced the same facts
+and source identities; cached input reached 97.42%, latency fell from 5.45 to
+4.55 seconds, and the local estimate fell from $0.01015 to $0.00381. Outreach
+remained the largest prompt/output and latency target. These were model-reasoning
+diagnostics over bounded supplied context, not authenticated provider or Slack
+acceptance. The OpenAI Admin Costs/Usage surface was unavailable, so local
+estimates are not invoice evidence. No additional model request followed the
+final offline changes.
+
+### 2026-08-03 second fidelity campaign pause checkpoint
+
+The second bounded campaign is paused at **13 of 20 actual live model roots** at
+the operator's request. No additional Slack message, provider mutation, or live
+SDK call followed this checkpoint. Gmail Triage, Business Research, Opportunity
+Scout, and Outreach Composer have live coverage. Airtable, Google Workspace,
+Zotero, RSS, Preprints, Orchestrator, Chief of Staff, and the Chief-to-specialist
+or graph multi-agent row remain deferred for the next authorized tranche.
+
+The maintained local model-plus-hosted-search estimate through backend run 6748
+is **$0.20398605**. This is trace-derived pricing-table telemetry, not billing or
+invoice evidence. Current traces distinguish model-visible function calls,
+deterministic helper execution, workflow/provider calls, and provider receipts;
+therefore a zero-tool supplied-fact transformation is no longer reported as an
+unexplained zero-tool run.
+
+The three latest Outreach rows exposed two separate issues. Runs 6746 and 6747
+blocked because the repaired copy still missed the requested word or Contact-gap
+contract. Run 6748 met the measurable format after a second model pass, but that
+repair padded a thin supplied-fact packet with soft interpretation such as fit,
+operational focus, and accountability. It is classified as **partial**, not a
+grounding pass. The direct supplied-context lane now refuses minimum-length
+expansion repair for Outreach: it keeps the first model response, records
+`strict_evidence_length_expansion_disabled`, and blocks when the grounded copy
+is too short instead of spending another call to add unsupported prose.
+Formatting-only and contraction repairs remain available in other lanes.
+
+The affected offline gate passes **1,035 tests**, including every registered
+agent's unique campaign prompt and request-scoped toolbox; focused direct and
+instruction-following coverage passes 64 tests. The complete no-API repository
+gate passes **5,361 tests with one intentional skip**. It also reconciles one
+stale Zotero registry assertion: the self-contained marked-note lifecycle owns
+its create/read-back/update/read-back/delete/absence proof, so the request-scoped
+agent receives only `zotero_test_note_lifecycle`, not two redundant read tools.
+Ruff and `git diff --check` pass. The next live tranche should begin only after
+a fresh cost allowance and should start with the deferred context/provider
+agents, then receipt inspection, Chief-to-specialist, and graph execution.
+Existing live roots should be reused rather than repeated unless a row is
+specifically testing the repaired behavior.
+
+#### Reconciled 13-root acceptance ledger
+
+Slack confirms exactly 13 campaign roots. Twelve map to persisted agent runs
+6736-6748, excluding deterministic helper run 6744. The Pine Harbor Outreach
+root did not create a specialist row: it misrouted into a generic fixture-style
+answer before persistence. This resolves the apparent 12-versus-13 discrepancy.
+
+User-visible acceptance is **2 pass, 6 partial, 3 fail, and 2 truthful safety
+blocks**. Database `success` is not acceptance for Gmail's three-of-four schema
+answer, selected-page requests that used the search lane, truthful-empty
+Opportunity results whose completion flag remained false, Cedar Grove's
+unsupported `physician-led` claim, or Lakeshore's softer unsupported inferences.
+
+The durable root-by-root evidence and seven-root continuation manifest are in
+`artifacts/test-pack/second-fidelity-campaign-pause-ledger.md`. No additional
+live calls should run until a later operator-approved testing session.
+
+Two additional shared defects were then repaired offline without changing the
+historical root classifications. Gmail's schema answer now exposes all four
+model-visible inputs: three bounded query parameters plus the separately gated
+`live` execution control. Opportunity Scout now promotes a strict zero-result
+search as a reader-ready completed answer, preserving the synthesis summary,
+requested count, aggregate candidate counts, one relaxation suggestion, and the
+reason no source URL was promoted. The complete no-API gate after these changes
+passes **5,364 tests with one intentional skip**; Ruff and `git diff --check`
+pass. No model, provider, or Slack call was used for this repair.
+
+The deferred C20 graph row also received a zero-live execution audit. Before
+the repair, its Business Research stage lost the exact selected-page contract
+after the WorkItem target was normalized to a generic topic and substituted
+fixture research. The shared selected-URL admission now follows the typed
+manual plan across staged WorkItem target normalization. A successful bounded
+source receipt may be selected for the exact operator-requested internal draft,
+while external use, provider writes, save, and send remain unapproved. With no
+offline page evidence, the same zero-live CLI probe now stops at
+`selected_url_extraction_empty` instead of falling back to fixture claims. A
+mocked-provider regression proves the Cartwheel URL remains the sole source and
+the resulting artifact is selected only for thread-local drafting. The focused
+WorkflowRunner plus 20-case campaign-readiness gate passes **435 tests**; Ruff
+and `git diff --check` pass. This is offline execution evidence, not completion
+of the still-deferred live C20 graph row.
+
+The full deferred-run execution audit is now green offline. Airtable, Google
+Docs, and Zotero each have both fake-model lifecycle-tool selection and mocked
+provider same-object create/update/delete cleanup proof. RSS and Preprints each
+have fake-model history plus checkpoint inspection with consumed receipts and no
+mutation. Chief has a nested fake-model Business Research handoff whose inner
+model calls bounded selected-page extraction and preserves the original ask.
+
+C20 now has one-WorkItem graph proof across Opportunity, exact selected-page
+Research, and Outreach. That audit exposed two additional shared defects: exact
+draft constraints were restricted to prompts labeled as supplied facts, and a
+withheld draft could reappear from stale legacy `subject`/`body` fields during
+SQLite persistence. Exact constraints now cover selected-page and thread-local
+drafts, a repair call requires live model mode, URLs count as one human word, and
+canonical blank fields suppress legacy aliases. A nonconforming offline draft is
+withheld; a mocked live-synthesis repair produces exactly 70 words with the
+visible source URL before persistence.
+
+The affected no-API gate passes **1,022 tests**. The complete no-API repository
+gate passes **5,375 tests with one intentional skip**; repository-wide Ruff and
+scoped `git diff --check` pass. No live SDK, Slack, provider, deployment, or
+GitHub action was used. The campaign remains **13/20**, with C14-C20 reserved for
+the later serial live tranche.
+
+## 2026-08-04 Gmail Agent-Owned Selection Reproof Checkpoint
+
+The newest natural Slack Gmail test is **failed live but repaired offline**. The
+request asked Gmail Triage to find the current conversation for a same-day
+interview, exclude cancellations and obsolete times, and return Slack-only
+follow-up copy without creating or sending a Gmail draft. Run 6782 reached the
+correct specialist and blocked after the allowed repair. Transient child
+diagnostics reported one bounded Gmail query, 10 message summaries across seven
+conversations, candidate reads, and a plausible current-thread selection, but
+the historical persisted run contains no attached/called-tool records or
+durable provider receipt. Provider execution is therefore not durably proven.
+The diagnosed validation failure required assessments for the whole query
+universe rather than the smaller set of conversations the agent had actually
+read. No Gmail mutation was observed or reported, but the missing receipt means
+the historical provider outcome remains incomplete evidence.
+
+The generalized local repair keeps semantic ownership with Gmail Triage while
+making the evidence boundary exact: query results define allowed identities;
+successfully read conversations define the required comparison set; message and
+thread aliases normalize only through returned provider mappings; and unknown
+or contradictory identities fail closed. The agent still owns query arguments,
+bounded reads, comparison, exclusions, reply relevance, and wording. One
+validator-driven repair replays the same evidence without repeating the Gmail
+query or any completed context read. Structured child failures now preserve
+tools, provider attempts and receipts, decision attempts, usage, request budget,
+and latency. The phrase `set aside` is also treated as filtering, not update
+authority.
+
+The complete no-API repository gate now passes **5,783 tests with one
+intentional skip**. Focused coverage proves the 10-message/seven-thread/four-read
+case, exact message-to-thread canonicalization, rejection of fabricated or
+contradictory identities, and one successful tool-free repair with no provider
+reread. Repository-wide Ruff and `git diff --check` pass. The Slack worker was
+restarted after the final edits; launchd reports it running and its health record
+shows a current connected Socket Mode hello. This proves a post-edit restart and
+connectivity, not a loaded source fingerprint or the repaired Gmail behavior.
+
+The diagnostic run took 54.455 seconds end to end: about 15.08 seconds in the
+Orchestrator model stage and 36.014 seconds in the Gmail child process. The next
+proof is one separately authorized, novel, read-only Gmail Slack reproof. A
+baseline pass requires one Orchestrator request, one Gmail query, one to four
+candidate reads, an explicit selected conversation and exclusions, no repair,
+no writes, complete correlated trace evidence, and no more than 75 seconds end
+to end. One clearly traced repair may be classified as recovered if it finishes
+within 90 seconds. Stop immediately on any failure, missing receipt/trace, or
+unexpected side effect. No post-fix live run has occurred yet.
 
 ## Priority Order
 

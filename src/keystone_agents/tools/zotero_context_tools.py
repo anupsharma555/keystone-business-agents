@@ -14,13 +14,22 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from keystone_agents.config import parse_bool
 from keystone_agents.context_env import context_env_value
 from keystone_agents.guardrails import keystone_tool_guardrail_kwargs
+from keystone_agents.receipts.journal import durable_provider_tool, record_provider_observation
+from keystone_agents.receipts.normalization import identity_fingerprints
+from keystone_agents.schemas.zotero_reads import (
+    ZoteroChildrenContinuation,
+    ZoteroMetadataContinuation,
+    ZoteroMetadataScope,
+    ZoteroNoteContinuation,
+    ZoteroPdfContinuation,
+)
 from keystone_agents.sdk import function_tool
 from keystone_agents.source_specific_enrichment import enrich_source_reference
 from keystone_agents.zotero_research import (
@@ -167,6 +176,19 @@ def zotero_list_cached_items(
             "status": "success" if items else "not_found",
             "items": items,
             "item_count": len(items),
+            "identity_fingerprints": identity_fingerprints(
+                (
+                    item.get("item_key")
+                    or item.get("key")
+                    or (
+                        item.get("data", {}).get("key")
+                        if isinstance(item.get("data"), Mapping)
+                        else ""
+                    )
+                )
+                for item in items
+                if isinstance(item, Mapping)
+            ),
             "item_type_filter": item_type.strip(),
             "source": "local_zotero_cache",
             "send_enabled": False,
@@ -195,6 +217,14 @@ def _zotero_api_path(
     return f"{base}/items/top" if top_level_only else f"{base}/items"
 
 
+class _ZoteroAPIItems(list):
+    """Keep transport coverage without changing the JSON-list read contract."""
+
+    def __init__(self, items: list[Any], headers: Mapping[str, Any]) -> None:
+        super().__init__(items)
+        self.read_headers = {str(k).lower(): str(v) for k, v in headers.items()}
+
+
 def _read_zotero_api_json(path: str, *, api_key: str, params: dict[str, Any]) -> Any:
     query = f"?{urlencode(params)}" if params else ""
     request = Request(
@@ -206,7 +236,73 @@ def _read_zotero_api_json(path: str, *, api_key: str, params: dict[str, Any]) ->
         },
     )
     with urlopen(request, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8"))
+        payload = json.loads(response.read().decode("utf-8"))
+        if isinstance(payload, list):
+            return _ZoteroAPIItems(payload, getattr(response, "headers", {}))
+        return payload
+
+
+def _zotero_page_coverage(
+    payload: Any,
+    *,
+    path: str,
+    start: int,
+    limit: int,
+    pages_read: int,
+    expected_version: int | None = None,
+) -> dict[str, Any]:
+    headers = getattr(payload, "read_headers", {})
+    total = headers.get("total-results", "")
+    total = int(total) if str(total).isdigit() else None
+    version = headers.get("last-modified-version", "")
+    version = int(version) if str(version).isdigit() else None
+    if expected_version is not None and version != expected_version:
+        raise RuntimeError("Zotero library version changed or is unavailable; restart the read.")
+    count = len(payload) if isinstance(payload, list) else 1
+    next_start = None
+    limitations: list[str] = []
+    for link in headers.get("link", "").split(","):
+        match = re.search(r'<([^>]+)>;\s*rel="next"', link)
+        if not match:
+            continue
+        target = urlsplit(match.group(1))
+        # Never follow a provider-supplied URL or broaden its query: only its
+        # bounded offset is used with the original typed scope.
+        if target.scheme != "https" or target.netloc != "api.zotero.org" or target.path != path:
+            raise RuntimeError("Zotero next-page link does not match the selected source.")
+        value = parse_qs(target.query).get("start", [""])[0]
+        if not value.isdigit() or int(value) <= start:
+            raise RuntimeError("Zotero next-page offset is invalid.")
+        if int(value) != start + count:
+            raise RuntimeError("Zotero next-page offset would skip or overlap source records.")
+        next_start = int(value)
+    if next_start is None and total is not None and start + count < total and count:
+        next_start = start + count
+    complete = not isinstance(payload, list) or (
+        total is not None and start + count >= total and next_start is None
+    )
+    if total is None and isinstance(payload, list):
+        limitations.append("Provider total is unavailable; absence is limited to this page.")
+    if next_start is not None and (pages_read >= 10 or next_start >= 1000):
+        limitations.append("The continuation budget of 10 pages / 1000 records was reached.")
+    if next_start is not None and version is None:
+        limitations.append("A source version is required before continuing this read.")
+    return {
+        "scope": "single_item" if not isinstance(payload, list) else "provider_page",
+        "start": start,
+        "page_size_limit": limit,
+        "provider_items_on_page": count,
+        "total_results": total,
+        "library_version": version,
+        "pages_read": pages_read,
+        "complete": complete,
+        "has_more": next_start is not None,
+        "next_start": next_start,
+        "continuation_supported": bool(
+            next_start is not None and next_start < 1000 and pages_read < 10 and version is not None
+        ),
+        "limitations": limitations,
+    }
 
 
 def _read_zotero_api_bytes(path: str, *, api_key: str) -> tuple[bytes, str]:
@@ -273,6 +369,7 @@ def zotero_read_api_metadata(
     collection_key: str = "",
     item_key: str = "",
     query: str = "",
+    tag: str = "",
     limit: int = 25,
     sort: str = "",
     direction: str = "",
@@ -280,20 +377,55 @@ def zotero_read_api_metadata(
     item_type: str = "",
     require_abstract: bool = False,
     selection_rank: int = 1,
+    selection_count: int = 1,
+    include_abstract_text: bool = True,
     live: bool = False,
+    continuation: ZoteroMetadataContinuation | None = None,
 ) -> str:
-    """Read Zotero API metadata for libraries, collections, or items without mutation."""
+    """Read bounded Zotero metadata using title/creator `query` or exact `tag`."""
 
+    if continuation is not None:
+        continuation = ZoteroMetadataContinuation.model_validate(continuation)
+        supplied = {
+            name: value for name, value in locals().copy().items()
+            if name in ZoteroMetadataScope.model_fields
+        }
+        defaults = ZoteroMetadataScope(library_id="").model_dump()
+        scope = continuation.scope
+        for name, value in supplied.items():
+            if value != defaults[name] and value != getattr(scope, name):
+                raise ValueError(f"Zotero continuation cannot change {name}.")
+        library_id, library_type = scope.library_id, scope.library_type
+        collection_key, item_key = scope.collection_key, scope.item_key
+        query, tag, limit = scope.query, scope.tag, scope.limit
+        sort, direction = scope.sort, scope.direction
+        top_level_only, item_type = scope.top_level_only, scope.item_type
+        require_abstract = scope.require_abstract
+        selection_rank, selection_count = scope.selection_rank, scope.selection_count
+        include_abstract_text = scope.include_abstract_text
+    if library_type not in {"user", "group"}:
+        raise ValueError("library_type must be user or group.")
     clean_selection_rank = int(selection_rank or 1)
     if not 1 <= clean_selection_rank <= 10:
         raise ValueError("selection_rank must be between 1 and 10.")
+    clean_selection_count = int(selection_count or 1)
+    if not 1 <= clean_selection_count <= 10:
+        raise ValueError("selection_count must be between 1 and 10.")
     bounded_limit = min(
-        max(int(limit or 25), clean_selection_rank),
+        max(
+            int(limit or 25),
+            clean_selection_rank + clean_selection_count - 1,
+        ),
         100,
     )
     params = {"limit": bounded_limit}
+    if continuation is not None:
+        params["start"] = continuation.next_start
+        params["limit"] = min(bounded_limit, 1000 - continuation.next_start)
     if query.strip():
         params["q"] = query.strip()
+    if tag.strip():
+        params["tag"] = tag.strip()
     clean_item_type = item_type.strip()
     allowed_item_types = {
         "journalArticle",
@@ -360,6 +492,7 @@ def zotero_read_api_metadata(
                     else "ranked_item_in_provider_order"
                 ),
                 "selection_rank": clean_selection_rank,
+                "selection_count": clean_selection_count,
                 "provider_order": {
                     "sort": clean_sort,
                     "direction": clean_direction,
@@ -367,6 +500,7 @@ def zotero_read_api_metadata(
                     "item_type": clean_item_type,
                 },
                 "require_abstract": bool(require_abstract),
+                "include_abstract_text": bool(include_abstract_text),
                 "send_enabled": False,
                 "zotero_write_supported": False,
                 "required_live_env": ["ZOTERO_API_KEY", "ZOTERO_LIBRARY_ID"],
@@ -410,6 +544,16 @@ def zotero_read_api_metadata(
         )
         payload = _read_zotero_api_json(path, api_key=api_key, params=params)
         library_id_resolution = "api_key_current_user_after_configured_403"
+    if not isinstance(payload, list | dict):
+        raise RuntimeError("Zotero metadata returned an invalid response.")
+    coverage = _zotero_page_coverage(
+        payload,
+        path=path,
+        start=continuation.next_start if continuation else 0,
+        limit=int(params["limit"]),
+        pages_read=continuation.pages_read + 1 if continuation else 1,
+        expected_version=continuation.library_version if continuation else None,
+    )
     items = payload if isinstance(payload, list) else [payload]
     if require_abstract:
         items = [
@@ -420,15 +564,36 @@ def zotero_read_api_metadata(
             and str(item["data"].get("abstractNote") or "").strip()
         ]
     available_item_count = len(items)
-    items = items[clean_selection_rank - 1 : clean_selection_rank]
+    eligible_seen = continuation.eligible_items_seen if continuation else 0
+    selection_start = max(0, clean_selection_rank - 1 - eligible_seen)
+    selection_end = max(0, clean_selection_rank - 1 + clean_selection_count - eligible_seen)
+    items = items[selection_start:selection_end]
+    next_page = None
+    if coverage["continuation_supported"]:
+        next_page = ZoteroMetadataContinuation(
+            scope=ZoteroMetadataScope(
+                library_id=resolved_library_id, library_type=library_type,
+                collection_key=collection_key, item_key=item_key, query=query, tag=tag,
+                limit=bounded_limit, sort=clean_sort, direction=clean_direction,
+                top_level_only=top_level_only, item_type=clean_item_type,
+                require_abstract=require_abstract, selection_rank=clean_selection_rank,
+                selection_count=clean_selection_count, include_abstract_text=include_abstract_text,
+            ),
+            next_start=coverage["next_start"], pages_read=coverage["pages_read"],
+            eligible_items_seen=eligible_seen + available_item_count,
+            library_version=coverage["library_version"],
+        ).model_dump(mode="json")
     selected_data = (
         items[0].get("data")
         if items and isinstance(items[0], dict) and isinstance(items[0].get("data"), dict)
         else {}
     )
+    selected_item_has_abstract = bool(str(selected_data.get("abstractNote") or "").strip())
+    if not include_abstract_text:
+        items = [_zotero_item_without_abstract_text(item) for item in items]
     return _json_payload(
         {
-            "status": "success" if items else "not_found",
+            "status": "success" if items else "partial" if coverage["has_more"] else "not_found",
             "api_base_url": ZOTERO_API_BASE_URL,
             "path": path,
             "params": params,
@@ -444,7 +609,12 @@ def zotero_read_api_metadata(
                 else "ranked_item_in_provider_order"
             ),
             "selection_rank": clean_selection_rank,
+            "selection_count": clean_selection_count,
             "available_item_count": available_item_count,
+            "available_item_count_scope": "current_page_after_filtering",
+            "absence_scope": "complete_query" if coverage["complete"] else "current_page",
+            "coverage": coverage,
+            "continuation": next_page,
             "provider_order": {
                 "sort": clean_sort,
                 "direction": clean_direction,
@@ -452,20 +622,49 @@ def zotero_read_api_metadata(
                 "item_type": clean_item_type,
             },
             "require_abstract": bool(require_abstract),
+            "include_abstract_text": bool(include_abstract_text),
             "items": items,
             "item_count": len(items),
+            "identity_fingerprints": identity_fingerprints(
+                (
+                    item.get("key")
+                    or (
+                        item.get("data", {}).get("key")
+                        if isinstance(item.get("data"), Mapping)
+                        else ""
+                    )
+                )
+                for item in items
+                if isinstance(item, Mapping)
+            ),
             "selected_item_title": str(selected_data.get("title") or ""),
             "selected_item_key": str(
                 items[0].get("key") if items and isinstance(items[0], dict) else ""
             ),
-            "selected_item_has_abstract": bool(
-                str(selected_data.get("abstractNote") or "").strip()
-            ),
+            "selected_item_has_abstract": selected_item_has_abstract,
             "selected_item_date_added": str(selected_data.get("dateAdded") or ""),
             "send_enabled": False,
             "zotero_write_supported": False,
         }
     )
+
+
+def _zotero_item_without_abstract_text(item: Any) -> Any:
+    """Preserve abstract presence while withholding the abstract body."""
+
+    if not isinstance(item, dict):
+        return item
+    projected = dict(item)
+    data = item.get("data")
+    if not isinstance(data, dict):
+        return projected
+    projected_data = dict(data)
+    projected_data["abstractPresent"] = bool(
+        str(projected_data.get("abstractNote") or "").strip()
+    )
+    projected_data.pop("abstractNote", None)
+    projected["data"] = projected_data
+    return projected
 
 
 @function_tool(**keystone_tool_guardrail_kwargs())
@@ -475,12 +674,35 @@ def zotero_read_item_children(
     library_type: str = "user",
     limit: int = 50,
     live: bool = False,
+    continuation: ZoteroChildrenContinuation | None = None,
+    note_continuation: ZoteroNoteContinuation | None = None,
 ) -> str:
     """Read bounded notes and attachment metadata for one exact Zotero parent item."""
 
     clean_parent = str(parent_item_key or "").strip()
     if not clean_parent:
         raise ValueError("parent_item_key is required for Zotero child reads.")
+    if continuation is not None and note_continuation is not None:
+        raise ValueError("Continue either a child page or one note, not both.")
+    if continuation is not None:
+        continuation = ZoteroChildrenContinuation.model_validate(continuation)
+    if note_continuation is not None:
+        note_continuation = ZoteroNoteContinuation.model_validate(note_continuation)
+    cursor = continuation or note_continuation
+    if cursor is not None:
+        if clean_parent != cursor.parent_item_key:
+            raise ValueError("Zotero continuation cannot change the parent item.")
+        if library_id and library_id != cursor.library_id:
+            raise ValueError("Zotero continuation cannot change the library.")
+        if library_type != "user" and library_type != cursor.library_type:
+            raise ValueError("Zotero continuation cannot change the library type.")
+        library_id, library_type = cursor.library_id, cursor.library_type
+    if continuation is not None:
+        if limit != 50 and limit != continuation.limit:
+            raise ValueError("Zotero continuation cannot change the page limit.")
+        limit = continuation.limit
+    if library_type not in {"user", "group"}:
+        raise ValueError("library_type must be user or group.")
     bounded_limit = min(max(int(limit or 50), 1), 100)
     explicit_library_id = str(library_id or "").strip()
     planned_path = _zotero_api_path(
@@ -497,6 +719,7 @@ def zotero_read_item_children(
                 "parent_item_key": clean_parent,
                 "limit": bounded_limit,
                 "supported_child_types": ["note", "attachment"],
+                "note_continuation": note_continuation.model_dump() if note_continuation else None,
                 "send_enabled": False,
                 "zotero_write_supported": False,
             }
@@ -511,13 +734,17 @@ def zotero_read_item_children(
             library_type=current_library_type,
             library_id=current_library_id,
             collection_key="",
-            item_key=clean_parent,
-        ) + "/children"
+            item_key=note_continuation.note_item_key if note_continuation else clean_parent,
+        ) + ("" if note_continuation else "/children")
 
     path = child_path(resolved_library_id, library_type)
     library_id_resolution = "explicit" if explicit_library_id else "configured"
+    params = {} if note_continuation else {"limit": bounded_limit}
+    if continuation is not None:
+        params["start"] = continuation.next_start
+        params["limit"] = min(bounded_limit, 1000 - continuation.next_start)
     try:
-        payload = _read_zotero_api_json(path, api_key=api_key, params={"limit": bounded_limit})
+        payload = _read_zotero_api_json(path, api_key=api_key, params=params)
     except HTTPError as exc:
         may_resolve_current_user = (
             exc.code == 403
@@ -528,24 +755,73 @@ def zotero_read_item_children(
             raise
         resolved_library_id = _current_zotero_user_library_id(api_key)
         path = child_path(resolved_library_id, "user")
-        payload = _read_zotero_api_json(path, api_key=api_key, params={"limit": bounded_limit})
+        payload = _read_zotero_api_json(path, api_key=api_key, params=params)
         library_id_resolution = "api_key_current_user_after_configured_403"
-    children = payload if isinstance(payload, list) else []
+    if note_continuation:
+        if not isinstance(payload, dict) or _zotero_item_data(payload).get("itemType") != "note":
+            raise RuntimeError("Zotero note identity or type changed; restart the read.")
+    elif not isinstance(payload, list):
+        raise RuntimeError("Zotero children returned an invalid response.")
+    coverage = _zotero_page_coverage(
+        payload, path=path, start=continuation.next_start if continuation else 0,
+        limit=int(params.get("limit", 1)),
+        pages_read=continuation.pages_read + 1 if continuation else 1,
+        expected_version=continuation.library_version if continuation else None,
+    )
+    children = [payload] if note_continuation else payload if isinstance(payload, list) else []
+    next_page = None
+    if not note_continuation and coverage["continuation_supported"]:
+        next_page = ZoteroChildrenContinuation(
+            library_id=resolved_library_id, library_type=library_type,
+            parent_item_key=clean_parent, limit=bounded_limit,
+            next_start=coverage["next_start"], pages_read=coverage["pages_read"],
+            library_version=coverage["library_version"],
+        ).model_dump(mode="json")
     projected_children: list[dict[str, Any]] = []
-    for child in children[:bounded_limit]:
+    for child in children[:int(params.get("limit", bounded_limit))]:
         if not isinstance(child, dict):
             continue
         data = child.get("data") if isinstance(child.get("data"), dict) else {}
         item_type = str(data.get("itemType") or "").strip()
         if item_type not in {"note", "attachment"}:
             continue
-        raw_note = str(data.get("note") or "")[:12000]
+        if str(data.get("parentItem") or "").strip() != clean_parent:
+            raise RuntimeError("The selected Zotero child does not belong to the parent item.")
+        child_key = str(child.get("key") or data.get("key") or "").strip()
+        version = child.get("version", data.get("version"))
+        raw_note = str(data.get("note") or "")
+        source_sha256 = hashlib.sha256(raw_note.encode("utf-8")).hexdigest()
         note_text = html.unescape(re.sub(r"<[^>]+>", " ", raw_note))
         note_text = " ".join(note_text.split())
+        offset = note_continuation.next_char if note_continuation else 0
+        if note_continuation is not None and (
+            item_type != "note" or child_key != note_continuation.note_item_key
+            or version != note_continuation.version
+            or source_sha256 != note_continuation.source_sha256
+        ):
+            raise RuntimeError("Zotero note identity, version or source changed; restart the read.")
+        if offset > len(note_text):
+            raise ValueError("Zotero note continuation starts beyond the source text.")
+        end = min(offset + 12000, len(note_text))
+        windows_read = note_continuation.windows_read + 1 if note_continuation else 1
+        next_note = None
+        note_limitations = (
+            ["Normalized note text does not interpret HTML layout, links, tables or images."]
+            if item_type == "note" else []
+        )
+        if end < len(note_text):
+            if isinstance(version, int) and version >= 0 and child_key and windows_read < 10:
+                next_note = ZoteroNoteContinuation(
+                    library_id=resolved_library_id, library_type=library_type,
+                    parent_item_key=clean_parent, note_item_key=child_key, version=version,
+                    source_sha256=source_sha256, next_char=end, windows_read=windows_read,
+                ).model_dump(mode="json")
+            else:
+                note_limitations.append("Note continuation needs source identity/version and is capped at 10 windows.")
         projected_children.append(
             {
-                "item_key": str(child.get("key") or data.get("key") or "").strip(),
-                "version": child.get("version"),
+                "item_key": child_key,
+                "version": version,
                 "item_type": item_type,
                 "parent_item_key": str(data.get("parentItem") or "").strip(),
                 "title": str(data.get("title") or "").strip(),
@@ -553,8 +829,18 @@ def zotero_read_item_children(
                 "content_type": str(data.get("contentType") or "").strip(),
                 "link_mode": str(data.get("linkMode") or "").strip(),
                 "url": str(data.get("url") or "").strip(),
-                "note": raw_note,
-                "note_text": note_text,
+                "note": raw_note[:12000] if not note_continuation else "",
+                "note_html_included": not bool(note_continuation),
+                "note_html_truncated": len(raw_note) > 12000,
+                "note_text": note_text[offset:end],
+                "note_text_coverage": {
+                    "representation": "normalized_plain_text",
+                    "char_start": offset, "char_end": end, "total_chars": len(note_text),
+                    "complete": offset == 0 and end == len(note_text),
+                    "has_more": end < len(note_text), "source_sha256": source_sha256,
+                    "windows_read": windows_read, "limitations": note_limitations,
+                },
+                "note_continuation": next_note,
                 "tags": data.get("tags") if isinstance(data.get("tags"), list) else [],
                 "date_added": str(data.get("dateAdded") or "").strip(),
                 "date_modified": str(data.get("dateModified") or "").strip(),
@@ -567,6 +853,10 @@ def zotero_read_item_children(
             "path": path,
             "library_id_resolution": library_id_resolution,
             "parent_item_key": clean_parent,
+            "library_id": resolved_library_id,
+            "library_type": library_type,
+            "coverage": coverage,
+            "continuation": next_page,
             "children": projected_children,
             "child_count": len(projected_children),
             "note_count": sum(item["item_type"] == "note" for item in projected_children),
@@ -579,6 +869,47 @@ def zotero_read_item_children(
     )
 
 
+def _zotero_pdf_visual_flags(page: Any) -> tuple[bool, bool, bool]:
+    """Inspect page/form operators; do not render, OCR or decode image pixels."""
+
+    raster = vector = False
+    visited: set[int] = set()
+
+    def inspect_resources(node: Any, depth: int = 0) -> None:
+        nonlocal raster, vector
+        if depth > 12 or len(visited) > 100:
+            raise ValueError("PDF visual resource inspection limit reached.")
+        node = node.get_object() if hasattr(node, "get_object") else node
+        if id(node) in visited:
+            return
+        visited.add(id(node))
+        if node.get("/Subtype") == "/Image":
+            raster = True
+        resources = node.get("/Resources", {})
+        resources = resources.get_object() if hasattr(resources, "get_object") else resources
+        objects = resources.get("/XObject", {})
+        objects = objects.get_object() if hasattr(objects, "get_object") else objects
+        for child in objects.values():
+            inspect_resources(child, depth + 1)
+        if hasattr(node, "get_contents"):
+            contents = node.get_contents()
+        elif hasattr(node, "get_data") and node.get("/Subtype") == "/Form":
+            from pypdf.generic import ContentStream
+
+            contents = ContentStream(node, getattr(page, "pdf", None))
+        else:
+            contents = None
+        for _, operator in getattr(contents, "operations", []):
+            raster = raster or operator == b"INLINE IMAGE"
+            vector = vector or operator in {b"m", b"l", b"re", b"S", b"f", b"f*", b"sh"}
+
+    try:
+        inspect_resources(page)
+    except Exception:
+        return raster, vector, False
+    return raster, vector, True
+
+
 @function_tool(**keystone_tool_guardrail_kwargs())
 def zotero_read_pdf_attachment_text(
     parent_item_key: str,
@@ -588,6 +919,7 @@ def zotero_read_pdf_attachment_text(
     max_pages: int = 25,
     max_chars: int = 50000,
     live: bool = False,
+    continuation: ZoteroPdfContinuation | None = None,
 ) -> str:
     """Read bounded text from one exact PDF attachment without persisting the file."""
 
@@ -595,6 +927,24 @@ def zotero_read_pdf_attachment_text(
     clean_attachment = str(attachment_item_key or "").strip()
     if not clean_parent or not clean_attachment:
         raise ValueError("parent_item_key and attachment_item_key are required.")
+    if continuation is not None:
+        continuation = ZoteroPdfContinuation.model_validate(continuation)
+        if (clean_parent, clean_attachment) != (
+            continuation.parent_item_key, continuation.attachment_item_key,
+        ):
+            raise ValueError("Zotero PDF continuation cannot change the parent or attachment.")
+        if library_id and library_id != continuation.library_id:
+            raise ValueError("Zotero PDF continuation cannot change the library.")
+        if library_type != "user" and library_type != continuation.library_type:
+            raise ValueError("Zotero PDF continuation cannot change the library type.")
+        if (max_pages != 25 and max_pages != continuation.max_pages) or (
+            max_chars != 50000 and max_chars != continuation.max_chars
+        ):
+            raise ValueError("Zotero PDF continuation cannot change the read limits.")
+        library_id, library_type = continuation.library_id, continuation.library_type
+        max_pages, max_chars = continuation.max_pages, continuation.max_chars
+    if library_type not in {"user", "group"}:
+        raise ValueError("library_type must be user or group.")
     bounded_pages = min(max(int(max_pages or 25), 1), 100)
     bounded_chars = min(max(int(max_chars or 50000), 1000), 200000)
     explicit_library_id = str(library_id or "").strip()
@@ -647,6 +997,12 @@ def zotero_read_pdf_attachment_text(
         raise RuntimeError("The selected Zotero child is not an attachment.")
     if str(data.get("parentItem") or "").strip() != clean_parent:
         raise RuntimeError("The selected Zotero attachment does not belong to the parent item.")
+    source_key = str(attachment.get("key") or data.get("key") or "")
+    source_version = attachment.get("version", data.get("version"))
+    if source_key and source_key != clean_attachment:
+        raise RuntimeError("Zotero attachment identity does not match the selected item.")
+    if continuation and (source_key != clean_attachment or source_version != continuation.version):
+        raise RuntimeError("Zotero attachment identity or version changed; restart the read.")
     content_type = str(data.get("contentType") or "").lower().strip()
     filename = str(data.get("filename") or data.get("title") or "").strip()
     if content_type != "application/pdf" and not filename.lower().endswith(".pdf"):
@@ -657,33 +1013,98 @@ def zotero_read_pdf_attachment_text(
     )
     if not file_payload.startswith(b"%PDF-"):
         raise RuntimeError("Zotero attachment bytes did not have a valid PDF signature.")
+    source_sha256 = hashlib.sha256(file_payload).hexdigest()
+    if continuation and source_sha256 != continuation.source_sha256:
+        raise RuntimeError("Zotero attachment bytes changed; restart the read.")
     try:
         from pypdf import PdfReader  # type: ignore[import-not-found]
     except ImportError as exc:  # pragma: no cover - dependency boundary
         raise RuntimeError("PDF text extraction requires optional pypdf.") from exc
     reader = PdfReader(io.BytesIO(file_payload))
     page_count = len(reader.pages)
-    text_parts = [
-        str(reader.pages[index].extract_text() or "")
-        for index in range(min(page_count, bounded_pages))
-    ]
-    extracted = "\n\n".join(text_parts).strip()
-    truncated = len(extracted) > bounded_chars or page_count > bounded_pages
+    start_page = continuation.next_page if continuation else 0
+    start_char = continuation.next_char if continuation else 0
+    if start_page >= page_count and continuation:
+        raise ValueError("Zotero PDF continuation starts beyond the source pages.")
+    text_parts: list[str] = []
+    pages: list[dict[str, Any]] = []
+    next_page, next_char = start_page, start_char
+    remaining = bounded_chars
+    for index in range(start_page, min(page_count, start_page + bounded_pages)):
+        if remaining <= 2:
+            break
+        page = reader.pages[index]
+        text = str(page.extract_text() or "")
+        offset = start_char if index == start_page else 0
+        if offset > len(text):
+            raise ValueError("Zotero PDF continuation starts beyond the page text.")
+        raster, vector, visual_inspected = _zotero_pdf_visual_flags(page)
+        allowance = remaining - (2 if text_parts else 0)
+        piece = text[offset:offset + allowance]
+        text_parts.append(piece)
+        remaining -= len(piece) + (2 if len(text_parts) > 1 else 0)
+        end = offset + len(piece)
+        pages.append({
+            "page_number": index + 1, "char_start": offset, "char_end": end,
+            "total_text_chars": len(text), "has_text": bool(text.strip()),
+            "text_complete": offset == 0 and end == len(text),
+            "raster_content_detected": raster, "vector_content_detected": vector,
+            "visual_inspection_complete": visual_inspected,
+            "visual_content_read": False,
+            "ocr_required": raster or not bool(text.strip()),
+        })
+        if end < len(text):
+            next_page, next_char = index, end
+            break
+        next_page, next_char = index + 1, 0
+    extracted = "\n\n".join(text_parts)
+    truncated = next_page < page_count
+    visual_gap = any(
+        item["raster_content_detected"] or item["vector_content_detected"] or not item["has_text"]
+        for item in pages
+    )
+    limitations = ["Selectable-text extraction does not verify visual meaning, layout or table relationships."]
+    if visual_gap:
+        limitations.append("Image, drawing or text-empty pages remain unread; this Zotero tool does not support OCR or visual interpretation.")
+    if any(not item["visual_inspection_complete"] for item in pages):
+        limitations.append("Visual resource inspection was incomplete for one or more pages.")
+    windows_read = continuation.windows_read + 1 if continuation else 1
+    next_window = None
+    if truncated:
+        if source_key == clean_attachment and isinstance(source_version, int) and source_version >= 0 and windows_read < 10:
+            next_window = ZoteroPdfContinuation(
+                library_id=resolved_library_id, library_type=library_type,
+                parent_item_key=clean_parent, attachment_item_key=clean_attachment,
+                version=source_version, source_sha256=source_sha256,
+                next_page=next_page, next_char=next_char,
+                max_pages=bounded_pages, max_chars=bounded_chars, windows_read=windows_read,
+            ).model_dump(mode="json")
+        else:
+            limitations.append("PDF continuation needs source identity/version and is capped at 10 windows.")
     return _json_payload(
         {
-            "status": "success",
+            "status": "partial" if visual_gap else "success" if extracted.strip() else "unsupported",
             "provider_read": True,
             "library_id_resolution": library_id_resolution,
             "parent_item_key": clean_parent,
             "attachment_item_key": clean_attachment,
+            "library_id": resolved_library_id,
+            "library_type": library_type,
+            "version": source_version,
             "filename": filename,
             "content_type": content_type or response_content_type,
             "page_count": page_count,
-            "pages_read": min(page_count, bounded_pages),
-            "text": extracted[:bounded_chars],
-            "char_count": min(len(extracted), bounded_chars),
+            "pages_read": len(pages),
+            "pages": pages,
+            "text": extracted,
+            "char_count": len(extracted),
             "truncated": truncated,
-            "sha256": hashlib.sha256(file_payload).hexdigest(),
+            "coverage": "partial" if truncated or visual_gap else "selectable_text_only",
+            "ocr_supported": False,
+            "visual_content_read": False,
+            "limitations": limitations,
+            "continuation": next_window,
+            "sha256": source_sha256,
             "file_persisted": False,
             "send_enabled": False,
             "zotero_write_supported": False,
@@ -934,6 +1355,7 @@ def zotero_creator_names(creators: Any) -> list[str]:
     return list(dict.fromkeys(names))
 
 
+@durable_provider_tool("zotero_write_test_note")
 def zotero_write_test_note_impl(
     note_html: str,
     *,
@@ -1034,6 +1456,11 @@ def zotero_write_test_note_impl(
         if not resolved_item_key:
             raise RuntimeError("Zotero test-note create returned no item key.")
 
+    record_provider_observation({
+        "status": "observed", "provider": "zotero", "operation": clean_operation,
+        "item_key": resolved_item_key, "provider_write": True,
+        "verification": {"passed": False, "status": "pending_readback"},
+    })
     after = _zotero_get_item(
         item_key=resolved_item_key,
         library_id=resolved_library_id,
@@ -1094,6 +1521,7 @@ def zotero_write_test_note(
     )
 
 
+@durable_provider_tool("zotero_delete_test_note")
 def zotero_delete_test_note_impl(
     item_key: str,
     *,
@@ -1152,6 +1580,11 @@ def zotero_delete_test_note_impl(
         headers={"If-Unmodified-Since-Version": str(version)},
         expected_statuses=(204,),
     )
+    record_provider_observation({
+        "status": "observed", "provider": "zotero", "operation": "delete_test_note",
+        "item_key": clean_item_key, "provider_write": True,
+        "verification": {"passed": False, "status": "pending_readback"},
+    })
     after_status, _after, _headers = _zotero_http_request(
         "GET",
         path,
@@ -1342,6 +1775,7 @@ def zotero_test_note_lifecycle(
     )
 
 
+@durable_provider_tool("zotero_write_test_collection")
 def zotero_write_test_collection_impl(
     name: str,
     *,
@@ -1435,6 +1869,11 @@ def zotero_write_test_collection_impl(
         resolved_key = _zotero_created_object_key(created)
         if not resolved_key:
             raise RuntimeError("Zotero test-collection create returned no collection key.")
+    record_provider_observation({
+        "status": "observed", "provider": "zotero", "operation": clean_operation,
+        "collection_key": resolved_key, "provider_write": True,
+        "verification": {"passed": False, "status": "pending_readback"},
+    })
     after = _zotero_get_collection(
         collection_key=resolved_key,
         library_id=resolved_library_id,
@@ -1492,6 +1931,7 @@ def zotero_write_test_collection(
     )
 
 
+@durable_provider_tool("zotero_write_test_item")
 def zotero_write_test_item_impl(
     title: str,
     *,
@@ -1593,6 +2033,11 @@ def zotero_write_test_item_impl(
         resolved_key = _zotero_created_object_key(created)
         if not resolved_key:
             raise RuntimeError("Zotero test-item create returned no item key.")
+    record_provider_observation({
+        "status": "observed", "provider": "zotero", "operation": clean_operation,
+        "item_key": resolved_key, "provider_write": True,
+        "verification": {"passed": False, "status": "pending_readback"},
+    })
     after = _zotero_get_item(
         item_key=resolved_key,
         library_id=resolved_library_id,
@@ -1666,6 +2111,7 @@ def zotero_write_test_item(
     )
 
 
+@durable_provider_tool("zotero_delete_test_item")
 def zotero_delete_test_item_impl(
     item_key: str,
     *,
@@ -1718,6 +2164,11 @@ def zotero_delete_test_item_impl(
         headers={"If-Unmodified-Since-Version": str(_zotero_item_version(before))},
         expected_statuses=(204,),
     )
+    record_provider_observation({
+        "status": "observed", "provider": "zotero", "operation": "delete_test_item",
+        "item_key": clean_key, "provider_write": True,
+        "verification": {"passed": False, "status": "pending_readback"},
+    })
     status, _payload, _headers = _zotero_http_request(
         "GET", path, api_key=api_key, expected_statuses=(200, 404)
     )
@@ -1759,6 +2210,7 @@ def zotero_delete_test_item(
     )
 
 
+@durable_provider_tool("zotero_delete_test_collection")
 def zotero_delete_test_collection_impl(
     collection_key: str,
     *,
@@ -1823,6 +2275,11 @@ def zotero_delete_test_collection_impl(
         headers={"If-Unmodified-Since-Version": str(_zotero_object_version(before))},
         expected_statuses=(204,),
     )
+    record_provider_observation({
+        "status": "observed", "provider": "zotero", "operation": "delete_test_collection",
+        "collection_key": clean_key, "provider_write": True,
+        "verification": {"passed": False, "status": "pending_readback"},
+    })
     status, _payload, _headers = _zotero_http_request(
         "GET", path, api_key=api_key, expected_statuses=(200, 404)
     )

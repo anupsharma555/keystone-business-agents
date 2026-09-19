@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
+
+import pytest
 
 from keystone_agents.memory import (
     approval_decision_memory_item,
@@ -19,7 +22,11 @@ from keystone_agents.memory import (
     retrieval_tool_performance_memory_item,
 )
 from keystone_agents.outreach_examples import retrieve_outreach_examples_local
-from keystone_agents.schemas.approval import ApprovalDecisionRecord, ApprovalQueueItem
+from keystone_agents.schemas.approval import (
+    ApprovalDecisionRecord,
+    ApprovalQueueItem,
+    ApprovalState,
+)
 from keystone_agents.schemas.company_profile import CompanyProfile, SourceRecord
 from keystone_agents.schemas.feedback import FeedbackRecord
 from keystone_agents.schemas.opportunity import OpportunityRecord, OpportunitySource
@@ -676,3 +683,88 @@ def test_chief_of_staff_memory_context_excludes_expired_and_superseded(
 
     assert [item.title for item in context.records] == ["Current Beacon decision"]
     assert context.send_enabled is False
+
+
+def test_memory_eligibility_precedes_ranking_and_limit(tmp_path) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    current_id = store.save_memory_item(
+        chief_of_staff_memory_item(
+            memory_type="project_goal", title="Current synthetic goal",
+            summary="Current objective", object_key="synthetic", source_ids=["fixture:goal"],
+        )
+    )
+    for expiry in ("2020-01-01T00:00:00Z", "not-a-timestamp"):
+        store.save_memory_item(
+            chief_of_staff_memory_item(
+                memory_type="project_goal", title="Ineligible synthetic goal",
+                summary="Current objective", object_key="synthetic",
+                source_ids=["fixture:goal"], expires_at=expiry, confidence=1.0,
+            )
+        )
+
+    direct = json.loads(retrieve_memory(
+        query="objective", object_key="synthetic", limit=1, database_url=database_url,
+    ))
+    chief = build_chief_of_staff_memory_context(
+        query="objective", object_key="synthetic", limit=1, database_url=database_url,
+    )
+
+    assert [record["id"] for record in direct["records"]] == [current_id]
+    assert [record.id for record in chief.records] == [current_id]
+    assert len(store.list_memory_items()) == 3
+
+
+def test_memory_supersession_is_independent_of_search_terms(tmp_path) -> None:
+    store = SQLiteStore(_database_url(tmp_path))
+    old_id = store.save_memory_item(chief_of_staff_memory_item(
+        memory_type="project_goal", title="Prior synthetic goal", summary="Old vocabulary",
+        object_key="synthetic", source_ids=["fixture:old"],
+    ))
+    store.save_memory_item(chief_of_staff_memory_item(
+        memory_type="project_decision", title="Replacement decision", summary="New direction",
+        object_key="synthetic", source_ids=["fixture:new"], supersedes_memory_id=old_id,
+        expires_at="2020-01-01T00:00:00Z",
+    ))
+
+    assert store.retrieve_memory(query="vocabulary", memory_types=["project_goal"]) == []
+    assert len(store.list_memory_items()) == 2
+
+
+@pytest.mark.parametrize("replacement_state", [ApprovalState.PENDING, ApprovalState.REJECTED])
+def test_unapproved_replacement_does_not_hide_current_memory(tmp_path, replacement_state) -> None:
+    store = SQLiteStore(_database_url(tmp_path))
+    old_id = store.save_memory_item(chief_of_staff_memory_item(
+        memory_type="project_goal", title="Current synthetic goal", summary="Current objective",
+        object_key="synthetic", source_ids=["fixture:current"],
+    ))
+    store.save_memory_item(chief_of_staff_memory_item(
+        memory_type="project_goal", title="Proposed replacement", summary="Other objective",
+        object_key="synthetic", source_ids=["fixture:proposal"],
+        supersedes_memory_id=old_id, approval_state=replacement_state,
+    ))
+
+    assert [item.id for item in store.retrieve_memory(object_key="synthetic")] == [old_id]
+
+
+def test_memory_expiration_uses_one_utc_boundary(tmp_path, monkeypatch) -> None:
+    from keystone_agents.storage import sqlite_store
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 10, 12, tzinfo=UTC)
+
+    store = SQLiteStore(_database_url(tmp_path))
+    for title, expiry in (
+        ("expired exactly", "2026-09-10T12:00:00Z"),
+        ("expired naive", "2026-09-10T12:00:00"),
+        ("valid offset", "2026-09-10T08:00:01-04:00"),
+    ):
+        store.save_memory_item(chief_of_staff_memory_item(
+            memory_type="project_goal", title=title, summary="Synthetic objective",
+            source_ids=["fixture:clock"], expires_at=expiry,
+        ))
+    monkeypatch.setattr(sqlite_store, "datetime", FixedDatetime)
+
+    assert [item.title for item in store.retrieve_memory()] == ["valid offset"]

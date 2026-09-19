@@ -12,6 +12,16 @@ from typing import Any
 
 from keystone_agents.execution_telemetry import compact_execution_telemetry
 from keystone_agents.model_provider import sanitize_trace_metadata
+from keystone_agents.runtime.output_validation import sanitized_output_diagnostics
+from keystone_agents.runtime.tool_execution import (
+    external_write_state_from_evidence,
+    sdk_tool_execution_records,
+    sdk_tool_output_payloads,
+)
+from keystone_agents.usage_projection import (
+    nonnegative_usage_integer,
+    project_request_usage_entries,
+)
 
 _REGISTERED_PROCESSOR: KeystoneEvalTraceProcessor | None = None
 _REGISTER_LOCK = threading.Lock()
@@ -139,7 +149,8 @@ def record_sdk_run_summary_trace_event(
     db_path = _sdk_summary_database_path(database_path)
     if db_path is None:
         return None
-    request_cache = request_cache or {}
+    if request_cache is None:
+        request_cache = {}
     usage = usage or {}
     cost = cost or {}
     budget_guard = budget_guard or {}
@@ -180,7 +191,7 @@ def record_sdk_run_summary_trace_event(
     try:
         from promptfoo.eval_database import record_eval_trace_event
 
-        return record_eval_trace_event(
+        row_id = record_eval_trace_event(
             event_type="sdk_run_summary",
             trace_id=str(trace_id),
             name="sdk_run_summary",
@@ -189,6 +200,14 @@ def record_sdk_run_summary_trace_event(
             duration_ms=duration_ms,
             database_path=db_path,
         )
+        request_cache["trace_summary"] = _sdk_trace_storage_link(
+            row_id=row_id,
+            trace_id=str(trace_id),
+            group_id=str(correlation.get("case_id") or correlation.get("work_item_id") or ""),
+            observed=_observed_sdk_activity(raw_result),
+            raw_result=raw_result,
+        )
+        return row_id
     except Exception:
         return None
 
@@ -228,6 +247,16 @@ def _sdk_run_summary_metadata(
     execution_telemetry: dict[str, Any],
 ) -> dict[str, Any]:
     observed = _observed_sdk_activity(raw_result)
+    observed_tool_outputs = [
+        item["output"]
+        for item in sdk_tool_output_payloads(raw_result)
+        if isinstance(item.get("output"), dict)
+    ]
+    external_write_state = external_write_state_from_evidence(
+        receipts=observed_tool_outputs,
+        tool_names=list(observed["tool_call_counts"]),
+        evidence_complete=raw_result is not None,
+    )
     turns_used, turns_source = _turns_used(raw_result, usage)
     retrieval_errors = len(search_diagnostics.get("search_provider_errors") or [])
     retrieval_error_types = _clean_issue_types(
@@ -260,6 +289,19 @@ def _sdk_run_summary_metadata(
     failure_text = _clean_scalar(failure_kind)
     retry_total = max(0, int(retry_count or 0))
     repair_total = max(0, int(repair_loop_count or 0))
+    custom_evidence = sdk_tool_custom_trace_evidence(raw_result)
+    nested_specialist_executions = _dedupe_trace_records(
+        [
+            *list(request_cache.get("nested_specialist_executions") or []),
+            *custom_evidence["nested_specialist_executions"],
+        ]
+    )
+    nested_live_read_enforcements = _dedupe_trace_records(
+        [
+            *list(request_cache.get("nested_live_read_enforcements") or []),
+            *custom_evidence["nested_live_read_enforcements"],
+        ]
+    )
     has_orchestrator_preflight = bool(
         orchestrator_diagnostics.get("has_preflight")
         or orchestrator_diagnostics.get("preflight")
@@ -313,6 +355,8 @@ def _sdk_run_summary_metadata(
         "handoff_count": observed["handoff_count"],
         "retry_count": retry_total,
         "repair_loop_count": repair_total,
+        "nested_specialist_executions": nested_specialist_executions,
+        "nested_live_read_enforcements": nested_live_read_enforcements,
         "retrieval_provider_summary": {
             "provider_summary": _clean_scalar(search_diagnostics.get("provider_summary")),
             "providers_used": _clean_string_list(search_diagnostics.get("providers_used")),
@@ -329,10 +373,16 @@ def _sdk_run_summary_metadata(
         },
         "token_summary": {
             "available": bool(usage.get("available")),
-            "input_tokens": _safe_int(usage.get("input_tokens")),
-            "cached_input_tokens": _safe_int(usage.get("cached_input_tokens")),
-            "output_tokens": _safe_int(usage.get("output_tokens")),
-            "total_tokens": _safe_int(usage.get("total_tokens")),
+            "input_tokens": nonnegative_usage_integer(usage.get("input_tokens")),
+            "cached_input_tokens": nonnegative_usage_integer(usage.get("cached_input_tokens")),
+            "cache_write_input_tokens": nonnegative_usage_integer(
+                usage.get("cache_write_input_tokens"),
+            ),
+            "request_usage_entries": project_request_usage_entries(
+                usage.get("request_usage_entries"),
+            ),
+            "output_tokens": nonnegative_usage_integer(usage.get("output_tokens")),
+            "total_tokens": nonnegative_usage_integer(usage.get("total_tokens")),
             "cache_hit_rate": _safe_float(usage.get("cache_hit_rate")),
         },
         "cost_summary": {
@@ -349,6 +399,9 @@ def _sdk_run_summary_metadata(
             "raw_tool_io_included": False,
         },
     }
+    validation_diagnostics = sanitized_output_diagnostics(request_cache.get("validation_diagnostics"))
+    if validation_diagnostics.get("failures"):
+        metadata["validation_diagnostics"] = validation_diagnostics
     execution_timing = compact_execution_telemetry(execution_telemetry)
     if execution_timing:
         metadata["execution_timing"] = execution_timing
@@ -361,6 +414,7 @@ def _sdk_run_summary_metadata(
                     "model",
                     "tooling",
                     "child_steps",
+                    "nested_specialist_decisions",
                     "retrieval",
                     "orchestrator",
                     "approval",
@@ -393,6 +447,12 @@ def _sdk_run_summary_metadata(
                 "tool_call_summary": observed["tool_call_summary"],
                 "child_step_summary": observed["child_step_summary"],
                 "handoff_count": observed["handoff_count"],
+                "nested_specialist_execution_count": len(
+                    nested_specialist_executions
+                ),
+                "nested_live_read_enforcement_count": len(
+                    nested_live_read_enforcements
+                ),
                 "has_tool_metadata": bool(observed["tool_call_count"] or failed_tool_count or tool_names),
             },
             "retrieval": {
@@ -429,7 +489,11 @@ def _sdk_run_summary_metadata(
                 "send_enabled": False,
             },
             "side_effects": {
-                "external_write_performed": False,
+                "external_write_state": external_write_state,
+                # Compatibility projection; callers needing certainty must read
+                # external_write_state rather than treating False as proof.
+                "external_write_performed": external_write_state == "performed",
+                "external_write_evidence_available": external_write_state != "unknown",
                 "storage_mode": "api_redacted" if live else "local_review",
             },
             "error_retry": {
@@ -464,6 +528,9 @@ def _sdk_run_summary_metadata(
                     or orchestrator_blocker_count > 0
                 ),
                 "has_child_step_metadata": bool(observed["child_step_summary"]),
+                "has_nested_specialist_metadata": bool(
+                    nested_specialist_executions
+                ),
                 "has_web_extraction_issues": web_extraction_issue_count > 0,
                 "has_error_or_retry": (
                     status_text not in {"", "ok", "done", "success"}
@@ -526,13 +593,338 @@ def _safe_correlation(trace_metadata: dict[str, Any]) -> dict[str, str]:
     return result
 
 
+def _sdk_trace_storage_link(
+    *,
+    row_id: int,
+    trace_id: str,
+    group_id: str,
+    observed: dict[str, Any],
+    raw_result: Any,
+) -> dict[str, Any]:
+    """Return the bounded join record persisted with the later agent-run row."""
+
+    execution_records = {
+        record.call_index: record for record in sdk_tool_execution_records(raw_result)
+    }
+    calls = [
+        {
+            "call_order": int(item.get("step_index") or 0),
+            "name": _clean_scalar(item.get("name")),
+            "status": _clean_scalar(item.get("status")),
+            "call_id_fingerprint": (
+                hashlib.sha256(record.call_id.encode("utf-8")).hexdigest()
+                if (record := execution_records.get(int(item.get("step_index") or 0)))
+                else ""
+            ),
+            "output_observed": bool(record.output_observed) if record else False,
+            **(
+                {"duration_ms": _safe_float(item.get("duration_ms"))}
+                if item.get("duration_ms") is not None
+                else {}
+            ),
+        }
+        for item in observed.get("child_step_summary") or []
+        if isinstance(item, dict)
+        and item.get("category") == "tool"
+        and _clean_scalar(item.get("name"))
+    ][:50]
+    return {
+        "schema": "keystone.sdk_trace_storage_link.v1",
+        "event_id": int(row_id),
+        "event_type": "sdk_run_summary",
+        "trace_id": _clean_scalar(trace_id, identifier=True),
+        "group_id": _clean_scalar(group_id, identifier=True),
+        "model_tool_calls": calls,
+        "handoff_count": max(0, int(observed.get("handoff_count") or 0)),
+        "nested_specialist_execution_count": len(
+            sdk_tool_custom_trace_evidence(raw_result)["nested_specialist_executions"]
+        ),
+        "raw_arguments_retained": False,
+        "raw_outputs_retained": False,
+    }
+
+
+def sdk_tool_custom_trace_evidence(raw_result: Any) -> dict[str, list[dict[str, Any]]]:
+    """Return privacy-safe evidence retained in SDK tool-output custom data."""
+
+    nested_records: list[dict[str, Any]] = []
+    live_enforcements: list[dict[str, Any]] = []
+    for item in _result_items(raw_result):
+        custom_data = getattr(item, "custom_data", None)
+        if isinstance(item, dict):
+            custom_data = item.get("custom_data", custom_data)
+        if not isinstance(custom_data, dict):
+            continue
+        nested = custom_data.get("keystone_nested_specialist_execution")
+        if isinstance(nested, dict):
+            nested_records.append(_sanitize_nested_specialist_execution(nested))
+        enforcement = custom_data.get("keystone_nested_live_read_enforcement")
+        values = enforcement if isinstance(enforcement, list | tuple) else [enforcement]
+        for value in values:
+            if isinstance(value, dict):
+                live_enforcements.append(_sanitize_nested_live_read_enforcement(value))
+    return {
+        "nested_specialist_executions": _dedupe_trace_records(nested_records),
+        "nested_live_read_enforcements": _dedupe_trace_records(live_enforcements),
+    }
+
+
+def _sanitize_nested_specialist_execution(record: dict[str, Any]) -> dict[str, Any]:
+    """Redact one nested execution while preserving decision and validator origin."""
+
+    ownership = record.get("decision_ownership")
+    ownership = dict(ownership) if isinstance(ownership, dict) else {}
+    attempts = ownership.get("attempts")
+    if not isinstance(attempts, list | tuple):
+        attempts = [ownership] if ownership.get("validator_outcome") else []
+    sanitized_attempts: list[dict[str, Any]] = []
+    for index, attempt in enumerate(attempts[:4], start=1):
+        if not isinstance(attempt, dict):
+            continue
+        validator = attempt.get("validator_outcome")
+        validator = dict(validator) if isinstance(validator, dict) else {}
+        sanitized_attempts.append(
+            {
+                "attempt": _safe_int(attempt.get("attempt")) or index,
+                "decision_owner": _clean_scalar(
+                    attempt.get("decision_owner") or ownership.get("decision_owner")
+                ),
+                "decision_stage": _clean_scalar(
+                    attempt.get("decision_stage") or ownership.get("decision_stage")
+                ),
+                "candidate_identity_fingerprints": _identity_fingerprints(
+                    attempt.get("candidate_ids")
+                    or attempt.get("candidate_identity_fingerprints")
+                ),
+                "selected_identity_fingerprints": _identity_fingerprints(
+                    attempt.get("selected_candidate_ids")
+                    or attempt.get("selected_identity_fingerprints")
+                ),
+                "excluded_identity_fingerprints": _identity_fingerprints(
+                    attempt.get("excluded_candidate_ids")
+                    or attempt.get("excluded_identity_fingerprints")
+                ),
+                "reasoning_fingerprint": _fingerprint_value(attempt.get("reasoning")),
+                "limitation_fingerprints": [
+                    _fingerprint_value(value)
+                    for value in list(attempt.get("limitations") or [])[:20]
+                    if str(value).strip()
+                ],
+                "validator_status": _clean_scalar(validator.get("status")),
+                "validator_reason_code": _clean_scalar(validator.get("reason_code")),
+            }
+        )
+    receipts = [
+        value for value in list(record.get("receipts") or []) if isinstance(value, dict)
+    ]
+    origins = [
+        _sanitize_nested_tool_origin(value)
+        for value in list(record.get("tool_origins") or [])[:8]
+        if isinstance(value, dict)
+    ]
+    handoff = record.get("handoff")
+    handoff = dict(handoff) if isinstance(handoff, dict) else {}
+    usage = record.get("usage")
+    usage = dict(usage) if isinstance(usage, dict) else {}
+    call_id = str(record.get("tool_call_id") or "")
+    return {
+        "schema": "keystone.nested_specialist_trace.v1",
+        "origin": "sdk_tool_call_output_custom_data",
+        "custom_data_key": "keystone_nested_specialist_execution",
+        "route_name": _clean_scalar(record.get("route_name")),
+        "tool_name": _clean_scalar(record.get("tool_name")),
+        "tool_call_id_fingerprint": _fingerprint_value(call_id),
+        "execution_state": _clean_scalar(record.get("execution_state")),
+        "nested_execution_mode": _clean_scalar(record.get("nested_execution_mode")),
+        "decision_owner": _clean_scalar(ownership.get("decision_owner")),
+        "decision_stage": _clean_scalar(ownership.get("decision_stage")),
+        "decision_attempts": sanitized_attempts,
+        "candidate_identity_fingerprints": _identity_fingerprints(
+            record.get("candidate_universe")
+            or record.get("candidate_identity_fingerprints")
+        ),
+        "selected_identity_fingerprints": _identity_fingerprints(
+            record.get("selected_identity_fingerprints")
+        ),
+        "tool_origins": origins,
+        "live_read_enforcements": [
+            _sanitize_nested_live_read_enforcement(value)
+            for value in list(record.get("nested_live_read_enforcements") or [])[:20]
+            if isinstance(value, dict)
+        ],
+        "receipt_count": len(receipts),
+        "receipt_fingerprints": [_fingerprint_value(value) for value in receipts[:20]],
+        "usage": {
+            **{
+                key: nonnegative_usage_integer(usage.get(key))
+                for key in (
+                    "attempt_count", "requests", "input_tokens", "output_tokens",
+                    "total_tokens", "cached_input_tokens", "cache_write_input_tokens",
+                    "reasoning_output_tokens",
+                )
+                if key in usage
+            },
+            **({"request_usage_entries": project_request_usage_entries(
+                usage["request_usage_entries"],
+            )} if "request_usage_entries" in usage else {}),
+        },
+        "repair_attempts": _safe_int(record.get("repair_attempts")),
+        "limitation_fingerprints": [
+            _fingerprint_value(value)
+            for value in list(record.get("limitations") or [])[:20]
+            if str(value).strip()
+        ],
+        "handoff": {
+            "state": _clean_scalar(handoff.get("state")),
+            "consumption_status": _clean_scalar(handoff.get("consumption_status")),
+            "terminal_status": _clean_scalar(handoff.get("terminal_status")),
+        },
+        "provider_write_executed": bool(record.get("provider_write_executed")),
+        "reason_code": _clean_scalar(record.get("reason_code")),
+        "raw_sensitive_values_retained": False,
+    }
+
+
+def _sanitize_nested_live_read_enforcement(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": "keystone.nested_live_read_enforcement_trace.v1",
+        "origin": "sdk_tool_call_output_custom_data",
+        "custom_data_key": "keystone_nested_live_read_enforcement",
+        "tool_name": _clean_scalar(record.get("tool_name")),
+        "requested_live": (
+            bool(record.get("requested_live"))
+            if record.get("requested_live") is not None
+            else None
+        ),
+        "effective_live": bool(record.get("effective_live")),
+        "enforced": bool(record.get("enforced")),
+        "read_only": bool(record.get("read_only")),
+        "mutation_capability_enabled": False,
+        "raw_sensitive_values_retained": False,
+    }
+
+
+def _sanitize_nested_tool_origin(value: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "mode",
+        "model_tool_call_count",
+        "workflow_tool_call_count",
+        "provider_request_attempt_count",
+        "provider_request_success_count",
+        "provider_receipt_count",
+    )
+    result = {key: value.get(key) for key in keys if value.get(key) is not None}
+    for key in (
+        "selected_tool_names",
+        "model_called_tool_names",
+        "workflow_called_tool_names",
+        "workflow_called_helper_names",
+        "preacquired_context_tool_names",
+    ):
+        names = _clean_string_list(value.get(key))
+        if names:
+            result[key] = names
+    return result
+
+
+def _identity_fingerprints(value: Any) -> list[str]:
+    if not isinstance(value, list | tuple):
+        return []
+    result: list[str] = []
+    for item in value[:100]:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        fingerprint = (
+            text.lower()
+            if re.fullmatch(r"[a-fA-F0-9]{64}", text)
+            else _fingerprint_value(text)
+        )
+        if fingerprint not in result:
+            result.append(fingerprint)
+    return result
+
+
+def _fingerprint_value(value: Any) -> str:
+    text = str(value or "").strip()
+    return hashlib.sha256(text.encode("utf-8")).hexdigest() if text else ""
+
+
+def _dedupe_trace_records(values: list[Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in values[:50]:
+        if not isinstance(value, dict):
+            continue
+        fingerprint = _fingerprint_value(repr(sorted(value.items())))
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        result.append(dict(value))
+    return result
+
+
 def _observed_sdk_activity(raw_result: Any) -> dict[str, Any]:
+    items = _result_items(raw_result)
+    tool_records = sdk_tool_execution_records({"new_items": items})
     tool_counts: dict[str, int] = {}
     tool_failed_counts: dict[str, int] = {}
     tool_statuses: dict[str, set[str]] = {}
     handoff_count = 0
     child_step_summary: list[dict[str, Any]] = []
-    for step_index, item in enumerate(_result_items(raw_result), start=1):
+    tool_item_indices = {
+        index
+        for record in tool_records
+        for index in (record.call_index, record.output_index)
+        if index is not None
+    }
+    for record in tool_records:
+        name = _clean_scalar(record.tool_name)
+        if not name:
+            continue
+        failed = bool(
+            record.status
+            in {
+                "blocked",
+                "canceled",
+                "cancelled",
+                "denied",
+                "dry-run",
+                "dry_run",
+                "error",
+                "failed",
+                "failure",
+                "not_executed",
+                "partial",
+                "pending",
+                "preview",
+                "rejected",
+                "skipped",
+                "timed_out",
+                "timeout",
+                "unavailable",
+                "verification_failed",
+            }
+            or (record.output_observed and not record.succeeded)
+        )
+        tool_counts[name] = tool_counts.get(name, 0) + 1
+        tool_statuses.setdefault(name, set()).add(record.status)
+        if failed:
+            tool_failed_counts[name] = tool_failed_counts.get(name, 0) + 1
+        call_item = items[record.call_index - 1]
+        child_step_summary.append(
+            {
+                "step_index": record.call_index,
+                "category": "tool",
+                "name": name,
+                "status": "failed" if failed else record.status,
+                "duration_ms": _activity_duration_ms(call_item),
+                "error_kind": "tool_output_failed" if failed else "",
+            }
+        )
+    for step_index, item in enumerate(items, start=1):
+        if step_index in tool_item_indices:
+            continue
         kind = _activity_kind(item)
         name = _activity_name(item)
         category = _activity_category(kind, name)
@@ -549,16 +941,7 @@ def _observed_sdk_activity(raw_result: Any) -> dict[str, Any]:
             )
         if "handoff" in kind or "handoff" in name.lower():
             handoff_count += 1
-            continue
-        if "tool" in kind or "function" in kind or name:
-            safe_name = _clean_scalar(name or "unknown_tool")
-            if safe_name:
-                tool_counts[safe_name] = tool_counts.get(safe_name, 0) + 1
-                status = _activity_status(item)
-                if status:
-                    tool_statuses.setdefault(safe_name, set()).add(status)
-                if status in {"error", "failed", "failure", "timeout"} or _activity_error_kind(item):
-                    tool_failed_counts[safe_name] = tool_failed_counts.get(safe_name, 0) + 1
+    child_step_summary.sort(key=lambda item: int(item["step_index"]))
     tool_call_summary = []
     for name, count in sorted(tool_counts.items()):
         failed_count = tool_failed_counts.get(name, 0)

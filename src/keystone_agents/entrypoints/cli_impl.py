@@ -16,6 +16,7 @@ import sys
 import tempfile
 import traceback
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -24,6 +25,7 @@ from typing import Any
 from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from keystone_agents.agent_decision_contracts import context_agent_decision_contract
 from keystone_agents.agent_mentions import AgentMention, parse_agent_mention
 from keystone_agents.agent_registry import AGENT_REGISTRY, agent_cards
 from keystone_agents.agents.calendar_action_interpreter import (
@@ -35,16 +37,22 @@ from keystone_agents.agents.calendar_action_interpreter import (
 )
 from keystone_agents.agents.chief_of_staff import (
     plan_chief_of_staff_request,
+    run_chief_of_staff_sdk,
 )
+from keystone_agents.agents.gmail_triage import is_gmail_schema_only_request
 from keystone_agents.agents.orchestrator import (
     OrchestratorPreflight,
     build_orchestrator_agent,
+    reconcile_orchestrator_work_item_inspection,
     review_specialist_output,
     route_request,
     run_orchestrator_preflight,
     run_orchestrator_sdk,
 )
-from keystone_agents.authority.semantic import ExecutionIntentAuthority
+from keystone_agents.authority.semantic import (
+    ExecutionIntentAuthority,
+    is_read_only_work_item_inspection_plan,
+)
 from keystone_agents.automation_inventory import (
     build_automation_inventory_report,
     ensure_default_automation_inventory,
@@ -56,8 +64,10 @@ from keystone_agents.calendar_actions import (
     is_calendar_action_candidate,
 )
 from keystone_agents.capabilities.profile import (
+    child_result_explicitly_unverified,
     compile_child_result_promotion_receipt,
 )
+from keystone_agents.capabilities.tool_scope import tool_scope_receipt_for_agent
 from keystone_agents.child_process import run_isolated_child_process
 from keystone_agents.cli_sdk import add_sdk_session_arguments
 from keystone_agents.config import (
@@ -107,22 +117,35 @@ from keystone_agents.gmail_triage.execution_plan import (
     gmail_provider_read_scope,
     resolve_gmail_execution_plan,
 )
+from keystone_agents.guardrails import assess_unsupported_outreach_claims
 from keystone_agents.health import format_health_report, report_to_json, run_health_check
 from keystone_agents.instruction_following import (
+    canonical_source_url,
+    canonical_source_urls,
+    constraint_admission_has_unresolved,
     instruction_following_blocker_text,
     interpreted_output_constraints_text,
     output_constraints_from_plan,
+    raw_request_output_contract,
     resolve_instruction_following_response,
+    resolved_output_constraints,
+    validate_output_constraints,
 )
 from keystone_agents.live_retrieval import (
     company_source_matches_official_url,
     infer_official_company_url,
 )
-from keystone_agents.local_file_inputs import local_file_input_bundle_from_text
+from keystone_agents.local_file_inputs import (
+    LocalFileInputBundle,
+    local_file_input_bundle_from_operator_input,
+    local_file_input_bundle_from_text,
+    read_supported_local_file,
+)
 from keystone_agents.model_provider import get_runtime_agent_model_config
 from keystone_agents.models import RunMode
 from keystone_agents.multi_target_research import should_run_multi_target_research
 from keystone_agents.operator_failures import (
+    OperatorReadableFailure,
     known_exception_to_operator_failure,
     operator_failure_from_mapping,
     redact_operator_text,
@@ -133,17 +156,23 @@ from keystone_agents.orchestration.stages import (
     inline_gmail_fixture_from_request,
 )
 from keystone_agents.orchestrator.preflight_context import (
+    ORCHESTRATOR_ROUTE_RESULT_ENV,
     compact_orchestrator_preflight_payload,
     orchestrator_preflight_env,
     specialist_execution_context_text,
 )
 from keystone_agents.outreach_composer.execution_plan import infer_outreach_execution_plan
+from keystone_agents.outreach_composer.inline_context import (
+    normalize_inline_outreach_request_text,
+    parse_inline_outreach_fact_packet,
+)
 from keystone_agents.planning.compatibility import (
     has_explicit_local_attachment_context,
     has_materialized_slack_attachment_context,
     infer_manual_request_plan,
     is_internal_slack_composition_plan,
     live_search_allowed_for_execution,
+    looks_like_airtable_schema_request,
     looks_like_stateful_work_request,
     looks_like_supplied_context_synthesis_request,
     positive_capability_text,
@@ -151,20 +180,95 @@ from keystone_agents.planning.compatibility import (
     resolve_manual_request_owner,
 )
 from keystone_agents.planning.composition_admission import (
+    CONTEXT_ONLY_RESPONSE_ROUTES,
+    is_context_only_response_plan,
     is_provider_free_selected_context_draft_plan,
+    is_selected_public_url_read_plan,
 )
-from keystone_agents.presentation.public_result import attach_execution_public_result
+from keystone_agents.presentation.public_result import (
+    attach_execution_public_result,
+    build_work_item_result_payload,
+    ensure_work_item_user_facing_summary,
+)
 from keystone_agents.presentation.renderers import (
     render_markdown_table,
     render_work_item_result_text,
     sensitive_text_summary,
 )
-from keystone_agents.quality_budget import is_bounded_chief_response_only_request
-from keystone_agents.receipts.mutations import receipt_reports_possible_write
+from keystone_agents.quality_budget import (
+    business_research_quality_budget,
+    chief_of_staff_quality_budget,
+    is_bounded_chief_response_only_request,
+    opportunity_scout_quality_budget,
+)
+from keystone_agents.receipts.journal import (
+    instrument_agent_tools,
+    mutation_tool_names,
+    reset_tool_receipt_journal,
+    retry_receipt_context,
+    tool_invocation_journal,
+    tool_receipt_journal,
+)
+from keystone_agents.receipts.mutations import (
+    operation_is_mutation,
+    receipt_reports_possible_write,
+)
+from keystone_agents.receipts.normalization import identity_fingerprint
+from keystone_agents.receipts.recovery import verified_provider_write_summary
 from keystone_agents.run import (
     extract_sdk_usage,
     run_typed_sdk_agent,
     sdk_input_from_typed_input,
+    sdk_run_failure_metadata,
+)
+from keystone_agents.runtime.decision_validation import (
+    AgentDecisionValidationError,
+    SpecialistDecisionEvidence,
+    build_cumulative_decision_repair_evidence_replay,
+    build_decision_repair_evidence_replay,
+    decision_repair_prompt,
+    decision_validation_telemetry,
+    is_provider_read_tool_name,
+    validate_specialist_decision,
+    verified_candidate_fingerprints_from_receipts,
+)
+from keystone_agents.runtime.execution_attempt import (
+    ExecutionAttempt,
+    build_execution_failure_envelope,
+    start_execution_attempt,
+)
+from keystone_agents.runtime.execution_deadline import (
+    ExecutionDeadlineExceeded,
+    ExecutionDeadlineLedger,
+    activate_execution_deadline,
+    current_execution_deadline,
+    current_execution_deadline_snapshot,
+)
+from keystone_agents.runtime.provenance import current_runtime_fingerprint
+from keystone_agents.runtime.provider_context import (
+    provider_context_handoff_text,
+    provider_context_requirements_satisfied,
+    validate_calendar_provider_context_decision,
+)
+from keystone_agents.runtime.request_budget import (
+    activate_model_request_budget,
+    configured_model_request_budget_limit,
+    current_model_request_budget,
+    current_model_request_budget_snapshot,
+    model_request_budget_from_payload,
+    model_request_count_from_payload,
+    reserve_child_model_request_budget,
+)
+from keystone_agents.runtime.signal_context import run_signal_context_sdk
+from keystone_agents.runtime.tool_execution import (
+    ToolEvidenceGroup,
+    ToolExecutionContract,
+    ToolExecutionContractError,
+    build_tool_execution_summary,
+    evaluate_tool_execution_contract,
+    external_write_state_from_evidence,
+    sdk_tool_execution_records,
+    tool_execution_correction_prompt,
 )
 from keystone_agents.schemas.approval import (
     ApprovalQueueItem,
@@ -172,6 +276,7 @@ from keystone_agents.schemas.approval import (
     ApprovalScope,
     ApprovalState,
 )
+from keystone_agents.schemas.composition_admission import VerifiedSignalContext
 from keystone_agents.schemas.email_triage import EmailTriageResult
 from keystone_agents.schemas.execution_request import (
     ContinuationObjectReference,
@@ -203,7 +308,13 @@ from keystone_agents.schemas.work_item import (
     WorkItemRoute,
     WorkItemStatus,
 )
-from keystone_agents.sdk import run_typed_sdk_sync
+from keystone_agents.sdk import (
+    ToolGuardrailFunctionOutput,
+    agent_with_isolated_tool_state,
+    live_model_timeout_seconds,
+    run_typed_sdk_sync,
+    tool_input_guardrail,
+)
 from keystone_agents.sdk_run_policy import SDKTurnPolicy, resolve_sdk_turn_policy
 from keystone_agents.sdk_sessions import (
     SDKSessionSpec,
@@ -269,27 +380,72 @@ from keystone_agents.workflows import (
 
 
 class _CLIEntryTelemetryScope:
-    """Request-local CLI timing state with content-free persistence targets."""
+    """Request-local timing and output state; timing telemetry remains content-free."""
 
     def __init__(self, *, database_url: str | None) -> None:
         self.recorder = ExecutionTelemetryRecorder()
         self.database_url = database_url
         self.store: SQLiteStore | None = None
         self.agent_run_id: int | None = None
+        self.agent_run_ids: list[int] = []
         self.work_item_id = ""
+        self.execution_attempt: ExecutionAttempt | None = None
+        self.orchestrator_preflight_ms: float | None = None
+        self.admission_reserved_requests: int | None = None
+        self.hard_ceiling_requests: int | None = None
+        self.durable_context: Any | None = None
+        self.durable_lock: Any | None = None
+        self.durable_store: Any | None = None
+        self.durable_execution_id: str = ""
+        self.public_payload: dict[str, Any] | None = None
+        self.handled_failure: Exception | None = None
+
+
+class _RecordedChildProcessFailure(RuntimeError):
+    """Mark one nonzero child result in timing telemetry without replacing its payload."""
+
+
+class _CompletedExecution(Exception):
+    def __init__(self, payload: Mapping[str, Any], *, text: str = "") -> None:
+        self.payload = dict(payload)
+        self.text = text
 
 
 class _ObservedCLIStream:
     """Delegate output byte-for-byte while observing its first write."""
 
-    def __init__(self, stream: Any, recorder: ExecutionTelemetryRecorder) -> None:
+    MAX_CAPTURE_CHARS = 2_000_000
+
+    def __init__(self, stream: Any, recorder: ExecutionTelemetryRecorder, *, capture=False) -> None:
         self._stream = stream
         self._recorder = recorder
+        self._capture = capture
+        self._parts: list[str] = []
+        self._size = 0
+        self._truncated = False
+        self.final_started = False
+
+    def begin_final(self) -> None:
+        """Discard progress output at an explicit canonical result boundary."""
+        self._parts.clear()
+        self._size = 0
+        self._truncated = False
+        self.final_started = True
+
+    def captured_text(self) -> str | None:
+        return None if self._truncated else "".join(self._parts)
 
     def write(self, value: str) -> int:
         written = self._stream.write(value)
         if value:
             self._recorder.mark_first_feedback()
+        if self._capture and not self._truncated:
+            self._size += len(value)
+            if self._size > self.MAX_CAPTURE_CHARS:
+                self._parts.clear()
+                self._truncated = True
+            else:
+                self._parts.append(value)
         return written
 
     def flush(self) -> None:
@@ -304,6 +460,39 @@ _ASK_ENTRY_TELEMETRY: ContextVar[_CLIEntryTelemetryScope | None] = ContextVar(
     default=None,
 )
 
+
+def _capture_entry_public_result(payload: Mapping[str, Any]) -> None:
+    """Snapshot canonical output separately from agent rows and graph state."""
+    scope = _ASK_ENTRY_TELEMETRY.get()
+    if scope is None:
+        return
+    encoded = json.dumps(dict(payload), ensure_ascii=True)
+    scope.public_payload = (
+        json.loads(encoded) if len(encoded) <= _ObservedCLIStream.MAX_CAPTURE_CHARS else None
+    )
+    if isinstance(sys.stdout, _ObservedCLIStream):
+        sys.stdout.begin_final()
+
+
+def _final_json_result(text: str | None) -> dict[str, Any] | None:
+    """Read only a complete terminal JSON object, excluding preceding progress."""
+    if text is None:
+        return None
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"(?m)^[ \t]*\{", text):
+        start = text.index("{", match.start(), match.end())
+        try:
+            value, end = decoder.raw_decode(text, start)
+        except ValueError:
+            continue
+        if (
+            isinstance(value, dict)
+            and not text[end:].strip()
+            and {"public_result", "human_summary", "work_item", "output"}.intersection(value)
+        ):
+            return value
+    return None
+
 CONTEXT_AGENT_ROUTES = {
     "airtable_context_agent",
     "google_workspace_context_agent",
@@ -311,6 +500,14 @@ CONTEXT_AGENT_ROUTES = {
     "rss_context_agent",
     "zotero_context_agent",
 }
+
+
+class _ExplicitResultLimit(argparse.Action):
+    """Retain whether a caller actually supplied --max-results."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        namespace.max_results_explicit = True
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -370,9 +567,9 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Use the SDK manual-request planner before agent execution. Live SDK mode "
-            "enables it by default; use --no-live-manual-plan for a bounded run that "
-            "must avoid the extra planner request."
+            "Use the SDK manual-request planner before agent execution as an explicit "
+            "comparison/evaluation step. It is disabled by default because the selected "
+            "specialist or Orchestrator performs the live interpretation."
         ),
     )
     ask.add_argument(
@@ -404,7 +601,11 @@ def build_parser() -> argparse.ArgumentParser:
             "separate process-level read gate is enabled. Never posts."
         ),
     )
-    ask.add_argument("--max-results", type=int, default=3, help="Max WorkItem search results.")
+    ask.set_defaults(max_results_explicit=False)
+    ask.add_argument(
+        "--max-results", type=int, default=3, action=_ExplicitResultLimit,
+        help="Maximum WorkItem domain results; retrieval may inspect additional sources.",
+    )
     ask.add_argument(
         "--max-manager-steps",
         type=int,
@@ -533,7 +734,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use the optional LangGraph WorkItem orchestration wrapper.",
     )
-    work_items_advance.add_argument("--max-results", type=int, default=3)
+    work_items_advance.set_defaults(max_results_explicit=False)
+    work_items_advance.add_argument("--max-results", type=int, default=3, action=_ExplicitResultLimit)
     work_items_advance.add_argument(
         "--max-manager-steps",
         type=int,
@@ -719,6 +921,33 @@ def _agent_display_name(route: str) -> str:
     return spec.agent_name if spec is not None else route
 
 
+@contextmanager
+def _direct_calendar_provider_boundary(tool_name: str):
+    """Apply the ask-wide deadline to one direct Calendar provider operation."""
+
+    deadline = current_execution_deadline()
+    stage = f"chief_of_staff:calendar:{tool_name}"
+    if deadline is not None:
+        deadline.admit(stage=stage, boundary="provider_call")
+    try:
+        yield
+    except Exception:
+        if deadline is not None:
+            deadline.checkpoint(
+                stage=stage,
+                boundary="provider_call",
+                phase="failed",
+            )
+        raise
+    else:
+        if deadline is not None:
+            deadline.checkpoint(
+                stage=stage,
+                boundary="provider_call",
+                phase="completed",
+            )
+
+
 def execute_direct_calendar_action(
     input_text: str,
     plan: CalendarActionPlan,
@@ -730,6 +959,7 @@ def execute_direct_calendar_action(
 ) -> dict[str, Any]:
     """Execute one validated Calendar request without entering a workflow graph."""
 
+    attempted_tool_names: list[str] = []
     if not plan.complete:
         missing = ", ".join(plan.blockers)
         payload = {
@@ -741,6 +971,10 @@ def execute_direct_calendar_action(
             "openai_requests": openai_requests,
             "send_enabled": False,
         }
+        payload["tool_execution"] = _blocked_direct_calendar_tool_execution(
+            plan,
+            attempted_tool_names=attempted_tool_names,
+        )
         if interpretation_warnings:
             payload["interpretation_warnings"] = list(interpretation_warnings)
         return payload
@@ -760,19 +994,21 @@ def execute_direct_calendar_action(
     try:
         if window_read:
             time_min, time_max = _calendar_window_bounds(plan, now=now)
-            calendar_lookup = read_google_calendar_window_impl(
-                time_min,
-                time_max,
-                calendar_id=plan.calendar_id,
-                calendar_scope=plan.calendar_scope,
-                # Retrieve the bounded day across readable calendars before
-                # semantic selection. Provider text search cannot infer that an
-                # event on a care calendar answers a generic "medical appointment."
-                query="" if plan.read_scope == "filtered_window" else plan.query,
-                max_results=100,
-                display_timezone=plan.timezone,
-                live=live,
-            )
+            with _direct_calendar_provider_boundary("read_google_calendar_window"):
+                attempted_tool_names.append("read_google_calendar_window")
+                calendar_lookup = read_google_calendar_window_impl(
+                    time_min,
+                    time_max,
+                    calendar_id=plan.calendar_id,
+                    calendar_scope=plan.calendar_scope,
+                    # Retrieve the bounded day across readable calendars before
+                    # semantic selection. Provider text search cannot infer that an
+                    # event on a care calendar answers a generic "medical appointment."
+                    query="" if plan.read_scope == "filtered_window" else plan.query,
+                    max_results=100,
+                    display_timezone=plan.timezone,
+                    live=live,
+                )
             if not live:
                 return {
                     "status": "dry-run",
@@ -817,13 +1053,15 @@ def execute_direct_calendar_action(
                 "send_enabled": False,
             }
         elif exact_id_read:
-            calendar_lookup = read_google_calendar_event_impl(
-                resolved_event_id,
-                calendar_id=resolved_calendar_id,
-                display_timezone=plan.timezone,
-                include_description=_calendar_description_requested(input_text),
-                live=live,
-            )
+            with _direct_calendar_provider_boundary("read_google_calendar_event"):
+                attempted_tool_names.append("read_google_calendar_event")
+                calendar_lookup = read_google_calendar_event_impl(
+                    resolved_event_id,
+                    calendar_id=resolved_calendar_id,
+                    display_timezone=plan.timezone,
+                    include_description=_calendar_description_requested(input_text),
+                    live=live,
+                )
             if not live:
                 return {
                     "status": "dry-run",
@@ -847,19 +1085,21 @@ def execute_direct_calendar_action(
             if plan.operation in {"read", "delete"}:
                 lookup_start_date = lookup_start_date or plan.start_date
                 lookup_start_time = lookup_start_time or plan.start_time
-            calendar_lookup = resolve_google_calendar_event_impl(
-                plan.event_reference,
-                start_date=lookup_start_date,
-                start_time=lookup_start_time,
-                calendar_id=plan.calendar_id,
-                calendar_scope=(
-                    plan.calendar_scope
-                    if plan.calendar_scope != "configured"
-                    else "all_readable"
-                ),
-                display_timezone=plan.timezone,
-                live=live,
-            )
+            with _direct_calendar_provider_boundary("resolve_google_calendar_event"):
+                attempted_tool_names.append("resolve_google_calendar_event")
+                calendar_lookup = resolve_google_calendar_event_impl(
+                    plan.event_reference,
+                    start_date=lookup_start_date,
+                    start_time=lookup_start_time,
+                    calendar_id=plan.calendar_id,
+                    calendar_scope=(
+                        plan.calendar_scope
+                        if plan.calendar_scope != "configured"
+                        else "all_readable"
+                    ),
+                    display_timezone=plan.timezone,
+                    live=live,
+                )
             if not live:
                 payload = {
                     "status": "dry-run",
@@ -946,19 +1186,21 @@ def execute_direct_calendar_action(
                 "send_enabled": False,
             }
         elif plan.operation == "create":
-            result = create_google_calendar_event_impl(
-                plan.title,
-                plan.start_date,
-                description=plan.description,
-                end_date=plan.end_date,
-                repeat_each_day=plan.repeat_each_day,
-                calendar_id=plan.calendar_id,
-                timezone=plan.timezone,
-                start_time=plan.start_time,
-                end_time=plan.end_time,
-                approval_reference=approval_reference,
-                live=live,
-            )
+            with _direct_calendar_provider_boundary("create_google_calendar_event"):
+                attempted_tool_names.append("create_google_calendar_event")
+                result = create_google_calendar_event_impl(
+                    plan.title,
+                    plan.start_date,
+                    description=plan.description,
+                    end_date=plan.end_date,
+                    repeat_each_day=plan.repeat_each_day,
+                    calendar_id=plan.calendar_id,
+                    timezone=plan.timezone,
+                    start_time=plan.start_time,
+                    end_time=plan.end_time,
+                    approval_reference=approval_reference,
+                    live=live,
+                )
         elif plan.operation == "update":
             update_start_date = plan.start_date
             if plan.start_time and not update_start_date:
@@ -970,20 +1212,22 @@ def execute_direct_calendar_action(
             duration_minutes = _resolved_calendar_duration_minutes(
                 calendar_lookup,
             )
-            result = update_google_calendar_event_impl(
-                resolved_event_id,
-                title=plan.title,
-                start_date=update_start_date,
-                description=plan.description,
-                calendar_id=resolved_calendar_id,
-                timezone=plan.timezone,
-                start_time=plan.start_time,
-                end_time=plan.end_time,
-                duration_minutes=duration_minutes,
-                append_description=plan.append_description,
-                approval_reference=approval_reference,
-                live=live,
-            )
+            with _direct_calendar_provider_boundary("update_google_calendar_event"):
+                attempted_tool_names.append("update_google_calendar_event")
+                result = update_google_calendar_event_impl(
+                    resolved_event_id,
+                    title=plan.title,
+                    start_date=update_start_date,
+                    description=plan.description,
+                    calendar_id=resolved_calendar_id,
+                    timezone=plan.timezone,
+                    start_time=plan.start_time,
+                    end_time=plan.end_time,
+                    duration_minutes=duration_minutes,
+                    append_description=plan.append_description,
+                    approval_reference=approval_reference,
+                    live=live,
+                )
         else:
             if resolved_events:
                 non_writable = [
@@ -1001,17 +1245,26 @@ def execute_direct_calendar_action(
                 failure = ""
                 for event in resolved_events:
                     try:
-                        receipts.append(
-                            delete_google_calendar_event_impl(
-                                str(event.get("event_id") or ""),
-                                calendar_id=str(
-                                    event.get("calendar_id") or plan.calendar_id
-                                ),
-                                approval_reference=approval_reference,
-                                live=live,
+                        with _direct_calendar_provider_boundary(
+                            "delete_google_calendar_event"
+                        ):
+                            receipts.append(
+                                # Count every provider attempt, including one that fails
+                                # before producing a structured receipt.
+                                delete_google_calendar_event_impl(
+                                    str(event.get("event_id") or ""),
+                                    calendar_id=str(
+                                        event.get("calendar_id") or plan.calendar_id
+                                    ),
+                                    approval_reference=approval_reference,
+                                    live=live,
+                                )
                             )
-                        )
+                        attempted_tool_names.append("delete_google_calendar_event")
+                    except ExecutionDeadlineExceeded:
+                        raise
                     except (GoogleCalendarError, RuntimeError, ValueError) as exc:
+                        attempted_tool_names.append("delete_google_calendar_event")
                         failure = str(exc)
                         break
                 deleted_count = sum(
@@ -1037,12 +1290,14 @@ def execute_direct_calendar_action(
                     "send_enabled": False,
                 }
             else:
-                result = delete_google_calendar_event_impl(
-                    resolved_event_id,
-                    calendar_id=resolved_calendar_id,
-                    approval_reference=approval_reference,
-                    live=live,
-                )
+                with _direct_calendar_provider_boundary("delete_google_calendar_event"):
+                    attempted_tool_names.append("delete_google_calendar_event")
+                    result = delete_google_calendar_event_impl(
+                        resolved_event_id,
+                        calendar_id=resolved_calendar_id,
+                        approval_reference=approval_reference,
+                        live=live,
+                    )
     except (GoogleCalendarError, RuntimeError, ValueError) as exc:
         payload = {
             "status": "blocked",
@@ -1057,6 +1312,10 @@ def execute_direct_calendar_action(
         }
         if interpretation_warnings:
             payload["interpretation_warnings"] = list(interpretation_warnings)
+        payload["tool_execution"] = _blocked_direct_calendar_tool_execution(
+            plan,
+            attempted_tool_names=attempted_tool_names,
+        )
         return payload
 
     receipt_verification = result.get("verification")
@@ -1104,9 +1363,147 @@ def execute_direct_calendar_action(
             "slack_message_posted": False,
         },
     }
+    payload["tool_execution"] = _direct_calendar_tool_execution(
+        plan,
+        calendar_lookup=calendar_lookup,
+        result=result,
+    )
     if live:
         attach_execution_public_result(payload)
     return payload
+
+
+def _direct_calendar_tool_execution(
+    plan: CalendarActionPlan,
+    *,
+    calendar_lookup: Mapping[str, Any] | None,
+    result: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Expose typed Calendar provider work without calling it model-selected."""
+
+    tool_names: list[str] = []
+    workflow_call_count = 0
+    provider_receipt_count = 0
+    lookup_tool = _direct_calendar_lookup_tool_name(
+        plan,
+        calendar_lookup=calendar_lookup,
+    )
+    if lookup_tool:
+        tool_names.append(lookup_tool)
+        workflow_call_count += 1
+        provider_receipt_count += 1
+    action_tool = {
+        "create": "create_google_calendar_event",
+        "update": "update_google_calendar_event",
+        "delete": "delete_google_calendar_event",
+    }.get(plan.operation)
+    if action_tool:
+        tool_names.append(action_tool)
+        action_calls = (
+            len([item for item in result.get("receipts", []) if isinstance(item, Mapping)])
+            if plan.operation == "delete" and plan.target_count > 1
+            else 1
+        )
+        workflow_call_count += action_calls
+        provider_receipt_count += action_calls
+    tool_names = list(dict.fromkeys(tool_names))
+    verification = result.get("verification")
+    verified = bool(
+        isinstance(verification, Mapping) and verification.get("passed") is True
+    )
+    postcondition = {
+        "schema": "keystone.tool_execution_postcondition.v1",
+        "stage": f"google_calendar_{plan.operation}",
+        "mode": "required",
+        "satisfied": verified,
+        "attempted_tool_names": tool_names,
+        "completed_tool_names": tool_names if verified else [],
+        "missing_groups": [] if verified else ["calendar_provider_verification"],
+        "prohibited_tool_names": [],
+        "receipt_tool_names": tool_names if verified else [],
+    }
+    return build_tool_execution_summary(
+        mode="deterministic_bounded_provider_lifecycle",
+        scope_source="typed_calendar_action_plus_python_lifecycle_gate",
+        selected_tool_names=tool_names,
+        workflow_called_tool_names=tool_names,
+        workflow_tool_call_count=workflow_call_count,
+        provider_request_attempt_count=max(
+            workflow_call_count,
+            int(result.get("provider_request_attempt_count") or 0),
+        ),
+        provider_request_success_count=(
+            max(
+                workflow_call_count,
+                int(result.get("provider_request_success_count") or 0),
+            )
+            if verified
+            else 0
+        ),
+        provider_receipt_count=provider_receipt_count,
+        postcondition=postcondition,
+    )
+
+
+def _direct_calendar_lookup_tool_name(
+    plan: CalendarActionPlan,
+    *,
+    calendar_lookup: Mapping[str, Any] | None,
+) -> str:
+    """Name the exact bounded Calendar read helper that actually ran."""
+
+    if calendar_lookup is None and plan.operation != "read":
+        return ""
+    if plan.operation == "read" and plan.read_scope in {
+        "time_window",
+        "filtered_window",
+    }:
+        return "read_google_calendar_window"
+    if plan.operation == "read" and plan.event_id:
+        return "read_google_calendar_event"
+    if calendar_lookup is not None:
+        return "resolve_google_calendar_event"
+    return "read_google_calendar_window" if plan.operation == "read" else ""
+
+
+def _blocked_direct_calendar_tool_execution(
+    plan: CalendarActionPlan,
+    *,
+    attempted_tool_names: Sequence[str],
+) -> dict[str, Any]:
+    """Record admission and actual attempts when a direct Calendar run blocks."""
+
+    read_tool = _direct_calendar_lookup_tool_name(plan, calendar_lookup={})
+    action_tool = {
+        "read": read_tool,
+        "create": "create_google_calendar_event",
+        "update": "update_google_calendar_event",
+        "delete": "delete_google_calendar_event",
+    }.get(plan.operation, "")
+    selected_tool_names = [action_tool] if action_tool else []
+    attempted = [str(name) for name in attempted_tool_names if str(name)]
+    postcondition = {
+        "schema": "keystone.tool_execution_postcondition.v1",
+        "stage": f"google_calendar_{plan.operation}",
+        "mode": "required",
+        "satisfied": False,
+        "attempted_tool_names": list(dict.fromkeys(attempted)),
+        "completed_tool_names": [],
+        "receipt_tool_names": [],
+        "missing_groups": ["calendar_provider_verification"],
+        "prohibited_tool_names": [],
+    }
+    return build_tool_execution_summary(
+        mode="deterministic_bounded_provider_lifecycle",
+        scope_source="typed_calendar_action_plus_python_lifecycle_gate",
+        selected_tool_names=selected_tool_names,
+        workflow_called_tool_names=list(dict.fromkeys(attempted)),
+        workflow_tool_call_count=len(attempted),
+        provider_request_attempt_count=len(attempted),
+        provider_request_success_count=0,
+        provider_receipt_count=0,
+        postcondition=postcondition,
+    )
 
 
 def _calendar_receipt_covers_requested_changes(
@@ -1125,6 +1522,35 @@ def _calendar_receipt_covers_requested_changes(
     if plan.start_date and str(result.get("start_date") or "") != plan.start_date:
         return False
     if plan.start_time and str(result.get("start_time") or "")[:5] != plan.start_time[:5]:
+        return False
+    temporal_change_requested = bool(
+        plan.operation == "create"
+        or plan.start_date
+        or plan.end_date
+        or plan.start_time
+        or plan.end_time
+    )
+    if temporal_change_requested:
+        if plan.end_date and str(result.get("end_date") or "") != plan.end_date:
+            return False
+        if plan.end_time and str(result.get("end_time") or "")[:5] != plan.end_time[:5]:
+            return False
+        if bool(result.get("all_day")) is not bool(plan.all_day):
+            return False
+        if plan.timezone and str(result.get("timezone") or "") != plan.timezone:
+            return False
+    if plan.operation == "create" and bool(result.get("repeat_each_day")) is not bool(
+        plan.repeat_each_day
+    ):
+        return False
+    required_verification_checks: set[str] = set()
+    if temporal_change_requested:
+        required_verification_checks.update(
+            {"start_match", "end_match", "all_day_match", "timezone_match"}
+        )
+    if plan.operation == "create":
+        required_verification_checks.add("recurrence_match")
+    if any(verification.get(check) is not True for check in required_verification_checks):
         return False
     if plan.description and verification.get("description_match") is not True:
         return False
@@ -1242,6 +1668,17 @@ def _direct_calendar_human_summary(
         result.get("display_end_time") or result.get("end_time") or plan.end_time
     ).strip()
     time_suffix = _calendar_human_time_suffix(start_time, end_time)
+    if str(result.get("status") or "").lower() in {"dry-run", "dry_run", "preview"}:
+        preview_operation = {
+            "create": "create",
+            "update": "update",
+            "delete": "delete",
+        }.get(plan.operation, "perform")
+        date_suffix = f" on {start_date}" if start_date else ""
+        return (
+            f'Dry-run preview: would {preview_operation} Google Calendar event '
+            f'"{title}"{date_suffix}{time_suffix}. No Calendar write was performed.'
+        )
     if plan.operation == "read":
         if result.get("found") is True:
             date_suffix = f" on {start_date}" if start_date else ""
@@ -1344,6 +1781,59 @@ def _human_calendar_clock(value: str) -> str:
         return value
 
 
+def _safe_calendar_lookup_decision_telemetry(
+    value: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Keep Calendar choice/repair evidence without provider event identities."""
+
+    if not isinstance(value, Mapping):
+        return {}
+    safe: dict[str, Any] = {
+        key: value[key]
+        for key in (
+            "schema",
+            "decision_owner",
+            "decision_stage",
+            "candidate_count",
+            "attempt_count",
+            "repair_attempted",
+            "provider_calls_during_repair",
+            "model_tool_call_count",
+            "terminal_status",
+        )
+        if key in value
+    }
+    attempts: list[dict[str, Any]] = []
+    for raw_attempt in value.get("attempts", []):
+        if not isinstance(raw_attempt, Mapping):
+            continue
+        attempt = {
+            key: raw_attempt[key]
+            for key in (
+                "attempt",
+                "status",
+                "selected_event_indexes",
+                "validator_status",
+                "tool_mode",
+            )
+            if key in raw_attempt
+        }
+        if raw_attempt.get("selection_reason"):
+            attempt["selection_reason"] = _bounded_redacted_text(
+                raw_attempt.get("selection_reason"),
+                max_chars=700,
+            )
+        if raw_attempt.get("validator_feedback"):
+            attempt["validator_feedback"] = _bounded_redacted_text(
+                raw_attempt.get("validator_feedback"),
+                max_chars=700,
+            )
+        attempts.append(attempt)
+    if attempts:
+        safe["attempts"] = attempts
+    return safe
+
+
 def _resolved_calendar_duration_minutes(
     calendar_lookup: Mapping[str, Any] | None,
 ) -> int:
@@ -1369,6 +1859,7 @@ def run_direct_calendar_action(
     json_output: bool,
     openai_requests: int = 0,
     interpretation_warnings: tuple[str, ...] = (),
+    calendar_interpretation: Mapping[str, Any] | None = None,
     execution_admission: ExecutionAdmission | None = None,
     manual_plan: ManualRequestPlan | None = None,
     orchestrator_preflight: OrchestratorPreflight | None = None,
@@ -1386,6 +1877,8 @@ def run_direct_calendar_action(
         openai_requests=openai_requests,
         interpretation_warnings=interpretation_warnings,
     )
+    if calendar_interpretation:
+        payload["calendar_interpretation"] = dict(calendar_interpretation)
     provider_action_ms = round((perf_counter() - provider_started_at) * 1000, 3)
     lookup_synthesis_ms = 0.0
     if (
@@ -1415,6 +1908,19 @@ def run_direct_calendar_action(
                 list(group) for group in getattr(answer_resolution, "related_event_groups", ())
             ],
         }
+        decision_telemetry = _safe_calendar_lookup_decision_telemetry(
+            getattr(answer_resolution, "decision_telemetry", None),
+        )
+        if decision_telemetry:
+            payload["calendar_lookup_synthesis"]["decision_telemetry"] = decision_telemetry
+            payload["decision_ownership"] = decision_telemetry
+            request_cache = dict(payload.get("request_cache") or {})
+            request_cache["decision_ownership"] = decision_telemetry
+            request_cache["decision_repairs"] = int(
+                bool(decision_telemetry.get("repair_attempted"))
+            )
+            request_cache["tool_execution"] = dict(payload.get("tool_execution") or {})
+            payload["request_cache"] = request_cache
         payload["calendar_lookup_synthesis_warnings"] = list(answer_resolution.warnings)
         payload["openai_requests"] = (
             int(payload.get("openai_requests") or 0) + answer_resolution.openai_requests
@@ -1456,6 +1962,7 @@ def run_direct_calendar_action(
     if live and orchestrator_preflight is not None:
         payload["orchestrator_preflight"] = _orchestrator_preflight_payload(orchestrator_preflight)
     if live:
+        attach_execution_public_result(payload)
         _attach_slack_run_provenance(payload, execution_context)
         _persist_direct_calendar_run(
             input_text=input_text,
@@ -1495,6 +2002,7 @@ def _persist_direct_calendar_run(
 
 def _print_direct_calendar_payload(payload: dict[str, Any], *, json_output: bool) -> int:
     _register_entry_agent_run(payload.get("agent_run_id"))
+    _capture_entry_public_result(payload)
     if json_output:
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
@@ -1511,7 +2019,21 @@ def _print_direct_calendar_payload(payload: dict[str, Any], *, json_output: bool
     return 0 if payload.get("status") in {"done", "dry-run"} else 1
 
 
-def _route_with_manual_plan_advice(route: str, manual_plan: ManualRequestPlan) -> str:
+def _route_with_manual_plan_advice(
+    route: str,
+    manual_plan: ManualRequestPlan,
+    *,
+    orchestrator_preflight: OrchestratorPreflight | None = None,
+) -> str:
+    if (
+        orchestrator_preflight is not None
+        and orchestrator_preflight.execution_allowed
+        and orchestrator_preflight.route_result.routing_mode == "llm"
+        and not orchestrator_preflight.route_result.refused
+    ):
+        selected = _bounded_direct_route_from_preflight(orchestrator_preflight)
+        if selected is not None:
+            return selected
     requested_route = str(manual_plan.requested_agent or "").strip()
     if requested_route in {"", "orchestrator", "clarification"}:
         requested_route = route
@@ -1528,22 +2050,47 @@ def _route_with_manual_plan_advice(route: str, manual_plan: ManualRequestPlan) -
 def _run_with_entry_telemetry(
     args: argparse.Namespace,
     handler: Callable[[], int],
+    *,
+    structured_failure: bool = False,
 ) -> int:
     """Measure one CLI entry without changing its stdout or stderr contract."""
 
     if _ASK_ENTRY_TELEMETRY.get() is not None:
         return int(handler())
+    inherited_budget = current_model_request_budget()
+    cli_budget_limit = configured_model_request_budget_limit(
+        getattr(args, "max_openai_requests", None)
+    )
+    inherited_limit = inherited_budget.limit if inherited_budget is not None else None
+    effective_budget_limit = (
+        min(cli_budget_limit, inherited_limit)
+        if cli_budget_limit is not None and inherited_limit is not None
+        else cli_budget_limit
+        if cli_budget_limit is not None
+        else inherited_limit
+    )
+    budget_context = activate_model_request_budget(
+        effective_budget_limit,
+        correlation_id=(
+            inherited_budget.correlation_id if inherited_budget is not None else None
+        ),
+        parent_consumed=(
+            inherited_budget.parent_consumed if inherited_budget is not None else 0
+        ),
+    )
+    budget_context.__enter__()
     scope = _CLIEntryTelemetryScope(
         database_url=str(getattr(args, "database_url", "") or "") or None,
     )
     token = _ASK_ENTRY_TELEMETRY.set(scope)
     original_stdout = sys.stdout
     original_stderr = sys.stderr
-    observed_stdout = _ObservedCLIStream(original_stdout, scope.recorder)
+    observed_stdout = _ObservedCLIStream(original_stdout, scope.recorder, capture=True)
     observed_stderr = _ObservedCLIStream(original_stderr, scope.recorder)
     telemetry_status = "completed"
     result: int | None = None
     failure: BaseException | None = None
+    failure_handled = False
     try:
         sys.stdout = observed_stdout
         sys.stderr = observed_stderr
@@ -1553,9 +2100,47 @@ def _run_with_entry_telemetry(
                 attributes={"source": "cli"},
             ):
                 result = int(handler())
+        except _CompletedExecution as completed:
+            if bool(getattr(args, "json", False)):
+                print(json.dumps({**completed.payload, "reused_execution": True}))
+            elif completed.text:
+                print(completed.text, end="")
+            else:
+                print(completed.payload.get("human_summary") or completed.payload.get("summary")
+                      or "The completed execution was reused; no business operation was repeated.")
+            result = 0
         except BaseException as exc:
             telemetry_status = "failed"
             failure = exc
+        if failure is None and scope.handled_failure is not None:
+            failure = scope.handled_failure
+            telemetry_status = "failed"
+            failure_handled = True
+        if structured_failure and isinstance(failure, Exception) and not failure_handled:
+            failure_metadata = sdk_run_failure_metadata(failure)
+            envelope = build_execution_failure_envelope(
+                failure,
+                execution_attempt_id=(
+                    scope.execution_attempt.run_id
+                    if scope.execution_attempt is not None
+                    else None
+                ),
+                failure_metadata=failure_metadata,
+            )
+            if bool(getattr(args, "json", False)):
+                print(json.dumps(envelope, ensure_ascii=True, indent=2, sort_keys=True))
+            else:
+                operator_failure = envelope["failure"]
+                print(str(operator_failure.get("summary") or "The KBA run failed."))
+                next_step = str(operator_failure.get("next_step") or "").strip()
+                if next_step:
+                    print(f"Next step: {next_step}")
+            print(
+                "Business Agents run failed with structured diagnostics.",
+                file=sys.stderr,
+            )
+            result = 1
+            failure_handled = True
         observed_stdout.flush()
         observed_stderr.flush()
         if failure is None:
@@ -1568,13 +2153,46 @@ def _run_with_entry_telemetry(
             scope.recorder.snapshot(status=telemetry_status)
         )
         _persist_entry_execution_telemetry(scope, telemetry)
-        if failure is not None:
+        _finalize_entry_execution_attempt(
+            scope,
+            telemetry=telemetry,
+            result=int(result or 0),
+            failure=failure if isinstance(failure, Exception) else None,
+        )
+        if scope.durable_store is not None:
+            saved = scope.durable_store.get(scope.durable_execution_id)
+            text = observed_stdout.captured_text()
+            public = scope.public_payload or (
+                _final_json_result(text)
+                if bool(getattr(args, "json", False)) else None
+            )
+            output_complete = bool(getattr(args, "json", False)) or (
+                observed_stdout.final_started and bool(text)
+            )
+            if public and output_complete and failure is None and result == 0 and saved["status"] != "interrupted":
+                scope.durable_store.save_stage(scope.durable_execution_id, "public_result", {}, public)
+                if not bool(getattr(args, "json", False)) and observed_stdout.final_started and text:
+                    scope.durable_store.save_stage(
+                        scope.durable_execution_id, "public_text", {}, {"text": text}
+                    )
+            scope.durable_store.update(
+                scope.durable_execution_id,
+                status=saved["status"] if saved["status"] == "interrupted" else
+                "completed" if failure is None and result == 0 else "failed",
+                work_item_id=scope.work_item_id,
+            )
+        if failure is not None and not failure_handled:
             raise failure
         return int(result or 0)
     finally:
+        if scope.durable_context is not None:
+            scope.durable_context.__exit__(None, None, None)
+        if scope.durable_lock is not None:
+            scope.durable_lock.__exit__(None, None, None)
         sys.stdout = original_stdout
         sys.stderr = original_stderr
         _ASK_ENTRY_TELEMETRY.reset(token)
+        budget_context.__exit__(None, None, None)
 
 
 def _register_entry_agent_run(run_id: object) -> None:
@@ -1582,9 +2200,43 @@ def _register_entry_agent_run(run_id: object) -> None:
     if scope is None:
         return
     try:
-        scope.agent_run_id = int(run_id)
+        resolved = int(run_id)
     except (TypeError, ValueError):
         return
+    if resolved not in scope.agent_run_ids:
+        scope.agent_run_ids.append(resolved)
+    scope.agent_run_id = resolved
+
+
+def _register_entry_agent_runs(payload: Mapping[str, Any]) -> None:
+    """Collect only explicitly labeled run links from one rendered payload."""
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                normalized = str(key)
+                if normalized == "agent_run_id":
+                    _register_entry_agent_run(item)
+                elif (
+                    normalized == "agent_run_ids"
+                    and isinstance(item, Sequence)
+                    and not isinstance(item, str | bytes | bytearray)
+                ):
+                    for run_id in item:
+                        _register_entry_agent_run(run_id)
+                elif normalized == "agent_run":
+                    if isinstance(item, Mapping):
+                        _register_entry_agent_run(item.get("id"))
+                    else:
+                        _register_entry_agent_run(item)
+                visit(item)
+        elif isinstance(value, Sequence) and not isinstance(
+            value, str | bytes | bytearray
+        ):
+            for item in value:
+                visit(item)
+
+    visit(payload)
 
 
 def _register_entry_work_item(work_item_id: object) -> None:
@@ -1631,6 +2283,159 @@ def _persist_entry_execution_telemetry(
         return
 
 
+def _start_entry_execution_attempt(
+    args: argparse.Namespace,
+    *,
+    request_text: str,
+) -> None:
+    """Persist the ask attempt before Orchestrator preflight starts."""
+
+    scope = _ASK_ENTRY_TELEMETRY.get()
+    if scope is None or scope.execution_attempt is not None:
+        return
+    if str(getattr(args, "command", "") or "") != "ask":
+        return
+    store = scope.store or SQLiteStore(scope.database_url or database_url_from_env())
+    scope.store = store
+    requested_route = str(getattr(args, "agent", "") or "").strip()
+    try:
+        live = _ask_live_sdk_enabled(args, input_text=request_text)
+    except Exception:
+        live = bool(getattr(args, "live_sdk", False))
+    budget_snapshot = current_model_request_budget_snapshot() or {}
+    request_ceiling = budget_snapshot.get("limit")
+    request_ceiling = int(request_ceiling) if request_ceiling is not None else None
+    scope.execution_attempt = start_execution_attempt(
+        store=store,
+        request_text=request_text,
+        route_hint=requested_route or "orchestrator",
+        live=live,
+        max_model_requests=request_ceiling,
+    )
+    from keystone_agents.runtime.durable_execution import (
+        ExecutionConflict,
+        ExecutionStore,
+        activate_execution,
+        execution_database_path,
+        execution_lock,
+    )
+    from keystone_agents.runtime.provenance import current_runtime_fingerprint
+
+    if str(store.path) == ":memory:":
+        return
+    from keystone_agents.storage.sqlite_store import stable_hash
+
+    durable = ExecutionStore(execution_database_path(scope.database_url))
+    origin = ""
+    context_path = str(getattr(args, "context_file", "") or "")
+    if context_path:
+        try:
+            context = json.loads(Path(context_path).read_text())
+            if str(context.get("schema", "")).startswith("keystone.slack."):
+                identity = [context.get(k) for k in ("team_id", "channel_id", "request_ts")]
+                if all(identity):
+                    origin = "slack:" + ":".join(str(value) for value in identity)
+        except (OSError, ValueError, TypeError):
+            pass
+    record = durable.begin(
+        {"request_fingerprint": scope.execution_attempt.request_fingerprint,
+         "entrypoint": "ask", "route": requested_route, "live_sdk": live}, origin=origin,
+        budget_limit=request_ceiling,
+        source_fingerprint=current_runtime_fingerprint()["runtime_sha256"],
+    )
+    def reuse_completed_or_reject_progress(current):
+        if current["status"] == "completed":
+            public = durable.stage_result(current["id"], "public_result", {})
+            if public is not None:
+                text = durable.stage_result(current["id"], "public_text", {}) or {}
+                raise _CompletedExecution(public, text=str(text.get("text") or ""))
+            raise ExecutionConflict("This event already completed; inspect its recorded execution.")
+        if current["status"] in {"running", "failed", "interrupted"}:
+            raise ExecutionConflict(
+                f"Execution {current['id']} has prior progress; inspect or resume it explicitly."
+            )
+
+    reuse_completed_or_reject_progress(record)
+    scope.durable_lock = execution_lock(durable.path.with_name(
+        f"{durable.path.name}.{stable_hash(record['id'])[:20]}.lock"))
+    scope.durable_lock.__enter__()
+    reuse_completed_or_reject_progress(durable.get(record["id"]))
+    scope.durable_context = activate_execution(durable, record["id"])
+    scope.durable_context.__enter__()
+    scope.durable_store = durable
+    scope.durable_execution_id = record["id"]
+    durable.update(record["id"], status="running")
+    from keystone_agents.runtime.execution_attempt import bind_execution_attempt
+
+    durable.save_stage(
+        record["id"], "entry_attempt", {},
+        bind_execution_attempt(scope.execution_attempt, record["id"]),
+    )
+
+
+def _finalize_entry_execution_attempt(
+    scope: _CLIEntryTelemetryScope,
+    *,
+    telemetry: Mapping[str, Any],
+    result: int,
+    failure: Exception | None,
+) -> None:
+    attempt = scope.execution_attempt
+    if attempt is None:
+        return
+    failure_metadata = sdk_run_failure_metadata(failure) if failure is not None else {}
+    try:
+        attempt.finalize(
+            status="completed" if result == 0 else "failed",
+            exit_code=result,
+            linked_agent_run_id=scope.agent_run_id,
+            linked_agent_run_ids=scope.agent_run_ids,
+            work_item_id=scope.work_item_id,
+            telemetry=telemetry,
+            failure=failure,
+            failure_metadata=failure_metadata,
+        )
+    except Exception:
+        # Attempt persistence is diagnostic and must not mask the task result or its
+        # structured failure envelope when the telemetry store is unavailable.
+        return
+
+
+def _capture_entry_preflight_observation(preflight: OrchestratorPreflight) -> None:
+    """Record the returned model result, explicitly before CLI plan refinements."""
+    scope = _ASK_ENTRY_TELEMETRY.get()
+    if scope is None or scope.execution_attempt is None:
+        return
+    returned = {
+        "selected_agent": preflight.selected_agent,
+        "blocked_by_orchestrator": preflight.blocked_by_orchestrator,
+        "route_result": {
+            "route": preflight.route_result.route,
+            "workflow": preflight.route_result.workflow,
+        },
+        "sdk_usage_events": preflight.sdk_usage_events,
+    }
+    returned["sdk_usage_events"] = compact_orchestrator_preflight_payload(returned).get(
+        "sdk_usage_events", [],
+    )
+    # Capture consumption before serializing the larger plan snapshot.
+    scope.execution_attempt.record_preflight(returned)
+    reference = {}
+    if scope.durable_store is not None:
+        stage = "orchestrator_preflight_returned"
+        scope.durable_store.save_stage(
+            scope.durable_execution_id, stage, {}, {
+                "capture_stage": "before_cli_plan_refinement",
+                "preflight": preflight.model_dump(mode="json"),
+                "execution_reuse_authorized": False,
+            },
+        )
+        reference = {"execution_id": scope.durable_execution_id, "stage_id": stage}
+    scope.execution_attempt.record_preflight(
+        returned, plan_reference=reference,
+    )
+
+
 def _run_ask(args: argparse.Namespace) -> int:
     return _run_with_entry_telemetry(
         args,
@@ -1639,6 +2444,7 @@ def _run_ask(args: argparse.Namespace) -> int:
             if args.live_sdk is True
             else _run_ask_with_current_environment(args)
         ),
+        structured_failure=True,
     )
 
 
@@ -1648,8 +2454,18 @@ def _run_live_ask_with_environment(args: argparse.Namespace) -> int:
 
 
 def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
+    deadline_request_text = _ask_input(args)
+    if (
+        current_execution_deadline() is None
+        and _ask_live_sdk_enabled(args, input_text=deadline_request_text)
+    ):
+        with activate_execution_deadline(
+            _execution_deadline_for_ask(args, deadline_request_text)
+        ):
+            return _run_ask_with_current_environment(args)
     ask_started_at = perf_counter()
     raw_input = _ask_input(args)
+    _start_entry_execution_attempt(args, request_text=raw_input)
     slack_context_input = _context_file_is_slack_context(args.context_file)
     linked_work_item = _validated_slack_linked_work_item(
         work_item_id=str(getattr(args, "linked_work_item_id", "") or "").strip(),
@@ -1739,31 +2555,6 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     calendar_candidate = bool(
         calendar_plan is not None or is_calendar_action_candidate(calendar_input_text)
     )
-    live_search_capability_enabled = args.live_search or (live_sdk and cli_default_live_research())
-    live_search = live_search_capability_enabled
-    if live_search and (
-        _request_forbids_live_research(semantic_input_text)
-        or _context_file_is_work_item_source_bundle(args.context_file)
-    ):
-        live_search = False
-    live_manual_plan_requested = (
-        live_sdk if args.live_manual_plan is None else bool(args.live_manual_plan)
-    )
-    # The planner owns operation semantics for every live natural-language
-    # Calendar ask. Deterministic parsing remains a field-extraction and
-    # validation boundary only.
-    live_manual_plan = live_manual_plan_requested
-    request_estimate = _estimate_ask_openai_requests(
-        args,
-        input_text=semantic_input_text,
-        live_sdk=live_sdk,
-        live_manual_plan=live_manual_plan,
-        requested_route=requested_route,
-        effective_live_search=live_search,
-    )
-    # Semantic interpretation is a single bounded request. Do not block that
-    # planner call using the unresolved worst-case manager/graph estimate.
-    # Recompute and enforce the actual route ceiling immediately after preflight.
     calendar_route_eligible = bool(
         calendar_candidate
         and requested_route
@@ -1773,16 +2564,93 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             "orchestrator",
         }
     )
-    preflight_budget_estimate = (
-        1 if live_manual_plan else 0 if calendar_route_eligible else request_estimate["max"]
-    )
-    if args.max_openai_requests is not None and (
-        args.max_openai_requests < 0 or preflight_budget_estimate > args.max_openai_requests
+    live_search_capability_enabled = args.live_search or (live_sdk and cli_default_live_research())
+    live_search = live_search_capability_enabled
+    if live_search and (
+        _request_forbids_live_research(semantic_input_text)
+        or _context_file_is_work_item_source_bundle(args.context_file)
     ):
+        live_search = False
+    # The standalone planner is an explicit evaluation lane, not a mandatory
+    # live model hop.  Named specialists interpret the original request and
+    # choose from a bounded toolbox; ambiguous requests use the Orchestrator.
+    # Deterministic preflight still owns safety, authority, and exact write scope.
+    live_manual_plan = bool(args.live_manual_plan)
+    request_estimate = _estimate_ask_openai_requests(
+        args,
+        input_text=semantic_input_text,
+        live_sdk=live_sdk,
+        live_manual_plan=live_manual_plan,
+        requested_route=requested_route,
+        effective_live_search=live_search,
+    )
+    # Protect the specialist minimum and the initial route decision. Optional
+    # Orchestrator repair gets headroom only when the shared allowance can fund it.
+    requested_specialist_minimum = 0
+    if requested_route in _DIRECT_SPECIALIST_ROUTES:
+        requested_specialist_minimum = sum(
+            int(row.get("min_requests") or 0)
+            for row in _direct_specialist_request_stage_rows(
+                requested_route,
+                input_text=semantic_input_text,
+                live_search=live_search,
+                manual_plan=None,
+            )
+            if bool(row.get("model_controlled"))
+            and not bool(row.get("conditional"))
+        )
+    mandatory_post_preflight_minimum = _mandatory_post_preflight_request_minimum(
+        request_estimate
+    )
+    if calendar_route_eligible and live_sdk:
+        # Calendar intent is already bounded enough to reserve the typed
+        # Calendar interpreter/synthesis path instead of the generic manager
+        # graph that would never execute for this request.
+        mandatory_post_preflight_minimum = 1
+    specialist_reserve = max(requested_specialist_minimum, mandatory_post_preflight_minimum)
+    continuation_scope = _slack_context_payload(args.context_file) if slack_context_input else {}
+    planning_from_prior_context = bool(
+        live_sdk
+        and execution_request.entrypoint == "slack_followup"
+        and requested_route in {None, "chief_of_staff", "orchestrator"}
+        and execution_request.continuation.prior_result_summary.strip()
+        and continuation_scope.get("channel_id")
+        and continuation_scope.get("thread_ts")
+        and continuation_scope.get("request_ts")
+        and continuation_scope["request_ts"] != continuation_scope["thread_ts"]
+    )
+    if planning_from_prior_context:
+        # Supplied thread context may support a single synthesis. Its presence
+        # permits planning, not a semantic decision to reuse it or skip reads.
+        # Recheck the selected route's actual minimum after the Orchestrator.
+        specialist_reserve = 1
+    budget_snapshot = current_model_request_budget_snapshot() or {}
+    available_limits = [limit for limit in (
+        args.max_openai_requests, budget_snapshot.get("remaining"),
+    ) if isinstance(limit, int)]
+    available_requests = min(available_limits) if available_limits else None
+    preflight_allocation = int(live_manual_plan) + int(live_sdk)
+    if live_sdk and (available_requests is None or
+                     available_requests >= specialist_reserve + preflight_allocation + 1):
+        preflight_allocation += 1
+    preflight_budget_estimate = preflight_allocation + specialist_reserve
+    if entry_scope := _ASK_ENTRY_TELEMETRY.get():
+        entry_scope.admission_reserved_requests = preflight_budget_estimate
+        hard_ceiling = budget_snapshot.get("limit")
+        entry_scope.hard_ceiling_requests = (
+            int(hard_ceiling) if isinstance(hard_ceiling, int) else None
+        )
+    if available_requests is not None and (
+        available_requests < 0 or preflight_budget_estimate > available_requests
+    ):
+        blocked_estimate = {
+            **request_estimate,
+            "admission_reserved_request_minimum": preflight_budget_estimate,
+        }
         return _print_ask_request_budget_blocked(
             json_output=args.json,
-            requested_limit=args.max_openai_requests,
-            estimate=request_estimate,
+            requested_limit=available_requests,
+            estimate=blocked_estimate,
         )
     direct_workflow_state = _orchestrator_workflow_state_from_cli_context(
         context_file_path=args.context_file,
@@ -1818,17 +2686,58 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         )
         calendar_plan = infer_calendar_action_plan(calendar_input_text)
     preflight_started_at = perf_counter()
-    orchestrator_preflight = run_orchestrator_preflight(
-        semantic_input_text,
-        requested_agent=requested_route,
-        live_manual_plan=live_manual_plan,
-        database_url=args.database_url,
-        workflow_state=direct_workflow_state,
+    entry_scope = _ASK_ENTRY_TELEMETRY.get()
+    preflight_span = (
+        entry_scope.recorder.span(
+            "entry.orchestrator_preflight",
+            attributes={
+                "route": str(requested_route or "orchestrator"),
+                "source": "orchestrator_first",
+            },
+        )
+        if entry_scope is not None
+        else nullcontext()
     )
+    with preflight_span:
+        parent_budget = current_model_request_budget()
+        bounded_preflight = available_requests is not None and preflight_allocation > 0
+        preflight_lease = (
+            reserve_child_model_request_budget(stage="orchestrator_preflight:allocation")
+            if bounded_preflight else None
+        )
+        preflight_context = (
+            activate_model_request_budget(
+                preflight_allocation,
+                correlation_id=parent_budget.correlation_id if parent_budget else None,
+                parent_consumed=(parent_budget.parent_consumed + parent_budget.consumed
+                                 if parent_budget else 0),
+            ) if bounded_preflight else nullcontext()
+        )
+        preflight_ledger = None
+        try:
+            with preflight_context as preflight_ledger:
+                orchestrator_preflight = run_orchestrator_preflight(
+                    semantic_input_text,
+                    requested_agent=requested_route,
+                    live_manual_plan=live_manual_plan,
+                    live_orchestrator=live_sdk,
+                    database_url=args.database_url,
+                    workflow_state=direct_workflow_state,
+                )
+        finally:
+            if preflight_lease is not None:
+                preflight_lease.settle(
+                    preflight_ledger.consumed if preflight_ledger is not None else 0,
+                    exhaustion_stage=(preflight_ledger.snapshot()["exhaustion_stage"]
+                                      if preflight_ledger is not None else ""),
+                )
+        _capture_entry_preflight_observation(orchestrator_preflight)
     orchestrator_preflight_ms = round(
         (perf_counter() - preflight_started_at) * 1000,
         3,
     )
+    if entry_scope is not None:
+        entry_scope.orchestrator_preflight_ms = orchestrator_preflight_ms
     orchestrator_preflight = _apply_continuation_provider_affinity(
         orchestrator_preflight,
         execution_request.continuation.provider_affinity,
@@ -1866,6 +2775,35 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             }
         )
     manual_plan = orchestrator_preflight.manual_request_plan
+    # Terminal planning outcomes need no downstream execution reservation.
+    if _preflight_blocks_execution(orchestrator_preflight):
+        return _print_ask_preflight_blocked(
+            input_text,
+            json_output=args.json,
+            orchestrator_preflight=orchestrator_preflight,
+        )
+    if (
+        manual_plan.target_agent == "clarification"
+        or orchestrator_preflight.route_result.route == "clarification"
+    ):
+        clarification = (
+            orchestrator_preflight.route_result.clarification_request
+            or orchestrator_preflight.route_result.stop_reason
+            or "Please provide the missing item, target, or requested change."
+        )
+        return _print_ask_clarification(
+            "orchestrator",
+            input_text,
+            clarification,
+            json_output=args.json,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            extra={
+                "status": "needs_input",
+                "route": "clarification",
+                "block_kind": "clarification_required",
+            },
+        )
     live_search = live_search_allowed_for_execution(
         live_search_capability_enabled,
         manual_plan=manual_plan,
@@ -1928,12 +2866,6 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 estimate=calendar_request_estimate,
                 openai_requests_made=preflight_requests,
             )
-        if _preflight_blocks_execution(orchestrator_preflight):
-            return _print_ask_preflight_blocked(
-                input_text,
-                json_output=args.json,
-                orchestrator_preflight=orchestrator_preflight,
-            )
         calendar_resolution = resolve_calendar_action_plan(
             calendar_input_text,
             calendar_plan,
@@ -1949,6 +2881,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 semantic_plan=manual_plan,
                 allowed_agents={"chief_of_staff"},
                 allowed_intents={"business_system_write", "context_lookup"},
+                dry_run_preview=not live_sdk,
             )
             if calendar_admission.can_execute_provider_action:
                 return run_direct_calendar_action(
@@ -1958,6 +2891,11 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                     json_output=args.json,
                     openai_requests=(preflight_requests + calendar_resolution.openai_requests),
                     interpretation_warnings=calendar_resolution.warnings,
+                    calendar_interpretation=getattr(
+                        calendar_resolution,
+                        "decision_telemetry",
+                        None,
+                    ),
                     execution_admission=calendar_admission,
                     manual_plan=manual_plan,
                     orchestrator_preflight=orchestrator_preflight,
@@ -1985,6 +2923,11 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             manual_plan=manual_plan,
         )
     )
+    # Orchestrator preflight is the front-door control plane, but an unnamed
+    # request with one validated owner should execute that specialist instead
+    # of spending the only model turn on a route-only Orchestrator response.
+    # Ambiguous, multi-owner, durable, and approval-dependent work still falls
+    # through to the Orchestrator/WorkItem path below.
     semantic_direct_route = (
         _bounded_direct_route_from_preflight(orchestrator_preflight)
         if args.agent is None and not mention.explicit
@@ -2012,49 +2955,43 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             provider_free_composition_allowed=bool(
                 orchestrator_preflight.composition_admission.composition_allowed
             ),
+            observed_orchestrator_requests=(
+                _orchestrator_preflight_request_count(orchestrator_preflight)
+            ),
+            verified_gmail_continuation=any(
+                reference.provider_system == "gmail"
+                and reference.verification_status == "verified"
+                and reference.lifecycle_state != "deleted"
+                and bool(reference.object_id)
+                for reference in execution_request.continuation.verified_objects
+            ),
         )
-    if args.max_openai_requests is not None and (
-        args.max_openai_requests < 0 or resolved_request_estimate["max"] > args.max_openai_requests
+    observed_preflight_requests = _orchestrator_preflight_request_count(
+        orchestrator_preflight
+    )
+    if args.max_openai_requests is not None and _ask_request_estimate_exceeds_ceiling(
+        resolved_request_estimate,
+        requested_limit=args.max_openai_requests,
+        openai_requests_made=observed_preflight_requests,
     ):
         return _print_ask_request_budget_blocked(
             json_output=args.json,
             requested_limit=args.max_openai_requests,
             estimate=resolved_request_estimate,
-            openai_requests_made=_orchestrator_preflight_request_count(orchestrator_preflight),
+            openai_requests_made=observed_preflight_requests,
         )
+    admitted_signal_context = (
+        orchestrator_preflight.composition_admission.verified_signal_context
+    )
     direct_execution_context = _direct_specialist_execution_context(
         input_text,
         workflow_state=direct_workflow_state,
         force_thread_context=slack_continuation,
+        include_slack_scope=isinstance(
+            direct_workflow_state.get("slack_context"), Mapping
+        ),
+        verified_signal_context=admitted_signal_context,
     )
-    if _preflight_blocks_execution(orchestrator_preflight):
-        return _print_ask_preflight_blocked(
-            input_text,
-            json_output=args.json,
-            orchestrator_preflight=orchestrator_preflight,
-        )
-    if (
-        manual_plan.target_agent == "clarification"
-        or orchestrator_preflight.route_result.route == "clarification"
-    ):
-        clarification = (
-            orchestrator_preflight.route_result.clarification_request
-            or orchestrator_preflight.route_result.stop_reason
-            or "Please provide the missing item, target, or requested change."
-        )
-        return _print_ask_clarification(
-            "orchestrator",
-            input_text,
-            clarification,
-            json_output=args.json,
-            manual_plan=manual_plan,
-            orchestrator_preflight=orchestrator_preflight,
-            extra={
-                "status": "needs_input",
-                "route": "clarification",
-                "block_kind": "clarification_required",
-            },
-        )
     if _manual_plan_reuses_linked_work_item(
         manual_plan,
         work_item=linked_work_item,
@@ -2066,6 +3003,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             live_sdk=live_sdk,
             live_rss_slack_read=args.live_rss_slack_read,
             max_results=args.max_results,
+            max_results_explicit=getattr(args, "max_results_explicit", False),
             max_manager_steps=args.max_manager_steps,
             json_output=args.json,
             manual_plan=manual_plan,
@@ -2136,6 +3074,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 live_sdk=live_sdk,
                 live_rss_slack_read=args.live_rss_slack_read,
                 max_results=args.max_results,
+                max_results_explicit=getattr(args, "max_results_explicit", False),
                 max_manager_steps=args.max_manager_steps,
                 json_output=args.json,
                 manual_plan=manual_plan,
@@ -2152,7 +3091,16 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             (mention.explicit and mention.route is not None) or semantic_direct_route is not None
         ):
             route = (
-                _route_with_manual_plan_advice(str(mention.route), manual_plan)
+                "orchestrator"
+                if (
+                    mention.explicit
+                    and mention.route == "orchestrator"
+                    and is_read_only_work_item_inspection_plan(manual_plan)
+                )
+                else _route_with_manual_plan_advice(
+                    str(mention.route), manual_plan,
+                    orchestrator_preflight=orchestrator_preflight,
+                )
                 if mention.explicit and mention.route is not None
                 else str(semantic_direct_route)
             )
@@ -2244,6 +3192,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             live_sdk=live_sdk,
             live_rss_slack_read=args.live_rss_slack_read,
             max_results=args.max_results,
+            max_results_explicit=getattr(args, "max_results_explicit", False),
             max_manager_steps=args.max_manager_steps,
             json_output=args.json,
             manual_plan=manual_plan,
@@ -2268,6 +3217,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             live_sdk=live_sdk,
             live_rss_slack_read=args.live_rss_slack_read,
             max_results=args.max_results,
+            max_results_explicit=getattr(args, "max_results_explicit", False),
             max_manager_steps=args.max_manager_steps,
             json_output=args.json,
             manual_plan=manual_plan,
@@ -2289,6 +3239,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 live_sdk=live_sdk,
                 live_rss_slack_read=args.live_rss_slack_read,
                 max_results=args.max_results,
+                max_results_explicit=getattr(args, "max_results_explicit", False),
                 max_manager_steps=args.max_manager_steps,
                 json_output=args.json,
                 manual_plan=manual_plan,
@@ -2315,7 +3266,9 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             cost_tracking_requested=cost_directive.requested,
         )
     if live_sdk:
-        route = _route_with_manual_plan_advice(route, manual_plan)
+        route = _route_with_manual_plan_advice(
+            route, manual_plan, orchestrator_preflight=orchestrator_preflight,
+        )
         if route == "orchestrator":
             return _run_ask_orchestrator(
                 downstream_input_text,
@@ -2541,12 +3494,15 @@ def _latest_distinct_slack_operator_turn(
 def _route_from_slack_result_label(value: str) -> str:
     normalized = " ".join(str(value or "").lower().split())
     route_markers = (
+        ("preprints", "preprints_context_agent"),
         ("zotero", "zotero_context_agent"),
         ("gmail", "gmail_triage"),
         ("opportunity", "opportunity_scout"),
         ("outreach", "outreach_composer"),
         ("company research", "business_research_analyst"),
         ("business research", "business_research_analyst"),
+        ("rag retrieval", "rag_retrieval_specialist"),
+        ("semantic retrieval", "rag_retrieval_specialist"),
         ("google workspace", "google_workspace_context_agent"),
         ("calendar", "chief_of_staff"),
         ("chief of staff", "chief_of_staff"),
@@ -3175,6 +4131,291 @@ def _request_forbids_live_sdk(text: str) -> bool:
     )
 
 
+_CHIEF_NESTED_VALIDATED_CONTEXT_ROUTES = frozenset(
+    {
+        "airtable_context_agent",
+        "google_workspace_context_agent",
+        "zotero_context_agent",
+        "rss_context_agent",
+        "preprints_context_agent",
+    }
+)
+_CHIEF_NESTED_SPECIALIST_ROUTES = frozenset(
+    {
+        "gmail_triage",
+        "business_research_analyst",
+        "opportunity_scout",
+        "outreach_composer",
+        *_CHIEF_NESTED_VALIDATED_CONTEXT_ROUTES,
+    }
+)
+
+
+def _estimated_model_stage(
+    stage: str,
+    *,
+    max_requests: int,
+    min_requests: int | None = None,
+    admission_reserve_requests: int | None = None,
+    route: str = "",
+    conditional: bool = False,
+    model_controlled: bool = True,
+    note: str = "",
+) -> dict[str, Any]:
+    """Describe one model-request envelope without changing execution policy."""
+
+    bounded_max = max(0, int(max_requests))
+    bounded_min = (
+        0
+        if conditional or bounded_max == 0
+        else min(bounded_max, max(1, int(min_requests or 1)))
+    )
+    bounded_reserve = min(
+        bounded_max,
+        max(
+            0,
+            int(
+                bounded_min
+                if admission_reserve_requests is None
+                else admission_reserve_requests
+            ),
+        ),
+    )
+    return {
+        "stage": stage,
+        "route": str(route or ""),
+        "conditional": bool(conditional),
+        "model_controlled": bool(model_controlled and bounded_max),
+        "min_requests": bounded_min,
+        "admission_reserve_requests": bounded_reserve,
+        "max_requests": bounded_max,
+        **({"note": note} if note else {}),
+    }
+
+
+def _direct_specialist_request_stage_rows(
+    route: str,
+    *,
+    input_text: str,
+    live_search: bool,
+    manual_plan: ManualRequestPlan | None,
+    verified_gmail_continuation: bool = False,
+) -> list[dict[str, Any]]:
+    """Return route-sensitive initial, correction, and repair envelopes."""
+
+    initial_max = _direct_specialist_request_estimate(
+        route,
+        input_text=input_text,
+        live_search=live_search,
+        manual_plan=manual_plan,
+    )
+    initial_stage = f"{route}_direct_sdk"
+    rows: list[dict[str, Any]] = []
+    plan = manual_plan or infer_manual_request_plan(
+        input_text,
+        requested_agent=route,
+    )
+
+    if route == "gmail_triage":
+        if is_gmail_schema_only_request(input_text):
+            return [
+                _estimated_model_stage(
+                    initial_stage,
+                    route=route,
+                    max_requests=initial_max,
+                    min_requests=2,
+                    note="Model-visible schema-tool selection and bounded synthesis.",
+                ),
+                _estimated_model_stage(
+                    "conditional_gmail_triage_tool_correction",
+                    route=route,
+                    max_requests=min(initial_max, 2),
+                    conditional=True,
+                    note="Shared missing-required-schema-tool correction.",
+                ),
+            ]
+        initial_max = (
+            resolve_sdk_turn_policy(
+                "gmail_triage",
+                request_text=input_text,
+            ).max_turns
+            if verified_gmail_continuation
+            else 7
+        )
+        rows.append(
+            _estimated_model_stage(
+                initial_stage,
+                route=route,
+                max_requests=initial_max,
+                min_requests=2 if verified_gmail_continuation else 3,
+                note=(
+                    "Verified continuation read and semantic decision."
+                    if verified_gmail_continuation
+                    else (
+                        "Agent-owned Gmail query, candidate-context read, comparison, "
+                        "and final decision."
+                    )
+                ),
+            )
+        )
+        rows.append(
+            _estimated_model_stage(
+                "conditional_gmail_triage_tool_correction",
+                route=route,
+                max_requests=initial_max,
+                conditional=True,
+                note="Shared missing-required-Gmail-tool correction.",
+            )
+        )
+        rows.append(
+            _estimated_model_stage(
+                "conditional_gmail_triage_validator_repair",
+                route=route,
+                max_requests=2,
+                conditional=True,
+                note="Tool-free repair over the already verified Gmail candidate universe.",
+            )
+        )
+        return rows
+
+    rows.append(
+        _estimated_model_stage(
+            initial_stage,
+            route=route,
+            max_requests=initial_max,
+            admission_reserve_requests=(
+                initial_max if route == "opportunity_scout" else None
+            ),
+            note="Initial specialist SDK tool-and-decision loop.",
+        )
+    )
+    if route in {"business_research_analyst", "opportunity_scout"}:
+        provider_retrieval_required = bool(live_search or plan.requires_live_search)
+        if provider_retrieval_required:
+            rows.append(
+                _estimated_model_stage(
+                    f"conditional_{route}_tool_correction",
+                    route=route,
+                    max_requests=(2 if route == "opportunity_scout" else initial_max),
+                    admission_reserve_requests=(
+                        2 if route == "opportunity_scout" else None
+                    ),
+                    conditional=True,
+                    note=(
+                        "Shared wrapper correction when required retrieval/scoring tools "
+                        "did not satisfy their postcondition."
+                    ),
+                )
+            )
+        rows.append(
+            _estimated_model_stage(
+                f"conditional_{route}_decision_repair",
+                route=route,
+                max_requests=(1 if route == "opportunity_scout" else initial_max),
+                admission_reserve_requests=(
+                    1 if route == "opportunity_scout" else None
+                ),
+                conditional=True,
+                note="One evidence-preserving specialist decision repair.",
+            )
+        )
+        return rows
+
+    if route in {"rss_context_agent", "preprints_context_agent"}:
+        rows.append(
+            _estimated_model_stage(
+                f"conditional_{route}_tool_correction",
+                route=route,
+                max_requests=initial_max,
+                conditional=True,
+                note="Shared missing-required-history-tool correction.",
+            )
+        )
+        rows.append(
+            _estimated_model_stage(
+                f"conditional_{route}_decision_repair",
+                route=route,
+                max_requests=initial_max,
+                conditional=True,
+                note="Tool-free repair over the first bounded signal candidate universe.",
+            )
+        )
+        return rows
+
+    if route in {
+        "airtable_context_agent",
+        "google_workspace_context_agent",
+        "zotero_context_agent",
+    }:
+        if initial_max > 1:
+            rows.append(
+                _estimated_model_stage(
+                    f"conditional_{route}_tool_correction",
+                    route=route,
+                    max_requests=min(initial_max, 2),
+                    conditional=True,
+                    note="Bounded missing-required-tool correction.",
+                )
+            )
+        rows.append(
+            _estimated_model_stage(
+                f"conditional_{route}_decision_repair",
+                route=route,
+                max_requests=1,
+                conditional=True,
+                note="One evidence-only semantic decision repair.",
+            )
+        )
+    return rows
+
+
+def _chief_nested_specialist_stage_rows(
+    manual_plan: ManualRequestPlan | None,
+) -> list[dict[str, Any]]:
+    """Count one provably admitted child envelope for each canonical Chief route."""
+
+    authority = ExecutionIntentAuthority.from_value(manual_plan)
+    if not authority.canonical or authority.plan is None:
+        return []
+    plan = authority.plan
+    admitted_routes = sorted(
+        {plan.target_agent, *plan.workflow}.intersection(
+            _CHIEF_NESTED_SPECIALIST_ROUTES
+        )
+    )
+    rows: list[dict[str, Any]] = []
+    for route in admitted_routes:
+        rows.append(
+            _estimated_model_stage(
+                f"chief_nested_{route}_sdk",
+                route=route,
+                max_requests=6,
+                conditional=True,
+                note="One admitted Chief agent-as-tool child execution envelope.",
+            )
+        )
+        if route in _CHIEF_NESTED_VALIDATED_CONTEXT_ROUTES:
+            rows.append(
+                _estimated_model_stage(
+                    f"conditional_chief_nested_{route}_tool_correction",
+                    route=route,
+                    max_requests=6,
+                    conditional=True,
+                    note="Nested required-read-tool correction envelope.",
+                )
+            )
+            rows.append(
+                _estimated_model_stage(
+                    f"conditional_chief_nested_{route}_decision_repair",
+                    route=route,
+                    max_requests=6,
+                    conditional=True,
+                    note="Validated context child may make one tool-free repair run.",
+                )
+            )
+    return rows
+
+
 def _estimate_ask_openai_requests(
     args: argparse.Namespace,
     *,
@@ -3185,16 +4426,84 @@ def _estimate_ask_openai_requests(
     manual_plan: ManualRequestPlan | None = None,
     effective_live_search: bool | None = None,
     provider_free_composition_allowed: bool = False,
+    observed_orchestrator_requests: int | None = None,
+    verified_gmail_continuation: bool = False,
 ) -> dict[str, Any]:
     if not live_sdk and not live_manual_plan:
-        return {"min": 0, "max": 0, "stages": []}
+        return {
+            "min": 0,
+            "mandatory_request_minimum": 0,
+            "max": 0,
+            "stages": [],
+            "stage_rows": [],
+        }
     stages: list[str] = []
+    stage_rows: list[dict[str, Any]] = []
     maximum = 0
+
+    def add_stage(
+        stage: str,
+        max_requests: int,
+        *,
+        min_requests: int | None = None,
+        route: str = "",
+        conditional: bool = False,
+        model_controlled: bool = True,
+        note: str = "",
+    ) -> None:
+        nonlocal maximum
+        row = _estimated_model_stage(
+            stage,
+            max_requests=max_requests,
+            min_requests=min_requests,
+            route=route,
+            conditional=conditional,
+            model_controlled=model_controlled,
+            note=note,
+        )
+        stages.append(stage)
+        stage_rows.append(row)
+        maximum += int(row["max_requests"])
+
+    def add_rows(
+        rows: list[dict[str, Any]],
+        *,
+        legacy_stages: list[str] | None = None,
+    ) -> None:
+        nonlocal maximum
+        if legacy_stages is not None:
+            stages.extend(legacy_stages)
+        for row in rows:
+            if legacy_stages is None:
+                stages.append(str(row["stage"]))
+            stage_rows.append(dict(row))
+            maximum += int(row["max_requests"])
+
     if live_manual_plan:
-        stages.append("manual_request_planner")
-        maximum += 1
+        add_stage("manual_request_planner", 1)
     if not live_sdk:
-        return {"min": maximum, "max": maximum, "stages": stages}
+        return {
+            "min": maximum,
+            "mandatory_request_minimum": maximum,
+            "max": maximum,
+            "stages": stages,
+            "stage_rows": stage_rows,
+        }
+    orchestrator_requests = (
+        max(0, int(observed_orchestrator_requests))
+        if observed_orchestrator_requests is not None
+        else 2
+    )
+    add_stage(
+        "orchestrator_preflight",
+        orchestrator_requests,
+        model_controlled=orchestrator_requests > 0,
+        note=(
+            "Observed preflight model requests."
+            if observed_orchestrator_requests is not None
+            else "Conservative route-decision plus bounded validation-repair envelope."
+        ),
+    )
     search_enabled = (
         bool(args.live_search) if effective_live_search is None else bool(effective_live_search)
     )
@@ -3212,6 +4521,7 @@ def _estimate_ask_openai_requests(
         _manual_plan_is_bounded_provider_free_response(
             manual_plan,
             route=direct_supplied_route,
+            input_text=input_text,
             provider_free_composition_allowed=provider_free_composition_allowed,
         )
         or (
@@ -3223,12 +4533,19 @@ def _estimate_ask_openai_requests(
         )
     )
     if bounded_provider_free_response:
-        stages.append(f"{direct_supplied_route}_direct_supplied_response_sdk")
-        maximum += 1
+        add_stage(
+            f"{direct_supplied_route}_direct_supplied_response_sdk",
+            1,
+            route=direct_supplied_route,
+        )
         return {
-            "min": maximum,
+            "min": len(stages),
+            "mandatory_request_minimum": sum(
+                int(row.get("min_requests") or 0) for row in stage_rows
+            ),
             "max": maximum,
             "stages": stages,
+            "stage_rows": stage_rows,
             "note": (
                 "Complete supplied-context transformations use one schema-constrained "
                 "specialist request. An explicit live-planner override adds one prior "
@@ -3237,8 +4554,7 @@ def _estimate_ask_openai_requests(
             "request_text_sha256": hashlib.sha256(input_text.encode("utf-8")).hexdigest()[:12],
         }
     if _context_file_is_work_item_source_bundle(args.context_file):
-        stages.append("outreach_composer_synthesis")
-        maximum += 1
+        add_stage("outreach_composer_synthesis", 1, route="outreach_composer")
     elif requested_route or args.agent is not None or manual_plan is not None:
         original_route = str(
             requested_route
@@ -3254,10 +4570,21 @@ def _estimate_ask_openai_requests(
                     input_text,
                     requested_agent=estimated_route,
                 )
-            estimated_route = _route_with_manual_plan_advice(
-                estimated_route,
-                deterministic_plan,
-            )
+                if original_route == "chief_of_staff":
+                    # Coordinating-agent requests need a conservative estimate
+                    # for the specialist Chief is expected to delegate to.
+                    estimated_route = _route_with_manual_plan_advice(
+                        estimated_route,
+                        deterministic_plan,
+                    )
+            else:
+                # Before Orchestrator preflight, an explicit named specialist
+                # defines the budget envelope. Only the post-preflight canonical
+                # plan may redirect the resolved execution estimate.
+                estimated_route = _route_with_manual_plan_advice(
+                    estimated_route,
+                    deterministic_plan,
+                )
         supplied_context_bound = bool(
             deterministic_plan is not None
             and deterministic_plan.ask_shape.prior_context_dependency == "selected_context"
@@ -3323,23 +4650,29 @@ def _estimate_ask_openai_requests(
             and estimated_route == "chief_of_staff"
         )
         if bounded_provider_request and deterministic_plan is not None:
-            stages.append(f"{deterministic_plan.provider_system}_bounded_provider_sdk")
             # One model turn selects/calls the plan-scoped provider tool; the
             # next synthesizes the verified receipt. Provider calls themselves
             # are not OpenAI requests.
-            maximum += 2
+            add_stage(
+                f"{deterministic_plan.provider_system}_bounded_provider_sdk",
+                2,
+                route="chief_of_staff",
+            )
         elif bounded_supplied_workflow and deterministic_plan is not None:
             for route in deterministic_plan.workflow:
                 if route in {
                     "business_research_analyst",
                     "opportunity_scout",
                 }:
-                    stages.append(f"{route}_source_provided_deterministic")
+                    add_stage(
+                        f"{route}_source_provided_deterministic",
+                        0,
+                        route=route,
+                        model_controlled=False,
+                    )
                     continue
-                stages.append(f"{route}_sdk")
-                maximum += 1
-            stages.append("final_response_synthesis")
-            maximum += 1
+                add_stage(f"{route}_sdk", 1, route=route)
+            add_stage("final_response_synthesis", 1)
         elif (
             original_route == "chief_of_staff"
             and estimated_route == "chief_of_staff"
@@ -3348,8 +4681,12 @@ def _estimate_ask_openai_requests(
             and not deterministic_plan.requires_live_search
             and not search_enabled
         ):
-            stages.append("chief_of_staff_bounded_provider_sdk")
-            maximum += 4
+            add_stage(
+                "chief_of_staff_bounded_provider_sdk",
+                4,
+                route="chief_of_staff",
+            )
+            add_rows(_chief_nested_specialist_stage_rows(deterministic_plan))
         elif (
             original_route == "chief_of_staff"
             and estimated_route == "chief_of_staff"
@@ -3361,8 +4698,11 @@ def _estimate_ask_openai_requests(
                 )
             )
         ):
-            stages.append("chief_of_staff_response_only_sdk")
-            maximum += 1
+            add_stage(
+                "chief_of_staff_response_only_sdk",
+                1,
+                route="chief_of_staff",
+            )
         elif (
             original_route != "orchestrator"
             and direct_specialist_route
@@ -3373,88 +4713,215 @@ def _estimate_ask_openai_requests(
                 input_text=input_text,
                 manual_plan=deterministic_plan,
             ):
-                stages.append("gmail_test_draft_lifecycle_provider")
+                add_stage(
+                    "gmail_test_draft_lifecycle_provider",
+                    0,
+                    route="gmail_triage",
+                    model_controlled=False,
+                )
             else:
-                stages.append(f"{estimated_route}_direct_sdk")
-                maximum += _direct_specialist_request_estimate(
+                direct_rows = _direct_specialist_request_stage_rows(
                     estimated_route,
                     input_text=input_text,
                     live_search=search_enabled,
                     manual_plan=deterministic_plan,
+                    verified_gmail_continuation=verified_gmail_continuation,
+                )
+                legacy_direct_stages = [f"{estimated_route}_direct_sdk"]
+                if estimated_route in {
+                    "airtable_context_agent",
+                    "google_workspace_context_agent",
+                    "zotero_context_agent",
+                } and len(direct_rows) > 1:
+                    legacy_direct_stages.append(
+                        f"conditional_{estimated_route}_bounded_recovery"
+                    )
+                add_rows(
+                    direct_rows,
+                    legacy_stages=legacy_direct_stages,
                 )
         else:
-            stages.append(f"{estimated_route}_sdk")
-            maximum += resolve_sdk_turn_policy(
-                estimated_route,
-                request_text=input_text,
-                live_search=search_enabled,
-            ).max_turns
+            if estimated_route == "chief_of_staff":
+                chief_max = chief_of_staff_quality_budget(
+                    request_text=input_text,
+                    live_sdk=True,
+                    manual_request_plan=deterministic_plan,
+                ).max_turns
+                add_stage(
+                    "chief_of_staff_sdk",
+                    chief_max,
+                    route="chief_of_staff",
+                    note="Chief parent model loop under its resolved quality budget.",
+                )
+                add_rows(_chief_nested_specialist_stage_rows(deterministic_plan))
+            else:
+                add_stage(
+                    f"{estimated_route}_sdk",
+                    resolve_sdk_turn_policy(
+                        estimated_route,
+                        request_text=input_text,
+                        live_search=search_enabled,
+                    ).max_turns,
+                    route=estimated_route,
+                )
     else:
         manager_steps = max(1, int(args.max_manager_steps or 1))
         if _is_bounded_gmail_recommendation_graph(
             input_text,
             manager_steps=manager_steps,
         ):
-            stages.append("outreach_composer_sdk")
-            maximum += 1
+            add_stage("outreach_composer_sdk", 1, route="outreach_composer")
         elif _is_bounded_gmail_research_reply_graph(
             input_text,
             manager_steps=manager_steps,
         ):
-            stages.extend(
-                (
-                    "gmail_provider_read",
-                    "business_research_sdk",
-                    "outreach_composer_sdk",
-                    "final_response_synthesis",
-                )
+            add_stage(
+                "gmail_provider_read",
+                0,
+                route="gmail_triage",
+                model_controlled=False,
             )
-            maximum += 7
+            add_stage("business_research_sdk", 5, route="business_research_analyst")
+            add_stage("outreach_composer_sdk", 1, route="outreach_composer")
+            add_stage("final_response_synthesis", 1)
         elif _is_bounded_gmail_research_summary_graph(
             input_text,
             manager_steps=manager_steps,
         ):
-            stages.extend(
-                (
-                    "gmail_provider_read",
-                    "business_research_sdk",
-                    "final_response_synthesis",
-                )
+            add_stage(
+                "gmail_provider_read",
+                0,
+                route="gmail_triage",
+                model_controlled=False,
             )
-            maximum += 7
+            add_stage("business_research_sdk", 6, route="business_research_analyst")
+            add_stage("final_response_synthesis", 1)
         else:
-            stages.extend(
-                f"manager_specialist_step_{index}" for index in range(1, manager_steps + 1)
-            )
-            stages.append("final_response_synthesis")
-            maximum += manager_steps * 6 + 1
+            for index in range(1, manager_steps + 1):
+                add_stage(f"manager_specialist_step_{index}", 6)
+            add_stage("final_response_synthesis", 1)
     constraint_plan = manual_plan or infer_manual_request_plan(
         input_text,
         requested_agent=str(requested_route or args.agent or "orchestrator"),
     )
     constraints = output_constraints_from_plan(constraint_plan)
     if constraints.has_deterministic_requirements():
-        stages.append("conditional_instruction_following_repair")
-        maximum += 1
+        add_stage(
+            "conditional_instruction_following_repair",
+            1,
+            conditional=True,
+        )
     direct_specialist = any(stage.endswith("_direct_sdk") for stage in stages)
+    post_preflight_mandatory_rows = [
+        row
+        for row in stage_rows
+        if bool(row.get("model_controlled"))
+        and not bool(row.get("conditional"))
+        and str(row.get("stage") or "")
+        not in {"manual_request_planner", "orchestrator_preflight"}
+    ]
+    single_sdk_owner = (
+        post_preflight_mandatory_rows[0]
+        if len(post_preflight_mandatory_rows) == 1 else {}
+    )
+    shared_runtime_ceiling_eligible = bool(
+        (
+            direct_specialist
+            and str(single_sdk_owner.get("stage") or "").endswith("_direct_sdk")
+        )
+        or (
+            str(single_sdk_owner.get("route") or "") == "chief_of_staff"
+            and str(single_sdk_owner.get("stage") or "").endswith("_sdk")
+        )
+    )
     mandatory_stage_count = sum(
-        stage != "conditional_instruction_following_repair"
+        not stage.startswith("conditional_")
         and not stage.endswith("_provider")
         and not stage.endswith("_deterministic")
         for stage in stages
     )
     return {
         "min": mandatory_stage_count,
+        "mandatory_request_minimum": sum(
+            int(row.get("min_requests") or 0) for row in stage_rows
+        ),
         "max": maximum,
         "stages": stages,
+        "stage_rows": stage_rows,
+        "shared_runtime_ceiling_eligible": shared_runtime_ceiling_eligible,
         "note": (
             "Direct specialist estimate counts model turns only; bounded provider tool "
-            "calls are not OpenAI requests, and provider retries are a stop event."
+            "calls are not OpenAI requests. Semantic correction and repair envelopes "
+            "are explicit; transport retries remain outside this estimate and are "
+            "bounded by the hard request ledger."
             if direct_specialist
-            else "Maximum uses configured SDK turn limits; provider retries are a stop event."
+            else (
+                "Maximum uses configured semantic SDK turn envelopes. Transport retries "
+                "remain outside this estimate and are bounded by the hard request ledger."
+            )
         ),
         "request_text_sha256": hashlib.sha256(input_text.encode("utf-8")).hexdigest()[:12],
     }
+
+
+def _mandatory_post_preflight_request_minimum(estimate: Mapping[str, Any]) -> int:
+    """Return the irreducible model budget required after manager preflight."""
+
+    return sum(
+        max(0, int(row.get("min_requests") or 0))
+        for row in list(estimate.get("stage_rows") or [])
+        if isinstance(row, Mapping)
+        and bool(row.get("model_controlled"))
+        and not bool(row.get("conditional"))
+        and str(row.get("stage") or "")
+        not in {"manual_request_planner", "orchestrator_preflight"}
+    )
+
+
+def _post_preflight_admission_reserve(estimate: Mapping[str, Any]) -> int:
+    """Return the runtime-enforced capacity reserved for one direct child.
+
+    Conditional recovery stages may have an expected minimum of zero while still
+    needing bounded headroom if they are enabled. This reserve keeps admission
+    aligned with the actual per-attempt turn caps.
+    """
+
+    return sum(
+        max(0, int(row.get("admission_reserve_requests") or 0))
+        for row in list(estimate.get("stage_rows") or [])
+        if isinstance(row, Mapping)
+        and bool(row.get("model_controlled"))
+        and str(row.get("stage") or "")
+        not in {"manual_request_planner", "orchestrator_preflight"}
+    )
+
+
+def _ask_request_estimate_exceeds_ceiling(
+    estimate: Mapping[str, Any],
+    *,
+    requested_limit: int,
+    openai_requests_made: int,
+) -> bool:
+    """Admit one SDK owner under the already-enforced shared request ledger.
+
+    A quality turn ceiling is an allowance, not a mandatory number of calls.
+    Child work and repair still consume the same logical execution allowance.
+    Independent multi-stage manager envelopes retain their existing admission.
+    """
+
+    limit = int(requested_limit)
+    observed = max(0, int(openai_requests_made))
+    if limit < 0:
+        return True
+    if int(estimate.get("max") or 0) <= limit:
+        return False
+    if estimate.get("shared_runtime_ceiling_eligible") is not True:
+        return True
+    remaining = max(0, limit - observed)
+    admission_reserve = _post_preflight_admission_reserve(estimate)
+    if admission_reserve <= 0:
+        admission_reserve = _mandatory_post_preflight_request_minimum(estimate)
+    return remaining < max(1, admission_reserve)
 
 
 _CONTINUATION_PROVIDER_SYSTEMS = {
@@ -3482,14 +4949,26 @@ def _apply_continuation_provider_affinity(
 
     plan = preflight.manual_request_plan
     provider = _CONTINUATION_PROVIDER_SYSTEMS.get(str(provider_affinity or "").strip().lower())
-    if (
-        not provider
-        or plan.provider_system != "unspecified"
-        or plan.intent not in {"context_lookup", "business_system_write", "gmail_triage"}
-    ):
+    if not provider or plan.intent not in {
+        "context_lookup",
+        "business_system_write",
+        "gmail_triage",
+    }:
+        return preflight
+    if plan.provider_system not in {"unspecified", provider}:
+        return preflight
+    updates: dict[str, object] = {}
+    if plan.provider_system == "unspecified":
+        updates["provider_system"] = provider
+    if plan.intent == "context_lookup" and not plan.provider_operations:
+        # Provider affinity is typed continuation state from the prior thread.
+        # Adding one read operation completes a safe context lookup; it cannot
+        # authorize a mutation or change a provider selected by the planner.
+        updates["provider_operations"] = ["read"]
+    if not updates:
         return preflight
     return preflight.model_copy(
-        update={"manual_request_plan": plan.model_copy(update={"provider_system": provider})}
+        update={"manual_request_plan": plan.model_copy(update=updates)}
     )
 
 
@@ -3592,6 +5071,7 @@ def _print_ask_request_budget_blocked(
         "openai_requests_made": requests_made,
         "send_enabled": False,
     }
+    _attach_slack_run_provenance(payload, None)
     if json_output:
         print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
     else:
@@ -3603,15 +5083,7 @@ def _print_ask_request_budget_blocked(
     return 2
 
 
-_DIRECT_SUPPLIED_RESPONSE_ROUTES = frozenset(
-    {
-        "chief_of_staff",
-        "business_research_analyst",
-        "opportunity_scout",
-        "outreach_composer",
-        "gmail_triage",
-    }
-)
+_DIRECT_SUPPLIED_RESPONSE_ROUTES = CONTEXT_ONLY_RESPONSE_ROUTES
 
 
 def _is_direct_supplied_response_request(
@@ -3641,6 +5113,7 @@ def _is_direct_supplied_response_request(
         and plan.intent
         not in {
             "blocked_send",
+            "browser_diagnostics",
             "business_system_write",
             "clarification",
             "continue_work_item",
@@ -3652,26 +5125,100 @@ def _manual_plan_is_bounded_provider_free_response(
     manual_plan: ManualRequestPlan | None,
     *,
     route: str,
+    input_text: str,
     provider_free_composition_allowed: bool = False,
 ) -> bool:
-    """Classify post-plan direct answers without inspecting request wording."""
+    """Admit only true provider-free transformations to the generic schema."""
 
     authority = ExecutionIntentAuthority.from_value(manual_plan)
     if not authority.canonical:
         return False
     assert authority.plan is not None
     manual_plan = authority.plan
-    provider_context_is_already_supplied = bool(
-        manual_plan.provider_operations
-        and set(manual_plan.provider_operations) <= {"read"}
-        and manual_plan.ask_shape.source_type_preference
-        and all(
-            re.search(
-                r"\b(?:attached|local)\b",
-                str(source_type or ""),
-                re.IGNORECASE,
+    source_preferences = {
+        " ".join(str(value or "").lower().split())
+        for value in manual_plan.ask_shape.source_type_preference
+    }
+    local_attachment_context = bool(
+        has_explicit_local_attachment_context(input_text)
+        or any("attached" in value and "local" in value for value in source_preferences)
+    )
+    local_attachment_only = bool(
+        local_attachment_context
+        and manual_plan.target_type == "local_document_collection"
+        and not set(manual_plan.provider_operations).difference({"read"})
+        and not manual_plan.provider_action_steps
+        and not manual_plan.provider_context_requirements
+        and manual_plan.provider_result_scope is None
+        and manual_plan.provider_selection_order == "unspecified"
+        and manual_plan.provider_selection_rank is None
+    )
+    provider_or_selection_semantics = bool(
+        (manual_plan.provider_operations and not local_attachment_only)
+        or manual_plan.provider_action_steps
+        or manual_plan.provider_context_requirements
+        or manual_plan.provider_result_scope is not None
+        or manual_plan.provider_read_scope != "unspecified"
+        or manual_plan.provider_result_mode != "unspecified"
+        or manual_plan.provider_selection_order != "unspecified"
+        or manual_plan.provider_selection_rank is not None
+        or manual_plan.gmail_mailbox_direction != "unspecified"
+        or manual_plan.gmail_date_scope != "unspecified"
+        or manual_plan.gmail_query
+        or manual_plan.gmail_requested_fields
+        or manual_plan.zotero_requested_fields
+        or manual_plan.desired_count_explicit
+    )
+    if provider_or_selection_semantics:
+        return False
+    provider_free_system = bool(
+        manual_plan.provider_system == "unspecified" or local_attachment_only
+    )
+    internal_slack_system = bool(
+        route == "outreach_composer"
+        and manual_plan.provider_system == "slack"
+        and is_internal_slack_composition_plan(manual_plan)
+    )
+    if not (provider_free_system or internal_slack_system):
+        return False
+    inline_or_prior_context_reference = bool(
+        re.search(
+            r"\b(?:supplied|provided|pasted)\s+(?:facts?|material|context|"
+            r"information|notes?)\b|\b(?:information|material|facts?|notes?|"
+            r"points?)\s+(?:above|already\s+in\s+this\s+thread|i\s+pasted)\b",
+            " ".join(str(input_text or "").lower().split()),
+        )
+    )
+    supplied_context_visible = bool(
+        looks_like_supplied_context_synthesis_request(input_text)
+        or inline_or_prior_context_reference
+        or local_attachment_context
+        or "approved_synthetic" in manual_plan.ask_shape.source_type_preference
+        or is_internal_slack_composition_plan(manual_plan)
+        or provider_free_composition_allowed
+    )
+    plain_transformation = bool(
+        manual_plan.intent == "route_request"
+        and manual_plan.task_objective == "route_or_continue"
+        and manual_plan.expected_artifact_type == "none"
+    )
+    local_attachment_transformation = bool(
+        local_attachment_only
+        and manual_plan.intent == "context_lookup"
+        and manual_plan.task_objective == "context_lookup"
+        and manual_plan.expected_artifact_type == "context_summary"
+    )
+    provider_free_outreach_copy = bool(
+        route == "outreach_composer"
+        and manual_plan.intent in {"route_request", "outreach_draft"}
+        and manual_plan.task_objective == "outreach_draft"
+        and manual_plan.expected_artifact_type == "outreach_draft"
+        and (
+            is_internal_slack_composition_plan(manual_plan)
+            or (
+                provider_free_composition_allowed
+                and is_provider_free_selected_context_draft_plan(manual_plan)
             )
-            for source_type in manual_plan.ask_shape.source_type_preference
         )
     )
     return bool(
@@ -3679,6 +5226,13 @@ def _manual_plan_is_bounded_provider_free_response(
         and not manual_plan.workflow
         and not manual_plan.requires_durable_state
         and not manual_plan.requires_live_search
+        and not manual_plan.missing_required_information
+        and supplied_context_visible
+        and (
+            plain_transformation
+            or local_attachment_transformation
+            or provider_free_outreach_copy
+        )
         and (
             not manual_plan.requires_approved_context
             or is_internal_slack_composition_plan(manual_plan)
@@ -3687,14 +5241,11 @@ def _manual_plan_is_bounded_provider_free_response(
                 and is_provider_free_selected_context_draft_plan(manual_plan)
             )
         )
-        and (
-            (manual_plan.provider_system == "unspecified" and not manual_plan.provider_operations)
-            or provider_context_is_already_supplied
-        )
         and manual_plan.side_effect_policy == "draft_or_read_only"
         and manual_plan.intent
         not in {
             "blocked_send",
+            "browser_diagnostics",
             "business_system_write",
             "clarification",
             "continue_work_item",
@@ -3713,17 +5264,24 @@ def _should_run_direct_supplied_response(
 
     if requested_route not in _DIRECT_SUPPLIED_RESPONSE_ROUTES:
         return False
+    semantic_input_text = (
+        normalize_inline_outreach_request_text(input_text)
+        if requested_route == "outreach_composer"
+        and parse_inline_outreach_fact_packet(input_text) is not None
+        else input_text
+    )
     authority = ExecutionIntentAuthority.from_value(manual_plan)
     if authority.canonical and manual_plan is not None:
         return _manual_plan_is_bounded_provider_free_response(
             manual_plan,
             route=requested_route,
+            input_text=semantic_input_text,
             provider_free_composition_allowed=provider_free_composition_allowed,
         )
     if authority.invalid:
         return False
     return _is_direct_supplied_response_request(
-        input_text,
+        semantic_input_text,
         requested_route=requested_route,
     )
 
@@ -3731,6 +5289,7 @@ def _should_run_direct_supplied_response(
 _DIRECT_SPECIALIST_ROUTES = frozenset(
     {
         "business_research_analyst",
+        "rag_retrieval_specialist",
         "opportunity_scout",
         "gmail_triage",
         "outreach_composer",
@@ -3756,6 +5315,21 @@ def _direct_specialist_request_estimate(
     plan = profile["manual_plan"]
     normalized = str(profile["normalized_request"])
     if profile["compact_instructions"]:
+        if route == "opportunity_scout" and live_search_allowed_for_execution(
+            True,
+            manual_plan=manual_plan,
+            request_text=input_text,
+        ):
+            # Mirrors the direct Scout wrapper's enforced initial loop.
+            return min(
+                4,
+                resolve_sdk_turn_policy(
+                    route,
+                    request_text=input_text,
+                    live_search=True,
+                    manual_request_plan=manual_plan,
+                ).max_turns,
+            )
         if route == "opportunity_scout" and not live_search_allowed_for_execution(
             True,
             manual_plan=manual_plan,
@@ -3787,6 +5361,10 @@ def _direct_specialist_request_estimate(
             # Guarded lifecycle helpers perform their provider operations in
             # one bounded tool call, followed by one synthesis turn.
             return 2
+        if route in {"rss_context_agent", "preprints_context_agent"}:
+            # Signal-context reads may need both bounded history retrieval and
+            # lifecycle inspection before the final typed synthesis.
+            return 3
         if plan.intent == "business_system_write":
             if (
                 route == "airtable_context_agent"
@@ -3800,14 +5378,19 @@ def _direct_specialist_request_estimate(
                 # field mapping, create, attachment, and read-back in one tool
                 # call. Reserve one model turn for the call and one for synthesis.
                 return 2
-            # Allow a separate target/schema read, mutation, and final synthesis.
-            return 3
+            # Reserve distinct model turns for schema discovery, exact-record
+            # selection, the scoped mutation, and final synthesis.  Capping this
+            # at three can let the provider write succeed on the terminal tool
+            # turn while the SDK raises MaxTurnsExceeded before the agent can
+            # report that verified result.
+            return 4
         if route == "google_workspace_context_agent":
             # Workspace reads may need Drive discovery before the selected
-            # Docs/Sheets/Slides read. Keep enough room for both provider-tool
-            # turns plus the final source-grounded synthesis. This is a ceiling;
-            # simple one-tool reads may still finish earlier.
-            return 3
+            # Docs/Sheets/Slides read. Keep enough room for two sequential
+            # provider-tool turns, one bounded correction when a selected
+            # candidate lacks a requested metadata field, and final synthesis.
+            # This is a ceiling; simple one-tool reads may still finish earlier.
+            return 4
         # One model request may select a bounded read tool; the second synthesizes
         # its result. Provider calls do not count as OpenAI requests.
         return 2
@@ -3815,7 +5398,12 @@ def _direct_specialist_request_estimate(
         route,
         request_text=input_text,
         live_search=live_search,
+        manual_request_plan=manual_plan,
     ).max_turns
+    if route in {"business_research_analyst", "opportunity_scout"}:
+        # Their direct child scripts consume the full resolved quality-budget
+        # policy. Only compact adapters above use the one/two-turn ceilings.
+        return policy_max
     return min(policy_max, 4)
 
 
@@ -4221,10 +5809,15 @@ def _preflight_workflow_routes(preflight: OrchestratorPreflight) -> list[str]:
 
     plan_routes = list(getattr(preflight.manual_request_plan, "workflow", []) or [])
     route_result_routes = list(preflight.route_result.workflow or [])
+    routes = (
+        route_result_routes
+        if preflight.route_result.routing_mode == "llm" and not preflight.route_result.refused
+        else [*plan_routes, *route_result_routes]
+    )
     return list(
         dict.fromkeys(
             str(route)
-            for route in [*plan_routes, *route_result_routes]
+            for route in routes
             if str(route) in AGENT_REGISTRY and str(route) not in {"orchestrator", "clarification"}
         )
     )
@@ -4241,7 +5834,10 @@ def _preflight_requires_work_item(
     effective_request_text = str(request_text or preflight.request_text or "")
     return bool(
         len(_preflight_workflow_routes(preflight)) > 1
-        or plan.requires_durable_state
+        or (
+            plan.requires_durable_state
+            and not is_read_only_work_item_inspection_plan(plan)
+        )
         or (
             plan.target_agent == "business_research_analyst"
             and plan.intent in {"company_research", "research_brief"}
@@ -4297,6 +5893,13 @@ def _print_ask_preflight_blocked(
 ) -> int:
     result = orchestrator_preflight.route_result
     compact_preflight = _orchestrator_preflight_payload(orchestrator_preflight)
+    public_message = str(
+        redact_secrets(
+            result.clarification_request
+            or result.stop_reason
+            or "Orchestrator preflight blocked specialist execution."
+        )
+    )
     combined_reason = " ".join(
         str(part or "")
         for part in (
@@ -4324,9 +5927,11 @@ def _print_ask_preflight_blocked(
         "block_reason": orchestrator_preflight.block_reason,
         "manual_request_plan": orchestrator_preflight.manual_request_plan.model_dump(mode="json"),
         "orchestrator_preflight": compact_preflight,
-        "message": result.clarification_request
-        or result.stop_reason
-        or "Orchestrator preflight blocked specialist execution.",
+        "message": public_message,
+        "human_summary": public_message,
+        "slack_display_text": public_message,
+        "display_text": public_message,
+        "summary": public_message,
         "output": (compact_preflight or {}).get("route_result", {}),
     }
     if requires_approved_context:
@@ -4335,6 +5940,64 @@ def _print_ask_preflight_blocked(
             "Attach or approve source-backed context in a WorkItem before live drafting."
         )
     return _print_ask_live_payload(payload, json_output=json_output)
+
+
+def _execution_deadline_for_ask(
+    args: argparse.Namespace,
+    raw_request: str,
+) -> ExecutionDeadlineLedger:
+    """Build one request-wide deadline from the owning agent's quality budget."""
+
+    requested_route = str(getattr(args, "agent", "") or "").strip()
+    request_text = str(raw_request or "").strip()
+    if not requested_route:
+        mention = parse_agent_mention(request_text, allow_bare_agent_aliases=True)
+        if mention.explicit:
+            requested_route = mention.route
+            request_text = mention.input_text
+    plan = infer_manual_request_plan(
+        request_text,
+        requested_agent=requested_route or None,
+    )
+    route = requested_route or str(plan.target_agent or "").strip() or "orchestrator"
+    live_search = bool(
+        getattr(args, "live_search", False)
+        or plan.requires_live_search
+        or cli_default_live_research()
+    )
+    if route == "opportunity_scout":
+        budget = opportunity_scout_quality_budget(
+            request_text=request_text,
+            live_search=live_search,
+            manual_request_plan=plan,
+        )
+        soft_seconds = float(budget.max_seconds or 120)
+    elif route == "business_research_analyst":
+        budget = business_research_quality_budget(
+            request_text=request_text,
+            live_search=live_search,
+            manual_request_plan=plan,
+        )
+        soft_seconds = float(budget.max_seconds or 120)
+    elif route == "chief_of_staff":
+        budget = chief_of_staff_quality_budget(
+            request_text=request_text,
+            live_sdk=True,
+            manual_request_plan=plan,
+        )
+        soft_seconds = float(budget.max_seconds or 120)
+    else:
+        # Gmail, Outreach, context specialists, Orchestrator, and graph workflows
+        # share the balanced request envelope unless a narrower inherited envelope
+        # already exists. The same absolute cap follows every child and handoff.
+        soft_seconds = 120.0
+    return ExecutionDeadlineLedger.from_timeouts(
+        soft_timeout_seconds=soft_seconds,
+        hard_timeout_seconds=(
+            soft_seconds + max(60.0, live_model_timeout_seconds() + 15.0)
+        ),
+        finalization_reserve_seconds=15.0,
+    )
 
 
 def _should_run_opportunity_to_outreach_loop(
@@ -4532,9 +6195,19 @@ def _orchestrator_workflow_state_from_cli_context(
                     state["prior_agent_runs"] = admitted_prior_runs[-5:]
 
     if not _context_file_is_slack_context(context_file_path):
+        if _context_file_is_work_item_source_bundle(context_file_path):
+            from keystone_agents.orchestration.stages import load_workflow_external_context
+            from keystone_agents.orchestrator.preflight_context import source_bundle_routing_context
+
+            supplied = source_bundle_routing_context(load_workflow_external_context(
+                WorkflowRunRequest(context_file_path=context_file_path)
+            ))
+            if supplied:
+                state["supplied_source_bundle"] = supplied
         return _attach_verified_provider_scope_from_slack_thread(
             state,
             database_url=database_url,
+            request_text=request_text,
         )
     try:
         payload = json.loads(Path(context_file_path).read_text(encoding="utf-8"))
@@ -4556,9 +6229,13 @@ def _orchestrator_workflow_state_from_cli_context(
             request_text=request_text,
             database_url=database_url,
         )
+        attachment_context = _slack_attachment_manifest_context(payload)
+        if attachment_context:
+            slack_state["slack_attachment_manifest"] = attachment_context
         return _attach_verified_provider_scope_from_slack_thread(
             _merge_direct_workflow_state(slack_state, state),
             database_url=database_url,
+            request_text=request_text,
         )
 
     slack_context = {
@@ -4577,6 +6254,9 @@ def _orchestrator_workflow_state_from_cli_context(
     }
     if slack_context:
         state["slack_context"] = slack_context
+    attachment_context = _slack_attachment_manifest_context(payload)
+    if attachment_context:
+        state["slack_attachment_manifest"] = attachment_context
     thread_root = str(payload.get("thread_root_request") or "").strip()
     if thread_root:
         state["slack_thread_root"] = thread_root[:2400]
@@ -4612,6 +6292,7 @@ def _orchestrator_workflow_state_from_cli_context(
     return _attach_verified_provider_scope_from_slack_thread(
         state,
         database_url=database_url,
+        request_text=request_text,
     )
 
 
@@ -4619,6 +6300,7 @@ def _attach_verified_provider_scope_from_slack_thread(
     state: dict[str, Any],
     *,
     database_url: str | None,
+    request_text: str = "",
 ) -> dict[str, Any]:
     """Attach verified collection and exact-object identity for a Slack follow-up."""
 
@@ -4632,11 +6314,15 @@ def _attach_verified_provider_scope_from_slack_thread(
     if not team_id or not channel_id or not thread_ts or not request_ts:
         return state
     from keystone_agents.slack_actions import (
+        attach_verified_signal_context_to_workflow_state,
         latest_verified_provider_objects_for_slack_thread,
         latest_verified_provider_result_scope_for_slack_thread,
+        signal_context_resolution_for_slack_thread,
     )
 
     updated = dict(state)
+    updated.pop("verified_signal_context", None)
+    updated.pop("signal_run_history", None)
     if not isinstance(state.get("prior_provider_result_scope"), Mapping):
         scope = latest_verified_provider_result_scope_for_slack_thread(
             channel_id=channel_id,
@@ -4659,6 +6345,18 @@ def _attach_verified_provider_scope_from_slack_thread(
             updated["verified_provider_objects"] = [
                 reference.model_dump(mode="json") for reference in references
             ]
+    signal_context, signal_history = signal_context_resolution_for_slack_thread(
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+        database_url=database_url,
+        team_id=team_id,
+        before_request_ts=request_ts,
+        request_text=request_text,
+    )
+    if signal_history:
+        updated["signal_run_history"] = signal_history
+    if signal_context is not None:
+        attach_verified_signal_context_to_workflow_state(updated, signal_context)
     return updated
 
 
@@ -4932,6 +6630,7 @@ _DIRECT_CONTEXT_OBJECT_OPERATION_RE = re.compile(
     r"record|row|thread)\b",
     re.IGNORECASE,
 )
+_UNSET_VERIFIED_SIGNAL_CONTEXT = object()
 
 
 def _direct_specialist_execution_context(
@@ -4939,16 +6638,21 @@ def _direct_specialist_execution_context(
     *,
     workflow_state: dict[str, Any] | None,
     force_thread_context: bool = False,
+    include_slack_scope: bool = False,
+    verified_signal_context: VerifiedSignalContext | None | object = (
+        _UNSET_VERIFIED_SIGNAL_CONTEXT
+    ),
 ) -> dict[str, Any]:
-    """Project only reference-resolving thread state into a fast direct call."""
+    """Project bounded Slack identity plus any admitted reference context."""
 
-    if not workflow_state or not (
+    if not workflow_state:
+        return {}
+    reference_context_allowed = bool(
         force_thread_context
-        or (
-            _DIRECT_CONTEXT_REFERENCE_RE.search(input_text)
-            or _DIRECT_CONTEXT_OBJECT_OPERATION_RE.search(input_text)
-        )
-    ):
+        or _DIRECT_CONTEXT_REFERENCE_RE.search(input_text)
+        or _DIRECT_CONTEXT_OBJECT_OPERATION_RE.search(input_text)
+    )
+    if not reference_context_allowed and not include_slack_scope:
         return {}
 
     context: dict[str, Any] = {"schema": "keystone.direct_specialist_context.v1"}
@@ -4968,6 +6672,9 @@ def _direct_specialist_execution_context(
         }
         if scope:
             context["slack_scope"] = scope
+
+    if not reference_context_allowed:
+        return context if len(context) > 1 else {}
 
     thread_root = _bounded_redacted_text(
         workflow_state.get("slack_thread_root"),
@@ -5037,6 +6744,44 @@ def _direct_specialist_execution_context(
         if runs:
             context["prior_agent_runs"] = runs
 
+    raw_verified_objects = workflow_state.get("verified_provider_objects")
+    if isinstance(raw_verified_objects, list | tuple):
+        verified_objects: list[dict[str, Any]] = []
+        for value in raw_verified_objects:
+            if not isinstance(value, Mapping):
+                continue
+            try:
+                reference = ContinuationObjectReference.model_validate(value)
+            except (TypeError, ValueError):
+                continue
+            if (
+                reference.verification_status != "verified"
+                or reference.lifecycle_state != "active"
+            ):
+                continue
+            verified_objects.append(reference.model_dump(mode="json"))
+            if len(verified_objects) >= 8:
+                break
+        if verified_objects:
+            context["verified_provider_objects"] = verified_objects
+
+    raw_signal_context: object = (
+        workflow_state.get("verified_signal_context")
+        if verified_signal_context is _UNSET_VERIFIED_SIGNAL_CONTEXT
+        else verified_signal_context
+    )
+    if isinstance(raw_signal_context, VerifiedSignalContext):
+        signal_context = raw_signal_context
+    elif isinstance(raw_signal_context, Mapping):
+        try:
+            signal_context = VerifiedSignalContext.model_validate(raw_signal_context)
+        except (TypeError, ValueError):
+            signal_context = None
+    else:
+        signal_context = None
+    if signal_context is not None and signal_context.verification_status == "verified":
+        context["verified_signal_context"] = signal_context.model_dump(mode="json")
+
     transcript = _bounded_redacted_text(
         workflow_state.get("slack_thread_transcript"),
         max_chars=2400,
@@ -5045,6 +6790,10 @@ def _direct_specialist_execution_context(
     if transcript:
         context["thread_transcript_tail"] = transcript
 
+    attachment_context = workflow_state.get("slack_attachment_manifest")
+    if isinstance(attachment_context, Mapping):
+        context["slack_attachment_manifest"] = dict(attachment_context)
+
     return context if len(context) > 1 else {}
 
 
@@ -5052,7 +6801,13 @@ def _attach_slack_run_provenance(
     payload: dict[str, Any],
     execution_context: Mapping[str, Any] | None,
 ) -> None:
-    """Persist stable Slack correlation without exposing thread prose or provider data."""
+    """Persist a safe runtime identity plus optional validated Slack correlation."""
+
+    runtime_fingerprint = current_runtime_fingerprint()
+    payload["run_provenance"] = {
+        "schema": "keystone.run_provenance.v1",
+        "runtime_fingerprint": runtime_fingerprint,
+    }
 
     if not isinstance(execution_context, Mapping):
         return
@@ -5081,6 +6836,7 @@ def _attach_slack_run_provenance(
         payload["slack_run_provenance"] = {
             "schema": "keystone.slack.run_provenance.v1",
             "context_validated": True,
+            "runtime_fingerprint": runtime_fingerprint,
             **provenance,
         }
 
@@ -5089,12 +6845,124 @@ def _finance_receipt_context_input(
     input_text: str,
     execution_context: dict[str, Any] | None,
 ) -> str:
-    """Join only bounded selected-thread context needed to resolve a receipt file."""
+    """Resolve receipt paths from current operator text or verified Slack file refs."""
 
-    bounded_context = specialist_execution_context_text(execution_context)
-    if not bounded_context:
+    if local_file_input_bundle_from_text(input_text).has_inputs:
         return input_text
-    return f"{input_text}\n\n{bounded_context}"
+    bundle = _verified_slack_attachment_bundle(execution_context)
+    if len(bundle.attachments) != 1:
+        return input_text
+    return f"{input_text}\n\nVerified selected Slack attachment: {bundle.attachments[0].path}"
+
+
+def _slack_attachment_manifest_context(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep typed attachment provenance separate from model-visible thread prose."""
+
+    if str(payload.get("schema") or payload.get("schema_") or "") not in {
+        "keystone.slack.selected_message_context.v1", "keystone.slack.history_context.v1",
+    }:
+        return {}
+    manifest = payload.get("payload_manifest")
+    if not isinstance(manifest, Mapping):
+        return {}
+    scope = {
+        key: str(payload.get(key) or "").strip()
+        for key in ("team_id", "channel_id", "thread_ts")
+    }
+    if not all(scope.values()):
+        return {}
+    thread_messages = payload.get("thread_messages")
+    messages = [
+        payload.get("selected_message"),
+        *(thread_messages if isinstance(thread_messages, list) else []),
+    ]
+    human_sources = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        metadata = message.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        is_bot = bool(
+            message.get("bot_id") or message.get("app_id") or message.get("is_bot")
+            or metadata.get("is_bot") or metadata.get("bot_id")
+            or message.get("subtype") == "bot_message"
+            or message.get("role") in {"agent", "assistant", "bot", "system"}
+        )
+        user_id = str(message.get("user_id") or message.get("user") or "").strip()
+        ts = str(message.get("ts") or "").strip()
+        if is_bot or not user_id or not ts:
+            continue
+        if message.get("thread_ts") and str(message["thread_ts"]) != scope["thread_ts"]:
+            continue
+        human_sources.append(ts)
+    return {"scope": scope, "payload_manifest": dict(manifest), "human_message_ts": human_sources}
+
+
+def _verified_slack_attachment_bundle(
+    execution_context: Mapping[str, Any] | None,
+) -> LocalFileInputBundle:
+    from keystone_agents.slack_actions import SlackPayloadManifest
+
+    empty = LocalFileInputBundle((), ())
+    if not isinstance(execution_context, Mapping):
+        return empty
+    context = execution_context.get("slack_attachment_manifest")
+    scope = execution_context.get("slack_scope")
+    if not isinstance(context, Mapping) or not isinstance(scope, Mapping):
+        return empty
+    declared_scope = context.get("scope")
+    if not isinstance(declared_scope, Mapping) or any(
+        not scope.get(key) or scope.get(key) != declared_scope.get(key)
+        for key in ("team_id", "channel_id", "thread_ts")
+    ):
+        return empty
+    try:
+        manifest = SlackPayloadManifest.model_validate(context.get("payload_manifest"))
+    except (TypeError, ValueError):
+        return empty
+    humans = context.get("human_message_ts")
+    if not isinstance(humans, list):
+        return empty
+    attachments = []
+    seen = set()
+    for entry in manifest.entries:
+        expected_refs = {
+            f"slack:{kind}:{entry.source_message_ts}:text:attachment:{entry.file_id}"
+            for kind in ("selected", "thread")
+        }
+        if (
+            entry.kind != "attachment" or entry.provenance != "slack_file_metadata"
+            or entry.materialization_status != "materialized" or not entry.file_id
+            or entry.source_message_ts not in humans or entry.ref not in expected_refs
+            or entry.byte_size <= 0 or not re.fullmatch(r"[0-9a-f]{64}", entry.checksum_sha256)
+        ):
+            continue
+        bundle = local_file_input_bundle_from_operator_input(
+            "", attachment_paths=(entry.materialized_path,),
+        )
+        if len(bundle.attachments) != 1:
+            continue
+        attachment = bundle.attachments[0]
+        if (
+            attachment.checksum_sha256 != entry.checksum_sha256
+            or attachment.size_bytes != entry.byte_size
+            or entry.media_type not in {attachment.mime_type, attachment.path.suffix.lstrip(".")}
+        ):
+            continue
+        identity = (entry.file_id, attachment.checksum_sha256)
+        if identity not in seen:
+            seen.add(identity)
+            attachments.append(attachment)
+    return LocalFileInputBundle(tuple(attachments), ())
+
+
+def _direct_context_attachment_bundle(
+    input_text: str, execution_context: Mapping[str, Any] | None, *, include_prior: bool,
+) -> LocalFileInputBundle:
+    explicit = local_file_input_bundle_from_text(input_text)
+    if explicit.has_inputs or not include_prior:
+        return explicit
+    return _verified_slack_attachment_bundle(execution_context)
 
 
 def _bounded_redacted_text(
@@ -5343,6 +7211,7 @@ def _agent_from_eval_context_text(text: str) -> str:
     lowered = text.lower()
     phrase_to_route = {
         "business research analyst": "business_research_analyst",
+        "rag retrieval specialist": "rag_retrieval_specialist",
         "opportunity scout": "opportunity_scout",
         "chief of staff": "chief_of_staff",
         "gmail triage": "gmail_triage",
@@ -5362,6 +7231,7 @@ def _run_ask_work_item(
     live_sdk: bool,
     max_results: int,
     json_output: bool,
+    max_results_explicit: bool = False,
     live_rss_slack_read: bool = False,
     max_manager_steps: int = 3,
     manual_plan: ManualRequestPlan | None = None,
@@ -5389,6 +7259,11 @@ def _run_ask_work_item(
             json_output=json_output,
         )
         existing_work_item = store.get_work_item(work_item_id) if work_item_id else None
+        prior_event_count = (
+            len(store.list_work_item_events(existing_work_item.id))
+            if existing_work_item is not None
+            else 0
+        )
         prior_openai_requests = (
             _stored_work_item_openai_requests(store, existing_work_item.id)
             if existing_work_item is not None
@@ -5403,6 +7278,7 @@ def _run_ask_work_item(
             live_sdk=live_sdk,
             live_rss_slack_read=live_rss_slack_read,
             max_results=max_results,
+            max_results_explicit=max_results_explicit,
             requested_route=requested_route,
             manual_request_plan=manual_plan.model_dump(mode="json") if manual_plan else None,
             orchestrator_preflight=_orchestrator_preflight_payload(orchestrator_preflight),
@@ -5421,6 +7297,16 @@ def _run_ask_work_item(
         from keystone_agents.langgraph_workflow import (
             advance_work_item_manager_loop_with_optional_langgraph,
         )
+
+        scope = _ASK_ENTRY_TELEMETRY.get()
+        if scope is not None and scope.durable_store is not None:
+            scope.durable_store.save_stage(
+                scope.durable_execution_id, "work_item_dispatch_request", {}, {
+                    "capture_stage": "after_cli_refinement_before_work_item_execution",
+                    "request": request.model_dump(mode="json"),
+                    "execution_reuse_authorized": False,
+                },
+            )
 
         result = advance_work_item_manager_loop_with_optional_langgraph(
             request,
@@ -5456,6 +7342,11 @@ def _run_ask_work_item(
         store,
         result.work_item.id,
     )
+    public_telemetry = _stored_work_item_sdk_public_telemetry(
+        store,
+        result.work_item.id,
+        start_index=prior_event_count,
+    )
     return _print_work_item_result(
         result,
         json_output=json_output,
@@ -5468,6 +7359,7 @@ def _run_ask_work_item(
             "openai_requests": max(total_openai_requests - prior_openai_requests, 0),
             "work_item_openai_requests_total": total_openai_requests,
         },
+        public_telemetry=public_telemetry,
     )
 
 
@@ -5480,6 +7372,8 @@ def _stored_work_item_langgraph_metadata(
             continue
         return {
             "runtime": str(event.metadata.get("runtime") or "langgraph"),
+            "execution_id": str(event.metadata.get("execution_id") or ""),
+            "checkpoint_key": str(event.metadata.get("checkpoint_key") or ""),
             "node_path": list(event.metadata.get("node_path") or []),
             "checkpoint_required": bool(event.metadata.get("checkpoint_required")),
             "checkpoint_reason": str(event.metadata.get("checkpoint_reason") or ""),
@@ -5501,6 +7395,75 @@ def _stored_work_item_openai_requests(store: SQLiteStore, work_item_id: str) -> 
         except (TypeError, ValueError):
             continue
     return requests
+
+
+def _stored_work_item_sdk_public_telemetry(
+    store: SQLiteStore,
+    work_item_id: str,
+    *,
+    start_index: int = 0,
+) -> dict[str, object]:
+    """Aggregate bounded model usage for only the current WorkItem request."""
+
+    events = store.list_work_item_events(work_item_id)[max(start_index, 0) :]
+    sdk_events = [event for event in events if event.event_type == "workflow_sdk_usage"]
+    if not sdk_events:
+        return {}
+
+    usage_keys = (
+        "requests",
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+    )
+    usage: dict[str, int] = {}
+    estimated_cost = 0.0
+    cost_observed = False
+    stages: list[dict[str, object]] = []
+    for event in sdk_events:
+        metadata = event.metadata if isinstance(event.metadata, dict) else {}
+        event_usage = metadata.get("usage") if isinstance(metadata.get("usage"), dict) else {}
+        event_cost = metadata.get("cost") if isinstance(metadata.get("cost"), dict) else {}
+        for key in usage_keys:
+            try:
+                value = int(event_usage.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value:
+                usage[key] = usage.get(key, 0) + value
+        raw_cost = event_cost.get("estimated_usd") or event_cost.get("amount_usd")
+        try:
+            cost_value = float(raw_cost) if raw_cost is not None else 0.0
+        except (TypeError, ValueError):
+            cost_value = 0.0
+        if raw_cost is not None:
+            cost_observed = True
+            estimated_cost += max(cost_value, 0.0)
+        stage = {
+            "agent_name": str(metadata.get("agent_name") or event.actor or "").strip(),
+            "run_stage": str(metadata.get("run_stage") or "").strip(),
+            "requests": int(event_usage.get("requests") or 0),
+        }
+        if raw_cost is not None:
+            stage["estimated_cost_usd"] = max(cost_value, 0.0)
+        stages.append(stage)
+
+    payload: dict[str, object] = {
+        "usage": usage,
+        "execution_telemetry": {
+            "schema": "keystone.work_item_sdk_telemetry.v1",
+            "workflow_sdk_event_count": len(sdk_events),
+            "workflow_sdk_stages": stages[:10],
+        },
+    }
+    if cost_observed:
+        payload["cost"] = {
+            "estimated_usd": round(estimated_cost, 9),
+            "source": "aggregated_work_item_sdk_usage_events",
+        }
+    return payload
 
 
 def _promptfoo_agent_eval_mode() -> bool:
@@ -5996,6 +7959,14 @@ def _print_ask_work_item_failure(
     manual_plan: ManualRequestPlan | None,
     orchestrator_preflight: OrchestratorPreflight | None,
 ) -> int:
+    scope = _ASK_ENTRY_TELEMETRY.get()
+    if scope is not None:
+        scope.handled_failure = exc
+        try:
+            with scope.recorder.span("entry.work_item_failure", attributes={"source": "handled_failure"}):
+                raise exc
+        except Exception:
+            pass
     error_type = type(exc).__name__
     failure = known_exception_to_operator_failure(exc, context="WorkItem run")
     payload = {
@@ -6014,6 +7985,8 @@ def _print_ask_work_item_failure(
             "next_step": failure.next_step,
         },
     }
+    _attach_slack_run_provenance(payload, None)
+    _capture_entry_public_result(payload)
     print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
     print(f"Business Agents run failed: {failure.summary}", file=sys.stderr)
     if failure.reason and failure.reason != failure.summary:
@@ -6043,6 +8016,38 @@ def _operator_failure_from_child_output(
             if failure is not None:
                 return failure
     return known_exception_to_operator_failure(fallback, context=context)
+
+
+def _promoted_child_failure_evidence(payload: object) -> dict[str, Any]:
+    """Promote only the child runner's audit-safe structured failure evidence."""
+
+    if not isinstance(payload, Mapping):
+        return {}
+    sdk_failure = payload.get("sdk_failure")
+    if not isinstance(sdk_failure, Mapping):
+        return {}
+    promoted: dict[str, Any] = {
+        "sdk_failure": dict(sdk_failure),
+        "child_failure_evidence_preserved": True,
+    }
+    for key in (
+        "usage",
+        "cost",
+        "request_cache",
+        "tool_execution",
+        "tool_receipts",
+        "decision_ownership",
+        "execution_telemetry",
+        "request_budget",
+    ):
+        value = payload.get(key)
+        if value is None:
+            value = sdk_failure.get(key)
+        if isinstance(value, Mapping):
+            promoted[key] = dict(value)
+        elif isinstance(value, list):
+            promoted[key] = list(value)
+    return promoted
 
 
 def _print_manager_loop_feedback(event_type: str, payload: dict[str, Any]) -> None:
@@ -6089,7 +8094,12 @@ def _run_ask_orchestrator(
             session=build_sdk_session(sdk_session_spec) if sdk_session_spec else None,
             manual_request_plan=manual_plan,
         )
-        result = sdk_result.output
+        result = reconcile_orchestrator_work_item_inspection(
+            sdk_result.output,
+            request_text=input_text,
+            manual_request_plan=manual_plan,
+            database_url=database_url,
+        )
     else:
         result = route_request(input_text, manual_plan=manual_plan)
     payload = {
@@ -6106,10 +8116,30 @@ def _run_ask_orchestrator(
         "cost_tracking_requested": cost_tracking_requested,
         "output": result.model_dump(mode="json"),
     }
+    output_authority = str(
+        result.retrieval_diagnostics.get("output_authority") or ""
+    ).strip()
+    model_result_superseded = bool(
+        result.retrieval_diagnostics.get("model_result_superseded")
+    )
+    if output_authority:
+        payload["output_authority"] = output_authority
+        payload["model_result_superseded"] = model_result_superseded
     if sdk_result is not None:
+        if output_authority and isinstance(sdk_result.request_cache, dict):
+            sdk_result.request_cache["output_authority"] = output_authority
+            sdk_result.request_cache["model_result_superseded"] = (
+                model_result_superseded
+            )
         payload["usage"] = sdk_result.usage
         payload["cost"] = sdk_result.cost
         payload["request_cache"] = sdk_result.request_cache
+        tool_execution = _tool_execution_summary_from_request_cache(
+            sdk_result.request_cache,
+            tool_receipts=getattr(sdk_result, "tool_receipts", ()) or (),
+        )
+        if tool_execution:
+            payload["tool_execution"] = tool_execution
     if json_output:
         print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
     else:
@@ -6120,6 +8150,180 @@ def _run_ask_orchestrator(
         if manual_plan:
             print(f"Manual plan: {manual_plan.target_agent} / {manual_plan.intent}")
     return 0
+
+
+def _tool_execution_summary_from_request_cache(
+    request_cache: object,
+    *,
+    tool_receipts: Sequence[Mapping[str, Any] | Any] = (),
+) -> dict[str, object]:
+    """Promote SDK tool-call proof into the common public trace contract."""
+
+    if not isinstance(request_cache, dict):
+        return {}
+    scope = request_cache.get("request_tool_scope")
+    postcondition = request_cache.get("tool_execution_postcondition")
+    if not isinstance(scope, dict) or not isinstance(postcondition, dict):
+        return {}
+    selected = [
+        str(name)
+        for name in scope.get("selected_tool_names") or []
+        if str(name).strip()
+    ]
+    completed = [
+        str(name)
+        for name in postcondition.get("completed_tool_names") or []
+        if str(name).strip()
+    ]
+    return build_tool_execution_summary(
+        mode=(
+            "llm_selected_function_tools"
+            if completed
+            else "model_tools_attached_no_call"
+            if selected
+            else "tool_free"
+        ),
+        selected_tool_names=selected,
+        model_called_tool_names=completed,
+        provider_receipt_count=len(tool_receipts),
+        postcondition=postcondition,
+    )
+
+
+def _workflow_retrieval_tool_execution_summary(
+    payload: object,
+    retrieval_diagnostics: object,
+) -> dict[str, object]:
+    """Expose deterministic retrieval as workflow tool work, not model tool use."""
+
+    if not isinstance(retrieval_diagnostics, dict):
+        return {}
+    provider_usage = retrieval_diagnostics.get("provider_usage")
+    provider_usage = provider_usage if isinstance(provider_usage, dict) else {}
+    attempted = 0
+    succeeded = 0
+    provider_attempts: list[dict[str, object]] = []
+    for provider, raw_usage in provider_usage.items():
+        usage = raw_usage if isinstance(raw_usage, dict) else {}
+        try:
+            provider_attempted = int(usage.get("requests_attempted") or 0)
+        except (TypeError, ValueError):
+            provider_attempted = 0
+        try:
+            provider_succeeded = int(usage.get("requests_succeeded") or 0)
+        except (TypeError, ValueError):
+            provider_succeeded = 0
+        attempted += max(provider_attempted, 0)
+        succeeded += max(provider_succeeded, 0)
+        provider_attempts.append(
+            {
+                "provider": str(provider),
+                "attempted": max(provider_attempted, 0),
+                "succeeded": max(provider_succeeded, 0),
+            }
+        )
+    providers_used = [
+        str(item)
+        for item in retrieval_diagnostics.get("providers_used") or []
+        if str(item).strip()
+    ]
+    retrieval_mode = str(retrieval_diagnostics.get("mode") or "").strip()
+    selected_url_extraction = retrieval_mode == "selected_url_extraction"
+    if selected_url_extraction and not attempted:
+        extraction_summary = retrieval_diagnostics.get("website_extraction_summary")
+        extraction_summary = (
+            extraction_summary if isinstance(extraction_summary, dict) else {}
+        )
+        extraction_diagnostics = extraction_summary.get("diagnostics")
+        extraction_diagnostics = (
+            extraction_diagnostics if isinstance(extraction_diagnostics, list) else []
+        )
+        for raw_diagnostic in extraction_diagnostics:
+            diagnostic = raw_diagnostic if isinstance(raw_diagnostic, dict) else {}
+            raw_attempts = diagnostic.get("attempts")
+            attempts_for_url = (
+                raw_attempts
+                if isinstance(raw_attempts, list) and raw_attempts
+                else [diagnostic]
+            )
+            for raw_attempt in attempts_for_url:
+                attempt = raw_attempt if isinstance(raw_attempt, dict) else {}
+                provider = str(
+                    attempt.get("provider") or diagnostic.get("provider") or ""
+                ).strip()
+                status = str(attempt.get("status") or diagnostic.get("status") or "")
+                if not provider:
+                    continue
+                provider_succeeded = int(status == "success")
+                attempted += 1
+                succeeded += provider_succeeded
+                provider_attempts.append(
+                    {
+                        "provider": provider,
+                        "attempted": 1,
+                        "succeeded": provider_succeeded,
+                    }
+                )
+                if provider not in providers_used:
+                    providers_used.append(provider)
+        if not attempted:
+            try:
+                attempted = max(
+                    int(retrieval_diagnostics.get("selected_url_count") or 0),
+                    0,
+                )
+            except (TypeError, ValueError):
+                attempted = 0
+            try:
+                succeeded = max(
+                    int(retrieval_diagnostics.get("extracted_source_count") or 0),
+                    0,
+                )
+            except (TypeError, ValueError):
+                succeeded = 0
+    if not attempted and not providers_used:
+        return {}
+    scope: dict[str, Any] = {}
+    if isinstance(payload, dict) and isinstance(payload.get("request_cache"), dict):
+        raw_scope = payload["request_cache"].get("request_tool_scope")
+        if isinstance(raw_scope, dict):
+            scope = raw_scope
+    selected_names = [
+        str(item)
+        for item in scope.get("selected_tool_names") or []
+        if str(item).strip()
+    ]
+    raw_receipts = (
+        payload.get("tool_receipts")
+        if isinstance(payload, dict) and isinstance(payload.get("tool_receipts"), list)
+        else []
+    )
+    summary = build_tool_execution_summary(
+        mode="workflow_managed_retrieval_tool_free_synthesis",
+        scope_source=str(scope.get("source") or "supplied_context_tool_free"),
+        selected_tool_names=selected_names,
+        workflow_called_tool_names=[
+            "extract_selected_urls_to_source_bundle"
+            if selected_url_extraction
+            else "search_web"
+        ],
+        provider_receipt_count=len(raw_receipts),
+        provider_request_attempt_count=attempted,
+        provider_request_success_count=succeeded,
+    )
+    summary.update({
+        "provider_attempts": provider_attempts[:12],
+        "providers_used": providers_used[:12],
+        "broad_search_performed": (
+            False
+            if selected_url_extraction
+            else bool(
+                retrieval_diagnostics.get("broad_search_performed")
+                or retrieval_mode == "live_search"
+            )
+        ),
+    })
+    return summary
 
 
 def _print_ask_dry_run(
@@ -7357,38 +9561,76 @@ def _context_agent_blocked_write_attempts(
 def _strict_requested_display_text(
     output: object,
     manual_plan: ManualRequestPlan | dict[str, object] | None,
+    *,
+    original_request: str = "",
 ) -> str:
     """Render exact narrow asks without adding generic workflow sections."""
 
-    if not isinstance(output, dict) or not manual_plan:
+    if not isinstance(output, dict):
         return ""
     plan = (
         manual_plan.model_dump(mode="json")
         if isinstance(manual_plan, ManualRequestPlan)
         else manual_plan
+        if isinstance(manual_plan, dict)
+        else {}
     )
-    authority = ExecutionIntentAuthority.from_value(manual_plan)
-    canonical_plan = authority.plan if authority.canonical else None
+    authority = ExecutionIntentAuthority.from_value(manual_plan) if manual_plan else None
+    canonical_plan = authority.plan if authority is not None and authority.canonical else None
     ask_shape = plan.get("ask_shape")
     if not isinstance(ask_shape, dict):
-        return ""
+        ask_shape = {}
     strict_mode = str(ask_shape.get("strict_filter_mode") or "") in {"exact", "strict"}
     stop_condition = str(ask_shape.get("stop_condition") or "").lower()
     output_form = str(ask_shape.get("output_form") or "")
     objective_text = " ".join(
         (
+            str(original_request or ""),
             str(plan.get("objective") or ""),
             stop_condition,
             *[str(item or "") for item in plan.get("required_terms") or []],
         )
     ).lower()
     draft_text = str(output.get("draft_reply") or output.get("draft_reply_summary") or "").strip()
+    condition_outcome = (
+        output.get("needs_reply") if isinstance(output.get("needs_reply"), bool) else None
+    )
+    raw_contract = raw_request_output_contract(
+        original_request,
+        condition_outcome=condition_outcome,
+    )
+    reply_intent = bool(re.search(r"\b(?:reply|response)\b", objective_text))
     requests_copyable_draft = bool(
         draft_text
-        and (output_form == "draft" or re.search(r"\b(?:draft|write|prepare)\b", objective_text))
-        and re.search(r"\b(?:reply|response)\b", objective_text)
+        and (reply_intent or raw_contract.paste_ready_copy)
+        and (
+            output_form == "draft"
+            or raw_contract.paste_ready_copy
+            or re.search(
+                r"\b(?:draft|write|prepare|paste|copy|sentence|sentences)\b",
+                objective_text,
+            )
+        )
     )
-    precise_output_boundary = bool(stop_condition and output_form in {"brief", "bullets"})
+    exact_sentence_copy = bool(
+        requests_copyable_draft
+        and (
+            raw_contract.constraints.sentence_count_mode == "exact"
+            or (
+                reply_intent
+                and re.search(
+                    r"\bexactly\s+(?:one|two|three|\d+)\s+sentences?\b",
+                    objective_text,
+                )
+                and re.search(r"\b(?:paste|copy|give|provide|return)\b", objective_text)
+            )
+        )
+    )
+    precise_output_boundary = bool(
+        (stop_condition and output_form in {"brief", "bullets"})
+        or exact_sentence_copy
+        or raw_contract.exact_output_requested
+    )
     if not strict_mode and not precise_output_boundary and not requests_copyable_draft:
         return ""
 
@@ -7484,6 +9726,8 @@ def _strict_requested_display_text(
         return titles[0]
 
     summary = str(output.get("answer") or output.get("summary") or "").strip()
+    if raw_contract.conditional and condition_outcome is False:
+        summary = str(output.get("reasoning") or summary).strip()
     if not summary:
         facts = output.get("facts")
         if isinstance(facts, list):
@@ -7493,8 +9737,18 @@ def _strict_requested_display_text(
                     break
     if not summary:
         summary = str(output.get("why_it_matters") or output.get("product") or "").strip()
-    if output_form in {"brief", "draft"} and (summary or draft_text):
+    if raw_contract.conditional and condition_outcome is False and summary:
+        return summary
+    if exact_sentence_copy and condition_outcome is not False and draft_text:
+        return draft_text
+    if (
+        output_form in {"brief", "draft"}
+        or raw_contract.exact_output_requested
+        or raw_contract.paste_ready_copy
+    ) and (summary or draft_text):
         if requests_copyable_draft:
+            if exact_sentence_copy and draft_text:
+                return draft_text
             assessment_requested = bool(
                 re.search(
                     r"\b(?:assess|decide|explain|tell\s+me)\b[^.]{0,80}"
@@ -7539,9 +9793,15 @@ def _context_agent_human_summary(
     approval_needs = [
         str(item).strip() for item in output.get("approval_needs") or [] if str(item).strip()
     ]
-    blockers = [str(item).strip() for item in output.get("blockers") or [] if str(item).strip()]
-    blockers.extend(
-        str(item).strip() for item in output.get("evidence_gaps") or [] if str(item).strip()
+    blockers = list(
+        dict.fromkeys(
+            str(item).strip()
+            for item in [
+                *(output.get("blockers") or []),
+                *(output.get("evidence_gaps") or []),
+            ]
+            if str(item).strip()
+        )
     )
     parts: list[str] = []
     if summary:
@@ -7699,7 +9959,25 @@ def _context_agent_airtable_context_lines(output: dict[str, object]) -> list[str
         lines.extend(f"  - {item}" for item in fields)
     if record_identity and not _contains_internal_provider_identity(record_identity):
         lines.append(f"- Record filter guidance: {record_identity}")
+    table_count = _context_agent_bounded_airtable_table_count(output)
+    if table_count is not None:
+        lines.append(f"- Table count: {table_count}")
     return lines
+
+
+def _context_agent_bounded_airtable_table_count(output: dict[str, object]) -> int | None:
+    """Project a schema count without exposing provider table or record values."""
+    human_context = output.get("human_work_context")
+    if not isinstance(human_context, dict):
+        return None
+    entries = human_context.get("handoff_ready_context")
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        match = re.fullmatch(r"\s*Table count:\s*(\d{1,4})\.?\s*", str(entry or ""), re.I)
+        if match:
+            return int(match.group(1))
+    return None
 
 
 def _contains_internal_provider_identity(value: object) -> bool:
@@ -7794,6 +10072,26 @@ def _run_ask_specialist_live(
     database_url: str | None = None,
 ) -> int:
     load_settings(force_dotenv=True)
+    if (
+        route == "gmail_triage"
+        and manual_plan is not None
+        and manual_plan.provider_context_requirements
+    ):
+        execution_context, provider_context_blocker = _prepare_gmail_provider_context_stages(
+            input_text,
+            manual_plan=manual_plan,
+            execution_context=execution_context,
+        )
+        if provider_context_blocker is not None:
+            return _print_ask_clarification(
+                "gmail_triage",
+                input_text,
+                provider_context_blocker["human_summary"],
+                json_output=json_output,
+                manual_plan=manual_plan,
+                orchestrator_preflight=orchestrator_preflight,
+                extra=provider_context_blocker,
+            )
     if _should_run_direct_supplied_response(
         input_text,
         requested_route=route,
@@ -7812,6 +10110,25 @@ def _run_ask_specialist_live(
             sdk_session_spec=sdk_session_spec,
             execution_context=execution_context,
             database_url=database_url,
+        )
+    if route == "rag_retrieval_specialist":
+        return _run_ask_work_item(
+            input_text,
+            database_url=database_url,
+            live_search=False,
+            live_sdk=True,
+            max_results=max(1, min(10, manual_plan.desired_count if manual_plan else 6)),
+            json_output=json_output,
+            max_manager_steps=1,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            context_file_path=context_file_path,
+            sdk_session_enabled=sdk_session_spec.enabled if sdk_session_spec else None,
+            sdk_session_id=sdk_session_spec.session_id if sdk_session_spec else "",
+            sdk_session_db_path=sdk_session_spec.database_path if sdk_session_spec else "",
+            sdk_session_history_limit=sdk_session_spec.history_limit if sdk_session_spec else None,
+            cost_tracking_requested=cost_tracking_requested,
+            requested_route=route,
         )
     if route == "business_research_analyst":
         return _run_ask_company_research_live(
@@ -7889,6 +10206,127 @@ def _run_ask_specialist_live(
         raise SystemExit(f"Unsupported agent route: {route}")
 
 
+def _prepare_gmail_provider_context_stages(
+    input_text: str,
+    *,
+    manual_plan: ManualRequestPlan,
+    execution_context: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Run manager-owned read context before the primary Gmail specialist."""
+
+    context = dict(execution_context or {})
+    stages = []
+    calendar_required = any(
+        requirement.provider_system == "google_calendar" and requirement.required
+        for requirement in manual_plan.provider_context_requirements
+    )
+    if calendar_required:
+        manager_result = run_chief_of_staff_sdk(
+            {
+                "request": input_text,
+                "manual_request_plan": manual_plan.model_dump(mode="json"),
+                "include_specialist_tools": False,
+            },
+            live=True,
+            force_sdk_interpretation=True,
+            manual_request_plan=manual_plan,
+            include_specialist_tools=False,
+            attach_tools=True,
+        )
+        stage = validate_calendar_provider_context_decision(
+            manager_result.raw_result,
+            manager_result.final_output.provider_context_decisions,
+            manager_output=manager_result.final_output,
+            required_downstream_agent="gmail_triage",
+        )
+        stage_payload = stage.model_dump(mode="json")
+        stage_payload["tool_execution"] = dict(
+            manager_result.request_cache.get("tool_execution") or {}
+        )
+        stage_payload["usage"] = dict(manager_result.usage or {})
+        stage_payload["cost"] = dict(manager_result.cost or {})
+        stages.append(stage)
+        context.setdefault("provider_context_stage_telemetry", []).append(stage_payload)
+
+    satisfied, missing = provider_context_requirements_satisfied(manual_plan, stages)
+    handoff_text = provider_context_handoff_text(stages)
+    if handoff_text:
+        context["verified_provider_context"] = handoff_text
+    if not satisfied:
+        return context, {
+            "status": "needs_input",
+            "block_kind": "provider_context_selection_unresolved",
+            "human_summary": (
+                "The manager agent could not select and verify the required read-only "
+                "provider context without guessing, so Gmail Triage was not launched."
+            ),
+            "missing_provider_context": missing,
+            "provider_context_stages": context.get("provider_context_stage_telemetry", []),
+            "send_enabled": False,
+        }
+    return context, None
+
+
+def _verified_signal_context_from_execution_context(
+    execution_context: Mapping[str, Any] | None,
+) -> VerifiedSignalContext | None:
+    if not isinstance(execution_context, Mapping):
+        return None
+    value = execution_context.get("verified_signal_context")
+    if isinstance(value, VerifiedSignalContext):
+        context = value
+    elif isinstance(value, Mapping):
+        try:
+            context = VerifiedSignalContext.model_validate(value)
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+    return context if context.verification_status == "verified" else None
+
+
+def _validate_direct_signal_context_response(
+    response_text: str,
+    context: VerifiedSignalContext | None,
+) -> dict[str, Any]:
+    """Require final visible citations to match trusted selected signal evidence."""
+
+    if context is None:
+        return {
+            "schema": "keystone.retained_signal_validation.v1",
+            "applicable": False,
+            "passed": True,
+            "reason": "not_applicable",
+        }
+    expected_urls = {
+        canonical
+        for source in context.selected_sources
+        if (canonical := canonical_source_url(source.url))
+    }
+    visible_urls = set(canonical_source_urls(response_text))
+    if not expected_urls:
+        passed, reason = False, "verified_signal_source_url_missing"
+    elif not expected_urls.issubset(visible_urls):
+        passed, reason = False, "verified_signal_source_url_not_retained"
+    elif visible_urls.difference(expected_urls):
+        passed, reason = False, "unverified_signal_source_url_added"
+    else:
+        passed, reason = True, "retained_signal_identity_and_links_match"
+    return {
+        "schema": "keystone.retained_signal_validation.v1",
+        "applicable": True,
+        "passed": passed,
+        "reason": reason,
+        "source_run_id": context.source_run_id,
+        "source_route": context.source_route,
+        "expected_source_ids": [source.source_id for source in context.selected_sources],
+        "expected_source_urls": sorted(expected_urls),
+        "visible_source_urls": sorted(visible_urls),
+        "provider_reads": 0,
+        "provider_writes": 0,
+    }
+
+
 def _run_direct_supplied_context_response_live(
     route: str,
     input_text: str,
@@ -7902,12 +10340,17 @@ def _run_direct_supplied_context_response_live(
 ) -> int:
     """Run the explicitly named specialist once without tools or domain blockers."""
 
-    if has_explicit_local_attachment_context(input_text):
-        attachment_bundle = local_file_input_bundle_from_text(input_text)
+    authoritative_request = (
+        manual_plan.objective.strip()
+        if is_context_only_response_plan(manual_plan) and manual_plan.objective.strip()
+        else input_text
+    )
+    if has_explicit_local_attachment_context(authoritative_request):
+        attachment_bundle = local_file_input_bundle_from_text(authoritative_request)
         if not attachment_bundle.has_inputs:
             return _print_local_attachment_unavailable(
                 route,
-                input_text,
+                authoritative_request,
                 attachment_bundle.diagnostics,
                 json_output=json_output,
                 manual_plan=manual_plan,
@@ -7916,13 +10359,13 @@ def _run_direct_supplied_context_response_live(
 
     agent = build_direct_supplied_response_agent(
         route,
-        request_text=input_text,
+        request_text=authoritative_request,
         manual_request_plan=manual_plan,
     )
     bounded_context = specialist_execution_context_text(execution_context)
     typed_input = DirectAgentResponseInput(
         requested_agent=route,
-        original_request=input_text,
+        original_request=authoritative_request,
         selected_context=bounded_context,
         output_constraints=manual_plan.ask_shape.output_constraints.model_dump(mode="json"),
     )
@@ -7941,27 +10384,94 @@ def _run_direct_supplied_context_response_live(
         },
         max_turns=1,
     )
-    bounded_evidence = "\n\n".join(part for part in (input_text, bounded_context) if part)
+    bounded_evidence = "\n\n".join(
+        part for part in (authoritative_request, bounded_context) if part
+    )
     instruction_resolution = resolve_instruction_following_response(
         result.output.answer,
-        original_request=input_text,
+        original_request=authoritative_request,
         manual_plan=manual_plan,
         bounded_evidence=bounded_evidence,
         live=True,
+        allow_length_expansion_repair=route != "outreach_composer",
     )
-    passed = instruction_resolution.validation.passed
+    signal_context = _verified_signal_context_from_execution_context(execution_context)
+    signal_context_validation = _validate_direct_signal_context_response(
+        instruction_resolution.response_text,
+        signal_context,
+    )
+    unsupported_claims = (
+        assess_unsupported_outreach_claims(
+            instruction_resolution.response_text,
+            input_context=bounded_evidence,
+        )
+        if route == "outreach_composer"
+        else ()
+    )
+    passed = (
+        instruction_resolution.validation.passed
+        and not unsupported_claims
+        and signal_context_validation["passed"] is True
+    )
     answer = (
         instruction_resolution.response_text
         if passed
+        else (
+            "I blocked this draft because it introduced factual organization "
+            "descriptors that were not present in the approved supplied context: "
+            + ", ".join(unsupported_claims[:4])
+            + "."
+        )
+        if unsupported_claims
+        else (
+            "I blocked this response because its retained source identity or visible "
+            "source link did not match the verified prior signal context."
+        )
+        if signal_context_validation["passed"] is False
         else instruction_following_blocker_text(instruction_resolution.validation)
+    )
+    tool_execution = build_tool_execution_summary(
+        mode="tool_free_model_synthesis_with_deterministic_helpers",
+        scope_source="complete_provider_free_supplied_context",
+        model_tool_call_count=0,
+        workflow_called_helper_names=[
+            "validate_output_constraints",
+            *(
+                ["assess_unsupported_outreach_claims"]
+                if route == "outreach_composer"
+                else []
+            ),
+        ],
+        workflow_helper_call_count=(2 if route == "outreach_composer" else 1),
+        provider_request_attempt_count=0,
+        provider_request_success_count=0,
+        provider_receipt_count=0,
+    )
+    direct_request_cache = dict(result.request_cache or {})
+    direct_request_cache.update(
+        {
+            "entrypoint": "direct_supplied_context_response",
+            "output_authority": "synthesis_only",
+            "tool_execution": tool_execution,
+        }
     )
     payload: dict[str, Any] = {
         "mode": "live_sdk",
+        "entrypoint": "direct_supplied_context_response",
+        "output_authority": "synthesis_only",
         "selected_agent": route,
         "agent_name": _agent_display_name(route),
-        "input": input_text,
+        "input": authoritative_request,
         "status": "completed" if passed else "blocked",
-        "block_kind": "" if passed else "instruction_following_constraint_failed",
+        "block_kind": (
+            ""
+            if passed
+            else "outreach_grounding_failed"
+            if unsupported_claims
+            else "signal_context_identity_validation_failed"
+            if signal_context_validation["passed"] is False
+            else "instruction_following_constraint_failed"
+        ),
         "send_enabled": False,
         "completion_confirmed": passed,
         "manual_request_plan": manual_plan.model_dump(mode="json"),
@@ -7973,10 +10483,38 @@ def _run_direct_supplied_context_response_live(
         "display_text": answer,
         "summary": answer,
         "instruction_following": instruction_resolution.metadata(),
+        "grounding_validation": {
+            "applicable": route == "outreach_composer",
+            "passed": not unsupported_claims,
+            "unsupported_claims": list(unsupported_claims),
+        },
+        "deterministic_helper_execution": [
+            {
+                "name": "validate_output_constraints",
+                "called": True,
+                "passed": instruction_resolution.validation.passed,
+            },
+            {
+                "name": "assess_unsupported_outreach_claims",
+                "called": route == "outreach_composer",
+                "passed": not unsupported_claims,
+            },
+            *(
+                [
+                    {
+                        "name": "validate_retained_signal_context",
+                        "called": True,
+                        "passed": signal_context_validation["passed"],
+                    }
+                ]
+                if signal_context is not None
+                else []
+            ),
+        ],
         "usage": result.usage,
         "cost": result.cost,
         "budget_guard": result.budget_guard,
-        "request_cache": result.request_cache,
+        "request_cache": direct_request_cache,
         "model": {
             "provider": get_runtime_agent_model_config(
                 getattr(agent, "name", route),
@@ -8000,19 +10538,22 @@ def _run_direct_supplied_context_response_live(
             "tool_count": len(list(getattr(agent, "tools", []) or [])),
             "reason": "complete_provider_free_supplied_context",
         },
+        "tool_execution": tool_execution,
         "side_effects": {
             "external_write_performed": False,
             "email_sent": False,
             "slack_message_posted": False,
         },
     }
+    if signal_context is not None:
+        payload["retained_signal_validation"] = signal_context_validation
     _attach_slack_run_provenance(payload, execution_context)
     attach_execution_public_result(payload)
     try:
         run_id = SQLiteStore(database_url or database_url_from_env()).save_agent_run(
             agent_name=route,
-            input_payload={"request_text": input_text, "route": route},
-            input_summary=input_text[:500],
+            input_payload={"request_text": authoritative_request, "route": route},
+            input_summary=authoritative_request[:500],
             output=payload,
             model=f"sdk-live:{getattr(agent, 'model', '') or route}",
             dry_run=False,
@@ -8023,6 +10564,804 @@ def _run_direct_supplied_context_response_live(
     except Exception as exc:  # pragma: no cover - diagnostic metadata only
         payload["agent_run_persistence_error"] = f"{type(exc).__name__}: {exc}"
     return _print_ask_live_payload(payload, json_output=json_output)
+
+
+def _direct_context_verified_candidate_fingerprints(
+    *,
+    raw_results: Sequence[Any] = (),
+    preacquired_receipts: Sequence[Mapping[str, Any] | Any] = (),
+) -> tuple[str, ...]:
+    """Bind direct context-agent selections to actual bounded read evidence.
+
+    The shared journal is authoritative in production. Raw SDK result receipts are
+    included because local fake-model fixtures bypass the instrumented tool wrapper
+    while still returning the exact tool call/output pair the model saw.
+    """
+
+    receipts: list[Mapping[str, Any] | Any] = [
+        *preacquired_receipts,
+        *tool_receipt_journal(),
+    ]
+    for raw_result in raw_results:
+        receipts.extend(_context_agent_tool_receipts(raw_result))
+    fingerprints = list(verified_candidate_fingerprints_from_receipts(receipts))
+    direct_identity_keys = (
+        "selected_item_key",
+        "duplicate_record_id",
+        "parent_item_key",
+        "artifact_path",
+    )
+    for receipt in receipts:
+        if not isinstance(receipt, Mapping):
+            continue
+        fingerprints.extend(
+            identity_fingerprint(receipt.get(key))
+            for key in direct_identity_keys
+            if receipt.get(key)
+        )
+    return tuple(dict.fromkeys(value for value in fingerprints if value))
+
+
+def _context_tool_output_payload(item: Any) -> Mapping[str, Any] | None:
+    """Parse one SDK tool output for internal validation only."""
+
+    raw_output = getattr(item, "output", "")
+    if isinstance(raw_output, Mapping):
+        return raw_output
+    if not isinstance(raw_output, str):
+        return None
+    try:
+        parsed = json.loads(raw_output)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, Mapping) else None
+
+
+def _provider_candidate_ids_from_payload(
+    route: str,
+    payload: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Extract only provider object identities that the model actually received."""
+
+    identities: list[str] = []
+
+    def add(value: object) -> None:
+        cleaned = " ".join(str(value or "").split())
+        if cleaned:
+            identities.append(cleaned)
+
+    if route == "airtable_context_agent":
+        add(payload.get("record_id"))
+        add(payload.get("duplicate_record_id"))
+        result_scope = payload.get("result_scope")
+        if isinstance(result_scope, Mapping):
+            for item_ref in result_scope.get("item_refs") or ():
+                add(item_ref)
+        for key in ("records", "items", "matching_record_summaries"):
+            rows = payload.get(key)
+            if not isinstance(rows, list | tuple):
+                continue
+            for row in rows:
+                if isinstance(row, Mapping):
+                    add(row.get("record_id") or row.get("id"))
+    elif route == "google_workspace_context_agent":
+        for key in (
+            "document_id",
+            "file_id",
+            "folder_id",
+            "spreadsheet_id",
+            "presentation_id",
+        ):
+            add(payload.get(key))
+        for key in ("items", "files", "folders", "documents", "spreadsheets"):
+            rows = payload.get(key)
+            if not isinstance(rows, list | tuple):
+                continue
+            for row in rows:
+                if isinstance(row, Mapping):
+                    add(
+                        row.get("file_id")
+                        or row.get("folder_id")
+                        or row.get("document_id")
+                        or row.get("spreadsheet_id")
+                        or row.get("presentation_id")
+                        or row.get("id")
+                    )
+        file_payload = payload.get("file")
+        if isinstance(file_payload, Mapping):
+            add(file_payload.get("file_id") or file_payload.get("id"))
+        result_scope = payload.get("result_scope")
+        if isinstance(result_scope, Mapping):
+            for item_ref in result_scope.get("item_refs") or ():
+                add(item_ref)
+    elif route == "zotero_context_agent":
+        for key in (
+            "item_key",
+            "selected_item_key",
+            "parent_item_key",
+            "collection_key",
+        ):
+            add(payload.get(key))
+        for key in ("items", "collections", "results"):
+            rows = payload.get(key)
+            if not isinstance(rows, list | tuple):
+                continue
+            for row in rows:
+                if isinstance(row, Mapping):
+                    add(
+                        row.get("item_key")
+                        or row.get("collection_key")
+                        or row.get("key")
+                    )
+        result_scope = payload.get("result_scope")
+        if isinstance(result_scope, Mapping):
+            for item_ref in result_scope.get("item_refs") or ():
+                add(item_ref)
+    return tuple(dict.fromkeys(identities))
+
+
+def _direct_context_provider_candidate_universe(
+    route: str,
+    *,
+    raw_results: Sequence[Any] = (),
+    preacquired_receipts: Sequence[Mapping[str, Any] | Any] = (),
+) -> tuple[tuple[str, ...], bool]:
+    """Return the raw provider candidate universe and whether it was observed."""
+
+    candidates: list[str] = []
+    provider_evidence_observed = False
+    for receipt in preacquired_receipts:
+        if not isinstance(receipt, Mapping):
+            continue
+        provider_evidence_observed = True
+        candidates.extend(_provider_candidate_ids_from_payload(route, receipt))
+    for raw_result in raw_results:
+        items = list(getattr(raw_result, "new_items", []) or [])
+        tool_names_by_call_id = _sdk_tool_names_by_call_id(items)
+        for item in items:
+            if str(getattr(item, "type", "")) != "tool_call_output_item":
+                continue
+            tool_name = tool_names_by_call_id.get(_sdk_run_item_call_id(item), "")
+            if not tool_name:
+                continue
+            payload = _context_tool_output_payload(item)
+            if payload is None:
+                continue
+            provider_evidence_observed = True
+            candidates.extend(_provider_candidate_ids_from_payload(route, payload))
+    return tuple(dict.fromkeys(candidates)), provider_evidence_observed
+
+
+def _direct_context_orchestrator_decision_text(
+    orchestrator_preflight: OrchestratorPreflight | None,
+) -> str:
+    """Expose compact route advice without leaking a manager decision schema.
+
+    The full manager decision remains in the correlated trace. Passing its typed
+    ``decision`` object to a specialist creates a competing output example: the
+    child can copy ``decision_owner=orchestrator`` and route identities where its
+    own provider-evidence decision belongs.
+    """
+
+    raw = orchestrator_preflight_env(orchestrator_preflight).get(
+        ORCHESTRATOR_ROUTE_RESULT_ENV,
+        "",
+    )
+    if not raw:
+        return ""
+    try:
+        route_result = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(route_result, Mapping):
+        return ""
+    memo_keys = (
+        "route",
+        "target_agent",
+        "workflow",
+        "rationale",
+        "stop_reason",
+        "requires_human_review",
+        "approval_required",
+        "approval_scope",
+        "approval_state",
+        "external_use_approval_required",
+        "approved_context_present",
+        "refused",
+        "send_enabled",
+        "can_send_email",
+        "forbidden_actions",
+    )
+    route_memo = {
+        key: route_result[key]
+        for key in memo_keys
+        if key in route_result
+    }
+    return (
+        "Validated Orchestrator decision for specialist interpretation. This is "
+        "decision context, not provider-write authority; deterministic admission, "
+        "approval, and exact-scope gates remain authoritative. Do not copy route "
+        "identities or the Orchestrator's decision owner into your specialist decision; "
+        "use your route-specific decision stage and only provider evidence identities "
+        "returned by your tools:\n"
+        + json.dumps(route_memo, ensure_ascii=True, sort_keys=True)
+    )
+
+
+def _aggregate_direct_context_usage(raw_results: Sequence[Any]) -> dict[str, Any]:
+    """Aggregate initial and repair model usage without hiding missing attempts."""
+
+    rows = [extract_sdk_usage(raw_result) for raw_result in raw_results]
+    available = [row for row in rows if row.get("available") is True]
+    complete = len(rows) == len(available) and bool(rows)
+
+    def total(field: str) -> int | None:
+        values = [row.get(field) for row in available]
+        if not values or any(value is None for value in values):
+            return None
+        return sum(int(value or 0) for value in values)
+
+    input_tokens = total("input_tokens")
+    cached_input_tokens = total("cached_input_tokens")
+    cache_hit_rate = (
+        round(int(cached_input_tokens or 0) / input_tokens, 4)
+        if input_tokens
+        else 0.0
+        if input_tokens == 0
+        else None
+    )
+    return {
+        "available": bool(available),
+        "complete": complete,
+        "attempt_count": len(rows),
+        "requests": total("requests"),
+        "input_tokens": input_tokens,
+        "output_tokens": total("output_tokens"),
+        "total_tokens": total("total_tokens"),
+        "cached_input_tokens": cached_input_tokens,
+        "reasoning_output_tokens": total("reasoning_output_tokens"),
+        "cache_hit_rate": cache_hit_rate,
+    }
+
+
+def _direct_context_provider_call_counts(
+    *,
+    raw_results: Sequence[Any],
+    invocations: Sequence[Mapping[str, Any]],
+    preacquired_receipts: Sequence[Mapping[str, Any] | Any],
+) -> tuple[int, int]:
+    """Count provider attempts/successes from invocation and receipt evidence."""
+
+    def provider_tool(tool_name: object) -> bool:
+        normalized = str(tool_name or "").strip().lower()
+        return normalized.startswith(("airtable_", "google_", "zotero_"))
+
+    started = {
+        (int(item.get("invocation_index") or 0), str(item.get("tool_name") or ""))
+        for item in invocations
+        if item.get("status") == "started" and provider_tool(item.get("tool_name"))
+    }
+    completed = {
+        (int(item.get("invocation_index") or 0), str(item.get("tool_name") or ""))
+        for item in invocations
+        if item.get("status") == "completed" and provider_tool(item.get("tool_name"))
+    }
+    if not started:
+        raw_calls: set[tuple[int, str, str]] = set()
+        raw_successes: set[tuple[int, str, str]] = set()
+        for result_index, raw_result in enumerate(raw_results):
+            items = list(getattr(raw_result, "new_items", []) or [])
+            names = _sdk_tool_names_by_call_id(items)
+            for item in items:
+                call_id = _sdk_run_item_call_id(item)
+                tool_name = names.get(call_id, "")
+                if not call_id or not provider_tool(tool_name):
+                    continue
+                key = (result_index, call_id, tool_name)
+                raw_calls.add(key)
+                if str(getattr(item, "type", "")) == "tool_call_output_item":
+                    raw_successes.add(key)
+        model_attempts = len(raw_calls)
+        model_successes = len(raw_successes)
+    else:
+        model_attempts = len(started)
+        model_successes = len(completed)
+    preacquired = sum(
+        1 for receipt in preacquired_receipts if isinstance(receipt, Mapping)
+    )
+    return model_attempts + preacquired, model_successes + preacquired
+
+
+def _disable_direct_context_repair_read_tools(
+    agent: Any,
+    *,
+    replayed_tool_names: Sequence[str],
+) -> tuple[tuple[Any, Any], ...]:
+    """Disable provider reads for one evidence-backed direct repair attempt."""
+
+    replayed = set(replayed_tool_names)
+    changed: list[tuple[Any, Any]] = []
+    for tool in list(getattr(agent, "tools", []) or []):
+        tool_name = str(getattr(tool, "name", "") or "").strip()
+        if not tool_name or (
+            tool_name not in replayed and not is_provider_read_tool_name(tool_name)
+        ):
+            continue
+        previous = getattr(tool, "is_enabled", True)
+        changed.append((tool, previous))
+        tool.is_enabled = False
+    return tuple(changed)
+
+
+def _restore_direct_context_tools(changed: Sequence[tuple[Any, Any]]) -> None:
+    for tool, previous in changed:
+        tool.is_enabled = previous
+
+
+def _disable_direct_context_completed_tools_for_correction(
+    agent: Any,
+    raw_result: Any,
+    *,
+    receipts: Sequence[Mapping[str, Any]],
+    invocations: Sequence[Mapping[str, Any]],
+) -> tuple[tuple[tuple[Any, Any], ...], tuple[str, ...], tuple[str, ...]]:
+    """Disable completed reads and every observed mutation before one correction."""
+
+    completed_reads = {
+        record.tool_name
+        for record in sdk_tool_execution_records(raw_result)
+        if record.succeeded and is_provider_read_tool_name(record.tool_name)
+    }
+    observed_mutations = {
+        *mutation_tool_names(receipts),
+        *(
+            record.tool_name
+            for record in sdk_tool_execution_records(raw_result)
+            if operation_is_mutation(record.tool_name)
+        ),
+        *(
+            str(item.get("tool_name") or "").strip()
+            for item in invocations
+            if str(item.get("status") or "") in {"started", "completed", "failed"}
+            and operation_is_mutation(item.get("tool_name"))
+        ),
+    }
+    disabled_names = completed_reads | observed_mutations
+    changed: list[tuple[Any, Any]] = []
+    for tool in list(getattr(agent, "tools", []) or []):
+        tool_name = str(getattr(tool, "name", "") or "").strip()
+        if tool_name not in disabled_names:
+            continue
+        previous = getattr(tool, "is_enabled", True)
+        changed.append((tool, previous))
+        tool.is_enabled = False
+    return (
+        tuple(changed),
+        tuple(sorted(completed_reads)),
+        tuple(sorted(observed_mutations)),
+    )
+
+
+def _direct_context_tool_execution_error(
+    *,
+    agent: Any,
+    route: str,
+    model_config: Any,
+    outcome: Any,
+    receipts: Sequence[Mapping[str, Any] | Any],
+    correction: Mapping[str, Any],
+    failure_kind: str = "required_tool_execution_missing",
+    attempt_count: int | None = None,
+) -> ToolExecutionContractError:
+    """Return one trace-complete direct tool postcondition failure."""
+
+    error = ToolExecutionContractError(outcome)
+    error.keystone_sdk_run_failure = {  # type: ignore[attr-defined]
+        "schema": "keystone.sdk_run_failure.v1",
+        "agent_name": agent.name,
+        "provider": model_config.provider,
+        "model": model_config.model,
+        "run_mode": "live_sdk",
+        "failure_kind": failure_kind,
+        "attempt_count": (
+            int(attempt_count)
+            if attempt_count is not None
+            else 2
+            if correction.get("attempted")
+            else 1
+        ),
+        "request_cache": {
+            "tool_execution_postcondition": outcome.receipt(),
+            "tool_execution_correction": dict(correction),
+        },
+        "tool_execution_postcondition": outcome.receipt(),
+        "tool_receipts": [
+            dict(receipt) for receipt in receipts if isinstance(receipt, Mapping)
+        ],
+    }
+    return error
+
+
+_DIRECT_CONTEXT_MUTATION_IDENTITY_ARGUMENTS = (
+    "record_id",
+    "keep_record_id",
+    "duplicate_record_id",
+    "document_id",
+    "document_id_or_url",
+    "file_id",
+    "file_id_or_url",
+    "folder_id",
+    "folder_path_or_id",
+    "spreadsheet_id",
+    "spreadsheet_id_or_url",
+    "presentation_id",
+    "presentation_id_or_url",
+    "item_key",
+    "parent_item_key",
+    "attachment_item_key",
+    "collection_key",
+    "artifact_path",
+)
+_DIRECT_CONTEXT_CREATE_WITHOUT_EXISTING_TARGET = frozenset(
+    {
+        "airtable_create_expense_from_receipt",
+        "airtable_test_record_lifecycle",
+        "google_doc_test_lifecycle",
+        "google_drive_create_folder",
+        "google_sheet_create",
+        "presentation_extract_slide_copy_local",
+        "zotero_import_article_with_backend",
+        "zotero_test_note_lifecycle",
+        "zotero_write_test_collection",
+        "zotero_write_test_item",
+    }
+)
+
+
+def _direct_context_write_input_payload(data: Any) -> dict[str, Any]:
+    """Parse one SDK tool input without retaining it in telemetry."""
+
+    context = getattr(data, "context", None)
+    value = getattr(context, "tool_input", None)
+    if isinstance(value, Mapping):
+        return dict(value)
+    raw = getattr(context, "tool_arguments", "")
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return dict(parsed) if isinstance(parsed, Mapping) else {}
+    return {}
+
+
+def _direct_context_tool_is_mutation(
+    tool_name: str,
+    payload: Mapping[str, Any],
+) -> bool:
+    """Classify direct context-agent mutations before provider execution."""
+
+    return bool(
+        operation_is_mutation(tool_name)
+        or operation_is_mutation(payload.get("operation"))
+        or tool_name
+        in {
+            "presentation_extract_slide_copy_local",
+            "zotero_import_article_with_backend",
+        }
+    )
+
+
+def _direct_context_verified_write_fingerprints(
+    *,
+    preacquired_receipts: Sequence[Mapping[str, Any] | Any] = (),
+    execution_context: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
+    """Return only identities proven by provider reads or verified continuation state."""
+
+    fingerprints = list(
+        _direct_context_verified_candidate_fingerprints(
+            preacquired_receipts=preacquired_receipts,
+        )
+    )
+    receipts = [*preacquired_receipts, *tool_receipt_journal()]
+    for receipt in receipts:
+        if not isinstance(receipt, Mapping):
+            continue
+        if receipt_reports_possible_write(receipt):
+            continue
+        for key in (
+            "folder_path",
+            "html_link",
+            "provider_link",
+        ):
+            if receipt.get(key):
+                fingerprints.append(identity_fingerprint(receipt.get(key)))
+    verified_objects = (
+        execution_context.get("verified_provider_objects")
+        if isinstance(execution_context, Mapping)
+        else None
+    )
+    if isinstance(verified_objects, list | tuple):
+        for value in verified_objects:
+            if not isinstance(value, Mapping):
+                continue
+            if (
+                value.get("verification_status") != "verified"
+                or value.get("lifecycle_state") != "active"
+            ):
+                continue
+            if value.get("object_id"):
+                fingerprints.append(identity_fingerprint(value.get("object_id")))
+    return tuple(dict.fromkeys(value for value in fingerprints if value))
+
+
+def _direct_context_write_selection_issue(
+    tool_name: str,
+    payload: Mapping[str, Any],
+    *,
+    verified_fingerprints: Sequence[str],
+) -> tuple[str, str]:
+    """Validate a model-selected write target without selecting one in Python."""
+
+    if not _direct_context_tool_is_mutation(tool_name, payload):
+        return "", ""
+    operation = str(payload.get("operation") or "").strip().lower()
+    target_values = list(
+        dict.fromkeys(
+            " ".join(str(payload.get(key) or "").split())
+            for key in _DIRECT_CONTEXT_MUTATION_IDENTITY_ARGUMENTS
+            if str(payload.get(key) or "").strip()
+        )
+    )
+    create_without_target = bool(
+        tool_name in _DIRECT_CONTEXT_CREATE_WITHOUT_EXISTING_TARGET
+        or (
+            tool_name
+            in {
+                "airtable_write_record",
+                "google_doc_write",
+                "google_slide_deck_write",
+                "zotero_write_test_note",
+            }
+            and operation in {"", "create"}
+            and not target_values
+        )
+    )
+    if not target_values:
+        if create_without_target:
+            return "", ""
+        return (
+            "agent_selected_identity_missing",
+            "Before this provider mutation, read or reuse one verified candidate and "
+            "call the write tool with its exact identity. If the evidence is ambiguous, "
+            "do not write and return needs_more_context=true.",
+        )
+    allowed = set(verified_fingerprints)
+    unverified = [
+        value for value in target_values if identity_fingerprint(value) not in allowed
+    ]
+    if unverified:
+        return (
+            "agent_selected_identity_not_verified",
+            "The proposed provider target was not present in the verified candidate "
+            "evidence. Reuse an exact returned identity or return needs_more_context=true; "
+            "Python will not substitute a target.",
+        )
+    return "", ""
+
+
+def _install_direct_context_write_selection_guardrails(
+    agent: Any,
+    *,
+    preacquired_receipts: Sequence[Mapping[str, Any] | Any],
+    execution_context: Mapping[str, Any] | None,
+    allowed_attachment_digests: Mapping[str, str] | None = None,
+) -> tuple[list[tuple[Any, list[Any]]], dict[str, Any]]:
+    """Add one model-repairable, fail-closed write-selection boundary."""
+
+    installed: list[tuple[Any, list[Any]]] = []
+    state: dict[str, Any] = {
+        "schema": "keystone.direct_context_write_selection_guardrail.v1",
+        "rejection_count": 0,
+        "rejected_tool_names": [],
+        "reason_codes": [],
+        "disabled_read_tool_names": [],
+        "max_repair_attempts": 1,
+    }
+
+    def guardrail_for(tool_name: str) -> Any:
+        @tool_input_guardrail(name="keystone_direct_context_write_selection")
+        def selection_guardrail(data: Any) -> ToolGuardrailFunctionOutput:
+            payload = _direct_context_write_input_payload(data)
+            verified = _direct_context_verified_write_fingerprints(
+                preacquired_receipts=preacquired_receipts,
+                execution_context=execution_context,
+            )
+            reason_code, feedback = _direct_attachment_write_issue(
+                tool_name, payload, allowed_attachment_digests,
+            )
+            if not reason_code:
+                reason_code, feedback = _direct_context_write_selection_issue(
+                    tool_name,
+                    payload,
+                    verified_fingerprints=verified,
+                )
+            if not reason_code:
+                return ToolGuardrailFunctionOutput.allow(
+                    {
+                        "tool_name": tool_name,
+                        "selection_bound_to_verified_evidence": True,
+                    }
+                )
+            state["rejection_count"] = int(state["rejection_count"]) + 1
+            state["rejected_tool_names"] = list(
+                dict.fromkeys([*state["rejected_tool_names"], tool_name])
+            )
+            state["reason_codes"] = list(
+                dict.fromkeys([*state["reason_codes"], reason_code])
+            )
+            if verified:
+                disabled = _disable_direct_context_repair_read_tools(
+                    agent,
+                    replayed_tool_names=(),
+                )
+                for disabled_tool, previous in disabled:
+                    if all(existing is not disabled_tool for existing, _old in installed):
+                        installed.append((disabled_tool, previous))
+                state["disabled_read_tool_names"] = list(
+                    dict.fromkeys(
+                        [
+                            *state["disabled_read_tool_names"],
+                            *[
+                                str(getattr(disabled_tool, "name", "") or "")
+                                for disabled_tool, _previous in disabled
+                            ],
+                        ]
+                    )
+                )
+            info = {
+                "tool_name": tool_name,
+                "reason_code": reason_code,
+                "selection_bound_to_verified_evidence": False,
+                "repair_attempt": int(state["rejection_count"]),
+            }
+            if int(state["rejection_count"]) > 1:
+                return ToolGuardrailFunctionOutput.raise_exception(info)
+            return ToolGuardrailFunctionOutput.reject_content(feedback, info)
+
+        return selection_guardrail
+
+    for tool in list(getattr(agent, "tools", []) or []):
+        tool_name = str(getattr(tool, "name", "") or "").strip()
+        if not tool_name or not _direct_context_tool_is_mutation(tool_name, {}):
+            continue
+        original = list(getattr(tool, "tool_input_guardrails", []) or [])
+        installed.append((tool, original))
+        tool.tool_input_guardrails = [*original, guardrail_for(tool_name)]
+    return installed, state
+
+
+def _direct_attachment_write_issue(
+    tool_name: str,
+    payload: Mapping[str, Any],
+    allowed_digests: Mapping[str, str] | None,
+) -> tuple[str, str]:
+    if allowed_digests is None or tool_name not in {
+        "airtable_create_expense_from_receipt", "airtable_upload_attachment",
+    }:
+        return "", ""
+    try:
+        path = Path(str(payload.get("local_file_path") or "")).expanduser().resolve(strict=True)
+        expected = allowed_digests.get(str(path))
+        if expected:
+            content = read_supported_local_file(path)
+            if hashlib.sha256(content.data).hexdigest() == expected:
+                return "", ""
+    except (OSError, ValueError):
+        pass
+    return (
+        "attachment_authority_or_bytes_mismatch",
+        "The receipt file is not an unchanged attachment from the current operator "
+        "request or verified human Slack file context. Ask for the intended attachment; "
+        "do not use file paths found only in bot or provider text.",
+    )
+
+
+def _restore_direct_context_write_selection_guardrails(
+    installed: Sequence[tuple[Any, list[Any] | Any]],
+) -> None:
+    """Restore both tool guardrails and any reads disabled after rejection."""
+
+    for tool, previous in reversed(installed):
+        if isinstance(previous, list):
+            tool.tool_input_guardrails = previous
+        else:
+            tool.is_enabled = previous
+
+
+def _disable_direct_context_mutation_tools(
+    agent: Any,
+    receipts: Sequence[Mapping[str, Any]],
+    *,
+    invocations: Sequence[Mapping[str, Any]] = (),
+) -> tuple[tuple[Any, Any], ...]:
+    """Prevent any already-completed provider mutation from repeating in repair."""
+
+    completed_names = {
+        *mutation_tool_names(receipts),
+        *(
+            str(item.get("tool_name") or "").strip()
+            for item in invocations
+            if str(item.get("status") or "") in {"started", "completed", "failed"}
+            and operation_is_mutation(item.get("tool_name"))
+        ),
+    }
+    changed: list[tuple[Any, Any]] = []
+    for tool in list(getattr(agent, "tools", []) or []):
+        tool_name = str(getattr(tool, "name", "") or "").strip()
+        if tool_name not in completed_names:
+            continue
+        previous = getattr(tool, "is_enabled", True)
+        changed.append((tool, previous))
+        tool.is_enabled = False
+    return tuple(changed)
+
+
+def _direct_context_decision_error(
+    *,
+    agent: Any,
+    route: str,
+    model_config: Any,
+    contract: Any,
+    outcome: Any,
+    attempts: Sequence[Mapping[str, Any]],
+    receipts: Sequence[Mapping[str, Any] | Any],
+    repair_evidence: Mapping[str, Any] | None = None,
+    note: str = "",
+) -> AgentDecisionValidationError:
+    """Return one trace-complete direct decision failure without substitution."""
+
+    attempt_rows = [dict(item) for item in attempts]
+    ownership = {
+        "schema": "keystone.agent_decision_run.v1",
+        "route": route,
+        "decision_stage": contract.decision_stage,
+        "attempt_count": len(attempt_rows),
+        "repair_attempted": len(attempt_rows) > 1,
+        "attempts": attempt_rows,
+        "validator_outcome": outcome.model_dump(mode="json"),
+        **(
+            {"repair_evidence": dict(repair_evidence)}
+            if repair_evidence is not None
+            else {}
+        ),
+    }
+    error = AgentDecisionValidationError(outcome)
+    error.keystone_sdk_run_failure = {  # type: ignore[attr-defined]
+        "schema": "keystone.sdk_run_failure.v1",
+        "agent_name": agent.name,
+        "provider": model_config.provider,
+        "model": model_config.model,
+        "run_mode": "live_sdk",
+        "failure_kind": "agentdecisionvalidationerror",
+        "attempt_count": len(attempt_rows),
+        "request_cache": {
+            "decision_ownership": ownership,
+            **(
+                {"decision_repair_evidence": dict(repair_evidence)}
+                if repair_evidence is not None
+                else {}
+            ),
+        },
+        "tool_receipts": [
+            dict(receipt) for receipt in receipts if isinstance(receipt, Mapping)
+        ],
+        **({"note": note} if note else {}),
+    }
+    return error
 
 
 def _run_ask_context_agent_live(
@@ -8037,11 +11376,24 @@ def _run_ask_context_agent_live(
     cost_tracking_requested: bool = False,
     database_url: str | None = None,
 ) -> int:
-    provider_context, preacquired_receipts, provider_blocker = _direct_zotero_provider_preflight(
-        route,
-        input_text,
-        manual_plan=manual_plan,
+    provider_write_admitted = _direct_context_agent_write_admitted(
+        manual_plan,
+        input_text=input_text,
+        route=route,
     )
+    if route == "zotero_context_agent" and provider_write_admitted:
+        provider_context, preacquired_receipts, provider_blocker = (
+            _direct_zotero_provider_preflight(
+                route,
+                input_text,
+                manual_plan=manual_plan,
+            )
+        )
+    else:
+        # Ambiguous and natural-language Zotero reads stay model-led. The
+        # specialist calls bounded query/context tools and chooses the item;
+        # Python only validates returned identities and receipts afterward.
+        provider_context, preacquired_receipts, provider_blocker = "", [], ""
     (
         airtable_projection_context,
         airtable_projection_receipts,
@@ -8062,6 +11414,9 @@ def _run_ask_context_agent_live(
         input_text,
         manual_plan=manual_plan,
         execution_context=execution_context,
+    )
+    attachment_bundle = _direct_context_attachment_bundle(
+        input_text, execution_context, include_prior=bool(airtable_receipt_context),
     )
     if airtable_receipt_context:
         provider_context = "\n\n".join(
@@ -8086,11 +11441,6 @@ def _run_ask_context_agent_live(
                 "send_enabled": False,
             },
         )
-    provider_write_admitted = _direct_context_agent_write_admitted(
-        manual_plan,
-        input_text=input_text,
-        route=route,
-    )
     spec = AGENT_REGISTRY[route]
     build_kwargs: dict[str, Any] = {
         "request_text": input_text,
@@ -8110,6 +11460,8 @@ def _run_ask_context_agent_live(
     if route in {
         "airtable_context_agent",
         "google_workspace_context_agent",
+        "preprints_context_agent",
+        "rss_context_agent",
         "zotero_context_agent",
     }:
         build_kwargs["manual_plan"] = manual_plan
@@ -8119,12 +11471,7 @@ def _run_ask_context_agent_live(
             # Keep the specialist turn focused on synthesis instead of allowing
             # a second tool call to broaden or replace that set.
             build_kwargs["attach_tools"] = False
-    if route == "zotero_context_agent" and provider_context:
-        # Provider acquisition is already complete. Keep this synthesis turn
-        # tool-free; later thread follow-ups rebuild the agent with its Zotero
-        # read tools when they need new metadata.
-        build_kwargs["attach_tools"] = False
-    agent = spec.build_agent(**build_kwargs)
+    agent = agent_with_isolated_tool_state(spec.build_agent(**build_kwargs))
     model_config = get_runtime_agent_model_config(
         getattr(agent, "name", None),
         model_override=getattr(agent, "model", None),
@@ -8161,6 +11508,75 @@ def _run_ask_context_agent_live(
         if route == "airtable_context_agent"
         else ""
     )
+    zotero_approval_env = "KEYSTONE_ZOTERO_OPERATOR_APPROVAL_REFERENCE"
+    previous_zotero_approval = os.environ.get(zotero_approval_env)
+    reset_tool_receipt_journal()
+    instrument_agent_tools(agent)
+    initial_scope_receipt = tool_scope_receipt_for_agent(agent)
+    initial_selected_tool_names = [
+        str(item)
+        for item in initial_scope_receipt.get("selected_tool_names", [])
+        if str(item).strip()
+    ]
+    direct_tool_execution_contract = (
+        _context_agent_tool_execution_contract(
+            route,
+            input_text=input_text,
+            selected_tool_names=initial_selected_tool_names,
+            manual_plan=manual_plan,
+        )
+        if route
+        in {
+            "airtable_context_agent",
+            "google_workspace_context_agent",
+            "zotero_context_agent",
+        }
+        else None
+    )
+    if direct_tool_execution_contract is not None:
+        selected_tool_set = set(initial_selected_tool_names)
+        missing_admission_groups = tuple(
+            group.name
+            for group in direct_tool_execution_contract.required_groups
+            if not selected_tool_set.intersection(group.any_of_tool_names)
+        )
+        if missing_admission_groups:
+            admission_outcome = evaluate_tool_execution_contract(
+                {},
+                direct_tool_execution_contract,
+            )
+            admission_error = _direct_context_tool_execution_error(
+                agent=agent,
+                route=route,
+                model_config=model_config,
+                outcome=admission_outcome,
+                receipts=(),
+                correction={
+                    "schema": "keystone.tool_execution_correction.v1",
+                    "attempted": False,
+                    "reason": "required_tool_not_attached_before_model_execution",
+                    "missing_admission_groups": list(missing_admission_groups),
+                },
+                failure_kind="required_tool_admission_missing",
+                attempt_count=0,
+            )
+            return _print_ask_context_agent_failure(
+                route=route,
+                input_text=input_text,
+                exc=admission_error,
+                json_output=json_output,
+                manual_plan=manual_plan,
+                orchestrator_preflight=orchestrator_preflight,
+                sdk_session_spec=sdk_session_spec,
+                cost_tracking_requested=cost_tracking_requested,
+                database_url=database_url,
+                sdk_failure=sdk_run_failure_metadata(admission_error),
+                selected_tool_names=initial_selected_tool_names,
+            )
+    # Temporary live-read and approval state is installed only after tool
+    # admission succeeds. Admission failures return before the cleanup block,
+    # so mutating process state any earlier would leak authority into later
+    # requests and tests.
     if route == "airtable_context_agent" and provider_write_admitted:
         request_hash = hashlib.sha256(input_text.encode("utf-8")).hexdigest()[:16]
         os.environ[operator_approval_env] = f"airtable-direct:{request_hash}"
@@ -8169,15 +11585,60 @@ def _run_ask_context_agent_live(
             os.environ[AIRTABLE_ALLOWED_OPERATION_ENV] = airtable_allowed_operation
         else:
             os.environ.pop(AIRTABLE_ALLOWED_OPERATION_ENV, None)
-    zotero_approval_env = "KEYSTONE_ZOTERO_OPERATOR_APPROVAL_REFERENCE"
-    previous_zotero_approval = os.environ.get(zotero_approval_env)
     if route == "zotero_context_agent" and provider_write_admitted:
         request_hash = hashlib.sha256(input_text.encode("utf-8")).hexdigest()[:16]
         os.environ[zotero_approval_env] = f"zotero-direct:{request_hash}"
     if live_read_env_name:
         os.environ[live_read_env_name] = "true"
+    shared_decision_contract = (
+        context_agent_decision_contract(
+            route,
+            require_substantive_summary=_zotero_substantive_summary_required(
+                route,
+                input_text,
+                manual_plan=manual_plan,
+            ),
+        )
+        if route
+        in {
+            "airtable_context_agent",
+            "google_workspace_context_agent",
+            "zotero_context_agent",
+        }
+        else None
+    )
+    decision_attempts: list[dict[str, Any]] = []
+    decision_ownership: dict[str, Any] = {}
+    decision_raw_results: list[Any] = []
+    decision_repair_evidence: dict[str, Any] | None = None
+    direct_tool_execution_outcome: Any | None = None
+    tool_execution_correction: dict[str, Any] = {}
+    tool_correction_disabled_tools: tuple[tuple[Any, Any], ...] = ()
+    repair_disabled_tools: tuple[tuple[Any, Any], ...] = ()
+    mutation_repair_disabled_tools: tuple[tuple[Any, Any], ...] = ()
+    write_selection_guardrails: list[tuple[Any, list[Any] | Any]] = []
+    write_selection_guardrail_state: dict[str, Any] = {}
+    if provider_write_admitted and shared_decision_contract is not None:
+        (
+            write_selection_guardrails,
+            write_selection_guardrail_state,
+        ) = _install_direct_context_write_selection_guardrails(
+            agent,
+            preacquired_receipts=preacquired_receipts,
+            execution_context=execution_context,
+            allowed_attachment_digests={
+                str(attachment.path): attachment.checksum_sha256
+                for attachment in attachment_bundle.attachments
+            },
+        )
+    signal_sdk_result = None
     try:
         sdk_input_parts = [input_text]
+        orchestrator_decision_context = _direct_context_orchestrator_decision_text(
+            orchestrator_preflight
+        )
+        if orchestrator_decision_context:
+            sdk_input_parts.append(orchestrator_decision_context)
         interpreted_constraints = interpreted_output_constraints_text(manual_plan)
         if interpreted_constraints:
             sdk_input_parts.append(interpreted_constraints)
@@ -8191,7 +11652,13 @@ def _run_ask_context_agent_live(
                 "Authenticated direct execution context: this exact scoped provider "
                 "write is approved for the selected specialist. Call the matching "
                 "typed tool with live=true. Reuse the process-local operator approval "
-                "reference; do not request duplicate approval or downgrade to preview."
+                "reference; do not request duplicate approval or downgrade to preview. "
+                "For an update, delete, append, rename, link, attach, or replacement, "
+                "first inspect bounded provider evidence and choose the exact returned "
+                "identity yourself. If zero or multiple plausible targets remain, call "
+                "no mutation tool and return needs_more_context=true. For a create, "
+                "select the provider identity returned by the verified write receipt in "
+                "your final decision."
             )
         if airtable_allowed_operation:
             sdk_input_parts.append(
@@ -8200,27 +11667,437 @@ def _run_ask_context_agent_live(
                 "blocked by the tool boundary."
             )
         sdk_input_text = "\n\n".join(sdk_input_parts)
-        sdk_input = sdk_input_from_typed_input(
-            sdk_input_text,
-            live=True,
-            provider=model_config.provider,
+        sdk_input = (
+            attachment_bundle.response_input(sdk_input_text)
+            if attachment_bundle.has_inputs and model_config.provider == "openai"
+            else sdk_input_text
         )
         try:
-            raw_result, output = run_typed_sdk_sync(
-                agent,
-                sdk_input,
-                output_type,
-                live=True,
-                session=build_sdk_session(sdk_session_spec) if sdk_session_spec else None,
-                workflow_name=f"keystone.ask.{route}",
-                trace_metadata={
-                    "agent": route,
-                    "entrypoint": "cli.ask",
-                    "mode": "live_sdk",
-                },
-                max_turns=turn_policy.max_turns,
-            )
+            if _direct_signal_decision_runtime_required(
+                route,
+                input_text=input_text,
+            ):
+                signal_sdk_result = run_signal_context_sdk(
+                    "preprints" if route == "preprints_context_agent" else "rss",
+                    sdk_input_text,
+                    manual_request_plan=manual_plan,
+                    live=True,
+                    session=(
+                        build_sdk_session(sdk_session_spec)
+                        if sdk_session_spec
+                        else None
+                    ),
+                    max_turns=turn_policy.max_turns,
+                    max_selected=8,
+                    agent=agent,
+                )
+                raw_result = signal_sdk_result.raw_result
+                output = signal_sdk_result.final_output
+                decision_raw_results.append(raw_result)
+                decision_ownership = dict(
+                    signal_sdk_result.request_cache.get("decision_ownership") or {}
+                )
+            else:
+                raw_result, output = run_typed_sdk_sync(
+                    agent,
+                    sdk_input,
+                    output_type,
+                    live=True,
+                    session=build_sdk_session(sdk_session_spec) if sdk_session_spec else None,
+                    workflow_name=f"keystone.ask.{route}",
+                    trace_metadata={
+                        "agent": route,
+                        "entrypoint": "cli.ask",
+                        "mode": "live_sdk",
+                    },
+                    max_turns=turn_policy.max_turns,
+                )
+                decision_raw_results.append(raw_result)
+            if direct_tool_execution_contract is not None:
+                first_receipts = [
+                    *tool_receipt_journal(),
+                    *_context_agent_tool_receipts(raw_result),
+                ]
+                first_invocations = tool_invocation_journal()
+                first_tool_outcome = evaluate_tool_execution_contract(
+                    raw_result,
+                    direct_tool_execution_contract,
+                    tool_receipts=first_receipts,
+                    preacquired_receipts=preacquired_receipts,
+                )
+                direct_tool_execution_outcome = first_tool_outcome
+                if not first_tool_outcome.satisfied:
+                    if first_tool_outcome.prohibited_tool_names:
+                        raise _direct_context_tool_execution_error(
+                            agent=agent,
+                            route=route,
+                            model_config=model_config,
+                            outcome=first_tool_outcome,
+                            receipts=[*preacquired_receipts, *first_receipts],
+                            correction={"attempted": False},
+                        )
+                    (
+                        tool_correction_disabled_tools,
+                        completed_read_tool_names,
+                        observed_mutation_tool_names,
+                    ) = _disable_direct_context_completed_tools_for_correction(
+                        agent,
+                        raw_result,
+                        receipts=first_receipts,
+                        invocations=first_invocations,
+                    )
+                    replay = build_decision_repair_evidence_replay(
+                        raw_result,
+                        SpecialistDecisionEvidence.build(
+                            (),
+                            require_complete_assessments=False,
+                        ),
+                    )
+                    tool_execution_correction = {
+                        "schema": "keystone.tool_execution_correction.v1",
+                        "attempted": True,
+                        "attempt": 1,
+                        "postcondition": first_tool_outcome.receipt(),
+                        "disabled_completed_tool_names": [
+                            str(getattr(tool, "name", "") or "")
+                            for tool, _previous in tool_correction_disabled_tools
+                        ],
+                        "completed_read_tool_names": list(
+                            completed_read_tool_names
+                        ),
+                        "observed_mutation_tool_names": list(
+                            observed_mutation_tool_names
+                        ),
+                    }
+                    if completed_read_tool_names and not replay.ready:
+                        raise _direct_context_tool_execution_error(
+                            agent=agent,
+                            route=route,
+                            model_config=model_config,
+                            outcome=first_tool_outcome,
+                            receipts=[*preacquired_receipts, *first_receipts],
+                            correction=tool_execution_correction,
+                            failure_kind="tool_correction_evidence_replay_unavailable",
+                        )
+                    if replay.ready:
+                        tool_execution_correction["evidence_replay"] = (
+                            replay.telemetry(
+                                disabled_read_tool_names=completed_read_tool_names,
+                            )
+                        )
+                    correction_parts = [
+                        sdk_input_text,
+                        tool_execution_correction_prompt(
+                            direct_tool_execution_contract,
+                            first_tool_outcome,
+                            invocations=first_invocations,
+                        ),
+                    ]
+                    if replay.ready:
+                        correction_parts.append(replay.prompt_context)
+                    if first_receipts:
+                        correction_parts.append(retry_receipt_context(first_receipts))
+                    correction_input_text = "\n\n".join(
+                        part for part in correction_parts if part
+                    )
+                    correction_input = sdk_input_from_typed_input(
+                        correction_input_text,
+                        live=True,
+                        provider=model_config.provider,
+                    )
+                    raw_result, output = run_typed_sdk_sync(
+                        agent,
+                        correction_input,
+                        output_type,
+                        live=True,
+                        session=None,
+                        workflow_name=f"keystone.ask.{route}.tool_correction",
+                        trace_metadata={
+                            "agent": route,
+                            "entrypoint": "cli.ask",
+                            "mode": "live_sdk",
+                            "correction": "required_tool_execution",
+                        },
+                        max_turns=min(turn_policy.max_turns, 2),
+                    )
+                    decision_raw_results.append(raw_result)
+                    corrected_receipts = [
+                        *tool_receipt_journal(),
+                        *[
+                            receipt
+                            for result in decision_raw_results
+                            for receipt in _context_agent_tool_receipts(result)
+                        ],
+                    ]
+                    direct_tool_execution_outcome = evaluate_tool_execution_contract(
+                        raw_result,
+                        direct_tool_execution_contract,
+                        tool_receipts=corrected_receipts,
+                        preacquired_receipts=preacquired_receipts,
+                        prior_attempted_tool_names=(
+                            first_tool_outcome.attempted_tool_names
+                        ),
+                        prior_completed_tool_names=(
+                            first_tool_outcome.completed_tool_names
+                        ),
+                    )
+                    tool_execution_correction["terminal_postcondition"] = (
+                        direct_tool_execution_outcome.receipt()
+                    )
+                    if not direct_tool_execution_outcome.satisfied:
+                        raise _direct_context_tool_execution_error(
+                            agent=agent,
+                            route=route,
+                            model_config=model_config,
+                            outcome=direct_tool_execution_outcome,
+                            receipts=[*preacquired_receipts, *corrected_receipts],
+                            correction=tool_execution_correction,
+                        )
+            if shared_decision_contract is not None:
+                provider_candidate_ids, provider_evidence_observed = (
+                    _direct_context_provider_candidate_universe(
+                        route,
+                        raw_results=decision_raw_results,
+                        preacquired_receipts=preacquired_receipts,
+                    )
+                )
+                if provider_evidence_observed:
+                    shared_decision_contract = context_agent_decision_contract(
+                        route,
+                        require_substantive_summary=_zotero_substantive_summary_required(
+                            route,
+                            input_text,
+                            manual_plan=manual_plan,
+                        ),
+                        provider_candidate_ids=provider_candidate_ids,
+                    )
+                verified_decision_fingerprints = (
+                    _direct_context_verified_candidate_fingerprints(
+                        raw_results=decision_raw_results,
+                        preacquired_receipts=preacquired_receipts,
+                    )
+                )
+                decision_outcome, decision_evidence = validate_specialist_decision(
+                    output,
+                    shared_decision_contract,
+                    verified_candidate_fingerprints=verified_decision_fingerprints,
+                )
+                decision_attempts.append(
+                    decision_validation_telemetry(
+                        output,
+                        shared_decision_contract,
+                        decision_evidence,
+                        decision_outcome,
+                        attempt=1,
+                    )
+                )
+                if decision_outcome.status != "accepted":
+                    observed_receipts = [
+                        *preacquired_receipts,
+                        *tool_receipt_journal(),
+                        *_context_agent_tool_receipts(raw_result),
+                    ]
+                    mutation_already_observed = any(
+                        receipt_reports_possible_write(receipt)
+                        for receipt in observed_receipts
+                        if isinstance(receipt, Mapping)
+                    )
+                    observed_invocations = tool_invocation_journal()
+                    mutation_already_observed = mutation_already_observed or any(
+                        str(item.get("status") or "")
+                        in {"started", "completed", "failed"}
+                        and operation_is_mutation(item.get("tool_name"))
+                        for item in observed_invocations
+                    )
+                    replay = build_cumulative_decision_repair_evidence_replay(
+                        decision_raw_results,
+                        decision_evidence,
+                        verified_candidate_fingerprints=(
+                            verified_decision_fingerprints
+                        ),
+                    )
+                    if replay.required and not replay.ready:
+                        decision_repair_evidence = replay.telemetry()
+                        blocked_outcome = decision_outcome.model_copy(
+                            update={
+                                "status": "rejected",
+                                "reason_code": replay.reason_code,
+                                "feedback": replay.feedback,
+                            }
+                        )
+                        raise _direct_context_decision_error(
+                            agent=agent,
+                            route=route,
+                            model_config=model_config,
+                            contract=shared_decision_contract,
+                            outcome=blocked_outcome,
+                            attempts=decision_attempts,
+                            receipts=observed_receipts,
+                            repair_evidence=decision_repair_evidence,
+                            note=(
+                                "The first model turn returned provider/read evidence, "
+                                "but it could not be safely replayed for repair."
+                            ),
+                        )
+                    if replay.ready:
+                        repair_disabled_tools = _disable_direct_context_repair_read_tools(
+                            agent,
+                            replayed_tool_names=replay.replayed_tool_names,
+                        )
+                        decision_repair_evidence = replay.telemetry(
+                            disabled_read_tool_names=[
+                                str(getattr(tool, "name", "") or "")
+                                for tool, _previous in repair_disabled_tools
+                            ]
+                        )
+                    if mutation_already_observed:
+                        mutation_receipts = [
+                            dict(receipt)
+                            for receipt in observed_receipts
+                            if isinstance(receipt, Mapping)
+                            and receipt_reports_possible_write(receipt)
+                        ]
+                        mutation_repair_disabled_tools = (
+                            _disable_direct_context_mutation_tools(
+                                agent,
+                                mutation_receipts,
+                                invocations=observed_invocations,
+                            )
+                        )
+                        if not repair_disabled_tools:
+                            repair_disabled_tools = (
+                                _disable_direct_context_repair_read_tools(
+                                    agent,
+                                    replayed_tool_names=(),
+                                )
+                            )
+                        mutation_recovery = (
+                            retry_receipt_context(mutation_receipts)
+                            if mutation_receipts
+                            else (
+                                "\n\nProvider mutation recovery boundary:\n"
+                                "A mutation tool invocation was observed, but no durable "
+                                "provider receipt proved its outcome. Do not call any "
+                                "mutation tool again. Report the write state as unknown "
+                                "and request exact provider inspection."
+                            )
+                        )
+                    else:
+                        mutation_recovery = ""
+                    repair_text = decision_repair_prompt(
+                        shared_decision_contract,
+                        decision_evidence,
+                        decision_outcome,
+                        evidence_replay=replay,
+                    )
+                    repair_sdk_input = sdk_input_from_typed_input(
+                        f"{sdk_input_text}{mutation_recovery}{repair_text}",
+                        live=True,
+                        provider=model_config.provider,
+                    )
+                    raw_result, output = run_typed_sdk_sync(
+                        agent,
+                        repair_sdk_input,
+                        output_type,
+                        live=True,
+                        session=None,
+                        workflow_name=f"keystone.ask.{route}.decision_repair",
+                        trace_metadata={
+                            "agent": route,
+                            "entrypoint": "cli.ask",
+                            "mode": "live_sdk_decision_repair",
+                        },
+                        max_turns=1,
+                    )
+                    decision_raw_results.append(raw_result)
+                    provider_candidate_ids, provider_evidence_observed = (
+                        _direct_context_provider_candidate_universe(
+                            route,
+                            raw_results=decision_raw_results,
+                            preacquired_receipts=preacquired_receipts,
+                        )
+                    )
+                    if provider_evidence_observed:
+                        shared_decision_contract = context_agent_decision_contract(
+                            route,
+                            require_substantive_summary=(
+                                _zotero_substantive_summary_required(
+                                    route,
+                                    input_text,
+                                    manual_plan=manual_plan,
+                                )
+                            ),
+                            provider_candidate_ids=provider_candidate_ids,
+                        )
+                    verified_decision_fingerprints = (
+                        _direct_context_verified_candidate_fingerprints(
+                            raw_results=decision_raw_results,
+                            preacquired_receipts=preacquired_receipts,
+                        )
+                    )
+                    decision_outcome, decision_evidence = validate_specialist_decision(
+                        output,
+                        shared_decision_contract,
+                        verified_candidate_fingerprints=verified_decision_fingerprints,
+                    )
+                    decision_outcome = decision_outcome.model_copy(
+                        update={"repair_attempted": True}
+                    )
+                    decision_attempts.append(
+                        decision_validation_telemetry(
+                            output,
+                            shared_decision_contract,
+                            decision_evidence,
+                            decision_outcome,
+                            attempt=2,
+                            tool_mode=(
+                                "verified_context_tool_free"
+                                if decision_repair_evidence is not None
+                                else "model_called"
+                            ),
+                        )
+                    )
+                    if decision_outcome.status != "accepted":
+                        raise _direct_context_decision_error(
+                            agent=agent,
+                            route=route,
+                            model_config=model_config,
+                            contract=shared_decision_contract,
+                            outcome=decision_outcome,
+                            attempts=decision_attempts,
+                            receipts=[
+                                *preacquired_receipts,
+                                *tool_receipt_journal(),
+                                *[
+                                    receipt
+                                    for sdk_result in decision_raw_results
+                                    for receipt in _context_agent_tool_receipts(sdk_result)
+                                ],
+                            ],
+                            repair_evidence=decision_repair_evidence,
+                        )
+                decision_ownership = {
+                    "schema": "keystone.agent_decision_run.v1",
+                    "route": route,
+                    "decision_owner": decision_attempts[-1]["decision_owner"],
+                    "decision_stage": shared_decision_contract.decision_stage,
+                    "attempt_count": len(decision_attempts),
+                    "repair_attempted": len(decision_attempts) > 1,
+                    "attempts": decision_attempts,
+                    "validator_outcome": decision_outcome.model_dump(mode="json"),
+                    **(
+                        {"repair_evidence": dict(decision_repair_evidence)}
+                        if decision_repair_evidence is not None
+                        else {}
+                    ),
+                }
         except Exception as exc:
+            current_tool_receipts = tool_receipt_journal()
+            failed_tool_receipts = [
+                *preacquired_receipts,
+                *current_tool_receipts,
+            ]
+            failed_scope = tool_scope_receipt_for_agent(agent)
             return _print_ask_context_agent_failure(
                 route=route,
                 input_text=input_text,
@@ -8231,8 +12108,25 @@ def _run_ask_context_agent_live(
                 sdk_session_spec=sdk_session_spec,
                 cost_tracking_requested=cost_tracking_requested,
                 database_url=database_url,
+                tool_receipts=failed_tool_receipts,
+                current_tool_receipts=current_tool_receipts,
+                preacquired_tool_receipts=preacquired_receipts,
+                tool_invocations=tool_invocation_journal(),
+                sdk_failure=sdk_run_failure_metadata(exc),
+                selected_tool_names=[
+                    str(name)
+                    for name in failed_scope.get("selected_tool_names") or []
+                    if str(name).strip()
+                ],
+                write_selection_guardrail=write_selection_guardrail_state,
             )
     finally:
+        _restore_direct_context_tools(mutation_repair_disabled_tools)
+        _restore_direct_context_tools(repair_disabled_tools)
+        _restore_direct_context_tools(tool_correction_disabled_tools)
+        _restore_direct_context_write_selection_guardrails(
+            write_selection_guardrails
+        )
         if live_read_env_name:
             if previous_live_reads is None:
                 os.environ.pop(live_read_env_name, None)
@@ -8251,15 +12145,60 @@ def _run_ask_context_agent_live(
         else:
             os.environ[zotero_approval_env] = previous_zotero_approval
     output_payload = output.model_dump(mode="json")
-    _reconcile_context_agent_answer_fields(
-        route,
-        input_text,
-        output_payload,
-        manual_plan=manual_plan,
+    if route == "gmail_triage" and is_gmail_schema_only_request(input_text):
+        schema_summary = _gmail_schema_summary_from_tool_output(raw_result)
+        if schema_summary:
+            # The model chose the schema tool; the renderer now projects the
+            # exact typed tool result so a vague acknowledgement cannot replace
+            # the requested field list.
+            output_payload["summary"] = schema_summary
+    tool_receipts: list[dict[str, Any]] = []
+    seen_tool_receipts: set[str] = set()
+    for receipt in [
+        *preacquired_receipts,
+        *tool_receipt_journal(),
+        *[
+            item
+            for sdk_result in (decision_raw_results or [raw_result])
+            for item in _context_agent_tool_receipts(sdk_result)
+        ],
+    ]:
+        if not isinstance(receipt, Mapping):
+            continue
+        normalized_receipt = dict(receipt)
+        receipt_key = json.dumps(normalized_receipt, ensure_ascii=True, sort_keys=True, default=str)
+        if receipt_key in seen_tool_receipts:
+            continue
+        seen_tool_receipts.add(receipt_key)
+        tool_receipts.append(normalized_receipt)
+    scope_receipt = initial_scope_receipt
+    selected_tool_names = initial_selected_tool_names
+    tool_execution_contract = direct_tool_execution_contract or (
+        _context_agent_tool_execution_contract(
+            route,
+            input_text=input_text,
+            selected_tool_names=selected_tool_names,
+            manual_plan=manual_plan,
+        )
     )
-    tool_receipts = [*preacquired_receipts, *_context_agent_tool_receipts(raw_result)]
-    _reconcile_airtable_aggregate_result(route, output_payload, tool_receipts)
-    _reconcile_context_agent_metadata_projection(output_payload, tool_receipts)
+    tool_execution_outcome = (
+        direct_tool_execution_outcome
+        or evaluate_tool_execution_contract(
+            raw_result,
+            tool_execution_contract,
+            tool_receipts=tool_receipts,
+            preacquired_receipts=preacquired_receipts,
+        )
+        if tool_execution_contract is not None
+        else None
+    )
+    tool_execution_blocker = ""
+    if tool_execution_outcome is not None and not tool_execution_outcome.satisfied:
+        missing = ", ".join(tool_execution_outcome.missing_groups)
+        tool_execution_blocker = (
+            "The agent could not verify the requested current state because required "
+            f"tool evidence did not complete ({missing}). No provider change was made."
+        )
     provider_receipt_blocker = _zotero_ordered_abstract_receipt_blocker(
         route,
         input_text,
@@ -8272,18 +12211,25 @@ def _run_ask_context_agent_live(
         manual_plan=manual_plan,
         tool_receipts=tool_receipts,
     )
-    if provider_receipt_blocker:
-        output_payload["summary"] = provider_receipt_blocker
-        output_payload["blockers"] = list(
-            dict.fromkeys(
-                [
-                    *[str(item) for item in output_payload.get("blockers") or []],
-                    provider_receipt_blocker,
-                ]
-            )
-        )
-    external_write_performed = _context_agent_external_write_performed(tool_receipts)
-    _reconcile_context_agent_executed_write_plan(output_payload, tool_receipts)
+    invocation_rows = tool_invocation_journal()
+    external_write_state = external_write_state_from_evidence(
+        receipts=tool_receipts,
+        tool_invocations=invocation_rows,
+        evidence_complete=True,
+    )
+    external_write_performed = external_write_state == "performed"
+    unverified_write_blocker = _context_agent_unverified_write_blocker(
+        tool_receipts,
+        tool_invocations=invocation_rows,
+    )
+    write_decision_blocker = _context_agent_write_decision_blocker(
+        output_payload,
+        tool_receipts,
+    )
+    provider_verification = _context_agent_provider_verification(
+        route,
+        tool_receipts,
+    )
     review = review_specialist_output(
         agent_name=route,
         output=output_payload,
@@ -8312,11 +12258,115 @@ def _run_ask_context_agent_live(
         output_payload,
         tool_receipts,
     )
-    strict_display = _strict_requested_display_text(output_payload, manual_plan)
-    candidate_summary = (
-        _verified_context_agent_write_summary(tool_receipts)
-        or strict_display
-        or _context_agent_human_summary(output_payload, manual_plan)
+    public_decision_ownership = _context_agent_public_decision_ownership(
+        route,
+        decision_ownership,
+    )
+    called_tool_names = list(
+        dict.fromkeys(
+            tool_name
+            for sdk_result in (decision_raw_results or [raw_result])
+            for tool_name in _sdk_tool_names_by_call_id(
+                list(getattr(sdk_result, "new_items", []) or [])
+            ).values()
+        )
+    )
+    if called_tool_names:
+        tool_execution_mode = "llm_selected_function_tools"
+    elif preacquired_receipts:
+        tool_execution_mode = "preacquired_provider_context"
+    elif selected_tool_names:
+        tool_execution_mode = "model_tools_attached_no_call"
+    else:
+        tool_execution_mode = "tool_free"
+    preacquired_tool_names = [
+        str(receipt.get("tool_name") or receipt.get("provider") or "")
+        for receipt in preacquired_receipts
+        if isinstance(receipt, Mapping)
+    ]
+    if route in {
+        "airtable_context_agent",
+        "google_workspace_context_agent",
+        "zotero_context_agent",
+    }:
+        provider_attempt_count, provider_success_count = (
+            _direct_context_provider_call_counts(
+                raw_results=decision_raw_results or [raw_result],
+                invocations=invocation_rows,
+                preacquired_receipts=preacquired_receipts,
+            )
+        )
+    else:
+        provider_attempt_count, provider_success_count = None, None
+    signal_cached_tool_execution = (
+        signal_sdk_result.request_cache.get("tool_execution")
+        if signal_sdk_result is not None
+        and isinstance(signal_sdk_result.request_cache.get("tool_execution"), Mapping)
+        else {}
+    )
+    signal_decision_evidence = (
+        signal_sdk_result.request_cache.get("signal_decision_evidence")
+        if signal_sdk_result is not None
+        and isinstance(
+            signal_sdk_result.request_cache.get("signal_decision_evidence"), Mapping
+        )
+        else {}
+    )
+    distinct_persisted_receipt_count = (
+        int(signal_cached_tool_execution.get("distinct_persisted_receipt_count"))
+        if type(signal_cached_tool_execution.get("distinct_persisted_receipt_count"))
+        is int
+        else int(signal_cached_tool_execution.get("provider_receipt_count"))
+        if type(signal_cached_tool_execution.get("provider_receipt_count")) is int
+        else len(public_tool_receipts)
+    )
+    tool_execution = build_tool_execution_summary(
+        mode=tool_execution_mode,
+        selected_tool_names=selected_tool_names,
+        model_called_tool_names=called_tool_names,
+        model_tool_call_count=sum(
+            1
+            for item in invocation_rows
+            if str(item.get("status") or "") == "started"
+        ),
+        tool_output_count=(
+            int(signal_decision_evidence.get("tool_output_count"))
+            if type(signal_decision_evidence.get("tool_output_count")) is int
+            else sum(
+                1
+                for sdk_result in (decision_raw_results or [raw_result])
+                for record in sdk_tool_execution_records(sdk_result)
+                if record.succeeded
+            )
+        ),
+        workflow_called_tool_names=(),
+        workflow_tool_call_count=0,
+        preacquired_context_tool_names=preacquired_tool_names,
+        preacquired_context_count=len(preacquired_receipts),
+        preacquired_context_source=(
+            "direct_context_provider_preflight" if preacquired_receipts else ""
+        ),
+        provider_receipt_count=distinct_persisted_receipt_count,
+        distinct_persisted_receipt_count=distinct_persisted_receipt_count,
+        receipt_observation_count=len(public_tool_receipts),
+        provider_request_attempt_count=provider_attempt_count,
+        provider_request_success_count=provider_success_count,
+        context_receipt_count=len(preacquired_receipts),
+        context_receipt_source=(
+            "preacquired_provider_context" if preacquired_receipts else ""
+        ),
+        postcondition=(
+            tool_execution_outcome.receipt() if tool_execution_outcome is not None else {}
+        ),
+    )
+    strict_display = _strict_requested_display_text(
+        output_payload,
+        manual_plan,
+        original_request=input_text,
+    )
+    candidate_summary = strict_display or _context_agent_human_summary(
+        output_payload,
+        manual_plan,
     )
     instruction_resolution = resolve_instruction_following_response(
         candidate_summary,
@@ -8324,17 +12374,40 @@ def _run_ask_context_agent_live(
         manual_plan=manual_plan,
         bounded_evidence=json.dumps(public_output_payload, ensure_ascii=True, sort_keys=True),
         live=True,
+        source_urls_applicable=_context_agent_source_urls_applicable(
+            route,
+            public_tool_receipts,
+        ),
+        condition_outcome=(
+            output_payload.get("needs_reply")
+            if isinstance(output_payload.get("needs_reply"), bool)
+            else None
+        ),
     )
     resolved_summary = (
         instruction_resolution.response_text
         if instruction_resolution.validation.passed
         else instruction_following_blocker_text(instruction_resolution.validation)
     )
-    execution_blocker = provider_receipt_blocker or airtable_write_blocker
+    execution_blocker = (
+        provider_receipt_blocker
+        or airtable_write_blocker
+        or unverified_write_blocker
+        or write_decision_blocker
+        or tool_execution_blocker
+    )
     provider_links: list[str] = []
     if execution_blocker:
         resolved_summary = execution_blocker
     else:
+        verified_write_summary = str(
+            provider_verification.get("write_readback_summary") or ""
+        ).strip()
+        if verified_write_summary:
+            resolved_summary = (
+                f"{resolved_summary}\n\n*Provider verification:*\n"
+                f"{verified_write_summary}"
+            ).strip()
         provider_links = _verified_provider_links(tool_receipts)
         if provider_links and not strict_display:
             resolved_summary = "\n\n".join(
@@ -8351,6 +12424,12 @@ def _run_ask_context_agent_live(
             if provider_receipt_blocker
             else "airtable_write_unverified"
             if airtable_write_blocker
+            else "provider_write_unverified"
+            if unverified_write_blocker
+            else "provider_write_decision_unbound"
+            if write_decision_blocker
+            else "required_tool_execution_missing"
+            if tool_execution_blocker
             else ""
         ),
         "selected_agent": route,
@@ -8367,7 +12446,33 @@ def _run_ask_context_agent_live(
         "orchestrator_review": review_payload,
         "output": public_output_payload,
         "tool_receipts": public_tool_receipts,
+        "provider_verification": provider_verification,
+        "tool_execution": tool_execution,
+        "request_cache": {
+            "request_tool_scope": scope_receipt,
+            **(
+                {"tool_execution_correction": tool_execution_correction}
+                if tool_execution_correction
+                else {}
+            ),
+            **(
+                {"write_selection_guardrail": write_selection_guardrail_state}
+                if write_selection_guardrail_state
+                else {}
+            ),
+            **(
+                {"decision_ownership": public_decision_ownership}
+                if public_decision_ownership
+                else {}
+            ),
+        },
+        **(
+            {"decision_ownership": public_decision_ownership}
+            if public_decision_ownership
+            else {}
+        ),
         "verified_provider_links": provider_links,
+        "external_write_state": external_write_state,
         "human_summary": resolved_summary,
         "instruction_following": instruction_resolution.metadata(),
         "blockers": _context_agent_public_blockers(
@@ -8395,14 +12500,41 @@ def _run_ask_context_agent_live(
         },
     }
     attach_verified_continuation_objects(payload, tool_receipts)
+    internal_workspace_continuation: object | None = None
+    if route == "google_workspace_context_agent":
+        internal_workspace_continuation = json.loads(
+            json.dumps(payload.get("continuation_objects"), default=str)
+        )
+        workspace_provider_ids = _workspace_provider_ids_for_public_redaction(
+            output_payload,
+            tool_receipts,
+            decision_ownership,
+        )
+        redacted_payload = _redact_workspace_provider_ids(
+            payload,
+            workspace_provider_ids,
+        )
+        if isinstance(redacted_payload, dict):
+            payload = redacted_payload
     _attach_slack_run_provenance(payload, execution_context)
-    usage = extract_sdk_usage(raw_result)
+    direct_context_results = decision_raw_results or [raw_result]
+    usage = (
+        dict(signal_sdk_result.usage)
+        if signal_sdk_result is not None
+        else extract_sdk_usage(direct_context_results[0])
+        if len(direct_context_results) == 1
+        else _aggregate_direct_context_usage(direct_context_results)
+    )
     if usage.get("available"):
         payload["usage"] = usage
-        payload["cost"] = estimate_usage_cost(
-            provider=model_config.provider,
-            model=model_config.model,
-            usage=usage,
+        payload["cost"] = (
+            dict(signal_sdk_result.cost)
+            if signal_sdk_result is not None and signal_sdk_result.cost
+            else estimate_usage_cost(
+                provider=model_config.provider,
+                model=model_config.model,
+                usage=usage,
+            )
         )
     payload["model_execution"] = {
         "provider": model_config.provider,
@@ -8413,11 +12545,51 @@ def _run_ask_context_agent_live(
         "base_url_configured": bool(model_config.base_url),
         "gateway_mode": bool(model_config.use_responses is False and model_config.base_url),
         "sdk_turn_policy": turn_policy.metadata(),
+        "decision_repairs": (
+            int(signal_sdk_result.request_cache.get("decision_repairs") or 0)
+            if signal_sdk_result is not None
+            else int(bool(decision_ownership.get("repair_attempted")))
+        ),
     }
     # Persist the same completed public contract that the Slack adapter receives.
     # Verified provider scope remains internal and contains no raw record fields.
     attach_execution_public_result(payload)
     persistence_payload = json.loads(json.dumps(payload, default=str))
+    if signal_sdk_result is not None:
+        signal_request_cache = dict(signal_sdk_result.request_cache or {})
+        signal_scope = dict(
+            signal_request_cache.get("request_tool_scope") or {}
+        )
+        signal_request_cache["request_tool_scope"] = {
+            **scope_receipt,
+            **signal_scope,
+        }
+        persistence_payload.update(
+            {
+                "_sdk_model": {
+                    "provider": model_config.provider,
+                    "name": model_config.model,
+                    "run_mode": "live_sdk",
+                },
+                "_sdk_usage": dict(signal_sdk_result.usage or {}),
+                "_sdk_cost": dict(signal_sdk_result.cost or {}),
+                "_sdk_budget_guard": dict(signal_sdk_result.budget_guard or {}),
+                "_sdk_request_cache": signal_request_cache,
+            }
+        )
+        signal_execution_telemetry = compact_execution_telemetry(
+            signal_sdk_result.execution_telemetry
+        )
+        if signal_execution_telemetry:
+            persistence_payload["_execution_telemetry"] = (
+                signal_execution_telemetry
+            )
+    if decision_ownership:
+        persistence_payload["internal_decision_ownership"] = decision_ownership
+    if internal_workspace_continuation is not None:
+        persistence_payload["internal_continuation_objects"] = (
+            internal_workspace_continuation
+        )
     airtable_result_scope = _verified_airtable_provider_result_scope(tool_receipts)
     if airtable_result_scope is not None:
         persistence_payload["verified_provider_result_scope"] = airtable_result_scope.model_dump(
@@ -8453,6 +12625,13 @@ def _print_ask_context_agent_failure(
     sdk_session_spec: SDKSessionSpec | None,
     cost_tracking_requested: bool,
     database_url: str | None,
+    tool_receipts: Sequence[Mapping[str, Any] | Any] = (),
+    current_tool_receipts: Sequence[Mapping[str, Any] | Any] | None = None,
+    preacquired_tool_receipts: Sequence[Mapping[str, Any] | Any] = (),
+    tool_invocations: Sequence[Mapping[str, Any] | Any] = (),
+    sdk_failure: Mapping[str, Any] | None = None,
+    selected_tool_names: Sequence[str] = (),
+    write_selection_guardrail: Mapping[str, Any] | None = None,
 ) -> int:
     """Render a concise context-agent blocker and persist traceback internally."""
 
@@ -8460,8 +12639,164 @@ def _print_ask_context_agent_failure(
         exc,
         context=f"{_agent_display_name(route)} run",
     )
+    failure_kind = str((sdk_failure or {}).get("failure_kind") or "").strip()
+    if isinstance(exc, ToolExecutionContractError) or failure_kind in {
+        "required_tool_execution_missing",
+        "required_tool_admission_missing",
+        "tool_correction_evidence_replay_unavailable",
+    }:
+        admission_missing = failure_kind == "required_tool_admission_missing"
+        evidence_replay_missing = (
+            failure_kind == "tool_correction_evidence_replay_unavailable"
+        )
+        failure = OperatorReadableFailure(
+            kind=(
+                "required_tool_admission_missing"
+                if admission_missing
+                else "tool_correction_evidence_replay_unavailable"
+                if evidence_replay_missing
+                else "required_tool_execution_missing"
+            ),
+            summary=(
+                f"{_agent_display_name(route)} did not receive the required provider "
+                "tool before model execution, so no model or provider call was made."
+                if admission_missing
+                else f"{_agent_display_name(route)} could not safely reuse a completed "
+                "provider read for its one correction attempt."
+                if evidence_replay_missing
+                else f"{_agent_display_name(route)} did not complete the required "
+                "provider tool evidence after one bounded correction attempt."
+            ),
+            reason=redact_operator_text(str(exc), max_chars=800),
+            next_step=(
+                "Keep the run blocked and repair request-scoped tool admission before "
+                "retrying the agent."
+                if admission_missing
+                else "Keep the run blocked, inspect the recorded tool postcondition, and "
+                "rerun only after the missing provider evidence path is available."
+            ),
+            retryable=admission_missing,
+            safe_to_continue=True,
+        )
     public_failure = failure.to_dict()
     public_failure["reason"] = failure.summary
+    receipt_rows = [
+        dict(receipt)
+        for receipt in tool_receipts
+        if isinstance(receipt, Mapping)
+    ]
+    if current_tool_receipts is None:
+        unmatched_preacquired = [
+            dict(receipt)
+            for receipt in preacquired_tool_receipts
+            if isinstance(receipt, Mapping)
+        ]
+        current_receipt_rows: list[dict[str, Any]] = []
+        for receipt in receipt_rows:
+            try:
+                matched_index = unmatched_preacquired.index(receipt)
+            except ValueError:
+                current_receipt_rows.append(receipt)
+            else:
+                unmatched_preacquired.pop(matched_index)
+    else:
+        current_receipt_rows = [
+            dict(receipt)
+            for receipt in current_tool_receipts
+            if isinstance(receipt, Mapping)
+        ]
+    receipt_tool_names = list(dict.fromkeys(
+        str(receipt.get("tool_name") or receipt.get("provider") or "")
+        for receipt in receipt_rows
+        if str(receipt.get("tool_name") or receipt.get("provider") or "").strip()
+    ))
+    preacquired_names = list(dict.fromkeys(
+        str(receipt.get("tool_name") or receipt.get("provider") or "")
+        for receipt in preacquired_tool_receipts
+        if isinstance(receipt, Mapping)
+        and str(receipt.get("tool_name") or receipt.get("provider") or "").strip()
+    ))
+    invocation_rows = [
+        dict(item)
+        for item in tool_invocations
+        if isinstance(item, Mapping)
+    ]
+    model_called_names = [
+        str(item.get("tool_name") or "").strip()
+        for item in invocation_rows
+        if str(item.get("status") or "") == "started"
+        and str(item.get("tool_name") or "").strip()
+    ]
+    completed_names = list(dict.fromkeys(
+        str(item.get("tool_name") or "").strip()
+        for item in invocation_rows
+        if str(item.get("status") or "") == "completed"
+        and str(item.get("tool_name") or "").strip()
+    ))
+    failed_names = list(dict.fromkeys(
+        str(item.get("tool_name") or "").strip()
+        for item in invocation_rows
+        if str(item.get("status") or "") == "failed"
+        and str(item.get("tool_name") or "").strip()
+    ))
+    if model_called_names:
+        failure_mode = "llm_selected_function_tools_failed"
+    elif preacquired_names:
+        failure_mode = "preacquired_provider_context_failed"
+    elif selected_tool_names:
+        failure_mode = "model_tools_attached_no_call_failed"
+    else:
+        failure_mode = "tool_free_failure"
+    safe_sdk_failure = dict(sdk_failure or {})
+    postcondition = safe_sdk_failure.get("tool_execution_postcondition")
+    tool_execution = build_tool_execution_summary(
+        mode=failure_mode,
+        scope_source="direct_context_agent_terminal_envelope",
+        selected_tool_names=selected_tool_names,
+        model_called_tool_names=model_called_names,
+        model_tool_call_count=len(model_called_names),
+        workflow_called_tool_names=(),
+        workflow_tool_call_count=0,
+        preacquired_context_tool_names=preacquired_names,
+        preacquired_context_count=len(
+            [
+                receipt
+                for receipt in preacquired_tool_receipts
+                if isinstance(receipt, Mapping)
+            ]
+        ),
+        preacquired_context_source=(
+            "direct_context_provider_preflight" if preacquired_names else ""
+        ),
+        provider_request_attempt_count=(
+            len(model_called_names)
+            + len(
+                [
+                    receipt
+                    for receipt in preacquired_tool_receipts
+                    if isinstance(receipt, Mapping)
+                ]
+            )
+        ),
+        provider_request_success_count=sum(
+            1
+            for receipt in receipt_rows
+            if str(receipt.get("status") or "").strip().lower()
+            in {"completed", "done", "ok", "success", "succeeded"}
+        ),
+        provider_receipt_count=len(receipt_rows),
+        context_receipt_count=len(
+            [
+                receipt
+                for receipt in preacquired_tool_receipts
+                if isinstance(receipt, Mapping)
+            ]
+        ),
+        context_receipt_source=(
+            "preacquired_provider_context" if preacquired_names else ""
+        ),
+        postcondition=postcondition if isinstance(postcondition, Mapping) else None,
+    )
     public_payload: dict[str, Any] = {
         "mode": "live_sdk",
         "status": "failed",
@@ -8477,6 +12812,17 @@ def _print_ask_context_agent_failure(
         "cost_tracking_requested": cost_tracking_requested,
         "human_summary": f"{failure.summary} {failure.next_step}".strip(),
         "blockers": [failure.summary],
+        "tool_receipts": receipt_rows,
+        "tool_invocations": invocation_rows,
+        "tool_execution": tool_execution,
+        "sdk_failure": safe_sdk_failure,
+        "request_cache": {
+            **(
+                {"write_selection_guardrail": dict(write_selection_guardrail)}
+                if write_selection_guardrail
+                else {}
+            )
+        },
         "output": {
             "summary": failure.summary,
             "next_step": failure.next_step,
@@ -8498,10 +12844,65 @@ def _print_ask_context_agent_failure(
             "evidence_complete": False,
         },
     }
+    verified_write_summary = verified_provider_write_summary(
+        current_receipt_rows
+    )
+    verified_write_recovery = bool(verified_write_summary)
+    if verified_write_recovery:
+        synthesis_failure = (
+            "The provider change is complete and verified, but the final model "
+            "explanation did not finish. Do not repeat the write."
+        )
+        approval_ref = next(
+            (
+                str(receipt.get("approval_reference") or "").strip()
+                for receipt in reversed(current_receipt_rows)
+                if str(receipt.get("approval_reference") or "").strip()
+            ),
+            "",
+        )
+        public_payload.update(
+            {
+                "status": "partial",
+                "block_kind": "verified_provider_write_synthesis_incomplete",
+                "human_summary": f"{verified_write_summary} {synthesis_failure}",
+                "blockers": [
+                    "Final model explanation did not complete after the "
+                    "provider-verified write."
+                ],
+                "request_cache": {
+                    **dict(public_payload.get("request_cache") or {}),
+                    "post_side_effect_reconciliation": {
+                        "schema": "keystone.post_side_effect_reconciliation.v1",
+                        "provider_write_verified": True,
+                        "model_synthesis_completed": False,
+                        "retry_mutation": False,
+                    },
+                },
+                "output": {
+                    "summary": verified_write_summary,
+                    "next_step": (
+                        "Use the verified provider state as authoritative; only "
+                        "rerun a read or narration step if more explanation is needed."
+                    ),
+                    "failure": public_failure,
+                    "send_enabled": False,
+                },
+                "side_effects": {
+                    **dict(public_payload["side_effects"]),
+                    "external_write_performed": True,
+                    "approval_ref": approval_ref,
+                    "evidence_complete": True,
+                },
+            }
+        )
     persisted_payload = {
         **public_payload,
         "internal_diagnostics": {
             "error_type": type(exc).__name__,
+            "completed_tool_names": completed_names,
+            "failed_tool_names": failed_names,
+            "receipt_tool_names": receipt_tool_names,
             "traceback": redact_operator_text(traceback.format_exc(), max_chars=12000),
         },
     }
@@ -8513,16 +12914,19 @@ def _print_ask_context_agent_failure(
             output=persisted_payload,
             model="sdk-live",
             dry_run=False,
-            status="error",
+            status="partial" if verified_write_recovery else "error",
             error=failure.kind,
         )
         public_payload["agent_run_id"] = run_id
     except Exception:  # pragma: no cover - diagnostic metadata only
         public_payload["agent_run_persistence_error"] = (
-            "Internal diagnostic persistence failed; no provider action was confirmed."
+            "Internal diagnostic persistence failed; the provider action remains "
+            "confirmed by its current-run verification receipt."
+            if verified_write_recovery
+            else "Internal diagnostic persistence failed; no provider action was confirmed."
         )
     _print_ask_live_payload(public_payload, json_output=json_output)
-    return 1
+    return 0 if verified_write_recovery else 1
 
 
 def _direct_context_agent_tool_tier(
@@ -8542,6 +12946,270 @@ def _direct_context_agent_tool_tier(
     return "core_read"
 
 
+def _context_agent_tool_execution_contract(
+    route: str,
+    *,
+    input_text: str,
+    selected_tool_names: Sequence[str],
+    manual_plan: ManualRequestPlan | None,
+) -> ToolExecutionContract | None:
+    """Require current-state evidence without forcing tools after preacquisition."""
+
+    selected = tuple(dict.fromkeys(str(name) for name in selected_tool_names if name))
+    selected_set = set(selected)
+    groups: list[ToolEvidenceGroup] = []
+    exact_signal_tools = {
+        "rss_context_agent": (
+            "retrieve_rss_announcement_history",
+            "inspect_signal_lifecycle",
+        ),
+        "preprints_context_agent": (
+            "retrieve_preprint_announcement_history",
+            "inspect_signal_lifecycle",
+        ),
+    }.get(route, ())
+    normalized = " ".join(positive_capability_text(input_text).lower().split())
+    for tool_name in exact_signal_tools:
+        lifecycle_tool = tool_name == "inspect_signal_lifecycle"
+        requested = bool(
+            re.search(
+                r"\b(?:checkpoint|lifecycle|receipt|processed\s+(?:feed\s+)?identit)",
+                normalized,
+            )
+            if lifecycle_tool
+            else re.search(
+                r"\b(?:announcement|feed|histor|items?|papers?|preprints?|unreviewed|unseen)\b",
+                normalized,
+            )
+        )
+        if tool_name in selected_set and requested:
+            groups.append(ToolEvidenceGroup(tool_name, (tool_name,)))
+
+    if route == "gmail_triage":
+        if "inspect_gmail_mailbox_schema" in selected_set:
+            groups.append(
+                ToolEvidenceGroup(
+                    "gmail_schema",
+                    ("inspect_gmail_mailbox_schema",),
+                )
+            )
+        if "query_gmail_message_summaries" in selected_set:
+            groups.append(
+                ToolEvidenceGroup(
+                    "gmail_messages",
+                    ("query_gmail_message_summaries",),
+                )
+            )
+    elif route == "airtable_context_agent":
+        marked_lifecycle = "airtable_test_record_lifecycle" in selected_set
+        if marked_lifecycle:
+            groups.append(
+                ToolEvidenceGroup(
+                    "airtable_marked_test_record_lifecycle",
+                    ("airtable_test_record_lifecycle",),
+                )
+            )
+        schema_requested = looks_like_airtable_schema_request(input_text)
+        if schema_requested and not marked_lifecycle:
+            groups.append(
+                ToolEvidenceGroup(
+                    "airtable_schema",
+                    ("airtable_get_base_schema",),
+                )
+            )
+        aggregate_requested = bool(
+            re.search(
+                r"\b(?:aggregate|average|count|group(?:ed)?|how\s+many|sum|total)\b",
+                normalized,
+            )
+        )
+        record_rows_requested = bool(
+            re.search(
+                r"\b(?:identify|list|show|records?\s+missing|record\s+names?|"
+                r"most\s+recent|newest|rows?)\b",
+                normalized,
+            )
+        )
+        if (
+            not marked_lifecycle
+            and aggregate_requested
+            and "airtable_aggregate_records" in selected_set
+        ):
+            groups.append(
+                ToolEvidenceGroup(
+                    "airtable_aggregate",
+                    ("airtable_aggregate_records",),
+                )
+            )
+        if (
+            not marked_lifecycle
+            and record_rows_requested
+            and "airtable_read_records" in selected_set
+        ):
+            groups.append(
+                ToolEvidenceGroup(
+                    "airtable_records",
+                    ("airtable_read_records",),
+                )
+            )
+        if (
+            not marked_lifecycle
+            and not schema_requested
+            and not aggregate_requested
+            and not record_rows_requested
+        ):
+            records = tuple(
+                name
+                for name in selected
+                if name in {"airtable_read_records", "airtable_aggregate_records"}
+            )
+            if records:
+                groups.append(ToolEvidenceGroup("airtable_records", records))
+    elif route == "google_workspace_context_agent":
+        workspace_groups = (
+            (
+                "workspace_file_search",
+                "google_drive_search_files",
+                r"\b(?:find|search|latest|newest|recent|title|folder|drive)\b",
+            ),
+            (
+                "workspace_file_metadata",
+                "google_drive_get_file_metadata",
+                r"\b(?:file\s+name|owner|modified|metadata|mime\s*type)\b",
+            ),
+        )
+        for group_name, tool_name, pattern in workspace_groups:
+            if tool_name in selected_set and re.search(pattern, normalized):
+                groups.append(ToolEvidenceGroup(group_name, (tool_name,)))
+        substantive_readers = tuple(
+            name
+            for name in (
+                "google_doc_read",
+                "google_sheet_read_table",
+                "google_slide_deck_read",
+                "google_drive_media_ocr_read",
+            )
+            if name in selected_set
+        )
+        generic_mime_bundle = len(substantive_readers) == 4
+        if generic_mime_bundle:
+            groups.append(
+                ToolEvidenceGroup(
+                    "workspace_substantive_content",
+                    substantive_readers,
+                )
+            )
+        else:
+            workspace_content_groups = (
+                (
+                    "workspace_document_content",
+                    "google_doc_read",
+                    r"\b(?:docs?|document|body|content|text)\b",
+                ),
+                (
+                    "workspace_sheet_content",
+                    "google_sheet_read_table",
+                    r"\b(?:spreadsheet|sheet|table\s+headers?|newest\s+non-empty\s+row|cells?)\b",
+                ),
+                (
+                    "workspace_slide_content",
+                    "google_slide_deck_read",
+                    r"\b(?:slides?|presentation|deck|speaker\s+notes?)\b",
+                ),
+                (
+                    "workspace_media_content",
+                    "google_drive_media_ocr_read",
+                    r"\b(?:pdf|image|scan|ocr|first\s+page|read\s+(?:content|text))\b",
+                ),
+            )
+            for group_name, tool_name, pattern in workspace_content_groups:
+                if tool_name in selected_set and re.search(pattern, normalized):
+                    groups.append(ToolEvidenceGroup(group_name, (tool_name,)))
+    elif route == "zotero_context_agent":
+        marked_lifecycle = "zotero_test_note_lifecycle" in selected_set
+        if marked_lifecycle:
+            groups.append(
+                ToolEvidenceGroup(
+                    "zotero_marked_test_note_lifecycle",
+                    ("zotero_test_note_lifecycle",),
+                )
+            )
+        if not marked_lifecycle and "zotero_resolve_article_context" in selected_set and re.search(
+            r"\b(?:find|newest|latest|articles?|items?|papers?|topic|about)\b",
+            normalized,
+        ):
+            groups.append(
+                ToolEvidenceGroup(
+                    "zotero_article_resolution",
+                    (
+                        "zotero_resolve_article_context",
+                        "zotero_read_api_metadata",
+                    ),
+                )
+            )
+        if not marked_lifecycle and "zotero_read_api_metadata" in selected_set and re.search(
+            r"\b(?:title|authors?|year|doi|url|abstract|tags?|collection|publication)\b",
+            normalized,
+        ):
+            groups.append(
+                ToolEvidenceGroup(
+                    "zotero_metadata",
+                    ("zotero_read_api_metadata",),
+                )
+            )
+    elif route not in {"rss_context_agent", "preprints_context_agent"}:
+        read_tools = tuple(
+            name
+            for name in selected
+            if not re.search(
+                r"(?:append|attach|create|delete|lifecycle|remove|rename|trash|update|upload|write)",
+                name,
+            )
+        )
+        if read_tools:
+            groups.append(ToolEvidenceGroup(f"{route}_current_state", read_tools))
+
+    authority = ExecutionIntentAuthority.from_value(manual_plan)
+    plan = authority.plan
+    if plan is not None:
+        mutations = set(authority.effective_provider_operations(plan.provider_system)).intersection(
+            {"create", "update", "delete", "attach"}
+        )
+        if mutations:
+            mutation_tools = tuple(
+                name
+                for name in selected
+                if operation_is_mutation(name)
+            )
+            if mutation_tools:
+                groups.append(ToolEvidenceGroup("provider_mutation", mutation_tools))
+    if not groups:
+        return None
+    return ToolExecutionContract.required(
+        *groups,
+        stage=f"{route}_current_state",
+    )
+
+
+def _direct_signal_decision_runtime_required(
+    route: str,
+    *,
+    input_text: str,
+) -> bool:
+    """Use the history-bound decision runtime for every direct signal route.
+
+    Reaching this function already means the canonical entry path selected the
+    registered RSS or Preprints specialist.  The operator's vocabulary must not
+    decide whether that specialist receives its candidate-bound validator and
+    no-reread repair contract.  Provider-free supplied-context transformations
+    are admitted by an earlier direct-response boundary and do not reach this
+    path.
+    """
+
+    del input_text
+    return route in {"rss_context_agent", "preprints_context_agent"}
+
+
 def _direct_context_agent_write_admitted(
     manual_plan: ManualRequestPlan | None,
     *,
@@ -8552,7 +13220,7 @@ def _direct_context_agent_write_admitted(
 
     if manual_plan is not None:
         authority = ExecutionIntentAuthority.from_value(manual_plan)
-        if authority.canonical:
+        if authority.plan is not None:
             provider_owner = {
                 "airtable": "airtable_context_agent",
                 "google_workspace": "google_workspace_context_agent",
@@ -8565,17 +13233,35 @@ def _direct_context_agent_write_admitted(
                 )
                 if operation in {"create", "update", "delete", "attach"}
             }
+            if provider_owner:
+                return bool(
+                    manual_plan.target_agent == provider_owner
+                    and (not route or route == provider_owner)
+                    and manual_plan.intent == "business_system_write"
+                    and effective_mutations
+                )
+            fallback_text = "\n".join(
+                item
+                for item in (input_text, str(manual_plan.objective or ""))
+                if item
+            )
             return bool(
-                provider_owner
-                and manual_plan.target_agent == provider_owner
-                and (not route or route == provider_owner)
-                and manual_plan.intent == "business_system_write"
-                and effective_mutations
+                manual_plan.intent == "business_system_write"
+                and manual_plan.target_agent
+                in {
+                    "airtable_context_agent",
+                    "google_workspace_context_agent",
+                    "zotero_context_agent",
+                }
+                and re.search(
+                    r"\b(?:append|attach|create|delete|edit|modify|remove|rename|"
+                    r"replace|revise|set|trash|update|upload|write)\b",
+                    positive_capability_text(fallback_text),
+                    re.I,
+                )
             )
         if authority.invalid:
             return False
-        if manual_plan.intent == "business_system_write":
-            return True
     return chief_workflow_requests_marked_airtable_test_lifecycle(input_text)
 
 
@@ -8634,14 +13320,13 @@ def _direct_airtable_allowed_operation(
     return ""
 
 
-def _reconcile_context_agent_answer_fields(
+def _zotero_substantive_summary_required(
     route: str,
     input_text: str,
-    output: dict[str, Any],
     *,
     manual_plan: ManualRequestPlan | None = None,
-) -> None:
-    """Promote substantive model evidence when a strict answer lands in the wrong field."""
+) -> bool:
+    """Return whether the operator requested a model-authored abstract synthesis."""
 
     normalized_request = " ".join(str(input_text or "").lower().split())
     authority = ExecutionIntentAuthority.from_value(manual_plan)
@@ -8655,60 +13340,13 @@ def _reconcile_context_agent_answer_fields(
         abstract_requested = False
     else:
         abstract_requested = "abstract" in normalized_request
-    if route != "zotero_context_agent" or not abstract_requested:
-        return
-    if not output.get("article_titles"):
-        return
-    summary = " ".join(str(output.get("summary") or "").split())
-    procedural_summary = bool(
-        re.search(
-            r"\b(?:selected|identified|found)\b.*\b(?:summari[sz]ed|summary)\b",
-            summary,
-            re.IGNORECASE,
-        )
-        or re.search(
-            r"\b(?:summary|response)\b.*\b(?:word limit|requested format|constrained)\b",
-            summary,
-            re.IGNORECASE,
-        )
-    )
-    if summary and not procedural_summary:
-        return
-    evidence = output.get("relevant_evidence")
-    if not isinstance(evidence, list):
-        return
-    for item in evidence:
-        candidate = " ".join(str(item or "").split())
-        candidate_lower = candidate.lower()
-        if not candidate or "abstract" not in candidate_lower:
-            continue
-        if not re.search(
-            r"\babstract\b.*\b(?:reports?|finds?|describes?|shows?|concludes?|"
-            r"examines?|reviews?|evaluates?|assesses?|investigates?)\b",
-            candidate_lower,
-        ):
-            continue
-        output["summary"] = candidate
-        diagnostics = output.get("diagnostics")
-        if isinstance(diagnostics, list):
-            diagnostics.append(
-                {
-                    "key": "canonical_summary_field",
-                    "value": "relevant_evidence",
-                    "note": (
-                        "Promoted the specialist's substantive abstract synthesis into "
-                        "the canonical summary field."
-                    ),
-                }
-            )
-        return
+    return route == "zotero_context_agent" and abstract_requested
 
 
-def _reconcile_context_agent_metadata_projection(
-    output: dict[str, Any],
+def _verified_context_agent_metadata_projection(
     tool_receipts: list[dict[str, object]],
-) -> None:
-    """Preserve schema-aware provider fields through model synthesis and rendering."""
+) -> dict[str, Any]:
+    """Return provider metadata separately; never insert it after model judgment."""
 
     projection = next(
         (
@@ -8719,105 +13357,93 @@ def _reconcile_context_agent_metadata_projection(
         None,
     )
     if not isinstance(projection, dict):
-        return
+        return {}
     fields = projection.get("fields")
     if not isinstance(fields, dict):
-        return
-    title = str(fields.get("title") or "").strip()
-    if title and not output.get("article_titles"):
-        output["article_titles"] = [title]
-    diagnostics = output.get("diagnostics")
-    if not isinstance(diagnostics, list):
-        diagnostics = []
-        output["diagnostics"] = diagnostics
-    by_key = {
-        str(item.get("key") or "").strip(): item
-        for item in diagnostics
-        if isinstance(item, dict) and str(item.get("key") or "").strip()
+        return {}
+    requested_fields = [
+        str(field or "").strip()
+        for field in projection.get("requested_fields") or []
+        if str(field or "").strip()
+    ]
+    return {
+        "schema": "keystone.verified_metadata_projection.v1",
+        "label": "Verified provider metadata",
+        "requested_fields": requested_fields,
+        "fields": {
+            field: fields.get(field)
+            for field in requested_fields
+            if field in fields
+        },
     }
-    for field in projection.get("requested_fields") or []:
-        clean_field = str(field or "").strip()
-        if clean_field in {"", "title"}:
-            continue
-        value = fields.get(clean_field)
-        rendered_value = (
-            "; ".join(str(item).strip() for item in value if str(item).strip())
-            if isinstance(value, list)
-            else str(value or "").strip()
-        )
-        entry = by_key.get(clean_field)
-        if entry is None:
-            diagnostics.append(
-                {
-                    "key": clean_field,
-                    "value": rendered_value,
-                    "note": (
-                        "Projected from the schema-aware provider context."
-                        if rendered_value
-                        else "The requested field was unavailable in provider metadata."
-                    ),
-                }
-            )
-        elif rendered_value:
-            entry["value"] = rendered_value
-            entry["note"] = "Projected from the schema-aware provider context."
 
 
-def _reconcile_airtable_aggregate_result(
+def _verified_airtable_aggregate_result(
     route: str,
-    output: dict[str, Any],
     tool_receipts: list[dict[str, object]],
-) -> None:
-    """Make verified provider arithmetic authoritative over model prose."""
+) -> dict[str, Any]:
+    """Return verified arithmetic separately from the model-authored response."""
 
     if route != "airtable_context_agent":
-        return
+        return {}
     receipt = next(
         (
             item
             for item in reversed(tool_receipts)
             if item.get("operation") == "aggregate_records" and item.get("status") == "success"
+            and item.get("provider_read") is True
+            and item.get("provider_write") is not True
+            and item.get("complete") is True
+            and item.get("verified") is True
+            and isinstance(item.get("verification"), dict)
+            and item["verification"].get("passed") is True
         ),
         None,
     )
     if receipt is None:
-        return
+        return {}
     table = str(receipt.get("table") or "Airtable records").strip()
-    total = str(receipt.get("total") or "0.00").strip()
-    currency = str(receipt.get("currency") or "USD").strip()
+    total = str(receipt.get("total") or "0").strip()
+    currency = str(receipt.get("currency") or "").strip()
+    raw_unit = receipt.get("unit")
+    unit = dict(raw_unit) if isinstance(raw_unit, dict) else {}
     period = receipt.get("estimated_period")
     year = receipt.get("year")
     matching = int(receipt.get("matching_records") or 0)
     period_text = f"estimated period {period}" if period else "the requested scope"
     if year:
         period_text = f"{period_text} in {year}"
-    amount_text = f"${total}" if currency == "USD" else f"{total} {currency}"
-    output["summary"] = (
-        f"Total {table.lower()} for {period_text}: {amount_text} across "
-        f"{matching} matching record{'s' if matching != 1 else ''}."
-    )
-    output["base_alias"] = str(receipt.get("base_alias") or "")
-    output["relevant_tables"] = [table]
-    output["relevant_fields"] = list(
-        dict.fromkeys(
-            str(receipt.get(key) or "").strip()
-            for key in ("amount_field", "period_field", "date_field")
-            if str(receipt.get(key) or "").strip()
+    amount_text = str(receipt.get("display_total") or "").strip()
+    if not amount_text:
+        amount_text = (
+            f"${total}"
+            if currency == "USD"
+            else f"{total} {currency}"
+            if currency
+            else f"{str(unit.get('symbol') or '')}{total}"
         )
-    )
-    matching_summaries = receipt.get("matching_record_summaries")
-    if isinstance(matching_summaries, list) and matching_summaries:
-        output["record_summaries"] = [
-            item for item in matching_summaries[:10] if isinstance(item, dict)
-        ]
-    else:
-        output["record_summaries"] = [
-            {
-                "key": "verified_total",
-                "value": amount_text,
-                "note": f"{matching} matching provider records; Decimal sum",
-            }
-        ]
+    return {
+        "schema": "keystone.verified_airtable_aggregate.v1",
+        "label": "Verified provider arithmetic",
+        "summary": (
+            f"Total {table.lower()} for {period_text}: {amount_text} across "
+            f"{matching} matching record{'s' if matching != 1 else ''}."
+        ),
+        "base_alias": str(receipt.get("base_alias") or ""),
+        "table": table,
+        "total": total,
+        "display_total": amount_text,
+        "currency": currency,
+        "unit": unit,
+        "matching_records": matching,
+        "relevant_fields": list(
+            dict.fromkeys(
+                str(receipt.get(key) or "").strip()
+                for key in ("amount_field", "period_field", "date_field")
+                if str(receipt.get(key) or "").strip()
+            )
+        ),
+    }
 
 
 def _verified_airtable_provider_result_scope(
@@ -8846,6 +13472,8 @@ def _verified_airtable_provider_result_scope(
     scope = raw_scope if isinstance(raw_scope, dict) else {}
     item_refs = scope.get("item_refs")
     refs = item_refs if isinstance(item_refs, list) else []
+    raw_unit = scope.get("unit") or receipt.get("unit")
+    unit = raw_unit if isinstance(raw_unit, dict) else {}
     return ManualProviderResultSetScope(
         provider_system="airtable",
         provider_read_scope="bounded_collection",
@@ -8867,7 +13495,14 @@ def _verified_airtable_provider_result_scope(
             else None
         ),
         aggregate_total=str(scope.get("total") or receipt.get("total") or ""),
+        aggregate_display_total=str(
+            scope.get("display_total") or receipt.get("display_total") or ""
+        ),
         aggregate_currency=str(scope.get("currency") or receipt.get("currency") or ""),
+        aggregate_unit_kind=str(unit.get("kind") or ""),
+        aggregate_unit_symbol=str(unit.get("symbol") or ""),
+        aggregate_unit_precision=unit.get("precision"),
+        aggregate_unit_source=str(unit.get("source") or ""),
         item_refs=refs,
         complete=True,
         verified=True,
@@ -8893,11 +13528,36 @@ def _verified_provider_links(
     return links[:5]
 
 
+def _context_agent_source_urls_applicable(
+    route: str,
+    tool_receipts: list[dict[str, object]],
+) -> bool:
+    """Require item URLs for feed reads only when the bounded read found items."""
+
+    history_tool = {
+        "rss_context_agent": "retrieve_rss_announcement_history",
+        "preprints_context_agent": "retrieve_preprint_announcement_history",
+    }.get(route)
+    if not history_tool:
+        return True
+    history_receipts = [
+        receipt
+        for receipt in tool_receipts
+        if receipt.get("tool_name") == history_tool
+        and str(receipt.get("status") or "").lower() == "success"
+    ]
+    if not history_receipts:
+        return True
+    return any(int(receipt.get("item_count") or 0) > 0 for receipt in history_receipts)
+
+
 def _context_agent_tool_receipts(raw_result: object) -> list[dict[str, object]]:
     """Return bounded, content-safe provider receipts from SDK tool outputs."""
 
+    items = list(getattr(raw_result, "new_items", []) or [])
+    tool_names_by_call_id = _sdk_tool_names_by_call_id(items)
     receipts: list[dict[str, object]] = []
-    for item in list(getattr(raw_result, "new_items", []) or []):
+    for item in items:
         if str(getattr(item, "type", "")) != "tool_call_output_item":
             continue
         raw_output = getattr(item, "output", "")
@@ -8942,6 +13602,9 @@ def _context_agent_tool_receipts(raw_result: object) -> list[dict[str, object]]:
                     "attachment_count_before",
                     "attachment_count_after",
                     "spreadsheet_id_match",
+                    "presentation_id_match",
+                    "folder_id_match",
+                    "name_match",
                     "title_match",
                     "mime_type_match",
                     "trashed",
@@ -8965,6 +13628,7 @@ def _context_agent_tool_receipts(raw_result: object) -> list[dict[str, object]]:
                     "scope_membership_match",
                     "prior_total_match",
                     "record_projection_count",
+                    "blocker",
                 )
                 if key in verification
             }
@@ -8977,6 +13641,9 @@ def _context_agent_tool_receipts(raw_result: object) -> list[dict[str, object]]:
                 "status",
                 "operation",
                 "provider",
+                "source_kind",
+                "resolution",
+                "checkpoint_count",
                 "gmail_account",
                 "draft_id",
                 "message_id",
@@ -8995,8 +13662,13 @@ def _context_agent_tool_receipts(raw_result: object) -> list[dict[str, object]]:
                 "library_type",
                 "document_id",
                 "file_id",
+                "folder_id",
                 "spreadsheet_id",
+                "presentation_id",
                 "title",
+                "name",
+                "html_link",
+                "provider_link",
                 "folder_path",
                 "sheet_name",
                 "row_count",
@@ -9010,6 +13682,8 @@ def _context_agent_tool_receipts(raw_result: object) -> list[dict[str, object]]:
                 "mime_type",
                 "item_count",
                 "provider_read",
+                "provider_write",
+                "provider_mutated",
                 "provider_order",
                 "selection_rule",
                 "require_abstract",
@@ -9050,9 +13724,110 @@ def _context_agent_tool_receipts(raw_result: object) -> list[dict[str, object]]:
         }
         if safe_verification:
             receipt["verification"] = safe_verification
+        tool_name = tool_names_by_call_id.get(_sdk_run_item_call_id(item), "")
+        if tool_name:
+            receipt["tool_name"] = tool_name
+            receipt["invocation_source"] = "llm_selected_function_tool"
         if receipt:
             receipts.append(receipt)
     return receipts[:12]
+
+
+def _gmail_schema_summary_from_tool_output(raw_result: object) -> str:
+    """Render the exact query-field contract returned by the called Gmail tool."""
+
+    items = list(getattr(raw_result, "new_items", []) or [])
+    tool_names_by_call_id = _sdk_tool_names_by_call_id(items)
+    for item in items:
+        if str(getattr(item, "type", "")) != "tool_call_output_item":
+            continue
+        call_id = _sdk_run_item_call_id(item)
+        if tool_names_by_call_id.get(call_id) != "inspect_gmail_mailbox_schema":
+            continue
+        raw_output = getattr(item, "output", "")
+        if isinstance(raw_output, str):
+            try:
+                parsed = json.loads(raw_output)
+            except json.JSONDecodeError:
+                continue
+        elif isinstance(raw_output, dict):
+            parsed = raw_output
+        else:
+            continue
+        query_details = (
+            parsed.get("query_parameter_details") if isinstance(parsed, dict) else None
+        )
+        execution_details = (
+            parsed.get("execution_parameter_details") if isinstance(parsed, dict) else None
+        )
+        if not isinstance(query_details, list):
+            continue
+        details = [
+            *query_details,
+            *(execution_details if isinstance(execution_details, list) else []),
+        ]
+        lines: list[str] = []
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            name = str(detail.get("name") or "").strip()
+            purpose = " ".join(str(detail.get("purpose") or "").split())
+            constraints = [
+                " ".join(str(value or "").split())
+                for value in detail.get("constraints") or []
+                if str(value or "").strip()
+            ]
+            if not name or not purpose:
+                continue
+            suffix = f" Constraints: {'; '.join(constraints)}." if constraints else ""
+            lines.append(f"- `{name}`: {purpose}{suffix}")
+        if len(lines) >= 3:
+            return "\n".join(lines)
+    return ""
+
+
+def _sdk_tool_names_by_call_id(items: Sequence[object]) -> dict[str, str]:
+    """Map model-emitted SDK tool calls to their output call identities."""
+
+    return {
+        call_id: tool_name
+        for item in items
+        if str(getattr(item, "type", "")) == "tool_call_item"
+        if (call_id := _sdk_run_item_call_id(item))
+        if (tool_name := _sdk_run_item_tool_name(item))
+    }
+
+
+def _sdk_run_item_call_id(item: object) -> str:
+    """Return the SDK call identity shared by a tool call and its output."""
+
+    direct = getattr(item, "call_id", None)
+    if direct:
+        return str(direct)
+    raw_item = getattr(item, "raw_item", None)
+    if isinstance(raw_item, Mapping):
+        return str(raw_item.get("call_id") or raw_item.get("id") or "")
+    return str(
+        getattr(raw_item, "call_id", None)
+        or getattr(raw_item, "id", None)
+        or ""
+    )
+
+
+def _sdk_run_item_tool_name(item: object) -> str:
+    """Return a bounded function-tool name from an SDK tool-call item."""
+
+    direct = getattr(item, "tool_name", None) or getattr(item, "name", None)
+    if direct:
+        return str(direct)[:160]
+    raw_item = getattr(item, "raw_item", None)
+    if isinstance(raw_item, Mapping):
+        return str(raw_item.get("name") or raw_item.get("tool_name") or "")[:160]
+    return str(
+        getattr(raw_item, "name", None)
+        or getattr(raw_item, "tool_name", None)
+        or ""
+    )[:160]
 
 
 def _direct_airtable_receipt_provider_context(
@@ -9073,10 +13848,12 @@ def _direct_airtable_receipt_provider_context(
     if target is None or not target.receipt_local_path:
         return ""
     receipt_path = Path(target.receipt_local_path)
-    if not receipt_path.is_file():
+    try:
+        read_supported_local_file(receipt_path)
+    except (OSError, ValueError):
         return ""
     context = finance_expense_receipt_provider_context(target)
-    return "Selected Slack receipt context for the approved Airtable operation:\n" + json.dumps(
+    return "Selected receipt context for the approved Airtable operation:\n" + json.dumps(
         context, ensure_ascii=True, sort_keys=True
     )
 
@@ -9432,6 +14209,9 @@ def _direct_zotero_provider_preflight(
                     "title",
                     "authors",
                     "publication_title",
+                    "publication_date",
+                    "doi",
+                    "url",
                     "abstract",
                     "metadata",
                 }
@@ -9747,6 +14527,51 @@ def _context_agent_public_payload(
             if isinstance(receipt, dict):
                 receipt.pop("selected_item_key", None)
                 receipt.pop("library_id", None)
+    elif route == "google_workspace_context_agent":
+        identity_keys = (
+            "document_id",
+            "file_id",
+            "folder_id",
+            "spreadsheet_id",
+            "presentation_id",
+        )
+        provider_ids = {
+            str(receipt.get(key) or "").strip()
+            for receipt in tool_receipts
+            for key in identity_keys
+            if str(receipt.get(key) or "").strip()
+        }
+        decision = output_payload.get("decision")
+        if isinstance(decision, Mapping):
+            provider_ids.update(
+                str(value or "").strip()
+                for value in [
+                    decision.get("selected_candidate_id"),
+                    *(decision.get("selected_candidate_ids") or []),
+                    *(
+                        item.get("candidate_id")
+                        for item in decision.get("candidate_assessments") or []
+                        if isinstance(item, Mapping)
+                    ),
+                ]
+                if str(value or "").strip()
+            )
+        public_output = _redact_workspace_provider_ids(public_output, provider_ids)
+        for receipt in public_receipts:
+            if not isinstance(receipt, dict):
+                continue
+            fingerprints = [
+                identity_fingerprint(receipt.get(key))
+                for key in identity_keys
+                if str(receipt.get(key) or "").strip()
+            ]
+            for key in identity_keys:
+                receipt.pop(key, None)
+            if fingerprints:
+                receipt["provider_identity_fingerprints"] = list(
+                    dict.fromkeys(fingerprints)
+                )
+        return public_output, public_receipts
     else:
         return public_output, public_receipts
     lifecycle_receipts = [
@@ -9786,6 +14611,121 @@ def _context_agent_public_payload(
         if isinstance(receipt, dict) and receipt.get("operation") == lifecycle_operation:
             receipt.pop(identity_field, None)
     return public_output, public_receipts
+
+
+def _workspace_provider_ids_for_public_redaction(
+    output_payload: Mapping[str, Any],
+    tool_receipts: Sequence[Mapping[str, Any]],
+    decision_ownership: Mapping[str, Any] | None = None,
+) -> set[str]:
+    """Collect exact Workspace IDs only for immediate public redaction."""
+
+    identity_keys = {
+        "candidate_id",
+        "candidate_ids",
+        "document_id",
+        "excluded_candidate_ids",
+        "file_id",
+        "folder_id",
+        "presentation_id",
+        "recommended_target",
+        "selected_candidate_id",
+        "selected_candidate_ids",
+        "spreadsheet_id",
+    }
+    provider_ids: set[str] = set()
+
+    def collect(value: object, *, parent_key: str = "") -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                collect(item, parent_key=str(key))
+            return
+        if isinstance(value, list | tuple):
+            for item in value:
+                collect(item, parent_key=parent_key)
+            return
+        if parent_key in identity_keys and str(value or "").strip():
+            provider_ids.add(str(value).strip())
+
+    collect(output_payload)
+    collect(decision_ownership or {})
+    for receipt in tool_receipts:
+        for key in (
+            "document_id",
+            "file_id",
+            "folder_id",
+            "presentation_id",
+            "spreadsheet_id",
+        ):
+            if str(receipt.get(key) or "").strip():
+                provider_ids.add(str(receipt.get(key)).strip())
+    return provider_ids
+
+
+def _redact_workspace_provider_ids(
+    value: object,
+    provider_ids: set[str],
+    *,
+    parent_key: str = "",
+) -> object:
+    """Replace raw Workspace IDs with stable non-reversible public references."""
+
+    if isinstance(value, dict):
+        return {
+            key: _redact_workspace_provider_ids(
+                item,
+                provider_ids,
+                parent_key=str(key),
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _redact_workspace_provider_ids(item, provider_ids, parent_key=parent_key)
+            for item in value
+        ]
+    if isinstance(value, str) and parent_key not in {
+        "html_link",
+        "provider_link",
+        "url",
+    }:
+        cleaned = value
+        for provider_id in sorted(provider_ids, key=len, reverse=True):
+            public_ref = f"workspace-item-{identity_fingerprint(provider_id)[:12]}"
+            cleaned = cleaned.replace(provider_id, public_ref)
+        return cleaned
+    return value
+
+
+def _context_agent_public_decision_ownership(
+    route: str,
+    decision_ownership: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Keep exact provider decision IDs internal while preserving public trace shape."""
+
+    payload = json.loads(json.dumps(dict(decision_ownership), default=str))
+    if route != "google_workspace_context_agent":
+        return payload
+    provider_ids: set[str] = set()
+
+    def collect(value: object, *, parent_key: str = "") -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                collect(item, parent_key=str(key))
+        elif isinstance(value, list | tuple):
+            for item in value:
+                collect(item, parent_key=parent_key)
+        elif parent_key in {
+            "candidate_ids",
+            "selected_candidate_id",
+            "selected_candidate_ids",
+            "excluded_candidate_ids",
+        } and str(value or "").strip():
+            provider_ids.add(str(value).strip())
+
+    collect(payload)
+    redacted = _redact_workspace_provider_ids(payload, provider_ids)
+    return redacted if isinstance(redacted, dict) else {}
 
 
 def _replace_context_provider_ids(
@@ -9836,6 +14776,126 @@ def _context_agent_external_write_performed(
         )
         for receipt in tool_receipts
     )
+
+
+def _context_agent_write_decision_blocker(
+    output_payload: Mapping[str, Any],
+    tool_receipts: Sequence[Mapping[str, Any]],
+) -> str:
+    """Require model-selected identity to match every verified direct write."""
+
+    verified_writes = []
+    for receipt in tool_receipts:
+        verification = receipt.get("verification")
+        if (
+            _context_agent_receipt_is_write(dict(receipt))
+            and str(receipt.get("status") or "").strip().lower() == "success"
+            and isinstance(verification, Mapping)
+            and verification.get("passed") is True
+        ):
+            verified_writes.append(receipt)
+    if not verified_writes:
+        return ""
+    decision = output_payload.get("decision")
+    if not isinstance(decision, Mapping):
+        return (
+            "A provider write verified, but the specialist omitted its agent-owned "
+            "decision record. The receipt is retained; no automatic retry is allowed."
+        )
+    if decision.get("needs_more_context") is True:
+        return (
+            "A provider write verified, but the specialist simultaneously reported an "
+            "ambiguous target. The receipt is retained; no automatic retry is allowed."
+        )
+    selected = {
+        str(value or "").strip()
+        for value in [
+            decision.get("selected_candidate_id"),
+            *(decision.get("selected_candidate_ids") or []),
+        ]
+        if str(value or "").strip()
+    }
+    if not selected:
+        return (
+            "A provider write verified, but the specialist did not explicitly select "
+            "the written identity. The receipt is retained; no automatic retry is allowed."
+        )
+    identity_keys = (
+        "record_id",
+        "document_id",
+        "file_id",
+        "folder_id",
+        "spreadsheet_id",
+        "presentation_id",
+        "item_key",
+        "collection_key",
+        "artifact_path",
+    )
+    written_identities = {
+        str(receipt.get(key) or "").strip()
+        for receipt in verified_writes
+        for key in identity_keys
+        if str(receipt.get(key) or "").strip()
+    }
+    if not written_identities:
+        return (
+            "The provider write receipt verified the operation but exposed no bounded "
+            "identity that can be matched to the specialist's selection."
+        )
+    missing = sorted(written_identities - selected)
+    if missing:
+        return (
+            "The specialist's selected identity did not match the verified provider "
+            "write receipt. The receipt is retained; Python did not substitute a target."
+        )
+    return ""
+
+
+def _context_agent_unverified_write_blocker(
+    tool_receipts: Sequence[Mapping[str, Any]],
+    *,
+    tool_invocations: Sequence[Mapping[str, Any]] = (),
+) -> str:
+    """Fail closed when a mutation ran without conclusive provider read-back."""
+
+    mutation_receipts = [
+        receipt
+        for receipt in tool_receipts
+        if receipt_reports_possible_write(receipt)
+        and receipt.get("dry_run") is not True
+        and receipt.get("provider_write") is not False
+    ]
+    for receipt in mutation_receipts:
+        verification = receipt.get("verification")
+        if not (
+            str(receipt.get("status") or "").strip().lower() == "success"
+            and isinstance(verification, Mapping)
+            and verification.get("passed") is True
+        ):
+            return (
+                "A provider mutation may have completed, but exact read-after-write "
+                "verification did not pass. The run is blocked with write state unknown "
+                "or unverified; do not repeat the mutation until the exact provider "
+                "object is inspected."
+            )
+    receipt_tool_names = {
+        str(receipt.get("tool_name") or "").strip()
+        for receipt in mutation_receipts
+        if str(receipt.get("tool_name") or "").strip()
+    }
+    invoked_mutations = {
+        str(item.get("tool_name") or "").strip()
+        for item in tool_invocations
+        if str(item.get("status") or "") in {"started", "completed", "failed"}
+        and operation_is_mutation(item.get("tool_name"))
+    }
+    if invoked_mutations - receipt_tool_names:
+        return (
+            "A mutation tool invocation was observed without a durable provider receipt. "
+            "Its external write state is unknown, so the mutation was not retried. "
+            "Inspect the exact provider object before another write attempt."
+        )
+    return ""
 
 
 def _airtable_receipt_execution_blocker(
@@ -10023,50 +15083,14 @@ def _context_agent_receipt_is_write(receipt: dict[str, object]) -> bool:
     return receipt_reports_possible_write(receipt)
 
 
-def _reconcile_context_agent_executed_write_plan(
-    output_payload: dict[str, object],
-    tool_receipts: list[dict[str, object]],
-) -> None:
-    """Align a direct-agent write plan with authoritative verified tool execution."""
-
-    verified_write = False
-    for receipt in tool_receipts:
-        verification = receipt.get("verification")
-        if (
-            receipt.get("status") == "success"
-            and isinstance(verification, dict)
-            and verification.get("passed") is True
-        ):
-            verified_write = True
-            break
-    write_plan = output_payload.get("write_plan")
-    if not verified_write or not isinstance(write_plan, dict):
-        if not verified_write:
-            return
-    if isinstance(write_plan, dict):
-        write_plan["live_write_allowed_for_specialist"] = True
-        write_plan["approval_reference_needed"] = False
-    contradiction = re.compile(
-        r"\b(?:not|never|cannot|can't|did\s+not|was\s+not|were\s+not)\b"
-        r"[^.;\n]{0,120}\b(?:execute|executed|write|written|create|created|"
-        r"update|updated|delete|deleted|reconcile|reconciled|verify|verified)\b"
-        r"|\b(?:approval|write)\b[^.;\n]{0,80}\b(?:still|required|blocked)\b",
-        re.I,
-    )
-    for field in ("blockers", "approval_needs", "evidence_gaps"):
-        values = output_payload.get(field)
-        if not isinstance(values, list):
-            continue
-        output_payload[field] = [
-            item for item in values if not contradiction.search(str(item or ""))
-        ]
-
-
 def _verified_context_agent_write_summary(
     tool_receipts: list[dict[str, object]],
 ) -> str:
     """Render verified provider execution from receipts, not model speculation."""
 
+    strict_summary = verified_provider_write_summary(tool_receipts)
+    if strict_summary:
+        return strict_summary
     for receipt in reversed(tool_receipts):
         verification = receipt.get("verification")
         if not (
@@ -10079,11 +15103,11 @@ def _verified_context_agent_write_summary(
         operation = str(receipt.get("operation") or "write").replace("_", " ")
         table = str(receipt.get("table") or "").strip()
         record_id = str(receipt.get("record_id") or "").strip()
-        duplicate_id = str(receipt.get("duplicate_record_id") or "").strip()
         target = " ".join(part for part in (table, record_id) if part).strip()
         if operation == "reconcile duplicate expense":
+            duplicate_id = str(receipt.get("duplicate_record_id") or "").strip()
             summary = (
-                f"Reconciled and provider-verified the exact Airtable expense record "
+                "Reconciled and provider-verified the exact Airtable expense record "
                 f"{record_id or 'requested record'} in place"
             )
             if duplicate_id:
@@ -10091,7 +15115,8 @@ def _verified_context_agent_write_summary(
             return summary + "."
         if operation in {"update", "update record", "update row"}:
             return (
-                f"Updated and provider-verified {target or 'the exact requested record'} in place."
+                f"Updated and provider-verified "
+                f"{target or 'the exact requested record'} in place."
             )
         if operation in {
             "create",
@@ -10099,13 +15124,39 @@ def _verified_context_agent_write_summary(
             "create sheet",
             "create note",
         }:
-            return f"Created and provider-verified {target or 'the exact requested item'}."
+            return (
+                f"Created and provider-verified "
+                f"{target or 'the exact requested item'}."
+            )
         return (
             f"Completed and provider-verified the requested {operation} operation"
             + (f" for {target}" if target else "")
             + "."
         )
     return ""
+
+
+def _context_agent_provider_verification(
+    route: str,
+    tool_receipts: list[dict[str, object]],
+) -> dict[str, Any]:
+    """Keep deterministic readback distinct from the agent-authored decision."""
+
+    write_summary = _verified_context_agent_write_summary(tool_receipts)
+    return {
+        "schema": "keystone.context_agent_provider_verification.v1",
+        "label": "Provider verification",
+        "write_readback_summary": write_summary,
+        "write_verified": bool(write_summary),
+        "aggregate_result": _verified_airtable_aggregate_result(
+            route,
+            tool_receipts,
+        ),
+        "metadata_projection": _verified_context_agent_metadata_projection(
+            tool_receipts
+        ),
+        "model_output_modified": False,
+    }
 
 
 def _run_ask_company_research_live(
@@ -10120,6 +15171,46 @@ def _run_ask_company_research_live(
     cost_tracking_requested: bool = False,
     database_url: str | None = None,
 ) -> int:
+    if manual_plan is not None and is_selected_public_url_read_plan(manual_plan):
+        company_url = _manual_plan_url_target(manual_plan)
+        if not company_url:
+            return _print_ask_clarification(
+                "business_research_analyst",
+                input_text,
+                "Business Research Analyst needs the exact selected public URL to extract.",
+                json_output=json_output,
+                manual_plan=manual_plan,
+                orchestrator_preflight=orchestrator_preflight,
+            )
+        command = [
+            sys.executable,
+            "scripts/run_company_research.py",
+            "--company",
+            _company_name_for_url_target(company_url),
+            "--company-url",
+            company_url,
+            "--request-text",
+            input_text,
+            "--selected-url-extraction",
+            "--no-live-search",
+            "--no-dry-run",
+            "--live-sdk",
+            "--focused-brief",
+            "--compact-instructions",
+            "--json",
+        ]
+        return _run_ask_script_live(
+            "business_research_analyst",
+            input_text,
+            command,
+            json_output=json_output,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            sdk_session_spec=sdk_session_spec,
+            execution_context=execution_context,
+            cost_tracking_requested=cost_tracking_requested,
+            database_url=database_url,
+        )
     if not live_search_allowed_for_execution(
         True,
         manual_plan=manual_plan,
@@ -10246,6 +15337,8 @@ def _direct_company_research_quick_retrieval(
     constraints = output_constraints_from_plan(manual_plan)
     if constraints.word_count is not None:
         return constraints.word_count <= 100
+    if constraints.maximum_words is not None:
+        return constraints.maximum_words <= 100
     compact_source_contract = (
         constraints.source_url_count is not None
         and constraints.source_url_count <= 3
@@ -10552,6 +15645,21 @@ def _run_ask_gmail_triage_live(
     cost_tracking_requested: bool = False,
     database_url: str | None = None,
 ) -> int:
+    if is_gmail_schema_only_request(input_text):
+        # A schema question is a model-visible tool-selection test, not mailbox
+        # triage. Route it directly to the request-scoped Gmail agent before the
+        # legacy execution-plan resolver can broaden it into an inbox read.
+        return _run_ask_context_agent_live(
+            "gmail_triage",
+            input_text,
+            json_output=json_output,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            sdk_session_spec=sdk_session_spec,
+            execution_context=execution_context,
+            cost_tracking_requested=cost_tracking_requested,
+            database_url=database_url,
+        )
     if _is_bounded_composite_lifecycle_request(
         "gmail_triage",
         input_text=input_text,
@@ -10564,11 +15672,26 @@ def _run_ask_gmail_triage_live(
             orchestrator_preflight=orchestrator_preflight,
             database_url=database_url,
         )
+    # The direct specialist may receive a compact prior-thread context string,
+    # but provider query terms must come only from the authoritative current
+    # request represented by the semantic plan. Otherwise envelope labels such
+    # as "Authoritative follow-up" can leak into Gmail search syntax.
+    gmail_plan_request = str(
+        (manual_plan.objective if manual_plan is not None else "") or input_text
+    ).strip()
     gmail_plan = resolve_gmail_execution_plan(
-        input_text,
+        gmail_plan_request,
         manual_plan=manual_plan,
     )
     thread_execution_text = specialist_execution_context_text(execution_context)
+    calendar_context_requires_gmail_read = _verified_calendar_to_gmail_context_ready(
+        execution_context
+    )
+    supplied_gmail_thread_context = bool(
+        thread_execution_text
+        and not calendar_context_requires_gmail_read
+        and _supplied_gmail_message_context_ready(execution_context)
+    )
     if gmail_plan.operation == "update_draft" and not (
         gmail_plan.draft_subject_hint or gmail_plan.draft_recipient_hint
     ):
@@ -10864,7 +15987,7 @@ def _run_ask_gmail_triage_live(
         and gmail_plan.live_read_required
         and explicit_fixture_path is None
         and inline_fixture is None
-        and not thread_execution_text
+        and not supplied_gmail_thread_context
     ):
         command = [
             sys.executable,
@@ -10903,10 +16026,11 @@ def _run_ask_gmail_triage_live(
             database_url=database_url,
         )
     if (
-        gmail_plan.operation == "draft_reply"
+        gmail_plan.operation in {"candidate_selection", "draft_reply"}
+        and gmail_plan.live_read_required
         and explicit_fixture_path is None
         and inline_fixture is None
-        and _gmail_query_has_specific_target(gmail_plan.gmail_query)
+        and not supplied_gmail_thread_context
     ):
         command = [
             sys.executable,
@@ -10918,11 +16042,11 @@ def _run_ask_gmail_triage_live(
             "--json",
             "--request",
             input_text,
-            "--gmail-query",
-            gmail_plan.gmail_query,
             "--max-messages",
-            "1",
+            str(max(4, min(10, gmail_plan.max_messages))),
         ]
+        if gmail_plan.gmail_query:
+            command.extend(["--gmail-query", gmail_plan.gmail_query])
         _append_compact_direct_flag(
             command,
             route="gmail_triage",
@@ -10968,35 +16092,6 @@ def _run_ask_gmail_triage_live(
             cost_tracking_requested=cost_tracking_requested,
             database_url=database_url,
         )
-    if (
-        gmail_plan.operation == "draft_reply"
-        and explicit_fixture_path is None
-        and inline_fixture is None
-        and not thread_execution_text
-    ):
-        return _print_ask_clarification(
-            "gmail_triage",
-            input_text,
-            (
-                "Gmail Triage needs usable email context before drafting a reply: a pasted "
-                "sanitized email, selected message/thread, explicit fixture, or approved "
-                "bounded read-only Gmail retrieval scope."
-            ),
-            json_output=json_output,
-            manual_plan=manual_plan,
-            orchestrator_preflight=orchestrator_preflight,
-            extra={
-                "status": "blocked",
-                "block_kind": "missing_gmail_context",
-                "requires_gmail_context": True,
-                "recommended_next_action": (
-                    "Paste the sanitized email, select the Gmail message/thread, provide an "
-                    "explicit fixture path, or approve bounded read-only retrieval; then rerun "
-                    "Gmail Triage."
-                ),
-                "agent_execution_plan": gmail_plan.model_dump(mode="json"),
-            },
-        )
 
     temp_path: Path | None = None
     if explicit_fixture_path is not None:
@@ -11013,7 +16108,7 @@ def _run_ask_gmail_triage_live(
             tmp.write(inline_fixture.body)
             temp_path = Path(tmp.name)
         selected_fixture = str(temp_path)
-    elif thread_execution_text:
+    elif supplied_gmail_thread_context:
         with tempfile.NamedTemporaryFile(
             "w",
             encoding="utf-8",
@@ -11086,6 +16181,46 @@ def _run_ask_gmail_triage_live(
                 pass
 
 
+def _verified_calendar_to_gmail_context_ready(
+    execution_context: Mapping[str, Any] | None,
+) -> bool:
+    """Return whether Calendar evidence must guide, not replace, a Gmail read."""
+
+    if not isinstance(execution_context, Mapping):
+        return False
+    stages = execution_context.get("provider_context_stage_telemetry")
+    if not isinstance(stages, list | tuple):
+        return False
+    return any(
+        isinstance(stage, Mapping)
+        and str(stage.get("provider_system") or "").strip() == "google_calendar"
+        and str(stage.get("downstream_agent") or "").strip() == "gmail_triage"
+        and stage.get("handoff_confirmed") is True
+        and str((stage.get("validator_outcome") or {}).get("status") or "")
+        == "accepted"
+        for stage in stages
+    )
+
+
+def _supplied_gmail_message_context_ready(
+    execution_context: Mapping[str, Any] | None,
+) -> bool:
+    """Accept operator-supplied email evidence, not generic Slack metadata."""
+
+    if not isinstance(execution_context, Mapping):
+        return False
+    messages = execution_context.get("recent_thread_messages")
+    if not isinstance(messages, list | tuple):
+        return False
+    for item in messages:
+        if not isinstance(item, Mapping):
+            continue
+        summary = str(item.get("summary") or item.get("text") or "").strip().lower()
+        if summary and "from:" in summary and "subject:" in summary:
+            return True
+    return False
+
+
 _PUBLIC_LIFECYCLE_RECEIPT_PRIVATE_KEYS = frozenset(
     {
         "approval_reference",
@@ -11149,6 +16284,35 @@ def _persist_direct_provider_lifecycle_run(
         payload["agent_run_id"] = run_id
     except Exception as exc:  # pragma: no cover - diagnostic metadata only
         payload["agent_run_persistence_error"] = f"{type(exc).__name__}: {exc}"
+
+
+def _direct_provider_lifecycle_tool_execution(
+    *,
+    tool_name: str,
+    passed: bool,
+) -> dict[str, object]:
+    """Identify a guarded workflow helper without implying a model tool call."""
+
+    return build_tool_execution_summary(
+        mode="deterministic_bounded_provider_lifecycle",
+        scope_source="orchestrator_preflight_plus_python_lifecycle_gate",
+        selected_tool_names=[tool_name],
+        workflow_called_tool_names=[tool_name],
+        provider_request_attempt_count=1,
+        provider_request_success_count=1 if passed else 0,
+        provider_receipt_count=1,
+        postcondition={
+            "schema": "keystone.tool_execution_postcondition.v1",
+            "stage": tool_name,
+            "mode": "required",
+            "satisfied": passed,
+            "attempted_tool_names": [tool_name],
+            "completed_tool_names": [tool_name] if passed else [],
+            "missing_groups": [] if passed else [tool_name],
+            "prohibited_tool_names": [],
+            "receipt_tool_names": [tool_name],
+        },
+    )
 
 
 def _run_direct_airtable_test_record_lifecycle(
@@ -11231,6 +16395,10 @@ def _run_direct_airtable_test_record_lifecycle(
             else "Business Agents Airtable Test Lifecycle Blocked"
         ),
         "slack_display_text": summary,
+        "tool_execution": _direct_provider_lifecycle_tool_execution(
+            tool_name="airtable_test_record_lifecycle",
+            passed=passed,
+        ),
         "tool_receipt": _public_lifecycle_receipt(result),
         "provider_identity_redacted": True,
         "openai_requests": _orchestrator_preflight_request_count(orchestrator_preflight),
@@ -11256,14 +16424,49 @@ def _run_direct_airtable_test_record_lifecycle(
     return _print_ask_live_payload(payload, json_output=json_output)
 
 
-def _google_doc_lifecycle_scope(
-    input_text: str,
-    *,
-    context_text: str,
-) -> tuple[str, str, str]:
-    """Resolve exact marked Doc scope, including a prior body named as "same body"."""
+_GOOGLE_DOC_LIFECYCLE_TITLE_MAX_CHARS = 300
+_GOOGLE_DOC_LIFECYCLE_BODY_MAX_CHARS = 4000
 
-    combined = f"{input_text}\n{context_text}"
+
+def _google_doc_lifecycle_title(input_text: str, context_text: str) -> str:
+    """Return one exact marked title without swallowing lifecycle instructions."""
+
+    for source_text in (input_text, context_text):
+        label_match = re.search(
+            r"\b(?:titled|named|called)\s+",
+            str(source_text or ""),
+            re.IGNORECASE,
+        )
+        if label_match is None:
+            continue
+        remainder = str(source_text or "")[label_match.end() :].lstrip()
+        if not remainder:
+            continue
+        if remainder[0] in {'"', "'", "\u2018", "\u201c"}:
+            closing_quote = {
+                '"': '"',
+                "'": "'",
+                "\u2018": "\u2019",
+                "\u201c": "\u201d",
+            }[remainder[0]]
+            closing_index = remainder.find(closing_quote, 1)
+            candidate = remainder[1:closing_index] if closing_index > 1 else ""
+        else:
+            candidate = re.split(
+                r"\s*(?::|;|,(?=\s)|\.(?=\s|$)|"
+                r"\b(?:in\s+KNIOps|with\s+(?:the\s+)?(?:body|sentence|text|content)|"
+                r"containing\s+(?:the\s+)?(?:body|sentence|text|content))\b)",
+                remainder,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0]
+        cleaned = " ".join(candidate.split()).strip(" \"'\u2018\u2019\u201c\u201d")
+        if "KBA_TEST_DOC" not in cleaned.upper():
+            continue
+        if len(cleaned) > _GOOGLE_DOC_LIFECYCLE_TITLE_MAX_CHARS:
+            return ""
+        return cleaned
+
     marker_match = re.search(
         r"\bKBA_TEST_DOC(?:_[A-Za-z0-9]+)*\b",
         input_text,
@@ -11273,6 +16476,17 @@ def _google_doc_lifecycle_scope(
         context_text,
         re.IGNORECASE,
     )
+    return marker_match.group(0) if marker_match else ""
+
+
+def _google_doc_lifecycle_scope(
+    input_text: str,
+    *,
+    context_text: str,
+) -> tuple[str, str, str]:
+    """Resolve exact marked Doc scope, including a prior body named as "same body"."""
+
+    combined = f"{input_text}\n{context_text}"
     body_matches = re.findall(
         r"\b(?:body|sentence|text|content)"
         r"(?:\s+(?:is|says?|reads?|that\s+says))?\s*:?\s*"
@@ -11281,8 +16495,10 @@ def _google_doc_lifecycle_scope(
         combined,
         flags=re.IGNORECASE,
     )
-    title = marker_match.group(0).upper() if marker_match else ""
+    title = _google_doc_lifecycle_title(input_text, context_text)
     body = " ".join(body_matches[-1].split()) if body_matches else ""
+    if len(body) > _GOOGLE_DOC_LIFECYCLE_BODY_MAX_CHARS:
+        body = ""
     folder = "KNIOps" if re.search(r"\bKNIOps\b", combined, re.IGNORECASE) else ""
     return title, body, folder
 
@@ -11295,18 +16511,22 @@ def _google_doc_lifecycle_bodies(
     """Return the original and optional revised bodies from bounded operator text."""
 
     combined = f"{input_text}\n{context_text}"
-    matches = [
-        " ".join(value.split())
-        for value in re.findall(
-            r"\b(?:body|sentence|text|content)"
-            r"(?:\s+(?:is|says?|reads?|that\s+says))?\s*:?\s*"
-            r"(?:to|with)?\s*"
-            r"[\"“'‘]([^\"”'’]+)[\"”'’]",
-            combined,
-            flags=re.IGNORECASE,
+    matches = list(
+        dict.fromkeys(
+            cleaned
+            for value in re.findall(
+                r"\b(?:body|sentence|text|content)"
+                r"(?:\s+(?:is|says?|reads?|that\s+says))?\s*:?\s*"
+                r"(?:to|with)?\s*"
+                r"[\"“'‘]([^\"”'’]+)[\"”'’]",
+                combined,
+                flags=re.IGNORECASE,
+            )
+            if value.strip()
+            and len(cleaned := " ".join(value.split()))
+            <= _GOOGLE_DOC_LIFECYCLE_BODY_MAX_CHARS
         )
-        if value.strip()
-    ]
+    )
     if not matches:
         return "", ""
     original = matches[0]
@@ -11425,6 +16645,10 @@ def _run_direct_google_doc_test_lifecycle(
             else "Business Agents Google Doc Test Lifecycle Blocked"
         ),
         "slack_display_text": summary,
+        "tool_execution": _direct_provider_lifecycle_tool_execution(
+            tool_name="google_doc_test_lifecycle",
+            passed=passed,
+        ),
         "tool_receipt": _public_lifecycle_receipt(result),
         "provider_identity_redacted": True,
         "openai_requests": _orchestrator_preflight_request_count(orchestrator_preflight),
@@ -11571,6 +16795,10 @@ def _run_direct_gmail_test_draft_lifecycle(
             else "Business Agents Gmail Draft Test Lifecycle Blocked"
         ),
         "slack_display_text": summary,
+        "tool_execution": _direct_provider_lifecycle_tool_execution(
+            tool_name="gmail_test_draft_lifecycle",
+            passed=passed,
+        ),
         "tool_receipt": _public_lifecycle_receipt(result),
         "provider_identity_redacted": True,
         "openai_requests": _orchestrator_preflight_request_count(orchestrator_preflight),
@@ -11710,7 +16938,15 @@ def _run_ask_outreach_composer_live(
         # A canonical semantic plan has already separated internal response
         # composition from external outreach. Do not let the legacy phrase
         # heuristic become a second intent classifier at execution time.
-        if is_internal_slack_composition_plan(manual_plan):
+        if _should_run_direct_supplied_response(
+            input_text,
+            requested_route="outreach_composer",
+            manual_plan=manual_plan,
+            provider_free_composition_allowed=bool(
+                orchestrator_preflight
+                and orchestrator_preflight.composition_admission.composition_allowed
+            ),
+        ):
             return _run_direct_supplied_context_response_live(
                 "outreach_composer",
                 input_text,
@@ -11852,6 +17088,324 @@ def _print_ask_outreach_context_blocked(
     )
 
 
+def _bounded_repair_count(value: object) -> int | None:
+    """Return a trace-safe repair count without treating missing evidence as zero."""
+
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int) and value >= 0:
+        return value
+    return None
+
+
+def _repair_status(count: int | None) -> dict[str, object]:
+    return {
+        "status": "unavailable" if count is None else "used" if count else "not_used",
+        "count": count,
+    }
+
+
+def _deadline_trace_relationship(
+    parent: Mapping[str, Any] | None,
+    child: Mapping[str, Any] | None,
+) -> dict[str, object]:
+    """Describe whether two deadline packets are safe to label as correlated."""
+
+    parent_id = str((parent or {}).get("correlation_id") or "")
+    child_id = str((child or {}).get("correlation_id") or "")
+    correlation_match = bool(parent_id and child_id and parent_id == child_id)
+    child_within_parent_caps: bool | None = None
+    if parent is not None and child is not None:
+        try:
+            child_within_parent_caps = all(
+                int(child[key]) <= int(parent[key])
+                for key in ("soft_deadline_epoch_ms", "hard_deadline_epoch_ms")
+            )
+        except (KeyError, TypeError, ValueError):
+            child_within_parent_caps = False
+    correlated = bool(correlation_match and child_within_parent_caps is True)
+    status = (
+        "matched"
+        if correlated
+        else "mismatched"
+        if parent is not None and child is not None
+        else "parent_only"
+        if parent is not None
+        else "child_only"
+    )
+    return {
+        "schema": (
+            "keystone.correlated_execution_deadline.v1"
+            if correlated
+            else "keystone.execution_deadline_observation.v1"
+        ),
+        "correlated": correlated,
+        "correlation_status": status,
+        "correlation_id": parent_id or child_id,
+        "correlation_id_match": correlation_match,
+        "child_within_parent_caps": child_within_parent_caps,
+    }
+
+
+def _attach_direct_specialist_entry_observability(
+    payload: dict[str, Any],
+    *,
+    route: str,
+    child_payload: object,
+    orchestrator_preflight: OrchestratorPreflight | None,
+    child_process_ms: float,
+    manual_plan: ManualRequestPlan | None,
+    live_search: bool,
+) -> None:
+    """Attach content-free request and latency evidence for a direct specialist run."""
+
+    scope = _ASK_ENTRY_TELEMETRY.get()
+    preflight_request_count = _orchestrator_preflight_request_count(orchestrator_preflight)
+    preflight_payload = compact_orchestrator_preflight_payload(orchestrator_preflight)
+    preflight_usage_events = (
+        preflight_payload.get("sdk_usage_events")
+        if isinstance(preflight_payload, Mapping)
+        else None
+    )
+    preflight_requests_available = bool(
+        preflight_request_count > 0
+        or (
+            isinstance(preflight_usage_events, list)
+            and any(
+                isinstance(event, Mapping) and isinstance(event.get("usage"), Mapping)
+                for event in preflight_usage_events
+            )
+        )
+    )
+    preflight_requests = preflight_request_count if preflight_requests_available else None
+    child_requests = model_request_count_from_payload(child_payload)
+    child_mapping = child_payload if isinstance(child_payload, Mapping) else None
+    sdk_failure = (
+        child_mapping.get("sdk_failure")
+        if isinstance(child_mapping, Mapping)
+        and isinstance(child_mapping.get("sdk_failure"), Mapping)
+        else {}
+    )
+    request_cache = (
+        child_mapping.get("request_cache")
+        if isinstance(child_mapping, Mapping)
+        and isinstance(child_mapping.get("request_cache"), Mapping)
+        else sdk_failure.get("request_cache")
+        if isinstance(sdk_failure, Mapping)
+        and isinstance(sdk_failure.get("request_cache"), Mapping)
+        else {}
+    )
+    decision_ownership = (
+        child_mapping.get("decision_ownership")
+        if isinstance(child_mapping, Mapping)
+        and isinstance(child_mapping.get("decision_ownership"), Mapping)
+        else request_cache.get("decision_ownership")
+        if isinstance(request_cache, Mapping)
+        and isinstance(request_cache.get("decision_ownership"), Mapping)
+        else {}
+    )
+    child_evidence_available = isinstance(child_mapping, Mapping)
+    tool_corrections = _bounded_repair_count(
+        request_cache.get("tool_corrections") if isinstance(request_cache, Mapping) else None
+    )
+    if tool_corrections is None and child_evidence_available:
+        tool_corrections = 0
+    decision_repairs = _bounded_repair_count(
+        request_cache.get("decision_repairs") if isinstance(request_cache, Mapping) else None
+    )
+    if decision_repairs is None and isinstance(decision_ownership, Mapping):
+        decision_repairs = _bounded_repair_count(decision_ownership.get("repair_attempted"))
+    if decision_repairs is None and child_evidence_available:
+        decision_repairs = 0
+    instruction_following = payload.get("instruction_following")
+    instruction_repairs = (
+        _bounded_repair_count(instruction_following.get("repair_attempted"))
+        if isinstance(instruction_following, Mapping)
+        else 0
+        if child_evidence_available
+        else None
+    )
+    orchestrator_repairs = (
+        max(preflight_request_count - 1, 0) if preflight_requests_available else None
+    )
+
+    stage_rows = _direct_specialist_request_stage_rows(
+        route,
+        input_text=str(payload.get("input") or ""),
+        live_search=live_search,
+        manual_plan=manual_plan,
+    )
+    specialist_minimum = sum(
+        int(row.get("min_requests") or 0)
+        for row in stage_rows
+        if bool(row.get("model_controlled")) and not bool(row.get("conditional"))
+    )
+    happy_path_requests = specialist_minimum + int(orchestrator_preflight is not None)
+    admission_reserved_requests = (
+        scope.admission_reserved_requests
+        if scope is not None and scope.admission_reserved_requests is not None
+        else specialist_minimum + (2 if orchestrator_preflight is not None else 0)
+    )
+    budget_snapshot = current_model_request_budget_snapshot() or {}
+    hard_ceiling_requests = (
+        scope.hard_ceiling_requests
+        if scope is not None and scope.hard_ceiling_requests is not None
+        else budget_snapshot.get("limit")
+        if isinstance(budget_snapshot.get("limit"), int)
+        else None
+    )
+    enforced_consumed = budget_snapshot.get("consumed")
+    actual_total_requests = (
+        int(enforced_consumed)
+        if isinstance(enforced_consumed, int) and enforced_consumed >= 0
+        else preflight_requests + child_requests
+        if preflight_requests is not None and child_requests is not None
+        else None
+    )
+    payload["entry_request_accounting"] = {
+        "schema": "keystone.entry_request_accounting.v1",
+        "route": route,
+        "happy_path_requests": happy_path_requests,
+        "admission_reserved_requests": admission_reserved_requests,
+        "hard_ceiling_requests": hard_ceiling_requests,
+        "actual_preflight_requests": preflight_requests,
+        "actual_preflight_requests_available": preflight_requests_available,
+        "actual_child_requests": child_requests,
+        "actual_child_requests_available": child_requests is not None,
+        "actual_total_requests": actual_total_requests,
+        "repair_status": {
+            "orchestrator": _repair_status(orchestrator_repairs),
+            "tool_correction": _repair_status(tool_corrections),
+            "decision": _repair_status(decision_repairs),
+            "instruction_following": _repair_status(instruction_repairs),
+        },
+    }
+    if (
+        str(payload.get("status") or "").strip().lower()
+        in {"failed", "error", "timeout"}
+        and actual_total_requests is not None
+    ):
+        # Legacy Slack diagnostics still read this name. Report the enforced
+        # root total, not a default zero that discards completed child requests.
+        payload["openai_requests_made"] = actual_total_requests
+    performance = dict(payload.get("performance") or {})
+    performance.update(
+        {
+            "orchestrator_preflight_ms": round(
+                max(
+                    scope.orchestrator_preflight_ms
+                    if scope is not None and scope.orchestrator_preflight_ms is not None
+                    else 0.0,
+                    0.0,
+                ),
+                3,
+            ),
+            "specialist_child_process_ms": round(max(child_process_ms, 0.0), 3),
+        }
+    )
+    payload["performance"] = performance
+    parent_deadline = current_execution_deadline_snapshot()
+    child_deadline = (
+        request_cache.get("execution_deadline")
+        if isinstance(request_cache, Mapping)
+        and isinstance(request_cache.get("execution_deadline"), Mapping)
+        else None
+    )
+    if parent_deadline is not None or child_deadline is not None:
+        relationship = _deadline_trace_relationship(parent_deadline, child_deadline)
+        payload["execution_deadline"] = {
+            **relationship,
+            "parent": parent_deadline,
+            "child": dict(child_deadline) if child_deadline is not None else None,
+            "child_available": child_deadline is not None,
+        }
+
+
+def _timeout_child_stream_evidence(value: object) -> dict[str, object]:
+    """Return bounded, redacted evidence without claiming a child stage completed."""
+
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    else:
+        text = str(value or "")
+    evidence: dict[str, object] = {
+        "available": bool(text),
+        "character_count": len(text),
+        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest() if text else None,
+    }
+    if text:
+        evidence["redacted_excerpt"] = _redacted_child_output(text, max_chars=2000)
+    return evidence
+
+
+def _child_process_timeout_evidence(
+    exc: subprocess.TimeoutExpired,
+    *,
+    timeout_seconds: float,
+    child_process_ms: float,
+) -> dict[str, object]:
+    """Describe an outer deadline without inventing its unknown inner cause."""
+
+    return {
+        "schema": "keystone.child_process_timeout_evidence.v1",
+        "timeout_scope": "isolated_child_process",
+        "active_parent_stage": "entry.specialist_child_process",
+        "inner_stage": None,
+        "inner_stage_available": False,
+        "deadline_seconds": timeout_seconds,
+        "elapsed_ms": child_process_ms,
+        "classification": "outer_deadline_inner_cause_unproven",
+        "partial_streams": {
+            "stdout": _timeout_child_stream_evidence(exc.output),
+            "stderr": _timeout_child_stream_evidence(exc.stderr),
+        },
+        "child_counts": {
+            "model_requests": None,
+            "model_tool_calls": None,
+            "provider_attempts": None,
+            "provider_receipts": None,
+            "availability": "unavailable",
+        },
+    }
+
+
+def _persisted_agent_run_status(payload: Mapping[str, Any]) -> str:
+    """Map canonical public completion to the durable agent-run status."""
+
+    public_result = payload.get("public_result")
+    public_status = (
+        str(public_result.get("status") or "").strip().lower()
+        if isinstance(public_result, Mapping)
+        else ""
+    )
+    status = public_status or str(payload.get("status") or "").strip().lower()
+    if status in {"verified", "completed", "recovered"}:
+        return "success"
+    if status in {"failed", "canceled", "cancelled"}:
+        return "error"
+    return status or "error"
+
+
+def _validated_child_exit_code(
+    payload: Mapping[str, Any],
+    *,
+    child_returncode: int,
+) -> int:
+    """Honor canonical terminal failure even when the child process exited zero."""
+
+    if child_returncode:
+        return int(child_returncode)
+    public_result = payload.get("public_result")
+    public_status = (
+        str(public_result.get("status") or "").strip().lower()
+        if isinstance(public_result, Mapping)
+        else ""
+    )
+    if public_status in {"failed", "error", "timeout"}:
+        return 1
+    return 0
+
+
 def _run_ask_script_live(
     route: str,
     input_text: str,
@@ -11866,26 +17420,77 @@ def _run_ask_script_live(
     cost_tracking_requested: bool = False,
     database_url: str | None = None,
 ) -> int:
+    from keystone_agents.runtime.durable_execution import execution_child_environment
+
     env = None
+    execution_deadline = current_execution_deadline()
+    timeout_seconds = _child_agent_timeout_seconds(route=route)
+    if execution_deadline is not None:
+        execution_deadline.admit(
+            stage=f"{route}:child_process",
+            boundary="child_process",
+        )
+    child_deadline = _child_execution_deadline_for_timeout(
+        execution_deadline,
+        timeout_seconds=timeout_seconds,
+    )
     child_env = orchestrator_preflight_env(
         orchestrator_preflight,
         execution_context=execution_context,
     )
+    if child_deadline is not None:
+        child_env = {**child_env, **child_deadline.environment()}
+    budget_lease = reserve_child_model_request_budget(
+        stage=f"{route}:child_process"
+    )
+    if budget_lease is not None:
+        child_env = {**child_env, **budget_lease.environment()}
     if sdk_session_spec is not None:
         child_env = {**child_env, **sdk_session_env(sdk_session_spec)}
+    if database_url is not None:
+        child_env = {**child_env, "DATABASE_URL": database_url}
+    child_env = {**child_env, **execution_child_environment()}
     if child_env:
         env = {**os.environ, **child_env}
-    timeout_seconds = _child_agent_timeout_seconds(route=route)
-    try:
-        completed = run_isolated_child_process(
-            command,
-            cwd=Path(__file__).resolve().parents[2],
-            env=env,
-            timeout=timeout_seconds,
+    entry_scope = _ASK_ENTRY_TELEMETRY.get()
+    child_span = (
+        entry_scope.recorder.span(
+            "entry.specialist_child_process",
+            attributes={"route": route, "source": "isolated_child_process"},
         )
-    except subprocess.TimeoutExpired:
+        if entry_scope is not None
+        else nullcontext()
+    )
+    child_started_at = perf_counter()
+    try:
+        with child_span:
+            completed = run_isolated_child_process(
+                command,
+                cwd=Path(__file__).resolve().parents[2],
+                env=env,
+                timeout=timeout_seconds,
+            )
+            if completed.returncode != 0:
+                raise _RecordedChildProcessFailure
+    except _RecordedChildProcessFailure:
+        if execution_deadline is not None:
+            execution_deadline.checkpoint(
+                stage=f"{route}:child_process",
+                boundary="child_process",
+                phase="completed_with_child_failure",
+            )
+    except subprocess.TimeoutExpired as exc:
+        if execution_deadline is not None:
+            execution_deadline.checkpoint(
+                stage=f"{route}:child_process",
+                boundary="child_process",
+                phase="outer_timeout",
+            )
+        child_process_ms = round((perf_counter() - child_started_at) * 1000, 3)
+        if budget_lease is not None:
+            budget_lease.settle(None)
         failure = known_exception_to_operator_failure(
-            subprocess.TimeoutExpired(command, timeout_seconds),
+            exc,
             context=f"{_agent_display_name(route)} child process",
         )
         payload = {
@@ -11906,19 +17511,56 @@ def _run_ask_script_live(
                 "send_enabled": False,
                 "failure": failure.to_dict(),
                 "error_type": "timeout",
+                "timeout_evidence": _child_process_timeout_evidence(
+                    exc,
+                    timeout_seconds=timeout_seconds,
+                    child_process_ms=child_process_ms,
+                ),
                 "next_step": failure.next_step,
             },
         }
+        _attach_direct_specialist_entry_observability(
+            payload,
+            route=route,
+            child_payload=None,
+            orchestrator_preflight=orchestrator_preflight,
+            child_process_ms=child_process_ms,
+            manual_plan=manual_plan,
+            live_search="--live-search" in command,
+        )
         _persist_ask_script_failure(
             payload,
             route=route,
             input_text=input_text,
             database_url=database_url,
             error_kind=failure.kind,
+            execution_context=execution_context,
         )
         _print_ask_live_payload(payload, json_output=json_output)
         return 1
+    else:
+        if execution_deadline is not None:
+            execution_deadline.checkpoint(
+                stage=f"{route}:child_process",
+                boundary="child_process",
+                phase="completed",
+            )
+    child_process_ms = round((perf_counter() - child_started_at) * 1000, 3)
     if completed.returncode != 0:
+        try:
+            failed_child_payload = json.loads(completed.stdout or "{}")
+        except json.JSONDecodeError:
+            failed_child_payload = None
+        if budget_lease is not None:
+            failed_child_budget = model_request_budget_from_payload(
+                failed_child_payload
+            )
+            budget_lease.settle(
+                model_request_count_from_payload(failed_child_payload),
+                exhaustion_stage=str(
+                    (failed_child_budget or {}).get("exhaustion_stage") or ""
+                ),
+            )
         failure = _operator_failure_from_child_output(
             completed.stdout,
             fallback=RuntimeError(
@@ -11952,19 +17594,32 @@ def _run_ask_script_live(
                 "error_tail": _redacted_child_tail(completed.stderr or completed.stdout),
                 "next_step": failure.next_step,
             },
+            **_promoted_child_failure_evidence(failed_child_payload),
         }
+        _attach_direct_specialist_entry_observability(
+            payload,
+            route=route,
+            child_payload=failed_child_payload,
+            orchestrator_preflight=orchestrator_preflight,
+            child_process_ms=child_process_ms,
+            manual_plan=manual_plan,
+            live_search="--live-search" in command,
+        )
         _persist_ask_script_failure(
             payload,
             route=route,
             input_text=input_text,
             database_url=database_url,
             error_kind=failure.kind,
+            execution_context=execution_context,
         )
         _print_ask_live_payload(payload, json_output=json_output)
         return int(completed.returncode) or 1
     try:
         script_payload = json.loads(completed.stdout or "{}")
     except json.JSONDecodeError as exc:
+        if budget_lease is not None:
+            budget_lease.settle(None)
         failure = known_exception_to_operator_failure(
             exc,
             context=f"{_agent_display_name(route)} child process",
@@ -11994,15 +17649,33 @@ def _run_ask_script_live(
                 "next_step": failure.next_step,
             },
         }
+        _attach_direct_specialist_entry_observability(
+            payload,
+            route=route,
+            child_payload=None,
+            orchestrator_preflight=orchestrator_preflight,
+            child_process_ms=child_process_ms,
+            manual_plan=manual_plan,
+            live_search="--live-search" in command,
+        )
         _persist_ask_script_failure(
             payload,
             route=route,
             input_text=input_text,
             database_url=database_url,
             error_kind=failure.kind,
+            execution_context=execution_context,
         )
         _print_ask_live_payload(payload, json_output=json_output)
         return 1
+    if budget_lease is not None:
+        child_budget = model_request_budget_from_payload(script_payload)
+        budget_lease.settle(
+            model_request_count_from_payload(script_payload),
+            exhaustion_stage=str(
+                (child_budget or {}).get("exhaustion_stage") or ""
+            ),
+        )
     output = script_payload.get("output") if isinstance(script_payload, dict) else None
     review = review_specialist_output(
         agent_name=route,
@@ -12043,17 +17716,47 @@ def _run_ask_script_live(
         # Do not spend a repair-model request trying to force normal answer-shape
         # constraints onto a blocker.
         human_summary = _payload_human_summary(script_payload)
+    elif child_result_explicitly_unverified(script_payload):
+        # Formatting compliance cannot override an explicit child verification
+        # failure or turn unsupported content into a completed public result.
+        human_summary = (
+            "The child result was explicitly marked unverified. Completion is "
+            "not confirmed."
+        )
+        payload["status"] = "blocked"
+        payload["block_kind"] = "child_result_verification_failed"
+        payload["user_facing_result_verified"] = False
     else:
         interpreted_constraints = output_constraints_from_plan(manual_plan)
         verified_provider_summary = _verified_child_provider_summary(script_payload)
-        typed_display = _strict_requested_display_text(output, manual_plan)
+        typed_display = _strict_requested_display_text(
+            output,
+            manual_plan,
+            original_request=input_text,
+        )
         candidate_summary = (
-            verified_provider_summary or _payload_human_summary(script_payload)
+            typed_display or verified_provider_summary or _payload_human_summary(script_payload)
             if interpreted_constraints.has_deterministic_requirements()
             else typed_display or _payload_human_summary(script_payload)
         )
-        if verified_provider_summary:
+        if verified_provider_summary and not typed_display:
             candidate_summary = verified_provider_summary
+        # A verified child answer may already meet the full request, including
+        # citations absent from its neutral typed summary. Keep that answer
+        # before choosing a shorter reconstruction or spending a repair call.
+        if verified_provider_summary and validate_output_constraints(
+            verified_provider_summary,
+            resolved_output_constraints(
+                manual_plan,
+                original_request=input_text,
+                condition_outcome=(
+                    output.get("needs_reply") if isinstance(output, dict)
+                    and isinstance(output.get("needs_reply"), bool) else None
+                ),
+            ),
+        ).passed:
+            candidate_summary = verified_provider_summary
+            typed_display = ""
         instruction_resolution = resolve_instruction_following_response(
             candidate_summary,
             original_request=input_text,
@@ -12070,6 +17773,12 @@ def _run_ask_script_live(
                 sort_keys=True,
             ),
             live=True,
+            condition_outcome=(
+                output.get("needs_reply")
+                if isinstance(output, dict)
+                and isinstance(output.get("needs_reply"), bool)
+                else None
+            ),
         )
         final_validation = instruction_resolution.validation
         provenance_violations = _official_source_response_violations(
@@ -12121,8 +17830,35 @@ def _run_ask_script_live(
         typed_display_verified=bool(
             script_status not in {"blocked", "clarification_required", "needs_input"}
             and typed_display
+            and not constraint_admission_has_unresolved(
+                payload.get("instruction_following", {}).get(
+                    "constraint_admission_warnings"
+                )
+                if isinstance(payload.get("instruction_following"), dict)
+                else ()
+            )
+            and (
+                not isinstance(payload.get("instruction_following"), dict)
+                or not isinstance(
+                    payload["instruction_following"].get("validation"),
+                    dict,
+                )
+                or payload["instruction_following"]["validation"].get("applicable")
+                is not True
+                or payload["instruction_following"]["validation"].get("passed")
+                is True
+            )
         ),
     )
+    if (
+        isinstance(payload.get("instruction_following"), dict)
+        and isinstance(payload["instruction_following"].get("validation"), dict)
+        and payload["instruction_following"]["validation"].get("applicable") is True
+        and payload["instruction_following"]["validation"].get("passed") is False
+    ):
+        promotion_receipt = promotion_receipt.model_copy(
+            update={"reader_ready": False}
+        )
     payload["child_result_promotion_receipt"] = promotion_receipt.receipt()
     if review.status != "fail" or not promotion_receipt.reader_ready:
         payload["orchestrator_review"] = review.model_dump(mode="json")
@@ -12131,7 +17867,14 @@ def _run_ask_script_live(
         payload["slack_display_text"] = human_summary
         payload["display_text"] = human_summary
         payload["summary"] = human_summary
-    for key in ("usage", "cost", "request_cache", "model", "budget_guard"):
+    for key in (
+        "usage",
+        "cost",
+        "request_cache",
+        "tool_execution",
+        "model",
+        "budget_guard",
+    ):
         value = script_payload.get(key) if isinstance(script_payload, dict) else None
         if value:
             payload[key] = value
@@ -12147,6 +17890,37 @@ def _run_ask_script_live(
     retrieval_diagnostics = _payload_retrieval_diagnostics(script_payload)
     if retrieval_diagnostics:
         payload["retrieval_diagnostics"] = retrieval_diagnostics
+        if not isinstance(payload.get("tool_execution"), dict):
+            retrieval_tool_execution = _workflow_retrieval_tool_execution_summary(
+                script_payload,
+                retrieval_diagnostics,
+            )
+            if retrieval_tool_execution:
+                payload["tool_execution"] = retrieval_tool_execution
+    if isinstance(execution_context, Mapping):
+        provider_context_stages = execution_context.get(
+            "provider_context_stage_telemetry"
+        )
+        if isinstance(provider_context_stages, list) and provider_context_stages:
+            payload["provider_context_stages"] = provider_context_stages
+            payload["cross_provider_execution"] = {
+                "schema": "keystone.cross_provider_execution.v1",
+                "primary_action_provider": (
+                    manual_plan.provider_system if manual_plan is not None else "unspecified"
+                ),
+                "read_context_stage_count": len(provider_context_stages),
+                "primary_specialist": route,
+                "stage_tool_traces_separate": True,
+            }
+    _attach_direct_specialist_entry_observability(
+        payload,
+        route=route,
+        child_payload=script_payload,
+        orchestrator_preflight=orchestrator_preflight,
+        child_process_ms=child_process_ms,
+        manual_plan=manual_plan,
+        live_search="--live-search" in command,
+    )
     _attach_slack_run_provenance(payload, execution_context)
     attach_execution_public_result(payload)
     try:
@@ -12161,12 +17935,24 @@ def _run_ask_script_live(
             output=payload,
             model=f"sdk-live:{model_name or route}",
             dry_run=False,
-            status="blocked" if payload.get("status") == "blocked" else "success",
+            status=_persisted_agent_run_status(payload),
         )
         payload["agent_run_id"] = run_id
+        # The public result is first compiled before persistence so the exact
+        # operator-facing payload can be stored. Refresh it after the durable ID
+        # exists so Slack/diagnosis collectors can correlate successful and
+        # blocked specialist terminals identically.
+        public_result = payload.get("public_result")
+        if isinstance(public_result, dict):
+            public_result["run_id"] = str(run_id)
+        attach_execution_public_result(payload)
     except Exception as exc:  # pragma: no cover - diagnostic metadata only
         payload["agent_run_persistence_error"] = f"{type(exc).__name__}: {exc}"
-    return _print_ask_live_payload(payload, json_output=json_output)
+    print_exit_code = _print_ask_live_payload(payload, json_output=json_output)
+    return _validated_child_exit_code(
+        payload,
+        child_returncode=int(completed.returncode),
+    ) or print_exit_code
 
 
 def _persist_ask_script_failure(
@@ -12176,9 +17962,11 @@ def _persist_ask_script_failure(
     input_text: str,
     database_url: str | None,
     error_kind: str,
+    execution_context: Mapping[str, Any] | None = None,
 ) -> None:
     """Persist redacted child diagnostics when the caller supplied local storage."""
 
+    _attach_slack_run_provenance(payload, execution_context)
     if not database_url:
         return
     try:
@@ -12197,8 +17985,45 @@ def _persist_ask_script_failure(
         payload["agent_run_persistence_error"] = f"{type(exc).__name__}: {exc}"
 
 
+def _child_execution_deadline_for_timeout(
+    execution_deadline: ExecutionDeadlineLedger | None,
+    *,
+    timeout_seconds: float,
+) -> ExecutionDeadlineLedger | None:
+    """Shorten an inherited child envelope when an explicit outer timeout is tighter."""
+
+    if execution_deadline is None:
+        return None
+    if not str(os.getenv("KEYSTONE_CHILD_AGENT_TIMEOUT_SECONDS") or "").strip():
+        return execution_deadline
+    remaining_hard_seconds = execution_deadline.remaining_hard_ms / 1000.0
+    if timeout_seconds >= remaining_hard_seconds:
+        return execution_deadline
+    reserve_seconds = min(
+        execution_deadline.finalization_reserve_ms / 1000.0,
+        max(0.0, timeout_seconds * 0.2),
+    )
+    soft_seconds = max(
+        0.0,
+        timeout_seconds - live_model_timeout_seconds() - reserve_seconds,
+    )
+    return execution_deadline.shortened(
+        soft_timeout_seconds=soft_seconds,
+        hard_timeout_seconds=timeout_seconds,
+        finalization_reserve_seconds=reserve_seconds,
+    )
+
+
 def _child_agent_timeout_seconds(*, route: str = "") -> float:
     explicit_child_timeout = os.getenv("KEYSTONE_CHILD_AGENT_TIMEOUT_SECONDS")
+    execution_deadline = current_execution_deadline()
+    if execution_deadline is not None:
+        remaining_hard_seconds = max(
+            execution_deadline.remaining_hard_ms / 1000.0,
+            0.001,
+        )
+        if not explicit_child_timeout:
+            return min(remaining_hard_seconds, 1800.0)
     raw = explicit_child_timeout or os.getenv("KEYSTONE_LIVE_MODEL_TIMEOUT_SECONDS")
     if not raw:
         value = 180.0
@@ -12208,6 +18033,8 @@ def _child_agent_timeout_seconds(*, route: str = "") -> float:
         except ValueError:
             value = 180.0
     value = min(max(value, 1.0), 1800.0)
+    if execution_deadline is not None:
+        return min(value, remaining_hard_seconds)
     if explicit_child_timeout or route != "opportunity_scout":
         return value
 
@@ -12359,8 +18186,13 @@ def _print_ask_clarification(
 
 
 def _print_ask_live_payload(payload: dict[str, object], *, json_output: bool) -> int:
-    _register_entry_agent_run(payload.get("agent_run_id"))
+    _attach_slack_run_provenance(payload, None)
+    budget_snapshot = current_model_request_budget_snapshot()
+    if budget_snapshot is not None:
+        payload.setdefault("request_budget", budget_snapshot)
+    _register_entry_agent_runs(payload)
     attach_execution_public_result(payload)
+    _capture_entry_public_result(payload)
     if json_output:
         print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
     else:
@@ -12734,6 +18566,12 @@ def _run_live_work_items_advance_with_environment(args: argparse.Namespace) -> i
 
 
 def _run_work_items_advance_with_current_environment(args: argparse.Namespace) -> int:
+    deadline_request_text = _read_input(args.input)
+    if current_execution_deadline() is None and bool(args.live_sdk):
+        with activate_execution_deadline(
+            _execution_deadline_for_ask(args, deadline_request_text)
+        ):
+            return _run_work_items_advance_with_current_environment(args)
     store = SQLiteStore(args.database_url or database_url_from_env())
     _register_entry_store(store)
     input_text = _read_input(args.input)
@@ -12757,7 +18595,7 @@ def _run_work_items_advance_with_current_environment(args: argparse.Namespace) -
         orchestrator_preflight = run_orchestrator_preflight(
             input_text,
             requested_agent=preflight_requested_agent,
-            live_manual_plan=bool(args.live_sdk),
+            live_manual_plan=False,
             database_url=args.database_url,
             workflow_state=_orchestrator_workflow_state_from_cli_context(
                 context_file_path=args.context_file,
@@ -12782,6 +18620,7 @@ def _run_work_items_advance_with_current_environment(args: argparse.Namespace) -
         live_sdk=args.live_sdk,
         live_rss_slack_read=args.live_rss_slack_read,
         max_results=args.max_results,
+        max_results_explicit=getattr(args, "max_results_explicit", False),
         context_file_path=args.context_file,
         manual_request_plan=manual_plan.model_dump(mode="json") if manual_plan else None,
         orchestrator_preflight=_orchestrator_preflight_payload(orchestrator_preflight),
@@ -12875,6 +18714,9 @@ def _work_item_langgraph_metadata(outcome) -> dict:
         "checkpoint_required": outcome.checkpoint_required,
         "checkpoint_reason": outcome.checkpoint_reason,
         "checkpoint_key": outcome.checkpoint_key,
+        "execution_id": getattr(outcome, "execution_id", ""),
+        "durable": getattr(outcome, "durable", False),
+        "interrupted": getattr(outcome, "interrupted", False),
         "node_path": [node for node in outcome.node_path if node != "manager_loop_finalize"],
         "improvements": outcome.improvements,
     }
@@ -13098,36 +18940,17 @@ def _print_work_item_result(
     graph_metadata: dict | None = None,
     eval_record: dict[str, object] | None = None,
     execution_metadata: dict[str, object] | None = None,
+    public_telemetry: dict[str, object] | None = None,
 ) -> int:
     result = _shape_work_item_result_for_requested_output(result)
     result, user_facing_result_verified = _ensure_work_item_user_facing_summary(result)
     _register_entry_work_item(getattr(result.work_item, "id", ""))
     if json_output:
-        payload = result.model_dump(mode="json")
-        result_status = str(getattr(result.status, "value", result.status))
-        completion_confirmed = bool(
-            user_facing_result_verified
-            and result_status == "done"
-            and not result.blockers
+        payload = build_work_item_result_payload(
+            result, user_facing_result_verified=user_facing_result_verified,
+            graph_metadata=graph_metadata, execution_metadata=execution_metadata,
+            public_telemetry=public_telemetry,
         )
-        payload["user_facing_result_verified"] = user_facing_result_verified
-        payload["completion_confirmed"] = completion_confirmed
-        payload["slack_display_title"] = (
-            "Business Agents Result Ready"
-            if completion_confirmed
-            else (
-                "Business Agents Awaiting Approval"
-                if result_status == "needs_approval"
-                else "Business Agents Completion Not Confirmed"
-            )
-        )
-        payload["slack_display_text"] = result.human_summary
-        payload["display_text"] = result.human_summary
-        payload["summary"] = result.human_summary
-        if graph_metadata is not None:
-            payload["_langgraph"] = graph_metadata
-        if execution_metadata is not None:
-            payload["_execution"] = execution_metadata
         if eval_record is not None:
             payload["_eval_record"] = eval_record
             payload["human_summary"] = _append_eval_thread_guidance_to_summary(
@@ -13135,8 +18958,12 @@ def _print_work_item_result(
                 eval_record=eval_record,
             )
         attach_execution_public_result(payload)
+        _capture_entry_public_result(payload)
         print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
     else:
+        payload = result.model_dump(mode="json")
+        attach_execution_public_result(payload)
+        _capture_entry_public_result(payload)
         print(render_work_item_result_text(result))
         if eval_record is not None:
             print(f"Eval record: {eval_record.get('case_id')} / {eval_record.get('run_id')}")
@@ -13153,86 +18980,18 @@ def _print_work_item_result(
 
 
 def _ensure_work_item_user_facing_summary(result: Any) -> tuple[Any, bool]:
-    """Reject workflow metadata as a substitute for a user-facing result."""
-
-    summary = " ".join(str(getattr(result, "human_summary", "") or "").split())
-    metadata_only = not summary or bool(
-        re.fullmatch(
-            r"(?:business agents\s+)?(?:work\s*item\s+)?"
-            r"(?:command\s+)?(?:completed|complete|ready|done)[.!]?",
-            summary,
-            flags=re.I,
-        )
-    )
-    if not metadata_only:
-        return result, True
-    blocker_messages = [
-        " ".join(str(getattr(blocker, "message", "") or "").split())
-        for blocker in list(getattr(result, "blockers", []) or [])
-        if str(getattr(blocker, "message", "") or "").strip()
-    ]
-    if blocker_messages:
-        replacement = (
-            "I could not complete the requested work. "
-            f"{blocker_messages[0]} Completion is not confirmed."
-        )
-    else:
-        replacement = (
-            "I could not verify a user-facing result for this run. Completion is "
-            "not confirmed; review the agent trace before relying on it."
-        )
-    return result.model_copy(update={"human_summary": replacement}), False
+    """Compatibility entrypoint for the shared deterministic summary guard."""
+    return ensure_work_item_user_facing_summary(result)
 
 
 def _shape_work_item_result_for_requested_output(result: Any) -> Any:
-    """Apply an exact narrow WorkItem display contract after synthesis."""
+    """Compatibility boundary: preserve the model-owned answer and workflow state.
 
-    plan = getattr(result, "manual_request_plan", None)
-    if not isinstance(plan, dict):
-        return result
-    ask_shape = plan.get("ask_shape")
-    if not isinstance(ask_shape, dict):
-        return result
-    if str(ask_shape.get("strict_filter_mode") or "") not in {"exact", "strict"}:
-        return result
-    stop_condition = str(ask_shape.get("stop_condition") or "")
-    if stop_condition != "stop_after_exact_requested_sentence_count":
-        return result
-    request_text = str(getattr(getattr(result, "work_item", None), "request_text", "") or "")
-    count_match = re.search(r"\bexactly\s+(\d+)\s+sentences?\b", request_text, re.I)
-    if count_match is None or int(count_match.group(1)) != 2:
-        return result
-    work_item = getattr(result, "work_item", None)
-    sources = list(getattr(work_item, "sources", []) or []) if work_item is not None else []
-    claims: list[str] = []
-    for source in sources:
-        supported_claim = str(getattr(source, "supported_claim", "") or "").strip()
-        key_facts = list(getattr(source, "key_facts", []) or [])
-        for claim in [supported_claim, *key_facts]:
-            cleaned = _ensure_terminal_punctuation(str(claim or "").strip())
-            if cleaned != "." and cleaned not in claims:
-                claims.append(cleaned)
-    if not claims:
-        return result
-    first_sentence = claims[0]
-    if len(claims) > 1:
-        second_sentence = claims[1]
-    else:
-        second_sentence = (
-            "No additional company details are supported by the bounded evidence supplied "
-            "for this run."
-        )
-    shaped = result.model_copy(
-        update={
-            "human_summary": f"{first_sentence} {second_sentence}",
-            "next_action": None,
-        }
-    )
-    if work_item is not None:
-        shaped = shaped.model_copy(
-            update={"work_item": work_item.model_copy(update={"next_action": None})}
-        )
-    return shaped
+    Exact-output validation and bounded model repair belong upstream. Display
+    formatting must not select source claims or erase pending workflow actions.
+    """
+
+    return result
 
 
 def _append_eval_thread_guidance_to_summary(

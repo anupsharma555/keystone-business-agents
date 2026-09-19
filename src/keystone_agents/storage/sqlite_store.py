@@ -7,7 +7,8 @@ import json
 import os
 import re
 import sqlite3
-from collections.abc import Iterator, Mapping
+import threading
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -59,6 +60,12 @@ from keystone_agents.schemas.work_item import (
     WorkItemArtifactRef,
     WorkItemEvent,
     WorkItemStatus,
+)
+from keystone_agents.usage_projection import (
+    NUMERIC_TOKEN_USAGE_KEYS,
+    nonnegative_usage_integer,
+    project_billable_tokens,
+    project_request_usage_entries,
 )
 
 DEFAULT_DATABASE_URL = "sqlite:///keystone_agents.db"
@@ -978,6 +985,15 @@ def redact_secrets(value: Any, *, summarize_email_content: bool = False) -> Any:
         for key, item in value.items():
             key_text = str(key)
             key_lookup = key_text.lower()
+            if key_lookup in NUMERIC_TOKEN_USAGE_KEYS:
+                result[key_text] = nonnegative_usage_integer(item)
+                continue
+            if key_lookup == "request_usage_entries":
+                result[key_text] = project_request_usage_entries(item)
+                continue
+            if key_lookup == "billable_tokens":
+                result[key_text] = project_billable_tokens(item)
+                continue
             if key_lookup in NON_SECRET_USAGE_KEYS:
                 result[key_text] = redact_secrets(
                     item,
@@ -1043,6 +1059,15 @@ def _audit_safe_value(value: Any) -> Any:
         for key, item in value.items():
             key_text = str(key)
             key_lookup = key_text.lower()
+            if key_lookup in NUMERIC_TOKEN_USAGE_KEYS:
+                result[key_text] = nonnegative_usage_integer(item)
+                continue
+            if key_lookup == "request_usage_entries":
+                result[key_text] = project_request_usage_entries(item)
+                continue
+            if key_lookup == "billable_tokens":
+                result[key_text] = project_billable_tokens(item)
+                continue
             if SECRET_KEY_RE.search(key_text):
                 result[key_text] = REDACTION_MARKER
                 continue
@@ -1242,6 +1267,18 @@ def _memory_query_tokens(query: str) -> list[str]:
     return [token for token in re.findall(r"[a-z0-9]+", str(query or "").lower()) if len(token) > 1]
 
 
+def _memory_item_is_expired(item: MemoryItem, *, now: datetime) -> bool:
+    if not item.expires_at:
+        return False
+    try:
+        expires_at = datetime.fromisoformat(item.expires_at.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    return expires_at <= now
+
+
 def _score_memory_row(
     *,
     tokens: list[str],
@@ -1364,6 +1401,7 @@ class SQLiteStore:
         self.path = sqlite_path_from_url(database_url)
         _assert_test_database_is_isolated(self.path)
         self._memory_connection: sqlite3.Connection | None = None
+        self._transaction_local = threading.local()
         if self.path != ":memory:":
             Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
@@ -1373,6 +1411,9 @@ class SQLiteStore:
         return cls(database_url_from_env())
 
     def connect(self) -> sqlite3.Connection:
+        transaction_connection = getattr(self._transaction_local, "connection", None)
+        if transaction_connection is not None:
+            return transaction_connection
         if self.path == ":memory:":
             if self._memory_connection is None:
                 self._memory_connection = sqlite3.connect(self.path)
@@ -1386,11 +1427,35 @@ class SQLiteStore:
     def managed_connection(self) -> Iterator[sqlite3.Connection]:
         """Provide a transaction and close transient file-backed connections."""
 
+        transaction_connection = getattr(self._transaction_local, "connection", None)
+        if transaction_connection is not None:
+            yield transaction_connection
+            return
         connection = self.connect()
         try:
             with connection:
                 yield connection
         finally:
+            if connection is not self._memory_connection:
+                connection.close()
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Commit a related WorkItem, artifact and event as one local transition."""
+        if getattr(self._transaction_local, "connection", None) is not None:
+            yield
+            return
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._transaction_local.connection = connection
+            yield
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            self._transaction_local.connection = None
             if connection is not self._memory_connection:
                 connection.close()
 
@@ -1591,7 +1656,7 @@ class SQLiteStore:
             row = connection.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
         return int(row["count"])
 
-    def save_work_item(self, work_item: WorkItem) -> str:
+    def save_work_item(self, work_item: WorkItem, *, expected_version: str | None = None) -> str:
         """Upsert one WorkItem payload."""
 
         item = WorkItem.model_validate(_as_dict(work_item)).touch()
@@ -1600,6 +1665,18 @@ class SQLiteStore:
         target_json = stable_json(item.target.model_dump(mode="json"))
         payload_json = stable_json(item.model_dump(mode="json"))
         with self.managed_connection() as connection:
+            if expected_version is not None:
+                if not connection.in_transaction:
+                    connection.execute("BEGIN IMMEDIATE")
+                current = connection.execute(
+                    "SELECT work_item_json FROM work_items WHERE id=?", (item.id,),
+                ).fetchone()
+                version = (
+                    stable_hash(WorkItem.model_validate(json.loads(current[0])).model_dump(mode="json"))
+                    if current else ""
+                )
+                if version != expected_version:
+                    raise ValueError("WorkItem changed since it was read; reload before updating.")
             connection.execute(
                 """
                 INSERT INTO work_items
@@ -1660,6 +1737,7 @@ class SQLiteStore:
         *,
         status: str | None = None,
         kind: str | None = None,
+        current_route: str | None = None,
         limit: int = 50,
     ) -> list[WorkItem]:
         """List recent WorkItems."""
@@ -1672,6 +1750,9 @@ class SQLiteStore:
         if kind:
             clauses.append("kind = ?")
             params.append(kind)
+        if current_route:
+            clauses.append("current_route = ?")
+            params.append(current_route)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self.managed_connection() as connection:
             rows = connection.execute(
@@ -2466,7 +2547,7 @@ class SQLiteStore:
     ) -> list[AnnouncementFeedItem]:
         """Retrieve prior RSS/preprint reviews from the local derived index."""
 
-        tokens = _fts_query_tokens(query)
+        tokens = list(dict.fromkeys(_fts_query_tokens(query)))
         if not tokens:
             return self.list_announcement_feed_items(
                 source=source,
@@ -2475,21 +2556,24 @@ class SQLiteStore:
             )
         match_query = _fts_match_query(query)
         clauses: list[str] = []
-        params: list[Any] = [match_query]
+        scope_params: list[Any] = []
         if source:
             clauses.append("(i.source = ? OR i.feed = ?)")
             cleaned = _redact_string(source)
-            params.extend([cleaned, cleaned])
+            scope_params.extend([cleaned, cleaned])
         if selected_only is not None:
             clauses.append("i.selected = ?")
-            params.append(1 if selected_only else 0)
+            scope_params.append(1 if selected_only else 0)
         where = f" AND {' AND '.join(clauses)}" if clauses else ""
         bounded_limit = max(1, min(100, int(limit or 10)))
+        candidate_pool_limit = min(500, max(50, bounded_limit * 8))
         with self.managed_connection() as connection:
             try:
-                rows = connection.execute(
+                fts_rows = connection.execute(
                     """
-                    SELECT i.*, bm25(announcement_feed_fts) AS fts_rank
+                    SELECT i.*,
+                           announcement_feed_fts.retrieval_text AS fts_retrieval_text,
+                           bm25(announcement_feed_fts) AS fts_rank
                     FROM announcement_feed_fts
                     JOIN announcement_feed_items i
                       ON i.canonical_key = announcement_feed_fts.canonical_key
@@ -2497,16 +2581,119 @@ class SQLiteStore:
                     """
                     + where
                     + " ORDER BY fts_rank, i.selected DESC, i.last_seen_at_utc DESC LIMIT ?",
-                    (*params, bounded_limit),
+                    (match_query, *scope_params, candidate_pool_limit),
                 ).fetchall()
             except sqlite3.OperationalError:
-                return self.list_announcement_feed_items(
-                    query=query,
-                    source=source,
-                    selected_only=selected_only,
-                    limit=limit,
+                fts_rows = []
+
+            # Rank the complete scoped saved-item/evidence set in SQLite before
+            # applying the bounded candidate transfer limit. Limiting a
+            # recency-ordered evidence lane first can permanently exclude an
+            # older item that covers more query terms when many newer partial
+            # matches exist. This query returns only a bounded ranked pool to
+            # Python and leaves legacy FTS bytes untouched.
+            query_term_values = ", ".join("(?)" for _token in tokens)
+            item_search_text = (
+                "lower("
+                "coalesce(i.canonical_key, '') || ' ' || "
+                "coalesce(i.publication_id, '') || ' ' || "
+                "coalesce(i.publication_id_type, '') || ' ' || "
+                "coalesce(i.doi, '') || ' ' || coalesce(i.arxiv_id, '') || ' ' || "
+                "coalesce(i.biorxiv_id, '') || ' ' || coalesce(i.medrxiv_id, '') || ' ' || "
+                "coalesce(i.title, '') || ' ' || coalesce(i.url, '') || ' ' || "
+                "coalesce(i.canonical_url, '') || ' ' || coalesce(i.source, '') || ' ' || "
+                "coalesce(i.feed, '') || ' ' || coalesce(i.authors_json, '') || ' ' || "
+                "coalesce(i.published_at, '') || ' ' || coalesce(i.tags_json, '') || ' ' || "
+                "coalesce(i.relevance_status, '') || ' ' || "
+                "coalesce(i.selection_reason, '') || ' ' || coalesce(i.summary, '') || ' ' || "
+                "coalesce(i.extraction_status, '') || ' ' || "
+                "coalesce(i.automation_run_id, '') || ' ' || "
+                "coalesce(i.review_metadata_json, '')"
+                ")"
+            )
+            evidence_search_text = (
+                "lower("
+                "coalesce(e.kind, '') || ' ' || coalesce(e.title, '') || ' ' || "
+                "coalesce(e.url, '') || ' ' || coalesce(e.source, '') || ' ' || "
+                "coalesce(e.status, '') || ' ' || coalesce(e.snippet, '') || ' ' || "
+                "coalesce(e.evidence_json, '')"
+                ")"
+            )
+            scope_where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            ranked_saved_rows = connection.execute(
+                f"""
+                WITH query_terms(term) AS (VALUES {query_term_values}),
+                candidate_scores AS (
+                    SELECT i.canonical_key,
+                           COUNT(DISTINCT query_terms.term) AS term_coverage
+                    FROM announcement_feed_items i
+                    CROSS JOIN query_terms
+                    {scope_where}
+                    {"AND" if clauses else "WHERE"} (
+                        instr({item_search_text}, query_terms.term) > 0
+                        OR EXISTS (
+                            SELECT 1
+                            FROM announcement_feed_evidence e
+                            WHERE e.item_key = i.canonical_key
+                              AND instr({evidence_search_text}, query_terms.term) > 0
+                        )
+                    )
+                    GROUP BY i.canonical_key
                 )
-            return [self._announcement_feed_item_from_row(connection, dict(row)) for row in rows]
+                SELECT i.*, candidate_scores.term_coverage
+                FROM candidate_scores
+                JOIN announcement_feed_items i
+                  ON i.canonical_key = candidate_scores.canonical_key
+                WHERE candidate_scores.term_coverage > 0
+                ORDER BY candidate_scores.term_coverage DESC,
+                         i.selected DESC,
+                         i.published_at DESC,
+                         i.last_seen_at_utc DESC,
+                         i.title
+                LIMIT ?
+                """,
+                (*tokens, *scope_params, candidate_pool_limit),
+            ).fetchall()
+
+            rows_by_key: dict[str, sqlite3.Row] = {}
+            term_coverage_by_key: dict[str, int] = {}
+            # Preserve the same distinct-term coverage definition through the
+            # FTS/saved merge and final cap. Recomputing from the Pydantic item
+            # would discard evidence metadata that the SQL lane legitimately
+            # matched and could demote the strongest candidate after admission.
+            for row in fts_rows:
+                key = str(row["canonical_key"] or "")
+                if not key:
+                    continue
+                retrieval_text = str(row["fts_retrieval_text"] or "").lower()
+                term_coverage_by_key[key] = sum(
+                    1 for token in tokens if token in retrieval_text
+                )
+            for row in ranked_saved_rows:
+                key = str(row["canonical_key"] or "")
+                if not key:
+                    continue
+                term_coverage_by_key[key] = max(
+                    term_coverage_by_key.get(key, 0),
+                    int(row["term_coverage"] or 0),
+                )
+            for row in [*fts_rows, *ranked_saved_rows]:
+                key = str(row["canonical_key"] or "")
+                if key and key not in rows_by_key:
+                    rows_by_key[key] = row
+            rows = list(rows_by_key.values())
+            items = [
+                self._announcement_feed_item_from_row(connection, dict(row))
+                for row in rows
+            ]
+            indexed_items = list(enumerate(items))
+            indexed_items.sort(
+                key=lambda value: (
+                    -term_coverage_by_key.get(value[1].canonical_key, 0),
+                    value[0],
+                )
+            )
+            return [item for _index, item in indexed_items[:bounded_limit]]
 
     def _announcement_feed_item_from_row(
         self,
@@ -2927,6 +3114,87 @@ class SQLiteStore:
                 ),
             )
             return int(cursor.lastrowid)
+
+    def get_agent_run(self, run_id: str | int) -> dict[str, Any] | None:
+        """Load one local run row with its redacted JSON projection decoded."""
+
+        row_id = int(run_id)
+        with self.managed_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM agent_runs WHERE id = ?",
+                (row_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = dict(row)
+        payload["output"] = _json_dict(payload.get("output_json"))
+        return payload
+
+    def get_agent_runs(self, run_ids: Sequence[str | int]) -> list[dict[str, Any]]:
+        """Load exact linked run rows in caller order without broad discovery."""
+
+        ordered_ids = list(dict.fromkeys(int(run_id) for run_id in run_ids))
+        if not ordered_ids:
+            return []
+        placeholders = ", ".join("?" for _ in ordered_ids)
+        with self.managed_connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM agent_runs WHERE id IN ({placeholders})",
+                tuple(ordered_ids),
+            ).fetchall()
+        by_id = {int(row["id"]): dict(row) for row in rows}
+        result: list[dict[str, Any]] = []
+        for row_id in ordered_ids:
+            payload = by_id.get(row_id)
+            if payload is None:
+                continue
+            payload["output"] = _json_dict(payload.get("output_json"))
+            result.append(payload)
+        return result
+
+    def finalize_agent_run_attempt(
+        self,
+        run_id: str | int,
+        *,
+        output: Mapping[str, Any],
+        status: str,
+        error: str | None = None,
+        agent_name: str | None = None,
+        model: str | None = None,
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        """Finalize one pre-created execution-attempt row without replacing its ID."""
+
+        row_id = int(run_id)
+        with self.managed_connection() as connection:
+            row = connection.execute(
+                "SELECT agent_name, model, dry_run FROM agent_runs WHERE id = ?",
+                (row_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"agent_run not found: {run_id}")
+            connection.execute(
+                """
+                UPDATE agent_runs
+                SET agent_name = ?, output_json = ?, model = ?, dry_run = ?,
+                    status = ?, error = ?
+                WHERE id = ?
+                """,
+                (
+                    _redact_string(agent_name or str(row["agent_name"])),
+                    stable_json(dict(output), summarize_email_content=True),
+                    _redact_string(model if model is not None else str(row["model"])),
+                    int(bool(row["dry_run"]) if dry_run is None else bool(dry_run)),
+                    _redact_string(status),
+                    _redact_string(error) if error else None,
+                    row_id,
+                ),
+            )
+        return {
+            "status": "updated",
+            "table": "agent_runs",
+            "id": row_id,
+        }
 
     def annotate_agent_run_execution_telemetry(
         self,
@@ -3369,10 +3637,16 @@ class SQLiteStore:
         approved_only: bool = True,
         safe_for_prompt: bool = True,
     ) -> list[MemoryItem]:
-        """Retrieve prompt-safe local memory with deterministic lexical ranking."""
+        """Rank eligible current memory; list_memory_items remains the historical view."""
 
         conditions: list[str] = []
         params: list[Any] = []
+        approved_states = [
+            ApprovalState.APPROVED_FOR_RESEARCH.value,
+            ApprovalState.APPROVED_FOR_DRAFTING.value,
+            ApprovalState.APPROVED_FOR_EXTERNAL_USE.value,
+            ApprovalState.APPROVED_FOR_SEND.value,
+        ]
         if object_key:
             conditions.append("i.object_key = ?")
             params.append(_redact_string(normalize_memory_key(object_key)))
@@ -3381,16 +3655,19 @@ class SQLiteStore:
             conditions.append(f"i.memory_type IN ({', '.join('?' for _ in resolved_types)})")
             params.extend(resolved_types)
         if approved_only:
-            approved_states = [
-                ApprovalState.APPROVED_FOR_RESEARCH.value,
-                ApprovalState.APPROVED_FOR_DRAFTING.value,
-                ApprovalState.APPROVED_FOR_EXTERNAL_USE.value,
-                ApprovalState.APPROVED_FOR_SEND.value,
-            ]
             conditions.append(f"m.approval_state IN ({', '.join('?' for _ in approved_states)})")
             params.extend(approved_states)
         if safe_for_prompt:
             conditions.append("m.safe_for_prompt = 1")
+        # Supersession is independent of search terms and requested memory types.
+        # Expiring a replacement must not resurrect the fact it superseded.
+        conditions.append(
+            "m.id NOT IN (SELECT replacement.supersedes_memory_id FROM memory_items replacement "
+            "WHERE replacement.supersedes_memory_id IS NOT NULL "
+            "AND replacement.safe_for_prompt = 1 "
+            f"AND replacement.approval_state IN ({', '.join('?' for _ in approved_states)}))"
+        )
+        params.extend(approved_states)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         with self.managed_connection() as connection:
             rows = connection.execute(
@@ -3407,9 +3684,12 @@ class SQLiteStore:
         tokens = _memory_query_tokens(query)
         ranked: list[tuple[int, float, int, MemoryItem]] = []
         normalized_object_key = normalize_memory_key(object_key or "")
+        now = datetime.now(UTC)
         for row in rows:
             row_dict = dict(row)
             item = self._memory_item_from_row(row_dict)
+            if _memory_item_is_expired(item, now=now):
+                continue
             score = _score_memory_row(
                 tokens=tokens,
                 object_key=normalized_object_key,
@@ -3943,7 +4223,20 @@ class SQLiteStore:
 
     def save_outreach_draft(self, draft: Any) -> int:
         payload = _as_dict(draft)
-        email_body = _redact_string(str(payload.get("email_body") or payload.get("body") or ""))
+        if "email_subject" in payload:
+            payload["subject"] = payload.get("email_subject")
+        if "email_body" in payload:
+            payload["body"] = payload.get("email_body")
+        email_body = _redact_string(
+            str(
+                (
+                    payload.get("email_body")
+                    if "email_body" in payload
+                    else payload.get("body")
+                )
+                or ""
+            )
+        )
         safe_payload = redact_secrets(payload, summarize_email_content=True)
         created = _time_metadata()
         with self.managed_connection() as connection:
@@ -3964,7 +4257,14 @@ class SQLiteStore:
                     )
                     or None,
                     _redact_string(
-                        str(payload.get("email_subject") or payload.get("subject") or "")
+                        str(
+                            (
+                                payload.get("email_subject")
+                                if "email_subject" in payload
+                                else payload.get("subject")
+                            )
+                            or ""
+                        )
                     ),
                     email_body,
                     _redact_string(

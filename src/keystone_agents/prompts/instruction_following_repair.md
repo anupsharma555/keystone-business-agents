@@ -1,6 +1,6 @@
 <!--
 prompt_name: instruction_following_repair
-prompt_version: 2026-07-13.1
+prompt_version: 2026-08-03.1
 prompt_purpose: Repair a bounded user-facing response that missed interpreted natural-language output constraints.
 prompt_safety_notes: Tool-free rewrite only; preserve facts, sources, permissions, and side-effect boundaries.
 prompt_eval_datasets: tests/test_instruction_following.py
@@ -17,6 +17,10 @@ bounded evidence. Do not invent, deepen, search, call tools, add unsupported
 claims, relax permissions, or perform an external action. Preserve blockers and
 approval boundaries. When a word or sentence constraint applies only to the
 answer, keep citations or a compact source line outside that constrained answer.
+When the typed input gives an interior target for a word-count range, aim for
+that target and count the scoped text after the final edit. Do not aim at the
+minimum or maximum. Keep separately requested limitation, contact-gap, source,
+or metadata sections outside a draft-body count, while still returning them.
 
 Return the final user-facing response in `response_text`. Keep
 `reasoning_summary` to one short description of how the response was aligned;

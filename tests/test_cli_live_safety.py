@@ -1513,7 +1513,7 @@ def test_opportunity_scout_os1_live_search_queries_pass_search_guardrails() -> N
         assert assessment.allowed, query
 
 
-def test_opportunity_scout_skips_sdk_when_live_retrieval_has_zero_raw_results(
+def test_opportunity_scout_live_sdk_uses_agent_owned_search_without_prefetch(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1525,27 +1525,42 @@ def test_opportunity_scout_skips_sdk_when_live_retrieval_has_zero_raw_results(
     monkeypatch.setattr(
         cli,
         "run_opportunity_scout_live",
-        lambda **_kwargs: (
-            OpportunityScoutResult(
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("live SDK path must not prefetch or preselect candidates")
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_opportunity_scout_sdk",
+        lambda *_args, **_kwargs: TypedAgentRunResult(
+            agent_name="opportunity_scout",
+            output=OpportunityScoutResult(
                 topic="remote clinical AI workshops",
                 dry_run=False,
                 search_provider="searxng",
                 raw_search_result_count=0,
                 records=[],
                 review_candidates=[],
-                audit_notes=["Provider returned zero raw results."],
+                audit_notes=["The model found no source-backed current result."],
             ),
-            {
-                "primary_search_provider": "searxng",
-                "retrieval_diagnostics": {"errors": ["all engines unavailable"]},
+            raw_result={"local": True},
+            live=False,
+            request_cache={
+                "tool_execution": {
+                    "mode": "llm_selected_function_tools",
+                    "model_called_tool_names": ["search_web"],
+                },
+                "decision_ownership": {},
             },
-        ),
-    )
-    monkeypatch.setattr(
-        cli,
-        "run_retrieved_sdk_synthesis",
-        lambda **_kwargs: (_ for _ in ()).throw(
-            AssertionError("empty retrieval must not invoke SDK synthesis")
+            tool_receipts=(
+                {
+                    "tool_name": "search_web",
+                    "operation": "search",
+                    "status": "not_found",
+                    "item_count": 0,
+                    "identity_fingerprints": [],
+                },
+            ),
         ),
     )
     monkeypatch.setattr(
@@ -1564,11 +1579,118 @@ def test_opportunity_scout_skips_sdk_when_live_retrieval_has_zero_raw_results(
 
     assert cli.main() == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["sdk_run_invoked"] is False
-    assert payload["synthesis_skipped_reason"] == ("live_retrieval_returned_zero_raw_results")
-    assert payload["usage"]["requests"] == 0
-    assert payload["cost"]["estimated_usd"] == 0.0
+    assert payload["sdk_run_invoked"] is True
+    assert payload["retrieval"]["mode"] == "agent_owned_tool_loop"
+    assert payload["tool_execution"]["model_called_tool_names"] == ["search_web"]
     assert payload["output"]["records"] == []
+
+
+def test_company_live_sdk_uses_agent_owned_search_and_preserves_raw_request(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import scripts.run_company_research as cli
+
+    raw_request = (
+        "Could you check Curebase's newest evidence work and tell me what looks "
+        "relevant for us?"
+    )
+    captured: dict[str, Any] = {}
+
+    def fake_run(typed_input: Any, **kwargs: Any) -> TypedAgentRunResult[CompanyProfile]:
+        captured["typed_input"] = typed_input
+        captured["kwargs"] = kwargs
+        output = CompanyProfile.model_validate(
+            _company_profile_payload(
+                sources=[
+                    {
+                        "source_id": "https://example.com/curebase-evidence",
+                        "title": "Curebase evidence update",
+                        "url": "https://example.com/curebase-evidence",
+                        "source_type": "news",
+                        "supported_claims": ["Curebase published an evidence update."],
+                        "confidence": 0.8,
+                    }
+                ],
+                decision={
+                    "decision_owner": "specialist_agent",
+                    "decision_stage": "research_source_selection",
+                    "selected_candidate_ids": [
+                        "https://example.com/curebase-evidence"
+                    ],
+                    "candidate_assessments": [
+                        {
+                            "candidate_id": "https://example.com/curebase-evidence",
+                            "disposition": "selected",
+                            "rationale": "It supports the current evidence signal.",
+                        }
+                    ],
+                    "reasoning": "Selected the current source returned by search.",
+                    "needs_more_context": False,
+                },
+            )
+        )
+        return TypedAgentRunResult(
+            agent_name="business_research_analyst",
+            output=output,
+            raw_result={"local": True},
+            live=False,
+            request_cache={
+                "tool_execution": {
+                    "mode": "llm_selected_function_tools",
+                    "model_called_tool_names": ["search_web"],
+                },
+                "decision_ownership": {},
+            },
+            tool_receipts=(
+                {
+                    "tool_name": "search_web",
+                    "operation": "search",
+                    "status": "success",
+                    "item_count": 1,
+                    "identity_fingerprints": ["fake-url-fingerprint"],
+                },
+            ),
+        )
+
+    _disable_dotenv(monkeypatch)
+    _patch_no_side_effects(cli, monkeypatch)
+    monkeypatch.setattr(cli, "SDK_RUN_CONFIG_FACTORY", lambda: LOCAL_RUN_CONFIG)
+    monkeypatch.setattr(cli, "run_business_research_analyst_sdk", fake_run)
+    monkeypatch.setattr(
+        cli,
+        "resolve_manual_request_plan",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("direct live SDK request must not invoke a standalone planner")
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_retrieve_company_profile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("live SDK path must not prefetch or preselect sources")
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_company_research.py",
+            "--request-text",
+            raw_request,
+            "--live-search",
+            "--no-dry-run",
+            "--run-sdk",
+            "--json",
+        ],
+    )
+
+    assert cli.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert raw_request in captured["typed_input"].context
+    assert captured["kwargs"]["provider_retrieval_required"] is True
+    assert payload["retrieval"]["mode"] == "agent_owned_tool_loop"
+    assert payload["tool_execution"]["model_called_tool_names"] == ["search_web"]
 
 
 def test_opportunity_scout_os1_live_search_falls_back_to_searxng(
@@ -1622,7 +1744,7 @@ def test_opportunity_scout_os1_live_search_falls_back_to_searxng(
 
     hits, metadata = cli._search_role_sources_live(args)
 
-    assert calls == ["serper", "searxng"]
+    assert calls == ["serper", "searxng", "agents-web-search"]
     assert hits == [
         {
             "title": "Remote Clinical AI Medical Director",
@@ -1708,6 +1830,7 @@ def test_opportunity_scout_improvement_case_requires_sdk(
 def test_specialist_cli_live_sdk_requires_openai_key_before_model_execution(
     case: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     cli = _import_cli(case)
 
@@ -1716,6 +1839,15 @@ def test_specialist_cli_live_sdk_requires_openai_key_before_model_execution(
     monkeypatch.delenv("KEYSTONE_OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(sys, "argv", case["live_argv"])
+
+    if case["module"] == "scripts.run_gmail_triage":
+        assert cli.main() == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "failed"
+        assert payload["output"]["failure"]["kind"] == "missing_credentials"
+        assert payload["sdk_failure"]["failure_kind"] == "missingopenaiapikeyerror"
+        assert payload["send_enabled"] is False
+        return
 
     with pytest.raises(SystemExit, match=case["missing_live_key_message"]):
         cli.main()

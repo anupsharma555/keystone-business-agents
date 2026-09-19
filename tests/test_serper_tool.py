@@ -464,6 +464,106 @@ def test_search_web_can_context_trigger_tavily_from_deepened_language(
     ]
 
 
+def test_search_web_natural_exa_preference_falls_back_after_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class FakeProvider:
+        def __init__(self, provider_name: str) -> None:
+            self.provider_name = provider_name
+
+        def search_structured(self, request):
+            calls.append(self.provider_name)
+            if self.provider_name == "exa":
+                raise TimeoutError("synthetic Exa timeout")
+            return [
+                SearchResult(
+                    title=f"{request.query} — {self.provider_name} result {index}",
+                    link=f"https://source{index}.example/about",
+                    snippet="Source-backed search result.",
+                    source=self.provider_name,
+                )
+                for index in range(4)
+            ]
+
+    def fake_build_search_provider(provider=None, *, live=False, **_kwargs):
+        assert live is True
+        return FakeProvider(str(provider))
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setenv("KEYSTONE_ENABLE_LIVE_RESEARCH", "true")
+    monkeypatch.delenv("SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", "true")
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_FALLBACK", "true")
+    monkeypatch.setenv("KEYSTONE_TAVILY_SEARCH_FALLBACK", "false")
+    monkeypatch.setattr(
+        "keystone_agents.tools.serper_tool.build_search_provider",
+        fake_build_search_provider,
+    )
+
+    reset_sdk_search_telemetry()
+    set_sdk_search_request_context("Use Exa to research this company, with safe backups.")
+    results = search_web("bounded company query", num_results=2)
+    diagnostics = sdk_search_diagnostics_from_telemetry(consume_sdk_search_telemetry())
+
+    assert calls == ["exa", "agents-web-search"]
+    assert {result.source for result in results} == {"agents-web-search"}
+    assert diagnostics["search_provider_sequence"] == [
+        "exa",
+        "agents-web-search",
+        "searxng",
+    ]
+    assert diagnostics["provider_error_fallback_used"] is True
+
+
+def test_search_web_natural_firecrawl_preference_stays_primary_when_useful(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class FakeProvider:
+        def __init__(self, provider_name: str) -> None:
+            self.provider_name = provider_name
+
+        def search_structured(self, request):
+            calls.append(self.provider_name)
+            return [
+                SearchResult(
+                    title=f"{request.query} — Firecrawl source {index}",
+                    link=f"https://source{index}.example/about",
+                    snippet="Official source-backed result.",
+                    source=self.provider_name,
+                )
+                for index in range(4)
+            ]
+
+    def fake_build_search_provider(provider=None, *, live=False, **_kwargs):
+        assert live is True
+        return FakeProvider(str(provider))
+
+    monkeypatch.setenv("KEYSTONE_LIVE_MODE", "true")
+    monkeypatch.setenv("KEYSTONE_DRY_RUN", "false")
+    monkeypatch.setenv("KEYSTONE_ENABLE_LIVE_RESEARCH", "true")
+    monkeypatch.delenv("SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK", "true")
+    monkeypatch.setenv("KEYSTONE_EXA_SEARCH_FALLBACK", "false")
+    monkeypatch.setenv("KEYSTONE_TAVILY_SEARCH_FALLBACK", "false")
+    monkeypatch.setattr(
+        "keystone_agents.tools.serper_tool.build_search_provider",
+        fake_build_search_provider,
+    )
+
+    reset_sdk_search_telemetry()
+    set_sdk_search_request_context("Try Firecrawl for this public-source search.")
+    results = search_web("official company source", num_results=4)
+    consume_sdk_search_telemetry()
+
+    assert calls == ["firecrawl"]
+    assert {result.source for result in results} == {"firecrawl"}
+
+
 def test_search_web_enforces_optional_provider_caps_across_sdk_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

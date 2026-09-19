@@ -11,6 +11,7 @@ GmailExecutionOperation = Literal[
     "message_count",
     "message_projection",
     "priority_grouping",
+    "candidate_selection",
     "thread_summary",
     "single_message_triage",
     "draft_reply",

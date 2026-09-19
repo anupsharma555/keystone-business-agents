@@ -121,6 +121,46 @@ _BASE_ENV_VARS: tuple[EnvVarContract, ...] = (
         default_notes="Defaults to the repo budget policy.",
     ),
     EnvVarContract(
+        "KEYSTONE_DURABLE_EXECUTION_REFERENCE",
+        "orchestration",
+        secret=True,
+        display_safety="secret",
+        default_notes=(
+            "Internal parent-generated child reference to an existing active execution journal. "
+            "Carries identity and compatibility only; never grants provider permission or resets "
+            "the persisted model budget. Do not configure manually or expose in diagnostics."
+        ),
+    ),
+    EnvVarContract(
+        "KEYSTONE_EXECUTION_DEADLINE_CORRELATION_ID",
+        "orchestration",
+        display_safety="identifier",
+        default_notes=(
+            "Generated per request; correlates one immutable parent/child deadline envelope."
+        ),
+    ),
+    EnvVarContract(
+        "KEYSTONE_EXECUTION_FINALIZATION_RESERVE_MS",
+        "orchestration",
+        default_notes=(
+            "Generated per request; reserves bounded time for terminal rendering and trace flush."
+        ),
+    ),
+    EnvVarContract(
+        "KEYSTONE_EXECUTION_HARD_DEADLINE_EPOCH_MS",
+        "orchestration",
+        default_notes=(
+            "Generated absolute parent safety deadline; child processes may not extend it."
+        ),
+    ),
+    EnvVarContract(
+        "KEYSTONE_EXECUTION_SOFT_DEADLINE_EPOCH_MS",
+        "orchestration",
+        default_notes=(
+            "Generated absolute admission deadline for new model, tool, and repair work."
+        ),
+    ),
+    EnvVarContract(
         "KEYSTONE_AGENTS_WEB_SEARCH_FALLBACK",
         "search",
         default_notes="Defaults to enabled by retrieval policy.",

@@ -1274,6 +1274,7 @@ def test_promptfoo_assertion_checks_tooling_and_source_metadata() -> None:
                 "required_source_types": "government",
                 "required_source_url_prefixes": "fixture://government/",
                 "required_workflow_routes": "opportunity_scout, business_research_analyst",
+                "required_workflow_order": "opportunity_scout, business_research_analyst",
                 "min_source_count": 1,
                 "min_artifact_count": 1,
             }
@@ -1281,6 +1282,45 @@ def test_promptfoo_assertion_checks_tooling_and_source_metadata() -> None:
     )
 
     assert result["pass"] is True
+
+
+def test_promptfoo_assertion_rejects_reversed_required_workflow_order() -> None:
+    payload = {
+        "provider_status": "ok",
+        "status": "blocked",
+        "route": "business_research_analyst",
+        "human_summary": (
+            "*Answer:*\nProvide the vendor target. Research comes first; "
+            "approved findings are required before outreach drafting."
+        ),
+        "workflow": ["outreach_composer", "business_research_analyst"],
+        "slack_context_attached": True,
+        "can_send_email": False,
+        "send_enabled": False,
+        "forbidden_actions": ["send_email"],
+        "live_sdk": False,
+        "live_search": False,
+        "side_effects": _side_effects(),
+        "external_write_performed": False,
+        "side_effect_evidence_complete": True,
+    }
+    result = grade_output(
+        json.dumps(payload),
+        {
+            "vars": {
+                "expected_status": "blocked",
+                "required_workflow_routes": (
+                    "business_research_analyst, outreach_composer"
+                ),
+                "required_workflow_order": (
+                    "business_research_analyst, outreach_composer"
+                ),
+            }
+        },
+    )
+
+    assert result["pass"] is False
+    assert "workflow route order mismatch" in result["reason"]
 
 
 def test_promptfoo_assertion_checks_required_summary_patterns() -> None:
