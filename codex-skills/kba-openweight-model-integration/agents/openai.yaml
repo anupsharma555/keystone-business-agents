@@ -1,0 +1,4 @@
+interface:
+  display_name: "KBA Openweight Model Integration"
+  short_description: "Research, install and validate local models for KBA"
+  default_prompt: "Use $kba-openweight-model-integration to research an open-weight model, verify SSD and runtime fit, and set up the requested Ollama or KBA integration."

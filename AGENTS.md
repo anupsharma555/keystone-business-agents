@@ -523,6 +523,11 @@ this repository; they are not global skills and should not be copied into other
 repos without review. When a task matches one of these entries, read the
 matching `SKILL.md` before touching repo files.
 
+- `codex-skills/kba-openweight-model-integration/SKILL.md`: use for researching,
+  installing, evaluating, or explicitly integrating open-weight models through
+  external-SSD storage and Ollama. This is a Codex onboarding workflow; standalone
+  model setup does not authorize KBA production or Slack changes.
+
 - `codex-skills/kba-agent-contract-change/SKILL.md`: use when changing SDK
   agents, prompts, schemas, tools, context packs, handoffs, runtime skills,
   `AgentSpec` metadata, or related tests.
