@@ -88,6 +88,13 @@ The final local suite passed **8,370 tests**, with **75 skipped**; Ruff, depende
 consistency, staged-file checks and secret scanning also passed. The focused
 reconciliation gate passed 167 tests with five skipped. These counts overlap.
 
+The first remote minimal-install CI run exposed six native-graph cases without
+optional-dependency guards. Those tests now skip only when graph/checkpoint
+modules are absent; direct cases remain active. With graph installed, all ten
+focused cases passed. A simulated missing-dependency process passed four direct
+cases and skipped six graph cases. The actual CI matrix is rerun on the final
+revision; simulation is not remote CI proof.
+
 Passing offline checks is distinct from live acceptance. The workspace rollout
 record retains failed and successful attempts plus pending other-channel,
 other-agent and failure-recovery checks. No additional live run is claimed here.

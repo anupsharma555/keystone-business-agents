@@ -690,6 +690,11 @@ def test_native_durable_chief_graph_preserves_capture_authority_without_child_en
     host, tmp_path, monkeypatch, capture_request,
 ):
     """Real graph and Chief SDK; only upstream route advice and model transport are fixtures."""
+    pytest.importorskip("langgraph.graph", reason="This proof requires the native graph.")
+    pytest.importorskip(
+        "langgraph.checkpoint.sqlite",
+        reason="Native SQLite checkpoints require the orchestration extra.",
+    )
     from keystone_agents import response_synthesis
     from keystone_agents.orchestration.checkpoints import inspect_graph_execution
     from keystone_agents.run import run_typed_sdk_agent

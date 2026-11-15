@@ -211,6 +211,13 @@ def test_channel_source_reaches_real_backend_extraction_and_sdk_synthesis(
     channel authorization and model-owned source selection are not proven here.
     """
 
+    if use_graph:
+        pytest.importorskip("langgraph.graph", reason="This proof requires the native graph.")
+        pytest.importorskip(
+            "langgraph.checkpoint.sqlite",
+            reason="Native SQLite checkpoints require the orchestration extra.",
+        )
+
     url = "https://example.org/articles/local-model-review"
     context_path = tmp_path / "channel-context.json"
     root_request = "Use the article shared yesterday as the source for this thread."
