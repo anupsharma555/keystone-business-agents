@@ -283,7 +283,10 @@ def supplied_opportunity_fake_sdk(monkeypatch):
     from keystone_agents.sdk import build_local_run_config
 
     actual = workflow_runner.run_opportunity_scout_sdk
-    control = SimpleNamespace(calls=[], subject="", count=None)
+    control = SimpleNamespace(
+        calls=[], subject="", count=None, summary_override=None, no_action=False,
+        record_url_suffix="",
+    )
 
     class ScriptedModel(Model):
         def __init__(self, typed_input):
@@ -316,15 +319,22 @@ def supplied_opportunity_fake_sdk(monkeypatch):
                 "missing_evidence": ["This proposed direction and its outcome remain unverified."],
                 "sources": [{
                     "source_id": source["source_id"], "provider_candidate_id": identity,
-                    "title": source["title"], "url": source["url"], "source_type": "unknown",
+                    "title": source["title"],
+                    "url": source["url"] + control.record_url_suffix,
+                    "source_type": "unknown",
                     "supported_signal": source["evidence_excerpt"],
                 }],
                 "source_signals": [source["evidence_excerpt"]],
                 "handoff_to_business_research_analyst": False,
             } for index in range(count)]
+            if control.no_action:
+                records = []
             output = OpportunityScoutResult.model_validate({
                 "topic": subject, "search_provider": "source-provided", "dry_run": True,
-                "human_summary": (
+                "human_summary": control.summary_override or (
+                    f"No source-backed opportunity was selected from the supplied evidence. "
+                    f"Source: {source['url']}"
+                    if control.no_action else
                     f"Model assessed {subject} and proposed {count} review-only directions "
                     f"from supplied evidence. Source: {source['url']}"
                 ),
@@ -332,13 +342,20 @@ def supplied_opportunity_fake_sdk(monkeypatch):
                 "decision": {
                     "decision_owner": "specialist_agent",
                     "decision_stage": "opportunity_candidate_selection",
-                    "selected_candidate_ids": [identity], "needs_more_context": False,
-                    "reasoning": "A scripted model selected a supplied evidence reference.",
+                    "selected_candidate_ids": [] if control.no_action else [identity],
+                    "needs_more_context": False,
+                    "reasoning": (
+                        "A scripted model found no supported opportunity in the supplied source."
+                        if control.no_action
+                        else "A scripted model selected a supplied evidence reference."
+                    ),
                     "limitations": ["This proves SDK wiring, not live reasoning quality."],
                     "candidate_assessments": [{
                         "candidate_id": value["provider_candidate_id"],
                         "disposition": (
-                            "selected" if value["provider_candidate_id"] == identity else "excluded"
+                            "selected"
+                            if not control.no_action and value["provider_candidate_id"] == identity
+                            else "excluded"
                         ),
                         "rationale": "Scripted selection for this orchestration control.",
                     } for value in sources],

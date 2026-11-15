@@ -24,6 +24,26 @@ from keystone_agents.schemas.work_item import (
 from keystone_agents.work_items import build_research_context_pack
 
 
+def project_explicit_research_evidence(
+    work_item: WorkItem, sources: tuple[WorkItemSourceRef, ...],
+) -> WorkItem:
+    """Build a stage-local view whose substantive evidence is only these sources."""
+    metadata = dict(work_item.target.metadata)
+    project = metadata.get("project_context")
+    if isinstance(project, dict):
+        # Preserve project identity, goals and governance, without importing
+        # historical evidence outside the explicitly supplied source catalog.
+        metadata["project_context"] = {**project, "source_refs": []}
+    return work_item.model_copy(update={
+        "target": work_item.target.model_copy(update={"metadata": metadata}),
+        "sources": list(sources),
+        "artifact_refs": [],
+        # Even facts linked to the same source may be stale or unaccepted.
+        # The selected source records carry this stage's evidence directly.
+        "facts": [],
+    })
+
+
 def supplied_research_sources(
     work_item: WorkItem, *, inline_context: str = "",
 ) -> tuple[WorkItemSourceRef, ...]:
@@ -141,7 +161,11 @@ def supplied_research_input(
             "orchestrator_context": context,
             "source_catalog": [source.model_dump(mode="json") for source in citations],
             "retrieval_enabled": False,
-            "retained_source_read_enabled": any(source.evidence_pages for source in sources),
+            "retained_source_read_enabled": any(
+                source.evidence_pages
+                or source.web_source_access is not None and source.web_source_access.available
+                for source in sources
+            ),
         }), ensure_ascii=True, sort_keys=True),
         local_context_source_ids=tuple(source.source_id for source in citations),
     ), citations

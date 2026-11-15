@@ -6,29 +6,21 @@ import json
 import re
 from collections.abc import Iterable
 from dataclasses import replace
+from hashlib import sha256
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 
 from keystone_agents.runtime.decision_validation import (
     AgentDecisionContract,
     SpecialistDecisionEvidence,
     model_tool_output_payloads,
 )
+from keystone_agents.schemas.orchestrator import RouteName
 from keystone_agents.tools.search_provider import search_result_candidate_id
 
-_ORCHESTRATOR_ROUTE_CANDIDATES = (
-    "gmail_triage",
-    "business_research_analyst",
-    "opportunity_scout",
-    "outreach_composer",
-    "chief_of_staff",
-    "airtable_context_agent",
-    "google_workspace_context_agent",
-    "zotero_context_agent",
-    "rss_context_agent",
-    "preprints_context_agent",
-    "clarification",
-)
+# Route identities share the structured output's source of truth. Runtime scope
+# may narrow this universe; it must not silently discard a supported owner.
+_ORCHESTRATOR_ROUTE_CANDIDATES = get_args(RouteName)
 _CHIEF_WORKFLOW_CANDIDATES = (
     "calendar-read",
     "gmail-summary",
@@ -112,18 +104,68 @@ def supplied_research_brief_decision_contract(sources: Iterable[Any]) -> AgentDe
         returned = list(getattr(output, "sources", []) or [])
         returned_ids = [str(source.source_id) for source in returned]
         cited = _research_required_source_ids(output)
-        if (
-            len(returned_ids) != len(set(returned_ids))
-            or any(expected.get(source.source_id) != source.url for source in returned)
-            or any(identity not in expected or identity not in returned_ids for identity in cited)
-            or any(str(note).startswith("Some model-cited source ids were not returned")
-                   for note in getattr(output, "unknowns", []) or [])
-        ):
+        issues: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for index, source in enumerate(returned):
+            source_id = str(source.source_id)
+            if source_id in seen:
+                issues.append({"field": f"sources[{index}].source_id", "category": "duplicate_id"})
+            seen.add(source_id)
+            if source_id not in expected:
+                issues.append({
+                    "field": f"sources[{index}].source_id", "category": "unexpected_source_id",
+                })
+            elif expected[source_id] != source.url:
+                issues.append({"field": f"sources[{index}].url", "category": "url_mismatch"})
+        cited_fields = [
+            (f"source_ids_used[{index}]", source_id)
+            for index, source_id in enumerate(getattr(output, "source_ids_used", []) or [])
+        ]
+        cited_fields.extend(
+            (f"claims[{index}].source_id", getattr(claim, "source_id", ""))
+            for index, claim in enumerate(getattr(output, "claims", []) or [])
+        )
+        cited_fields.extend(
+            (f"facts[{index}].source_ids[{source_index}]", source_id)
+            for index, fact in enumerate(getattr(output, "facts", []) or [])
+            for source_index, source_id in enumerate(getattr(fact, "source_ids", []) or [])
+        )
+        cited_fields.extend(
+            (f"article_summaries[{index}].source_ids[{source_index}]", source_id)
+            for index, article in enumerate(getattr(output, "article_summaries", []) or [])
+            for source_index, source_id in enumerate(getattr(article, "source_ids", []) or [])
+        )
+        issues.extend(
+            {"field": field, "category": "cited_but_not_returned"}
+            for field, source_id in cited_fields
+            if str(source_id).strip()
+            and (source_id not in expected or source_id not in returned_ids)
+        )
+        issues.extend(
+            {"field": f"unknowns[{index}]", "category": "unresolved_citations"}
+            for index, note in enumerate(getattr(output, "unknowns", []) or [])
+            if str(note).startswith("Some model-cited source ids were not returned")
+        )
+        if issues:
+            expected_pairs = sorted(expected.items())
+            returned_pairs = sorted((str(source.source_id), str(source.url)) for source in returned)
+            diagnostics = {
+                "issues": issues[:8],
+                "expected_count": len(expected_pairs),
+                "returned_count": len(returned_pairs),
+                "cited_count": len(cited),
+                "expected_fingerprint": sha256(
+                    json.dumps(expected_pairs).encode()
+                ).hexdigest()[:12],
+                "returned_fingerprint": sha256(
+                    json.dumps(returned_pairs).encode()
+                ).hexdigest()[:12],
+            }
             return (
                 "supplied_research_citation_mismatch",
-                "Use only supplied source IDs and copy their exact URLs. Every fact/article "
-                "citation must identify a returned source from that catalog; do not invent "
-                "or silently discard unresolved citations.",
+                "Use only supplied source IDs and copy their exact URLs. Every cited source "
+                "must be returned. citation_diagnostics="
+                + json.dumps(diagnostics, separators=(",", ":")),
             )
         if not str(getattr(output, "summary", "") or "").strip():
             return "supplied_research_summary_missing", "Return your source-grounded summary."
@@ -136,7 +178,12 @@ def supplied_research_brief_decision_contract(sources: Iterable[Any]) -> AgentDe
             )
         return None
 
-    return replace(contract, output_consistency_validator=consistency)
+    return replace(
+        contract,
+        output_consistency_validator=consistency,
+        repair_candidates_from_model_input=True,
+        model_input_replay_read_tools=("read_web_source_window",),
+    )
 
 
 def business_research_comparison_decision_contract() -> AgentDecisionContract:
@@ -339,10 +386,11 @@ def orchestrator_decision_contract(
             if bounded_candidates_supplied
             else ""
         ),
-        pre_model_source_visibility_required=False,
+        pre_model_source_visibility_required=bounded_candidates_supplied,
         output_consistency_validator=_orchestrator_output_consistency_issue,
         allow_plausible_alternatives_after_selection=True,
         max_decision_repairs=1,
+        repair_candidates_from_model_input=bounded_candidates_supplied,
     )
 
 

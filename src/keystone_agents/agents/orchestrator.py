@@ -6,7 +6,10 @@ import json
 import os
 import re
 from collections.abc import Callable, Mapping
+from dataclasses import replace
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field
 
@@ -14,6 +17,7 @@ from keystone_agents.agent_decision_contracts import orchestrator_decision_contr
 from keystone_agents.agent_registry import (
     SPECIALIST_AGENT_SPECS,
     agent_selection_catalog,
+    get_agent_spec,
     specialist_handoff_specs,
 )
 from keystone_agents.authority.semantic import (
@@ -39,7 +43,11 @@ from keystone_agents.guardrails import (
     keystone_guardrails,
     keystone_tool_guardrail_kwargs,
 )
-from keystone_agents.instruction_following import output_constraints_from_plan
+from keystone_agents.instruction_following import (
+    canonical_source_url,
+    canonical_source_urls,
+    output_constraints_from_plan,
+)
 from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.orchestrator.routing import (
     OPPORTUNITY_RE as _OPPORTUNITY_RE,
@@ -75,6 +83,8 @@ from keystone_agents.outreach_composer.inline_context import (
 from keystone_agents.planning.compatibility import (
     infer_manual_request_plan,
     positive_capability_text,
+    request_forbids_external_source_read,
+    request_forbids_live_research,
 )
 from keystone_agents.planning.composition_admission import (
     CONTEXT_ONLY_RESPONSE_ROUTES,
@@ -100,6 +110,7 @@ from keystone_agents.schemas.decision_trace import DecisionTrace
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.orchestrator import (
     HandoffSpec,
+    OrchestratorGeneralAnswer,
     OrchestratorOutputReview,
     OrchestratorOutputReviewScore,
     OrchestratorPlanningResult,
@@ -112,6 +123,7 @@ from keystone_agents.schemas.orchestrator import (
     RouteName,
 )
 from keystone_agents.schemas.retrieval import RetrievalHint
+from keystone_agents.schemas.work_item import WorkItemRoute
 from keystone_agents.sdk import (
     Agent,
     build_model_settings,
@@ -147,10 +159,19 @@ from keystone_agents.tools.local_context_tool import (
     search_local_context,
 )
 from keystone_agents.tools.memory_tool import retrieve_memory
+from keystone_agents.tools.operator_context_tools import OperatorContextCapability
 from keystone_agents.tools.playwright_tool import render_page
 from keystone_agents.tools.serper_tool import search_web
+from keystone_agents.tools.slack_channel_context_tools import (
+    SlackChannelContextCapability,
+    channel_context_capability_from_state,
+)
 from keystone_agents.tools.storage_tool import load_pending_approval_items
 from keystone_agents.tools.web_structuring_tool import structure_web_data_for_schema
+from keystone_agents.tools.website_extraction_tool import (
+    WebsiteExtractionError,
+    validate_public_http_url,
+)
 from keystone_agents.tools.work_item_receipt_tool import (
     inspect_work_item_execution_receipts,
     inspect_work_item_execution_receipts_impl,
@@ -167,6 +188,10 @@ OPPORTUNITY_SCOUT_TOOL_NAME = ORCHESTRATOR_OPPORTUNITY_SCOUT_TOOL_NAME
 
 _HANDOFF_BY_ROUTE = {handoff.route: handoff for handoff in INTENDED_HANDOFFS}
 _LLM_WORKFLOW_ROUTES = frozenset({*_HANDOFF_BY_ROUTE, "chief_of_staff", "clarification"})
+_DURABLE_WORK_ITEM_ROUTES = frozenset(
+    route.value for route in WorkItemRoute
+    if route not in {WorkItemRoute.ORCHESTRATOR, WorkItemRoute.CLARIFICATION}
+)
 
 
 def _orchestrator_sdk_input(
@@ -412,6 +437,7 @@ class OrchestratorPreflight(BaseModel):
     """Orchestrator-owned front-door interpretation for manual agent execution."""
 
     request_text: str = ""
+    request_time: str = ""
     requested_agent: str | None = None
     advisory_only: bool = False
     selected_agent: str = ""
@@ -425,6 +451,7 @@ class OrchestratorPreflight(BaseModel):
         default_factory=ProviderFreeCompositionAdmission
     )
     sdk_usage_events: list[dict[str, Any]] = Field(default_factory=list)
+    workflow_state: dict[str, Any] = Field(default_factory=dict)
 
 
 def run_orchestrator_preflight(
@@ -450,6 +477,21 @@ def run_orchestrator_preflight(
     from keystone_agents.agents.manual_request_planner import resolve_manual_request_plan
 
     text = _payload_text(request_text)
+    # This copy receives only evidence from tools completed in this preflight.
+    # Never mutate caller-owned context or replay a prior capability receipt.
+    workflow_state = dict(workflow_state or {})
+    workflow_state.pop("channel_context_evidence", None)
+    workflow_state.pop("operator_context_evidence", None)
+    workflow_state.pop("operator_context_usage", None)
+    from keystone_agents.runtime.continuity_policy import resolve_slack_compact_continuity_policy
+
+    if resolve_slack_compact_continuity_policy(workflow_state).eligible:
+        for key in (
+            "prior_agent_runs", "recent_slack_thread", "slack_thread_transcript",
+            "historical_work_item_facts",
+        ):
+            workflow_state.pop(key, None)
+    request_time = datetime.now(ZoneInfo("America/New_York")).isoformat()
     sdk_usage_events: list[dict[str, Any]] = []
 
     def record_planner_cost(sdk_result: Any) -> None:
@@ -507,7 +549,7 @@ def run_orchestrator_preflight(
             agent_route = _route_ambiguous_with_llm(
                 text,
                 approved_context_present=route_result.approved_context_present,
-                workflow_state=dict(workflow_state or {}),
+                workflow_state=workflow_state,
                 routing_advice={
                     "manual_request_plan": manual_plan.model_dump(mode="json"),
                     "deterministic_route": route_result.route,
@@ -518,6 +560,7 @@ def run_orchestrator_preflight(
                 model=model,
                 sdk_callback=record_orchestrator_cost,
                 runtime_scope=effective_runtime_scope,
+                database_url=database_url,
             )
         except AgentDecisionValidationError as exc:
             advisory_fallback = _explicit_single_owner_advisory_fallback_allowed(
@@ -578,6 +621,28 @@ def run_orchestrator_preflight(
                     context_plan = _context_only_manual_plan(manual_plan, agent_route, text)
                     if context_plan is not None:
                         manual_plan = context_plan
+                else:
+                    answer_plan = _general_answer_manual_plan(
+                        manual_plan, agent_route, text, workflow_state=workflow_state,
+                    )
+                    if answer_plan is not None:
+                        manual_plan = answer_plan
+                    else:
+                        research_plan = _public_research_manual_plan(
+                            manual_plan, agent_route, text, workflow_state=workflow_state,
+                        )
+                        if research_plan is not None:
+                            manual_plan = research_plan
+                if (
+                    agent_route.durable_task_requested
+                    and manual_plan.target_agent in _DURABLE_WORK_ITEM_ROUTES
+                    and manual_plan.side_effect_policy == "draft_or_read_only"
+                    and manual_plan.intent not in {"blocked_send", "business_system_write"}
+                    and not agent_route.context_only_response
+                ):
+                    manual_plan = manual_plan.model_copy(update={
+                        "requires_durable_state": True,
+                    })
                 composition_admission = resolve_provider_free_composition_admission(
                     manual_plan,
                     workflow_state=workflow_state,
@@ -586,6 +651,22 @@ def run_orchestrator_preflight(
     advisory_only = explicit_agent not in {None, "orchestrator"}
     selected_agent = str(route_result.route or manual_plan.target_agent)
     block_kind, block_reason = _preflight_block(route_result)
+    if (
+        route_result.selected_source_url
+        and route_result.route in {"business_research_analyst", "orchestrator"}
+        and not (
+            manual_plan.source == "canonical:orchestrator_selected_source"
+            or (
+                manual_plan.source == "canonical:orchestrator_general_answer"
+                and manual_plan.expected_artifact_type == "source_summary"
+            )
+        )
+    ):
+        block_kind = "selected_source_identity_unverified"
+        block_reason = (
+            "The selected public source was not validated against the supplied "
+            "request context. Preserve the source identity before reading it."
+        )
     if route_result.context_only_response and not composition_admission.composition_allowed:
         block_kind = "context_only_response_unavailable"
         block_reason = (
@@ -595,6 +676,7 @@ def run_orchestrator_preflight(
     execution_allowed = not bool(block_kind)
     return OrchestratorPreflight(
         request_text=text,
+        request_time=request_time,
         requested_agent=explicit_agent,
         advisory_only=advisory_only,
         selected_agent=selected_agent,
@@ -606,9 +688,252 @@ def run_orchestrator_preflight(
         route_result=route_result,
         composition_admission=composition_admission,
         sdk_usage_events=sdk_usage_events,
+        workflow_state={key: workflow_state[key] for key in (
+            "channel_context_capability", "channel_context_evidence", "channel_context_usage",
+            "operator_context_evidence", "operator_context_usage",
+            "current_work_item",
+            "linked_thread_context", "latest_thread_attempt",
+        ) if key in workflow_state},
     )
 
 
+def _admitted_selected_source_url(
+    route: OrchestratorResult, request_text: str,
+    workflow_state: Mapping[str, Any] | None,
+) -> str:
+    """Validate the model-selected identity against its actual visible input."""
+    selected_url = str(route.selected_source_url or "").strip()
+    if not selected_url:
+        return ""
+    try:
+        selected_url = validate_public_http_url(selected_url, resolve_hostname=False)
+    except (ValueError, WebsiteExtractionError):
+        return ""
+    # Decode fields first: JSON's escaped newline must not become part of a URL.
+    supplied_state = dict(workflow_state or {})
+    supplied_state.pop("channel_context_evidence", None)
+    visible_input = json.loads(_llm_route_prompt(request_text, supplied_state))
+    pending = [visible_input["request"], visible_input["workflow_state"]]
+    # These receipts were returned to this exact SDK loop before its decision.
+    # A query preview alone cannot authorize selecting a channel source.
+    for receipt in (workflow_state or {}).get("channel_context_evidence", []):
+        if isinstance(receipt, Mapping) and receipt.get("ok") and receipt.get("operation") == "read":
+            pending.extend(
+                message.get("source_links", [])
+                for message in receipt.get("messages", []) if isinstance(message, Mapping)
+            )
+    visible_urls: set[str] = set()
+    while pending:
+        value = pending.pop()
+        if isinstance(value, str):
+            visible_urls.update(canonical_source_urls(value))
+        elif isinstance(value, Mapping):
+            pending.extend(value.values())
+        elif isinstance(value, list | tuple):
+            pending.extend(value)
+    return selected_url if canonical_source_url(selected_url) in visible_urls else ""
+
+
+def _selected_source_matches_bound_task(
+    route: OrchestratorResult, workflow_state: Mapping[str, Any] | None,
+) -> bool:
+    """Leave an authenticated existing task's exact target to its binder."""
+
+    if route.linked_work_item_relation in {"branch_existing", "new_request", "clarify"}:
+        return False
+    state = workflow_state or {}
+    task = state.get("current_work_item")
+    continuation = state.get("execution_continuation")
+    if (
+        not isinstance(task, Mapping) or not isinstance(continuation, Mapping)
+        or not task.get("id") or continuation.get("work_item_id") != task["id"]
+        or task.get("route") != route.route
+    ):
+        return False
+    selected = canonical_source_url(str(route.selected_source_url or ""))
+    if not selected:
+        return False
+    target = task.get("target")
+    if (
+        isinstance(target, Mapping)
+        and canonical_source_url(str(target.get("url") or "")) == selected
+    ):
+        return True
+    sources = task.get("sources")
+    if not isinstance(sources, list):
+        return False
+    return any(
+        isinstance(source, Mapping)
+        and canonical_source_url(str(source.get("url") or "")) == selected
+        and isinstance(source.get("web_source_access"), Mapping)
+        for source in sources
+    )
+
+
+def _public_research_manual_plan(
+    previous: ManualRequestPlan, route: OrchestratorResult, request_text: str,
+    *, workflow_state: Mapping[str, Any] | None = None,
+) -> ManualRequestPlan | None:
+    """Project model-selected public acquisition without promoting heuristic grants."""
+    if (
+        (not route.requires_live_search and not route.selected_source_url)
+        or route.context_only_response
+        or route.refused or route.routing_mode != "llm"
+        or route.route != "business_research_analyst"
+        or set(route.workflow).difference({"business_research_analyst"})
+        or previous.provider_system != "unspecified"
+        or previous.side_effect_policy != "draft_or_read_only"
+        or previous.ask_shape.permission_state not in {"unspecified", "read_only"}
+        or (
+            request_forbids_external_source_read(request_text)
+            if route.selected_source_url else request_forbids_live_research(request_text)
+        )
+    ):
+        return None
+    selected_url = str(route.selected_source_url or "").strip()
+    if selected_url:
+        selected_url = _admitted_selected_source_url(route, request_text, workflow_state)
+        if not selected_url:
+            return None
+        if _selected_source_matches_bound_task(route, workflow_state):
+            task = (workflow_state or {}).get("current_work_item")
+            sources = task.get("sources") if isinstance(task, Mapping) else None
+            if isinstance(sources, list) and any(
+                isinstance(source, Mapping)
+                and canonical_source_url(str(source.get("url") or ""))
+                == canonical_source_url(selected_url)
+                and isinstance(source.get("web_source_access"), Mapping)
+                for source in sources
+            ):
+                # An exact cached snapshot stays on the host continuation path.
+                return None
+            # An existing task may need one current read. Keep its typed
+            # artifact and durability instead of recasting it as a new brief.
+            return previous.model_copy(update={
+                "source": "canonical:orchestrator_selected_source",
+                "target_agent": route.route,
+                "primary_target": selected_url,
+                "target_type": "url",
+                "provider_operations": ["read"],
+                "provider_read_scope": "single_item",
+                "requires_live_search": False,
+                "rationale": route.rationale,
+                "workflow": [route.route],
+                "ask_shape": previous.ask_shape.model_copy(update={
+                    "permission_state": "read_only",
+                    "strict_filter_mode": "exact",
+                    "prior_context_dependency": "selected_context",
+                }),
+            })
+        durable = previous.requires_durable_state or route.durable_task_requested
+        return previous.model_copy(update={
+            "source": "canonical:orchestrator_selected_source",
+            "target_agent": route.route,
+            "intent": "research_brief" if durable else "company_research",
+            "objective": request_text,
+            "primary_target": selected_url,
+            "target_type": "url",
+            "task_objective": "source_research",
+            "expected_artifact_type": "research_brief" if durable else "source_summary",
+            "provider_operations": ["read"],
+            "provider_read_scope": "single_item",
+            "requires_live_search": False,
+            "requires_durable_state": durable,
+            "rationale": route.rationale,
+            "workflow": [route.route],
+            "ask_shape": previous.ask_shape.model_copy(update={
+                "permission_state": "read_only",
+                "strict_filter_mode": "exact",
+                "prior_context_dependency": "selected_context",
+            }),
+        })
+    # A verified exact source can be retained by a resumable WorkItem without
+    # changing its state requirement. General discovery still needs its own plan.
+    if previous.requires_durable_state:
+        return None
+    return ManualRequestPlan(
+        source="canonical:orchestrator_public_research",
+        requested_agent=previous.requested_agent,
+        target_agent=route.route,
+        intent="research_brief",
+        task_objective="source_research",
+        expected_artifact_type="research_brief",
+        objective=request_text,
+        primary_target=request_text,
+        target_type="topic",
+        requires_live_search=True,
+        requires_durable_state=route.durable_task_requested,
+        rationale=route.rationale,
+        side_effect_policy="draft_or_read_only",
+        constraints=previous.constraints,
+        desired_count=previous.desired_count,
+        desired_count_explicit=previous.desired_count_explicit,
+        ask_shape=previous.ask_shape.model_copy(update={"permission_state": "read_only"}),
+        workflow=[route.route],
+    )
+
+
+def _general_answer_manual_plan(
+    previous: ManualRequestPlan, route: OrchestratorResult, request_text: str,
+    *, workflow_state: Mapping[str, Any] | None = None,
+) -> ManualRequestPlan | None:
+    """Project a model-selected informational answer under structural gates."""
+
+    selected_url = _admitted_selected_source_url(route, request_text, workflow_state)
+    if route.selected_source_url and not selected_url:
+        return None
+    if selected_url and request_forbids_external_source_read(request_text):
+        return None
+    if (
+        route.route != "orchestrator" or route.refused
+        or route.routing_mode != "llm" or route.context_only_response
+        or route.durable_task_requested
+        or route.workflow
+        or previous.requires_durable_state or previous.requires_approved_context
+        or previous.provider_action_steps
+        or (
+            previous.ask_shape.prior_context_dependency not in {"none", "unspecified"}
+            and not (
+                selected_url and previous.ask_shape.prior_context_dependency == "selected_context"
+            )
+        )
+        or previous.side_effect_policy != "draft_or_read_only"
+        or (
+            previous.source != "heuristic"
+            and (
+                previous.intent != "route_request"
+                or previous.expected_artifact_type != "none"
+                or previous.provider_operations
+                or previous.provider_system != "unspecified"
+                or previous.provider_context_requirements
+                or previous.provider_read_scope != "unspecified"
+                or previous.provider_result_scope is not None
+            )
+        )
+    ):
+        return None
+    return previous.model_copy(update={
+        "source": "canonical:orchestrator_general_answer",
+        "target_agent": "orchestrator",
+        "workflow": [],
+        "intent": "route_request",
+        "task_objective": "route_or_continue",
+        "expected_artifact_type": "source_summary" if selected_url else "none",
+        "objective": request_text,
+        "primary_target": selected_url or previous.primary_target,
+        "target_type": "url" if selected_url else previous.target_type,
+        "provider_operations": ["read"] if selected_url else (
+            ["search"] if route.requires_live_search else []
+        ),
+        "provider_read_scope": "single_item" if selected_url else "unspecified",
+        "requires_live_search": route.requires_live_search and not selected_url,
+        "requires_durable_state": False,
+        "ask_shape": previous.ask_shape.model_copy(update={
+            "prior_context_dependency": "none",
+            "permission_state": "read_only",
+            **({"strict_filter_mode": "exact"} if selected_url else {}),
+        }),
+    })
 def _context_only_manual_plan(
     previous: ManualRequestPlan, route: OrchestratorResult, request_text: str,
 ) -> ManualRequestPlan | None:
@@ -944,6 +1269,12 @@ def _normalize_workflow_state(value: Mapping[str, Any] | None) -> dict[str, Any]
         "prior_agent_runs": list(context.get("prior_agent_runs") or []),
         "channel_automations": list(context.get("channel_automations") or []),
         "slack_context": dict(context.get("slack_context") or {}),
+        "slack_thread_root": str(redact_secrets(
+            str(context.get("slack_thread_root") or "")
+        ))[:2400],
+        "slack_thread_transcript": str(redact_secrets(
+            str(context.get("slack_thread_transcript") or "")
+        ))[:6000],
         "send_enabled": False,
     }
     normalized["approved_context_available"] = bool(
@@ -984,6 +1315,9 @@ def _merge_workflow_state_context(
         ]
     if normalized_overlay.get("slack_context"):
         merged["slack_context"] = normalized_overlay["slack_context"]
+    for key in ("slack_thread_root", "slack_thread_transcript"):
+        if normalized_overlay.get(key):
+            merged[key] = normalized_overlay[key]
     merged["approved_context_available"] = bool(
         normalized_base.get("approved_context_available")
         or normalized_overlay.get("approved_context_available")
@@ -1807,6 +2141,7 @@ def _llm_route_prompt(
             dict.fromkeys(
                 [
                     *(handoff.route for handoff in INTENDED_HANDOFFS),
+                    "orchestrator",
                     "chief_of_staff",
                     "clarification",
                 ]
@@ -1823,18 +2158,30 @@ def _llm_route_prompt(
         "not by itself a reason to request more approval.",
         "Explicitly requested review-thread-only drafting does not grant sending, "
         "provider-draft creation, or other external-use permission.",
-        "Use clarification for unresolved identity, unavailable evidence, or missing "
-        "permission for the actual requested action.",
+        "Apply the shared runtime policy for ambiguity: investigate low-risk informational "
+        "asks before optional clarification; preserve exact authorization for writes.",
         "For business_research_analyst or opportunity_scout, you may optionally include "
         "retrieval_hint with precision, structured-enrichment, and search-review "
         "recommendations.",
         "Do not choose search providers; shared Python retrieval applies SearXNG plus "
         "capped Agents hosted web search unless the operator explicitly selected one.",
+        "For reading one identified public article/page, set selected_source_url to its "
+        "exact URL from the request or supplied context. Choose Orchestrator with an empty "
+        "workflow for a simple read/summarize/cite answer; choose Business Research Analyst "
+        "for deeper research or analysis. A preview or search snippet is not an article read.",
         "Return only an OrchestratorResult-compatible structured decision.",
     ]
     payload = {
         "request": redact_secrets(request),
+        "request_time": workflow_state.get("request_time") or datetime.now(
+            ZoneInfo("America/New_York")
+        ).isoformat(),
+        "request_timezone": "America/New_York",
         "workflow_state": workflow_state,
+        "saved_work_item_present": bool(
+            isinstance(workflow_state.get("current_work_item"), Mapping)
+            and workflow_state["current_work_item"].get("id")
+        ),
         "routing_advice": dict(routing_advice or {}),
         "allowed_routes": list(route_candidates),
         "specialist_catalog": agent_selection_catalog(route_candidates),
@@ -1901,55 +2248,26 @@ def _bounded_orchestrator_route_candidates(
     routing_advice: Mapping[str, Any] | None,
     runtime_scope: EffectiveRuntimeRouteScope | None = None,
 ) -> tuple[str, ...] | None:
-    """Bound a clear single-owner route without replacing model selection.
+    """Bound candidates by runtime capability, not named-agent route advice."""
 
-    The Orchestrator still returns the decision.  This candidate universe lets
-    the shared validator reject an incompatible owner and give the model one
-    repair turn instead of allowing route advice to silently redirect a named,
-    capability-compatible specialist request.
-    """
-
-    plan = _manual_plan_from_routing_advice(routing_advice)
-    manual_candidates: tuple[str, ...] | None = None
-    if plan is not None:
-        requested = str(plan.requested_agent or "").strip()
-        target = str(plan.target_agent or "").strip()
-        workflow = [
-            str(item or "").strip()
-            for item in plan.workflow
-            if str(item or "").strip()
-        ]
-        # Chief is intentionally excluded: a Chief request may legitimately expand
-        # into a multi-specialist workflow even when compatibility advice initially
-        # describes one manager-owned task.
-        recognized = {spec.route_name for spec in SPECIALIST_AGENT_SPECS}
-        if (
-            requested in recognized
-            and target in recognized
-            and len(workflow) <= 1
-            and (not workflow or workflow == [target])
-        ):
-            manual_candidates = tuple(
-                dict.fromkeys((target, "chief_of_staff", "clarification"))
-            )
     if runtime_scope is None:
-        return manual_candidates
+        return None
     if _unavailable_requested_owner(routing_advice, runtime_scope):
         return ("clarification",)
     route_universe = tuple(
         dict.fromkeys(
             [
                 *(handoff.route for handoff in INTENDED_HANDOFFS),
+                "orchestrator",
                 "chief_of_staff",
                 "clarification",
             ]
         )
     )
-    base_candidates = manual_candidates or route_universe
     permitted = set(runtime_scope.permitted_routes)
     bounded = tuple(
         route
-        for route in base_candidates
+        for route in route_universe
         if route == "clarification" or route in permitted
     )
     return bounded or ("clarification",)
@@ -3148,6 +3466,17 @@ def _post_process_llm_route(
         )
 
     candidate.routing_mode = "llm"
+    saved_task = workflow_state.get("current_work_item")
+    if (
+        candidate.linked_work_item_relation in {"continue_existing", "branch_existing"}
+        and not (isinstance(saved_task, Mapping) and saved_task.get("id"))
+    ):
+        raise ValueError("Orchestrator referenced a WorkItem that was not supplied.")
+    if candidate.durable_task_requested and (
+        candidate.route not in _DURABLE_WORK_ITEM_ROUTES
+        or candidate.context_only_response
+    ):
+        raise ValueError("Orchestrator durable task needs an executable WorkItem owner.")
     # Preserve the model-owned ordered workflow after the decision validator has
     # accepted it.  Filling an omitted single-route workflow is a structural
     # projection of the already-selected route, not a replacement decision.
@@ -3315,6 +3644,7 @@ def _route_ambiguous_with_llm(
     model: str | None = None,
     sdk_callback: Callable[[Any], None] | None = None,
     runtime_scope: EffectiveRuntimeRouteScope | Mapping[str, Any] | None = None,
+    database_url: str | None = None,
 ) -> OrchestratorResult | None:
     effective_runtime_scope = _coerce_runtime_route_scope(runtime_scope)
     bounded_route_candidates = _bounded_orchestrator_route_candidates(
@@ -3329,6 +3659,7 @@ def _route_ambiguous_with_llm(
         runtime_scope=effective_runtime_scope,
     )
     request_text = _payload_text(request)
+    advised_plan = _manual_plan_from_routing_advice(routing_advice)
     if llm_router is not None:
         candidate = _coerce_route_candidate(llm_router(prompt, workflow_state))
         return _post_process_llm_route(
@@ -3339,6 +3670,164 @@ def _route_ambiguous_with_llm(
         )
     if run_config is None and not live:
         return None
+    channel_capability = channel_context_capability_from_state(workflow_state)
+    from keystone_agents.runtime.operator_continuity import operator_capability_from_state
+
+    operator_capability = operator_capability_from_state(
+        workflow_state, raw_request=request_text,
+        database_url=database_url or database_url_from_env(), capture_authorized=False,
+    )
+    if operator_capability is not None:
+        route_input = json.loads(prompt)
+        permitted_owners = set(route_input["allowed_routes"])
+        owners_by_tool = {
+            name: [
+                owner for owner in ("orchestrator", "chief_of_staff")
+                if owner in permitted_owners
+                and name in (*get_agent_spec(owner).tools, *get_agent_spec(owner).optional_tools)
+            ]
+            for name in ("query_operator_context", "capture_operator_memory")
+        }
+        route_input["downstream_operator_context_capabilities"] = {
+            "query_operator_context": {
+                "owners": owners_by_tool["query_operator_context"],
+                "scope": "current_host_bound_scope",
+            },
+            "capture_operator_memory": {
+                "owners": owners_by_tool["capture_operator_memory"],
+                "scope": "current_host_bound_scope",
+                "requires_current_affirmative_request": True,
+                "requires_typed_capture_plan": True,
+                "requires_verified_storage_readback": True,
+                "preflight_may_execute": False,
+            },
+        }
+        prompt = json.dumps(route_input, ensure_ascii=True, sort_keys=True)
+
+    def current_route_state() -> dict[str, Any]:
+        state = dict(workflow_state)
+        if channel_capability is not None:
+            state["channel_context_evidence"] = [
+                item for item in channel_capability.evidence
+                if item.get("operation") == "read"
+            ]
+        if operator_capability is not None:
+            state["operator_context_evidence"] = dict(operator_capability.evidence)
+            state["operator_context_usage"] = dict(operator_capability.usage)
+        return state
+
+    # Bind validation and any tool-free repair to precisely the advertised owners.
+    decision_contract = orchestrator_decision_contract(json.loads(prompt)["allowed_routes"])
+    base_consistency = decision_contract.output_consistency_validator
+
+    def general_answer_route_consistency(output: Any) -> tuple[str, str] | None:
+        issue = base_consistency(output) if base_consistency is not None else None
+        if issue is not None:
+            return issue
+        saved_task = workflow_state.get("current_work_item")
+        if (
+            getattr(output, "linked_work_item_relation", "")
+            in {"continue_existing", "branch_existing"}
+            and not (isinstance(saved_task, Mapping) and saved_task.get("id"))
+        ):
+            return (
+                "linked_work_item_not_present",
+                "No saved WorkItem was supplied for this request. A short reply may "
+                "continue an unfinished thread request without an existing task. "
+                "Set linked_work_item_relation=unspecified, preserve the chosen owner "
+                "and exact source when valid, and set durable_task_requested from the "
+                "active operator task rather than claiming an existing WorkItem.",
+            )
+        if getattr(output, "durable_task_requested", False):
+            selected_route = str(getattr(output, "route", "") or "")
+            if selected_route not in _DURABLE_WORK_ITEM_ROUTES:
+                return (
+                    "durable_task_owner_unavailable",
+                    "A saved WorkItem needs a specialist route that supports durable work. "
+                    "Select that owner, or set durable_task_requested=false if the "
+                    "active operator task asks only for an immediate answer.",
+                )
+            if bool(getattr(output, "context_only_response", False)):
+                return (
+                    "durable_task_requires_execution",
+                    "A saved task cannot be completed by a context-only rewrite. "
+                    "Keep the specialist owner and set context_only_response=false.",
+                )
+            if advised_plan is not None and advised_plan.side_effect_policy != "draft_or_read_only":
+                return (
+                    "durable_task_cannot_bypass_write_gate",
+                    "Local task persistence cannot replace a provider write approval gate. "
+                    "Preserve the write plan and approval scope.",
+                )
+        selected = str(getattr(output, "route", "") or "")
+        if bool(getattr(output, "context_only_response", False)):
+            context_plan = _context_only_manual_plan(
+                advised_plan or ManualRequestPlan(), output, request_text,
+            )
+            admission = (
+                resolve_provider_free_composition_admission(
+                    context_plan, workflow_state=current_route_state(),
+                )
+                if context_plan is not None else None
+            )
+            if admission is None or not admission.composition_allowed:
+                reason = admission.reason if admission is not None else "context_only_plan_incompatible"
+                return (
+                    "context_only_response_unavailable",
+                    "The proposed context-only answer does not pass the selected completed-result "
+                    f"admission gate ({reason}). Reconsider whether the current reply calls "
+                    "for specialist execution or clarification; keep provider and approval "
+                    "boundaries unchanged.",
+                )
+        if (
+            advised_plan is not None
+            and advised_plan.requested_agent == "opportunity_scout"
+            and advised_plan.target_agent == "opportunity_scout"
+            and advised_plan.intent == "opportunity_search"
+            and advised_plan.expected_artifact_type == "opportunity_record"
+            and selected == "business_research_analyst"
+            and "opportunity_scout" not in getattr(output, "workflow", ())
+        ):
+            return (
+                "specialist_intent_owner_mismatch",
+                "The typed opportunity-search plan expects an Opportunity Scout record. "
+                "Include Opportunity Scout as the output owner; Business Research may supply evidence.",
+            )
+        if selected == "orchestrator" and (
+            advised_plan is not None and (
+                advised_plan.provider_action_steps
+                or (
+                    advised_plan.ask_shape.prior_context_dependency not in {"none", "unspecified"}
+                    and not (
+                        advised_plan.ask_shape.prior_context_dependency == "selected_context"
+                        and _admitted_selected_source_url(output, request_text, current_route_state())
+                    )
+                )
+                or advised_plan.requires_durable_state
+                or advised_plan.requires_approved_context
+                or advised_plan.side_effect_policy != "draft_or_read_only"
+                or advised_plan.source != "heuristic" and (
+                    advised_plan.provider_operations
+                    or advised_plan.provider_context_requirements
+                    or advised_plan.provider_system != "unspecified"
+                    or advised_plan.provider_read_scope != "unspecified"
+                    or advised_plan.provider_result_scope is not None
+                    or advised_plan.intent != "route_request"
+                    or advised_plan.expected_artifact_type != "none"
+                )
+            )
+        ):
+            return (
+                "orchestrator_general_answer_out_of_scope",
+                "Select a specialist for provider, approval, or durable work.",
+            )
+        if selected == "orchestrator" and bool(getattr(output, "context_only_response", False)):
+            return (
+                "general_answer_not_prior_context_rewrite",
+                "A new general answer cannot claim a completed same-thread source result.",
+            )
+        return None
+
     sdk_result = run_typed_sdk_agent(
         agent=build_orchestrator_agent(
             model=model,
@@ -3347,6 +3836,8 @@ def _route_ambiguous_with_llm(
             request_text=request_text,
             compact_instructions=True,
             route_only=True,
+            channel_context_capability=channel_capability,
+            operator_context_capability=operator_capability,
         ),
         typed_input=json.loads(prompt),
         output_type=OrchestratorPlanningResult,
@@ -3354,11 +3845,23 @@ def _route_ambiguous_with_llm(
         live=live,
         workflow_name="Keystone orchestrator LLM routing",
         trace_metadata={"agent": "orchestrator", "routing_mode": "llm"},
-        decision_contract=orchestrator_decision_contract(bounded_route_candidates),
+        max_turns=5 if channel_capability is not None or operator_capability is not None else None,
+        decision_repair_max_turns=1,
+        decision_contract=replace(
+            decision_contract, output_consistency_validator=general_answer_route_consistency,
+        ),
     )
     if sdk_callback is not None:
         sdk_callback(sdk_result)
     candidate = sdk_result.output
+    if channel_capability is not None and isinstance(workflow_state, dict):
+        workflow_state["channel_context_evidence"] = current_route_state().get(
+            "channel_context_evidence", [],
+        )
+        workflow_state["channel_context_usage"] = channel_capability.usage
+    if operator_capability is not None and isinstance(workflow_state, dict):
+        workflow_state["operator_context_evidence"] = dict(operator_capability.evidence)
+        workflow_state["operator_context_usage"] = dict(operator_capability.usage)
     candidate.audit_notes = [*candidate.audit_notes, *_sdk_cost_audit_notes(sdk_result)]
     return _post_process_llm_route(
         candidate,
@@ -4055,6 +4558,7 @@ def route_request(
             run_config=run_config,
             live=live,
             model=model,
+            database_url=database_url,
         )
         if llm_result is not None:
             return finish(llm_result)
@@ -4142,6 +4646,8 @@ def build_orchestrator_agent(
     route_only: bool = False,
     tool_tier: str | int | None = None,
     tool_scope_mode: ToolScopeMode | str = ToolScopeMode.AUTO,
+    channel_context_capability: SlackChannelContextCapability | None = None,
+    operator_context_capability: OperatorContextCapability | None = None,
 ) -> Agent:
     """Build the orchestrator agent with subordinate agent handoffs."""
 
@@ -4235,12 +4741,23 @@ def build_orchestrator_agent(
             or plan_authority.plan.intent in {"company_research", "research_brief", "opportunity_search"}
         )
     )
+    # Host-bound context queries are the entire route-only toolbox. Capture is
+    # excluded even if a caller supplies a capture-capable owner bundle.
+    context_tools = None
+    if route_only and (channel_context_capability is not None
+                       or operator_context_capability is not None):
+        context_tools = [
+            *(channel_context_capability.tools if channel_context_capability is not None else []),
+            *(tool for tool in (
+                operator_context_capability.tools if operator_context_capability is not None else []
+            ) if str(getattr(tool, "name", "")) == "query_operator_context"),
+        ]
     attachment = scope_tools_for_request(
         "orchestrator",
-        tools if include_tools else [],
+        context_tools if context_tools is not None else tools if include_tools else [],
         manual_request_plan=manual_request_plan,
         tool_tier=resolved_tool_tier,
-        mode=resolved_scope_mode,
+        mode=ToolScopeMode.FULL if context_tools is not None else resolved_scope_mode,
         required_tool_names=(
             *(("search_web", "extract_research_claims_from_html") if retrieval_tools_required else ()),
             *(str(getattr(tool, "name", "") or "") for tool in specialist_tools),
@@ -4265,6 +4782,45 @@ def build_orchestrator_agent(
         ),
     )
     return _attach_handoff_metadata(attach_tool_scope_receipt(agent, attachment.scope))
+
+
+def build_orchestrator_general_answer_agent(
+    model: str | None = None,
+    *,
+    live_search: bool = False,
+    selected_source_url: str = "",
+) -> Agent:
+    """Use a separate bounded answer phase after route-only preflight."""
+
+    instructions = compose_direct_instructions(
+        "keystone_profile.md",
+        "safety_policy.md",
+        "orchestrator_general_answer.md",
+        skill_files=select_agent_skill_names(
+            "orchestrator", request_text="general informational answer", compact=True,
+        ),
+    )
+    if selected_source_url:
+        selected_source_url = validate_public_http_url(
+            selected_source_url, resolve_hostname=False,
+        )
+        instructions += "\n\nSelected public source identity: " + json.dumps(
+            {"selected_source_url": selected_source_url}, ensure_ascii=False,
+        )
+    agent = build_sdk_agent(
+        name="orchestrator",
+        instructions=instructions,
+        output_type=OrchestratorGeneralAnswer,
+        tools=[search_web] if live_search and not selected_source_url else [],
+        guardrails=keystone_guardrails(),
+        model=model,
+        policy_agent_name="orchestrator",
+        model_settings=build_model_settings(
+            reasoning_effort=ORCHESTRATOR_REASONING_EFFORT,
+            verbosity=ORCHESTRATOR_REVIEW_VERBOSITY,
+        ),
+    )
+    return agent
 
 
 def build_orchestrator_review_agent(

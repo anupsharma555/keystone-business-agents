@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from dataclasses import asdict, dataclass, field
 from threading import RLock
 from time import perf_counter
@@ -1435,7 +1436,7 @@ class HybridSearchProvider:
         max_workers = max(1, min(len(runnable_providers), 4))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(run_provider, provider_name): provider_name
+                executor.submit(copy_context().run, run_provider, provider_name): provider_name
                 for provider_name in runnable_providers
             }
             for future in as_completed(futures):

@@ -149,6 +149,25 @@ def _outreach_example(
     )
 
 
+def test_model_memory_retrieval_cannot_opt_out_of_approval(tmp_path) -> None:
+    database_url = _database_url(tmp_path)
+    store = SQLiteStore(database_url)
+    item = chief_of_staff_memory_item(
+        memory_type="project_goal", title="Synthetic pending goal",
+        summary="Pending objective", object_key="synthetic-pending",
+        source_ids=["fixture:pending"],
+    ).model_copy(update={"approval_state": ApprovalState.PENDING})
+    store.save_memory_item(item)
+
+    result = json.loads(retrieve_memory(
+        object_key="synthetic-pending", approved_only=False, database_url=database_url,
+    ))
+
+    assert result["approved_only"] is True
+    assert result["records"] == []
+    assert len(store.list_memory_items()) == 1
+
+
 def test_company_and_opportunity_memory_are_source_backed_and_retrievable(tmp_path) -> None:
     store = SQLiteStore(_database_url(tmp_path))
 

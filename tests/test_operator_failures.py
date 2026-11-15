@@ -4,7 +4,8 @@ import json
 import subprocess
 
 import pytest
-from agents.exceptions import ModelBehaviorError
+from agents.exceptions import InputGuardrailTripwireTriggered, ModelBehaviorError
+from agents.guardrail import GuardrailFunctionOutput, InputGuardrailResult
 
 from keystone_agents.operator_failures import (
     known_exception_to_operator_failure,
@@ -26,6 +27,21 @@ def test_known_exception_to_operator_failure_redacts_and_classifies_guardrails()
     assert "[REDACTED]" in failure.reason
     assert failure.safe_to_continue is True
     assert "No send or external write" not in failure.summary
+
+
+def test_sdk_input_guardrail_classification_does_not_need_exception_prose() -> None:
+    exc = InputGuardrailTripwireTriggered(InputGuardrailResult(
+        guardrail=object(),
+        output=GuardrailFunctionOutput(output_info={}, tripwire_triggered=True),
+    ))
+
+    failure = known_exception_to_operator_failure(
+        exc, context="Business Research Analyst run", include_exception_reason=False,
+    )
+
+    assert failure.kind == "guardrail_block"
+    assert failure.reason == ""
+    assert failure.retryable is False
 
 
 def test_known_exception_to_operator_failure_classifies_outer_deadline_truthfully() -> None:

@@ -9,11 +9,43 @@ from keystone_agents.execution_request import (
     build_execution_request,
     continuation_owner_advice,
     execution_request_planning_text,
+    explicit_current_work_item_id,
     normalize_slack_operator_turn_identity,
 )
 from keystone_agents.instruction_following import resolve_instruction_following_response
 from keystone_agents.schemas.execution_request import ContinuationObjectReference
 from keystone_agents.schemas.manual_request_plan import AskShapePolicy, ManualRequestPlan
+
+
+@pytest.mark.parametrize("command", [
+    "Resume WorkItem wi_exact and finish its selected source summary.",
+    "Please retry the exact existing WorkItem wi_exact.",
+    "Continue wi_exact with the current constraints.",
+    "Run again wi_exact; preserve its identity.",
+])
+def test_explicit_current_state_control_resolves_exact_record(command: str) -> None:
+    assert explicit_current_work_item_id(command) == "wi_exact"
+
+
+def test_work_item_binding_ignores_quoted_previous_identity() -> None:
+    wrapped = (
+        "Continue this prior Slack thread. Previous request: Resume wi_previous. "
+        "Previous result: A prior result. User follow-up: Resume WorkItem wi_current."
+    )
+    assert explicit_current_work_item_id(wrapped) == "wi_current"
+
+
+@pytest.mark.parametrize("command", [
+    "Explain the outcome of wi_exact.", "Compare wi_first and wi_second.",
+    "Approve wi_exact.", "Reject wi_exact.", "Summarize this supplied text.",
+])
+def test_record_mentions_and_approvals_do_not_gain_resume_authority(command: str) -> None:
+    assert explicit_current_work_item_id(command) == ""
+
+
+def test_ambiguous_single_work_item_control_requires_one_identity() -> None:
+    with pytest.raises(ValueError, match="one exact WorkItem"):
+        explicit_current_work_item_id("Resume wi_first or wi_second.")
 
 
 def test_equivalent_cli_and_slack_root_asks_share_semantic_input() -> None:
@@ -134,6 +166,24 @@ def test_slack_turn_identity_ignores_only_leading_app_mention_decoration(
         normalize_slack_operator_turn_identity("Tell @Alex to delete the event.")
         == "tell @alex to delete the event."
     )
+
+
+@pytest.mark.parametrize("separator", ["\n", "\r\n", " "])
+def test_empty_continuation_fields_do_not_become_operator_content(separator):
+    envelope = separator.join([
+        "business agents continue this prior Slack thread.",
+        "Current user request (authoritative): Check online",
+        "Previous request: ",
+        "Previous result title: ",
+        "Previous result: not available",
+        "User follow-up: Check online",
+        "Continue the same agent task.",
+    ])
+    request = build_execution_request(envelope)
+    assert request.current_request == "Check online"
+    assert request.continuation.prior_request == ""
+    assert request.continuation.prior_result_title == ""
+    assert request.continuation.prior_result_summary == "not available"
 
 
 def test_planning_text_does_not_replay_same_slack_turn_with_mention_decoration() -> None:
@@ -795,6 +845,49 @@ def test_semantic_same_artifact_plan_retains_prior_owner_without_keyword_rules()
     )
 
     assert continuation_owner_advice(request, plan) == "business_research_analyst"
+
+
+@pytest.mark.parametrize(
+    "current_ask",
+    [
+        "Using that preprint, what opportunity, if any, is worth considering?",
+        "From the same source, assess whether a practical direction is justified.",
+    ],
+)
+def test_model_selected_context_only_owner_supersedes_prior_signal_owner(
+    current_ask: str,
+) -> None:
+    request = build_execution_request(
+        "\n".join(
+            [
+                "business agents continue this prior Slack thread.",
+                f"Current user request (authoritative): {current_ask}",
+                "Prior task owner (advisory): preprints_context_agent",
+                "Previous request: Select one saved preprint for review.",
+                f"User follow-up: {current_ask}",
+                "Continue the same agent task.",
+            ]
+        )
+    )
+    scout_plan = ManualRequestPlan(
+        source="canonical:orchestrator_context_only",
+        target_agent="opportunity_scout",
+        intent="route_request",
+        task_objective="route_or_continue",
+        expected_artifact_type="none",
+        side_effect_policy="draft_or_read_only",
+        ask_shape=AskShapePolicy(
+            prior_context_dependency="selected_context",
+            permission_state="read_only",
+        ),
+    )
+
+    assert request.continuation.prior_agent == "preprints_context_agent"
+    assert continuation_owner_advice(request, scout_plan) == ""
+    assert continuation_owner_advice(
+        request,
+        scout_plan.model_copy(update={"target_agent": "preprints_context_agent"}),
+    ) == "preprints_context_agent"
 
 
 def test_semantic_owner_advice_yields_to_new_capability_or_explicit_agent() -> None:

@@ -17,6 +17,7 @@ from keystone_agents.schemas.output_constraints import OutputScopeBindings
 from keystone_agents.schemas.retrieval import RetrievalHint
 
 RouteName = Literal[
+    "orchestrator",
     "gmail_triage",
     "business_research_analyst",
     "rag_retrieval_specialist",
@@ -31,6 +32,16 @@ RouteName = Literal[
     "clarification",
 ]
 RoutingMode = Literal["deterministic", "llm", "llm_unavailable"]
+
+
+class OrchestratorGeneralAnswer(BaseModel):
+    """One answer phase may decline claims that need unavailable source evidence."""
+
+    answer: str
+    needs_source: bool
+    source_need_reason: str = ""
+
+
 OutputReviewDimension = Literal["structure", "tone", "readability", "relevance"]
 OutputReviewStatus = Literal["pass", "partial", "fail"]
 OutputReviewMode = Literal["deterministic", "llm", "llm_unavailable"]
@@ -361,6 +372,18 @@ class OrchestratorResult(BaseModel):
         ),
     )
     output_scopes: OutputScopeBindings = Field(default_factory=OutputScopeBindings)
+    linked_work_item_relation: Literal[
+        "unspecified", "continue_existing", "branch_existing", "new_request", "clarify",
+    ] = Field(
+        default="unspecified",
+        description=(
+            "Interpret the current reply relative to the host-supplied linked WorkItem: "
+            "continue_existing retries or advances that same task; branch_existing starts "
+            "a separate task referencing it; new_request is independent; clarify means "
+            "the relationship is ambiguous. Use unspecified only when no linked task is "
+            "supplied. This decision grants no source, write, or approval permission."
+        ),
+    )
     context_only_response: bool = Field(
         default=False,
         description=(
@@ -368,6 +391,38 @@ class OrchestratorResult(BaseModel):
             "already supplied in this thread. No fresh provider read, tool, write, saved "
             "draft, or external action is needed. False when evidence must be acquired."
         ),
+    )
+    durable_task_requested: bool = Field(
+        default=False,
+        description=(
+            "True when the active operator task, interpreted from the current request "
+            "and admitted thread context, requires a saved resumable WorkItem. A short "
+            "follow-up may retain that requirement even when no WorkItem was created "
+            "yet. This requests local task persistence, not provider writes or proof "
+            "that an earlier WorkItem exists. False for an independent answer."
+        ),
+    )
+    requires_live_search: bool = Field(
+        default=False,
+        description=(
+            "True when the selected public-research specialist or bounded Orchestrator "
+            "answer needs public search. False for one selected article read, "
+            "supplied-context-only work or an "
+            "explicit no-search constraint. This requests read-only research, not write "
+            "permission or provider selection; runtime live gates still apply."
+        ),
+    )
+    selected_source_url: str = Field(
+        default="",
+        description=(
+            "Exact public article/page URL selected from the supplied request, context, "
+            "or a completed scoped channel message read in this model loop "
+            "when that one source must be read. Orchestrator may own a simple "
+            "read/summarize/cite answer; deeper research belongs to Business Research. "
+            "Leave empty for broader discovery or "
+            "answers using only supplied text. This does not verify the page contents."
+        ),
+        max_length=2048,
     )
     routing_mode: RoutingMode = "deterministic"
     rationale: str = ""

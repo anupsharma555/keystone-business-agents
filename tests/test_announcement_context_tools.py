@@ -486,10 +486,10 @@ def test_preprint_selected_evidence_read_preserves_public_snapshot_scope(
         database_url=database_url,
     )
 
-    assert result["status"] == "source_scope_mismatch"
+    assert result["status"] == "blocked"
     assert result["text"] == ""
     assert "Canonical content" not in json.dumps(result)
-    assert any("public preprint snapshot" in item for item in result["limitations"])
+    assert any("public preprint snapshot is unavailable" in item for item in result["limitations"])
 
 
 def test_selected_evidence_bounds_metadata_and_recovers_exact_long_url(
@@ -927,6 +927,306 @@ def test_preprint_context_falls_back_to_linked_discovery_store_read_only(
         item["key"] == "linked_discovery_store" and item["value"] == "linked_repo_env"
         for item in result["diagnostics"]
     )
+
+
+@pytest.mark.parametrize(
+    ("candidate_id", "expected_text"),
+    [
+        (
+            "synthetic:preprint:latest",
+            "Depression outcomes were evaluated in a synthetic cohort.",
+        ),
+        (
+            "synthetic:preprint:older",
+            "A depression follow-up study with synthetic evidence.",
+        ),
+    ],
+)
+def test_linked_preprint_exact_read_uses_discovered_identity_and_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    candidate_id: str,
+    expected_text: str,
+) -> None:
+    discovery_path = tmp_path / "discovery.sqlite"
+    _synthetic_linked_discovery_store(discovery_path)
+    monkeypatch.setenv("DISCOVERY_STORE_PATH", str(discovery_path))
+    database_url = _database_url(tmp_path)
+    history = retrieve_preprint_announcement_history_impl(
+        query="depression", database_url=database_url,
+    )
+    candidate = next(item for item in history["items"] if item["feed_item_id"] == candidate_id)
+    before = discovery_path.read_bytes()
+
+    result = read_preprint_announcement_evidence_impl(
+        feed_item_id=candidate_id,
+        evidence_id=candidate["evidence_index"][0]["evidence_id"],
+        expected_snapshot_sha256=candidate["source_snapshot"]["sha256"],
+        database_url=database_url,
+    )
+
+    assert result["status"] == "success"
+    assert result["text"] == expected_text
+    assert result["feed_item_id"] == candidate_id
+    assert result["feed_item"]["url"] == candidate["url"]
+    assert result["source_snapshot"]["sha256"] == candidate["source_snapshot"]["sha256"]
+    assert result["saved_content_scope"] == "linked_discovery_summary"
+    assert candidate["evidence_index"][0]["saved_content_scope"] == (
+        "linked_discovery_summary"
+    )
+    assert result["evidence"]["saved_content_scope"] == "linked_discovery_summary"
+    assert result["article_full_text_verified"] is False
+    assert result["send_enabled"] is False
+    assert discovery_path.read_bytes() == before
+
+
+def test_linked_preprint_exact_read_rejects_wrong_identity_and_changed_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    discovery_path = tmp_path / "discovery.sqlite"
+    _synthetic_linked_discovery_store(discovery_path)
+    monkeypatch.setenv("DISCOVERY_STORE_PATH", str(discovery_path))
+    database_url = _database_url(tmp_path)
+    candidate = retrieve_preprint_announcement_history_impl(
+        query="depression", database_url=database_url,
+    )["items"][0]
+    evidence_id = candidate["evidence_index"][0]["evidence_id"]
+    snapshot = candidate["source_snapshot"]["sha256"]
+
+    wrong_item = read_preprint_announcement_evidence_impl(
+        feed_item_id="synthetic:preprint:unknown",
+        evidence_id=evidence_id,
+        expected_snapshot_sha256=snapshot,
+        database_url=database_url,
+    )
+    wrong_kind = read_preprint_announcement_evidence_impl(
+        feed_item_id="synthetic:web:newer",
+        evidence_id=evidence_id,
+        expected_snapshot_sha256=snapshot,
+        database_url=database_url,
+    )
+    wrong_evidence = read_preprint_announcement_evidence_impl(
+        feed_item_id=candidate["feed_item_id"],
+        evidence_id="evidence:wrong",
+        expected_snapshot_sha256=snapshot,
+        database_url=database_url,
+    )
+    with sqlite3.connect(discovery_path) as connection:
+        connection.execute(
+            "UPDATE discovery_candidates SET summary = ? WHERE candidate_id = ?",
+            ("A changed saved summary.", candidate["feed_item_id"]),
+        )
+    changed = read_preprint_announcement_evidence_impl(
+        feed_item_id=candidate["feed_item_id"],
+        evidence_id=evidence_id,
+        expected_snapshot_sha256=snapshot,
+        database_url=database_url,
+    )
+
+    assert wrong_item["status"] == "not_found" and wrong_item["text"] == ""
+    assert wrong_kind["status"] == "source_scope_mismatch" and wrong_kind["text"] == ""
+    assert wrong_evidence["status"] == "not_found" and wrong_evidence["text"] == ""
+    assert changed["status"] == "source_changed" and changed["text"] == ""
+
+
+def test_linked_preprint_sparse_evidence_and_unbound_continuation_are_explicit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    discovery_path = tmp_path / "discovery.sqlite"
+    _synthetic_linked_discovery_store(discovery_path)
+    monkeypatch.setenv("DISCOVERY_STORE_PATH", str(discovery_path))
+    database_url = _database_url(tmp_path)
+    candidate = retrieve_preprint_announcement_history_impl(
+        query="Sparse metadata", database_url=database_url,
+    )["items"][0]
+    assert candidate["selected_evidence_read_required"] is True
+    assert candidate["evidence_index"][0]["saved_content_scope"] == (
+        "linked_discovery_summary"
+    )
+    evidence_id = candidate["evidence_index"][0]["evidence_id"]
+
+    unbound = read_preprint_announcement_evidence_impl(
+        feed_item_id=candidate["feed_item_id"],
+        evidence_id=evidence_id,
+        start_char=1,
+        database_url=database_url,
+    )
+    sparse = read_preprint_announcement_evidence_impl(
+        feed_item_id=candidate["feed_item_id"],
+        evidence_id=evidence_id,
+        expected_snapshot_sha256=candidate["source_snapshot"]["sha256"],
+        database_url=database_url,
+    )
+
+    assert unbound["status"] == "continuation_identity_required"
+    assert unbound["text"] == ""
+    assert sparse["status"] == "partial"
+    assert sparse["text"] == ""
+    assert sparse["content_complete"] is False
+    assert sparse["article_full_text_verified"] is False
+
+
+def test_linked_preprint_exact_read_requires_snapshot_when_id_collides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    discovery_path = tmp_path / "discovery.sqlite"
+    _synthetic_linked_discovery_store(discovery_path)
+    monkeypatch.setenv("DISCOVERY_STORE_PATH", str(discovery_path))
+    database_url = _database_url(tmp_path)
+    SQLiteStore(database_url).save_announcement_feed_item(
+        AnnouncementFeedItem(
+            canonical_key="synthetic:preprint:latest",
+            title="Different canonical item",
+            source="preprints",
+            feed="preprints",
+            summary="Canonical summary, not linked evidence.",
+            evidence=[
+                AnnouncementFeedEvidence(
+                    kind="search", snippet="Canonical source text only."
+                )
+            ],
+        )
+    )
+    linked = announcement_tools._linked_preprint_discovery_items(
+        query="depression", limit=8,
+    )[0][0]
+    canonical = retrieve_preprint_announcement_history_impl(
+        query="Different canonical", database_url=database_url,
+    )["items"][0]
+    item_id = "synthetic:preprint:latest"
+
+    ambiguous = read_preprint_announcement_evidence_impl(
+        feed_item_id=item_id, database_url=database_url,
+    )
+    linked_read = read_preprint_announcement_evidence_impl(
+        feed_item_id=item_id,
+        evidence_id=linked["evidence_index"][0]["evidence_id"],
+        expected_snapshot_sha256=linked["source_snapshot"]["sha256"],
+        database_url=database_url,
+    )
+    canonical_read = read_preprint_announcement_evidence_impl(
+        feed_item_id=item_id,
+        evidence_id=canonical["evidence_index"][0]["evidence_id"],
+        expected_snapshot_sha256=canonical["source_snapshot"]["sha256"],
+        database_url=database_url,
+    )
+
+    assert ambiguous["status"] == "source_scope_mismatch" and ambiguous["text"] == ""
+    assert "Depression outcomes" in linked_read["text"]
+    assert canonical_read["text"] == "Canonical source text only."
+    assert linked_read["source_snapshot"]["basis"] == (
+        "linked_discovery_candidate_content_fields"
+    )
+    assert canonical_read["source_snapshot"]["basis"] == (
+        "canonical_saved_feed_item_and_ordered_evidence"
+    )
+
+
+def test_linked_preprint_continuation_reconstructs_only_one_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    discovery_path = tmp_path / "discovery.sqlite"
+    _synthetic_linked_discovery_store(discovery_path)
+    monkeypatch.setenv("DISCOVERY_STORE_PATH", str(discovery_path))
+    summary = "A" * 1100 + "B" * 100
+    with sqlite3.connect(discovery_path) as connection:
+        connection.execute(
+            "UPDATE discovery_candidates SET summary = ? WHERE candidate_id = ?",
+            (summary, "synthetic:preprint:latest"),
+        )
+    candidate = retrieve_preprint_announcement_history_impl(
+        query="Clinical-AI", database_url=_database_url(tmp_path),
+    )["items"][0]
+    request: dict[str, object] = {
+        "feed_item_id": candidate["feed_item_id"],
+        "evidence_id": candidate["evidence_index"][0]["evidence_id"],
+        "expected_snapshot_sha256": candidate["source_snapshot"]["sha256"],
+        "max_chars": 500,
+    }
+    pages: list[dict[str, object]] = []
+    while True:
+        page = read_preprint_announcement_evidence_impl(
+            database_url=_database_url(tmp_path), **request,
+        )
+        pages.append(page)
+        if not page["continuation"]["available"]:
+            break
+        request = dict(page["continuation"]["next_request"])
+
+    assert "".join(str(page["text"]) for page in pages) == summary
+    assert len(pages) == 3
+    assert all(page["status"] == "success" for page in pages)
+    assert len({page["source_snapshot"]["sha256"] for page in pages}) == 1
+    with sqlite3.connect(discovery_path) as connection:
+        connection.execute(
+            "UPDATE discovery_candidates SET summary = ? WHERE candidate_id = ?",
+            ("Changed after continuation.", candidate["feed_item_id"]),
+        )
+    stale_page = read_preprint_announcement_evidence_impl(
+        feed_item_id=candidate["feed_item_id"],
+        evidence_id=candidate["evidence_index"][0]["evidence_id"],
+        start_char=500,
+        expected_snapshot_sha256=candidate["source_snapshot"]["sha256"],
+        database_url=_database_url(tmp_path),
+    )
+    assert stale_page["status"] == "source_changed" and stale_page["text"] == ""
+
+
+def test_linked_preprint_rescan_timestamp_does_not_change_content_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    discovery_path = tmp_path / "discovery.sqlite"
+    _synthetic_linked_discovery_store(discovery_path)
+    monkeypatch.setenv("DISCOVERY_STORE_PATH", str(discovery_path))
+    database_url = _database_url(tmp_path)
+    candidate = retrieve_preprint_announcement_history_impl(
+        query="depression", database_url=database_url,
+    )["items"][0]
+    with sqlite3.connect(discovery_path) as connection:
+        connection.execute(
+            "UPDATE discovery_candidates SET last_seen_at = ? WHERE candidate_id = ?",
+            ("2026-09-30T12:00:00Z", candidate["feed_item_id"]),
+        )
+    reread = read_preprint_announcement_evidence_impl(
+        feed_item_id=candidate["feed_item_id"],
+        evidence_id=candidate["evidence_index"][0]["evidence_id"],
+        expected_snapshot_sha256=candidate["source_snapshot"]["sha256"],
+        database_url=database_url,
+    )
+
+    assert reread["status"] == "success"
+    assert reread["source_snapshot"]["matches_expected"] is True
+    assert reread["text"] == candidate["summary"]
+
+
+def test_linked_preprint_exact_read_blocks_when_saved_store_disappears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    discovery_path = tmp_path / "discovery.sqlite"
+    _synthetic_linked_discovery_store(discovery_path)
+    monkeypatch.setenv("DISCOVERY_STORE_PATH", str(discovery_path))
+    database_url = _database_url(tmp_path)
+    candidate = retrieve_preprint_announcement_history_impl(
+        query="depression", database_url=database_url,
+    )["items"][0]
+    discovery_path.rename(tmp_path / "discovery-moved.sqlite")
+
+    result = read_preprint_announcement_evidence_impl(
+        feed_item_id=candidate["feed_item_id"],
+        evidence_id=candidate["evidence_index"][0]["evidence_id"],
+        expected_snapshot_sha256=candidate["source_snapshot"]["sha256"],
+        database_url=database_url,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["text"] == ""
+    assert result["send_enabled"] is False
 
 
 def test_linked_preprint_query_ranks_whole_term_matches_and_reports_coverage(

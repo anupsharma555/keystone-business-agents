@@ -341,11 +341,11 @@ Keystone supports per-agent runtime model configuration. Keep model selection
 centralized in the model provider helpers and agent builders; do not hardcode
 model names inside prompts, tools, or CLI branches.
 
-- The Orchestrator is the control plane. It defaults to `gpt-5.4-mini` through
+- The Orchestrator is the control plane. It defaults to `gpt-6-luna` through
   `KEYSTONE_ORCHESTRATOR_MODEL` for hybrid LLM/deterministic review. Python
   remains authoritative for safety gates, approvals, and side-effect blocking.
-- Main operating agents default to OpenAI `gpt-5.4-mini` during integration
-  testing. Schema interpretation, tool selection, memory use, source synthesis,
+- Main operating agents and the manual-request planner default to OpenAI
+  `gpt-6-luna`. Schema interpretation, tool selection, memory use, source synthesis,
   and SDK handoffs should stay on the same audited provider path unless
   explicitly changed.
   Gmail Triage and Outreach Composer may still use Gemini Flash through explicit
@@ -358,6 +358,9 @@ model names inside prompts, tools, or CLI branches.
   `LITELLM_BASE_URL` or agent-specific base URLs. Do not require or import the
   Python `litellm` package in this repo unless a future dependency review proves
   it is compatible with the pinned OpenAI Agents SDK baseline.
+- The canary acceptance benchmark retains its reviewed `gpt-5.4-mini` price and
+  reserve contract. It is an explicit benchmark model, separate from operating
+  defaults and per-agent overrides.
 - Explicit builder arguments override agent-specific environment variables.
   Agent-specific variables override the global `MODEL_PROVIDER` and
   `OPENAI_MODEL` settings.

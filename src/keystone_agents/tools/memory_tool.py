@@ -54,6 +54,9 @@ def retrieve_memory(
 ) -> str:
     """Retrieve eligible, prompt-safe current memory without live API calls."""
 
+    # Keep the legacy argument for callers, but model-visible retrieval cannot
+    # broaden eligibility. Administrative inspection belongs to storage APIs.
+    approved_only = True
     records = StorageTool(
         database_url=database_url or database_url_from_env(),
         agent_name="memory",

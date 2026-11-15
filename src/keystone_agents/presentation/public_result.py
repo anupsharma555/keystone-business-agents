@@ -107,6 +107,10 @@ def build_work_item_result_payload(
     payload = result.model_dump(mode="json")
     status = str(getattr(result.status, "value", result.status))
     confirmed = bool(user_facing_result_verified and status == "done" and not result.blockers)
+    public_text = (
+        _source_brief_review_text(result, graph_metadata=graph_metadata)
+        if confirmed else result.human_summary
+    )
     payload.update(
         user_facing_result_verified=user_facing_result_verified,
         completion_confirmed=confirmed,
@@ -117,9 +121,10 @@ def build_work_item_result_payload(
             if status == "needs_approval"
             else "Business Agents Completion Not Confirmed"
         ),
-        slack_display_text=result.human_summary,
-        display_text=result.human_summary,
-        summary=result.human_summary,
+        human_summary=public_text,
+        slack_display_text=public_text,
+        display_text=public_text,
+        summary=public_text,
     )
     if any(
         getattr(artifact, "artifact_type", "") == "outreach_draft"
@@ -153,6 +158,50 @@ def build_work_item_result_payload(
     return payload
 
 
+def _source_brief_review_text(result: Any, *, graph_metadata: Mapping[str, Any] | None) -> str:
+    """Add task navigation to a completed graph brief without rewriting evidence."""
+
+    text = str(result.human_summary or "")
+    work_item = result.work_item
+    next_action = result.next_action
+    if (
+        not text.strip() or graph_metadata is None
+        or str(getattr(result.route, "value", result.route)) != "business_research_analyst"
+        or str(getattr(work_item.status, "value", work_item.status)) != "done"
+        or next_action is None or next_action.action != "review_research_brief"
+    ):
+        return text
+    attached_briefs = {
+        artifact.artifact_id
+        for artifact in work_item.artifact_refs
+        if artifact.artifact_type == "research_brief" and artifact.artifact_id
+    }
+    if not any(
+        artifact.artifact_type == "research_brief"
+        and artifact.artifact_id in attached_briefs
+        for artifact in result.artifact_refs
+    ):
+        return text
+    if exact_output_validation_required(
+        getattr(result, "manual_request_plan", None),
+        original_request=str(getattr(work_item, "request_text", "") or ""),
+        condition_outcome=None,
+    ):
+        return text
+    sections: list[str] = []
+    if not re.search(r"(?im)^\*{1,2}Task status:\*{1,2}\s*$", text):
+        sections.append(
+            "*Task status:*\nThe research brief is attached to this task for review. "
+            "This step is complete."
+        )
+    if not re.search(r"(?im)^\*{1,2}Next action:\*{1,2}\s*$", text):
+        sections.append(
+            "*Next action:*\nReview the brief now, or ask a natural-language follow-up "
+            "when you are ready to continue."
+        )
+    return "\n\n".join([text, *sections])
+
+
 @dataclass(frozen=True)
 class _TerminalNonSuccessSignal:
     status: ExecutionResultStatus
@@ -171,6 +220,7 @@ def attach_execution_public_result(
         result = _reconcile_terminal_non_success(payload, result)
         result = reconcile_failed_review(payload, result)
         result = _canonicalize_noncompleted_result_title(result)
+        result = _classify_agent_decision_failure(payload, result)
         payload["public_result"] = result.model_dump(mode="json")
         _mirror_public_result(payload, result)
         return result
@@ -417,6 +467,7 @@ def attach_execution_public_result(
     result = _reconcile_terminal_non_success(payload, result)
     result = reconcile_failed_review(payload, result)
     result = _canonicalize_noncompleted_result_title(result)
+    result = _classify_agent_decision_failure(payload, result)
     payload["public_result"] = result.model_dump(mode="json")
     _mirror_public_result(payload, result)
     return result
@@ -588,14 +639,16 @@ def _terminal_signal_text(
         if isinstance(child, Mapping):
             text = _first_payload_text(
                 child,
-                ("human_summary", "output.failure.summary", "output.summary"),
+                ("human_summary", "output.failure.summary", "message",
+                 "output.clarification_request", "output.summary"),
             )
             if text:
                 return text
     if signal.source == "parent":
         text = _first_payload_text(
             payload,
-            ("human_summary", "output.failure.summary", "output.summary"),
+            ("human_summary", "output.failure.summary", "message",
+             "output.clarification_request", "output.summary"),
         )
         if text:
             return text
@@ -936,6 +989,35 @@ def _canonicalize_noncompleted_result_title(
     if replacement and (not current_title or current_title in stale_success_titles):
         return result.model_copy(update={"title": replacement})
     return result
+
+
+def _classify_agent_decision_failure(
+    payload: Mapping[str, Any], result: ExecutionPublicResult,
+) -> ExecutionPublicResult:
+    """A failed specialist decision needs repair, not another user answer."""
+
+    if result.status not in {"blocked", "needs_input"}:
+        return result
+    blockers = payload.get("blockers")
+    if not isinstance(blockers, list):
+        return result
+    code = next(
+        (
+            str(blocker.get("code") or "").strip()
+            for blocker in blockers
+            if isinstance(blocker, Mapping)
+            and str(blocker.get("code") or "").strip().endswith("_agent_decision_invalid")
+        ),
+        "",
+    )
+    if not code:
+        return result
+    return result.model_copy(update={
+        "status": "blocked",
+        "title": "Business Agents Review Needed",
+        "completion_confirmed": False,
+        "failure_code": result.failure_code or code,
+    })
 
 
 def _first_payload_text(payload: Mapping[str, Any], paths: tuple[str, ...]) -> str:

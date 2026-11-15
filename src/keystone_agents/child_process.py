@@ -32,7 +32,15 @@ def run_isolated_child_process(
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         _kill_child_group(process)
-        stdout, stderr = process.communicate()
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired as cleanup_error:
+            # A descendant may retain a pipe even after the group leader exits.
+            # Cleanup must obey a deadline too.
+            stdout, stderr = cleanup_error.output, cleanup_error.stderr
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
         exc.output = stdout
         exc.stderr = stderr
         raise
@@ -45,12 +53,11 @@ def run_isolated_child_process(
 
 
 def _kill_child_group(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
     if os.name != "nt":
         try:
             os.killpg(process.pid, signal.SIGKILL)
             return
         except ProcessLookupError:
             return
-    process.kill()
+    if process.poll() is None:
+        process.kill()

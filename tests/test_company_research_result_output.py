@@ -1,12 +1,84 @@
 from __future__ import annotations
 
 import json
+import sys
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 
+from agents.exceptions import InputGuardrailTripwireTriggered
+from agents.guardrail import GuardrailFunctionOutput, InputGuardrailResult
+
 import scripts.run_company_research as company_cli
 from keystone_agents.manual_request import infer_manual_request_plan
+from keystone_agents.runtime.request_budget import activate_model_request_budget
+
+
+def test_research_failure_preserves_child_invocations_and_tool_evidence(monkeypatch, capsys):
+    monkeypatch.setattr(company_cli, "sdk_run_failure_metadata", lambda exc: {
+        "usage": {"requests": 2},
+        "tool_execution": {"model_called_tool_names": ["search_web"]},
+        "request_cache": {"tool_corrections": 1},
+    })
+    with activate_model_request_budget(4) as ledger:
+        ledger.consume(stage="research:llm_start")
+        ledger.consume(stage="research:llm_start")
+        result = company_cli._research_failure_output(
+            RuntimeError("Required current research evidence was unavailable"), json_output=True,
+        )
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 1
+    assert payload["status"] == "failed"
+    assert payload["request_budget"]["consumed"] == 2
+    assert payload["request_budget"]["consumed_count_confirmed"] is True
+    assert payload["tool_execution"]["model_called_tool_names"] == ["search_web"]
+    assert payload["send_enabled"] is False
+
+
+def test_sdk_script_failure_emits_structured_envelope(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", [
+        "run_company_research.py", "--company", "Example topic", "--live-sdk", "--json",
+    ])
+    def fail(_args):
+        raise RuntimeError("Required public evidence was unavailable")
+    monkeypatch.setattr(company_cli, "_run_sdk_synthesis", fail)
+    with activate_model_request_budget(4) as ledger:
+        ledger.consume(stage="research:llm_start")
+        assert company_cli.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "failed"
+    assert payload["request_budget"]["consumed"] == 1
+
+
+def test_sdk_script_guardrail_failure_preserves_structured_evidence(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", [
+        "run_company_research.py", "--company", "Example topic", "--live-sdk", "--json",
+    ])
+    exc = InputGuardrailTripwireTriggered(InputGuardrailResult(
+        guardrail=object(),
+        output=GuardrailFunctionOutput(
+            output_info={"risk_flags": ["secret"]}, tripwire_triggered=True,
+        ),
+    ))
+    exc.keystone_sdk_run_failure = {
+        "failure_kind": "inputguardrailtripwiretriggered",
+        "guardrail": {"risk_flags": ["secret"]},
+        "usage": {"requests": 0},
+    }
+
+    def fail(_args):
+        raise exc
+
+    monkeypatch.setattr(company_cli, "_run_sdk_synthesis", fail)
+
+    assert company_cli.main() == 1
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["output"]["failure"]["kind"] == "guardrail_block"
+    assert payload["sdk_failure"]["guardrail"]["risk_flags"] == ["secret"]
+    assert payload["usage"]["requests"] == 0
+    assert "Traceback" not in captured.err
 
 
 def test_fixture_safety_overrides_env_backed_live_defaults() -> None:

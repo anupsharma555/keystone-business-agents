@@ -2778,15 +2778,33 @@ def _verified_persisted_signal_candidates(
         separators=(",", ":"),
     )
     tool_call_count = evidence.get("tool_call_count")
+    history_call_count = evidence.get("history_tool_call_count", tool_call_count)
+    evidence_read_count = evidence.get("evidence_read_call_count", 0)
+    evidence_reads = evidence.get("evidence_reads", [])
     result_counts = evidence.get("tool_result_item_counts")
     reformulation = evidence.get("bounded_reformulation")
     bounded_reads_valid = bool(
         type(tool_call_count) is int
-        and tool_call_count in {1, 2}
+        and type(history_call_count) is int
+        and history_call_count in {1, 2}
+        and type(evidence_read_count) is int
+        and 0 <= evidence_read_count <= 3
+        and tool_call_count == history_call_count + evidence_read_count
+        and isinstance(evidence_reads, list)
+        and len(evidence_reads) == evidence_read_count
         and evidence.get("model_tool_call_count") == tool_call_count
         and evidence.get("tool_output_count") == tool_call_count
+        and (
+            evidence_read_count == 0
+            or evidence.get("evidence_tool_name")
+            == (
+                "read_preprint_announcement_evidence"
+                if tool_name == "retrieve_preprint_announcement_history"
+                else "read_rss_announcement_evidence"
+            )
+        )
     )
-    if bounded_reads_valid and tool_call_count == 2:
+    if bounded_reads_valid and history_call_count == 2:
         bounded_reads_valid = bool(
             isinstance(result_counts, list)
             and len(result_counts) == 2
@@ -2854,6 +2872,48 @@ def _verified_persisted_signal_candidates(
             return None
         candidate_by_id[candidate_id] = candidate
     if set(candidate_by_id) != set(candidate_ids):
+        return None
+    required_read_ids = {
+        candidate_id
+        for candidate_id in selected_id_set
+        if candidate_by_id.get(candidate_id, {}).get("selected_evidence_read_required")
+        is True
+    }
+    completed_read_ids: set[str] = set()
+    for read in evidence_reads:
+        if not isinstance(read, dict):
+            return None
+        candidate_id = str(read.get("feed_item_id") or "").strip()
+        candidate = candidate_by_id.get(candidate_id)
+        if candidate is None:
+            return None
+        snapshot = candidate.get("source_snapshot_sha256")
+        evidence_ids = candidate.get("evidence_ids")
+        if (
+            not isinstance(snapshot, str)
+            or re.fullmatch(r"[0-9a-f]{64}", snapshot) is None
+            or not isinstance(evidence_ids, list)
+            or not 1 <= len(evidence_ids) <= 20
+            or any(
+                not isinstance(item, str)
+                or re.fullmatch(r"evidence:[0-9a-f]{24}", item) is None
+                for item in evidence_ids
+            )
+            or len(evidence_ids) != len(set(evidence_ids))
+            or read.get("evidence_id") not in evidence_ids
+            or read.get("snapshot_sha256") != snapshot
+            or read.get("status") != "success"
+            or read.get("read_mode") != "evidence_content"
+            or read.get("content_status") != "saved_content_available"
+            or read.get("content_complete") is not True
+            or type(read.get("text_char_count")) is not int
+            or read["text_char_count"] <= 0
+            or not isinstance(read.get("text_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", read["text_sha256"]) is None
+        ):
+            return None
+        completed_read_ids.add(candidate_id)
+    if not required_read_ids.issubset(completed_read_ids):
         return None
     return candidate_by_id
 

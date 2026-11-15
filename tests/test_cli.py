@@ -16,7 +16,10 @@ from keystone_agents.agents.manual_request_planner import resolve_manual_request
 from keystone_agents.calendar_actions import CalendarActionPlan
 from keystone_agents.cli import main
 from keystone_agents.gmail_triage.execution_plan import resolve_gmail_execution_plan
-from keystone_agents.instruction_following import InstructionFollowingRepairOutput
+from keystone_agents.instruction_following import (
+    InstructionFollowingRepairOutput,
+    validate_output_constraints,
+)
 from keystone_agents.manual_request import (
     infer_manual_request_plan,
     merge_manual_request_plan,
@@ -55,6 +58,7 @@ from keystone_agents.schemas.work_item import (
     WorkItem,
     WorkItemApprovalGate,
     WorkItemArtifactRef,
+    WorkItemBlocker,
     WorkItemEvent,
     WorkItemKind,
     WorkItemNextAction,
@@ -999,9 +1003,9 @@ def test_context_agent_live_payload_distinguishes_model_selected_tool_calls(
             "provider_request_attempt_count_available": False,
             "provider_request_success_count": 0,
             "provider_request_success_count_available": False,
-            "provider_receipt_count": 1,
+            "provider_receipt_count": 0,
             "provider_receipt_count_available": True,
-            "distinct_persisted_receipt_count": 1,
+            "distinct_persisted_receipt_count": 0,
             "receipt_observation_count": 1,
             "context_receipt_count": 0,
             "context_receipt_source": "",
@@ -1040,6 +1044,274 @@ def test_context_agent_live_payload_distinguishes_model_selected_tool_calls(
     )
     assert payload["instruction_following"]["validation"]["passed"] is True
     assert payload["instruction_following"]["repair_attempted"] is False
+
+
+@pytest.mark.parametrize(
+    (
+        "source_available", "exact_content_available", "evidence_depth",
+        "permission_state", "blocker_kind", "source_scope",
+    ),
+    [
+        (True, True, "standard", "read_only", "source_limit", "unspecified"),
+        (False, True, "standard", "read_only", "source_limit", "unspecified"),
+        (True, False, "standard", "read_only", "source_limit", "unspecified"),
+        (True, True, "deep", "read_only", "source_limit", "unspecified"),
+        (True, True, "deep", "read_only", "none", "unspecified"),
+        (True, True, "standard", "approval_required", "source_limit", "unspecified"),
+        (True, True, "standard", "read_only", "unrelated", "unspecified"),
+        (True, True, "standard", "read_only", "none", "unspecified"),
+        (True, True, "standard", "read_only", "none", "answer"),
+        (False, True, "standard", "read_only", "source_limit", "answer"),
+    ],
+)
+def test_selected_preprint_summary_limit_is_not_a_write_or_approval_blocker(
+    monkeypatch,
+    capsys,
+    source_available: bool,
+    exact_content_available: bool,
+    evidence_depth: str,
+    permission_state: str,
+    blocker_kind: str,
+    source_scope: str,
+) -> None:
+    candidate_id = "preprint:synthetic:review-1"
+    source_url = "https://example.test/preprints/review-1"
+    evidence_id = "evidence:" + "a" * 24
+    snapshot = "b" * 64
+    title = "Synthetic depression methods preprint"
+    summary = "Saved discovery summary of preliminary methods evidence."
+    candidate = {
+        "feed_item_id": candidate_id,
+        "title": title,
+        "url": source_url,
+        "source": "Example Preprints",
+        "published_at": "2026-09-01",
+        "summary": summary,
+        "evidence_status": "discovery_candidate",
+        "selected_evidence_read_required": True,
+        "saved_content_scope": "linked_discovery_summary",
+        "article_full_text_verified": False,
+        "evidence_index": [{"evidence_id": evidence_id}],
+        "source_snapshot": {"sha256": snapshot},
+    }
+    raw_result = SimpleNamespace(
+        usage=None,
+        new_items=[
+            SimpleNamespace(
+                type="tool_call_item", call_id="preprint-history-1",
+                tool_name="retrieve_preprint_announcement_history",
+            ),
+            SimpleNamespace(
+                type="tool_call_output_item", call_id="preprint-history-1",
+                output=json.dumps({
+                    "status": "success", "kind": "preprints", "item_count": 1,
+                    "items": [candidate], "send_enabled": False,
+                }),
+            ),
+            SimpleNamespace(
+                type="tool_call_item", call_id="preprint-exact-1",
+                tool_name="read_preprint_announcement_evidence",
+            ),
+            SimpleNamespace(
+                type="tool_call_output_item", call_id="preprint-exact-1",
+                output=json.dumps({
+                    "status": "success", "read_mode": "evidence_content",
+                    "feed_item_id": candidate_id, "evidence_id": evidence_id,
+                    "content_status": (
+                        "saved_content_available"
+                        if exact_content_available else "empty_saved_record"
+                    ),
+                    "content_complete": exact_content_available,
+                    "text": summary if exact_content_available else "",
+                    "source_snapshot": {"sha256": snapshot},
+                    "send_enabled": False,
+                }),
+            ),
+        ],
+    )
+    output = cli.PreprintsContextResult(
+        mode="llm",
+        summary="This saved preprint merits research review, subject to the stated limits.",
+        query="depression methods",
+        retrieved_item_ids=[candidate_id],
+        articles=[{
+            "feed_item_id": candidate_id, "title": title, "url": source_url,
+            "source": "Example Preprints", "published_at": "2026-09-01",
+            "summary": summary, "evidence_status": "discovery_candidate",
+        }],
+        sources=([{
+            "source_id": candidate_id, "title": title,
+            "source_type": "preprints_historical_context", "location": source_url,
+            "note": "Saved summary only; full text was not verified.",
+        }] if source_available else []),
+        blockers=[] if blocker_kind == "none" else [
+            "A required internal context grant is missing."
+            if blocker_kind == "unrelated"
+            else "Only a saved discovery summary is available, not article full text."
+        ],
+        evidence_gaps=["No full text was reviewed."],
+        approval_needs=["Research review approval remains pending."],
+        decision=AgentDecisionRecord(
+            decision_stage="signal_relevance_selection",
+            selected_candidate_ids=[candidate_id],
+            candidate_assessments=[DecisionCandidateAssessment(
+                candidate_id=candidate_id,
+                disposition="selected",
+                rationale="Best match for the bounded review request.",
+            )],
+            reasoning="The selected saved summary is the strongest preliminary match.",
+        ),
+    )
+    monkeypatch.setattr(
+        signal_context_runtime,
+        "run_typed_sdk_agent",
+        lambda **_kwargs: TypedAgentRunResult(
+            agent_name="preprints_context_agent", output=output,
+            raw_result=raw_result, live=True,
+        ),
+    )
+    monkeypatch.setattr(cli.SQLiteStore, "save_agent_run", lambda *_a, **_kw: 1)
+    plan = ManualRequestPlan(
+        source="llm", requested_agent="preprints_context_agent",
+        target_agent="preprints_context_agent", intent="context_lookup",
+        task_objective="context_lookup", expected_artifact_type="context_summary",
+        provider_operations=["read"],
+        ask_shape=AskShapePolicy(
+            permission_state=permission_state,
+            evidence_depth=evidence_depth,
+            output_constraints=InterpretedOutputConstraints(
+                include_source_urls=True,
+                source_scope=source_scope,
+            ),
+        ),
+    )
+    if source_scope == "answer":
+        def no_live_instruction_repair(**_kwargs):
+            if source_available:
+                pytest.fail("Answer-scope source URL should need no model repair")
+            raise RuntimeError("Offline test blocked instruction repair")
+
+        monkeypatch.setattr(
+            "keystone_agents.instruction_following.run_typed_sdk_agent",
+            no_live_instruction_repair,
+        )
+
+    exit_code = cli._run_ask_context_agent_live(
+        "preprints_context_agent",
+        "Which saved depression methods preprint merits review?",
+        json_output=True, manual_plan=plan,
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["side_effects"]["blocked_write_attempts"] == []
+    assert payload["public_result"]["provider_write_attempted"] is False
+    assert payload["side_effects"]["external_write_performed"] is False
+    if (
+        source_available and exact_content_available
+        and evidence_depth != "deep" and permission_state == "read_only"
+    ):
+        expected_status = "done" if blocker_kind == "none" else "partial"
+        assert payload["status"] == expected_status
+        assert payload["public_result"]["status"] == (
+            "completed" if blocker_kind == "none" else "partial"
+        )
+        assert payload["public_result"]["completion_confirmed"] is (
+            blocker_kind == "none"
+        )
+        assert payload["side_effects"]["evidence_complete"] is (
+            blocker_kind == "none"
+        )
+        assert bool(payload["blockers"]) is (blocker_kind != "none")
+        assert payload["output"]["approval_needs"] == [
+            "Research review approval remains pending."
+        ]
+        assert bool(payload["output"]["blockers"]) is (blocker_kind != "none")
+        assert source_url in payload["public_result"]["text"]
+        assert "No full text was reviewed" in payload["public_result"]["text"]
+        assert "Approval/write boundary" not in payload["public_result"]["text"]
+        assert "Model suggested review; no execution approval gate was verified" in (
+            payload["public_result"]["text"]
+        )
+        if source_scope == "answer":
+            answer_text = payload["public_result"]["text"].split(
+                "*Detailed Summary:*", 1
+            )[0]
+            assert source_url in answer_text
+            assert payload["instruction_following"]["validation"]["passed"] is True
+            assert payload["instruction_following"]["repair_attempted"] is False
+        if blocker_kind != "none":
+            assert (
+                "A required internal context grant is missing"
+                if blocker_kind == "unrelated" else "Only a saved discovery summary"
+            ) in payload["public_result"]["text"]
+        assert "structured-output stage failed" not in payload["public_result"][
+            "failure_summary"
+        ]
+    elif (
+        source_available and exact_content_available
+        and evidence_depth == "deep" and blocker_kind == "none"
+    ):
+        assert payload["status"] == "blocked"
+        assert payload["block_kind"] == "signal_requested_depth_unavailable"
+        assert payload["public_result"]["status"] == "blocked"
+        assert payload["public_result"]["completion_confirmed"] is False
+        assert payload["public_result"]["provider_write_attempted"] is False
+        assert payload["output"]["blockers"] == []
+        assert payload["blockers"]
+        assert source_url in payload["public_result"]["text"]
+        assert "No full text was reviewed" in payload["public_result"]["text"]
+    else:
+        assert payload["status"] == "blocked"
+        assert payload["public_result"]["status"] == "blocked"
+        assert payload["side_effects"]["evidence_complete"] is False
+        assert payload["output"]["blockers"]
+        assert payload["blockers"]
+        if source_scope == "answer":
+            answer_text = payload["public_result"]["text"].split(
+                "*Detailed Summary:*", 1
+            )[0]
+            assert source_url not in answer_text
+            assert payload["instruction_following"]["validation"]["passed"] is False
+            assert "visible source URL missing" in payload["instruction_following"][
+                "validation"
+            ]["violations"]
+        if permission_state == "approval_required":
+            assert payload["output"]["approval_needs"]
+            assert "Approval/write boundary" in payload["public_result"]["text"]
+
+
+@pytest.mark.parametrize(
+    ("scope", "full_text_flag", "blocked"),
+    [
+        ("linked_discovery_summary", None, True),
+        (["linked_discovery_summary"], False, False),
+    ],
+)
+def test_explicit_deep_signal_guard_requires_typed_known_saved_scope(
+    scope,
+    full_text_flag,
+    blocked: bool,
+) -> None:
+    plan = ManualRequestPlan(
+        source="llm", requested_agent="preprints_context_agent",
+        target_agent="preprints_context_agent", intent="context_lookup",
+        task_objective="context_lookup",
+        ask_shape=AskShapePolicy(permission_state="read_only", evidence_depth="deep"),
+    )
+    candidate = {"candidate_id": "synthetic-1", "saved_content_scope": scope}
+    if full_text_flag is not None:
+        candidate["article_full_text_verified"] = full_text_flag
+
+    blocker = cli._context_agent_deep_signal_scope_blocker(
+        "preprints_context_agent",
+        {"decision": {"selected_candidate_ids": ["synthetic-1"]}},
+        manual_plan=plan,
+        decision_ownership={"validator_outcome": {"status": "accepted"}},
+        signal_evidence={"candidates": [candidate]},
+    )
+
+    assert bool(blocker) is blocked
 
 
 def test_context_agent_current_state_zero_tool_call_is_blocked(
@@ -8314,6 +8586,21 @@ def test_cli_ask_context_agent_override_live_sdk_runs_typed_agent(
             SimpleNamespace(
                 final_output=None,
                 usage=None,
+                raw_responses=[
+                    SimpleNamespace(
+                        raw_usage={
+                            "input_tokens": 500,
+                            "output_tokens": 50,
+                            "total_tokens": 550,
+                            "input_tokens_details": {
+                                "cached_tokens": 100,
+                                "cache_write_tokens": 0,
+                            },
+                            "output_tokens_details": {"reasoning_tokens": 10},
+                        }
+                    )
+                    for _ in range(2)
+                ],
                 context_wrapper=SimpleNamespace(
                     usage=SimpleNamespace(
                         requests=2,
@@ -8407,7 +8694,7 @@ def test_cli_ask_context_agent_override_live_sdk_runs_typed_agent(
     assert payload["send_enabled"] is False
     assert payload["model_execution"] == {
         "provider": "openai",
-        "model": "gpt-5.4-mini",
+        "model": "gpt-6-luna",
         "run_mode": "live_sdk",
         "usage_available": True,
         "cost_available": True,
@@ -8427,8 +8714,18 @@ def test_cli_ask_context_agent_override_live_sdk_runs_typed_agent(
         "output_tokens": 100,
         "total_tokens": 1100,
         "cached_input_tokens": 200,
-        "cache_write_input_tokens": None,
-        "request_usage_entries": [],
+        "cache_write_input_tokens": 0,
+        "request_usage_entries": [
+            {
+                "input_tokens": 500,
+                "output_tokens": 50,
+                "total_tokens": 550,
+                "cached_input_tokens": 100,
+                "cache_write_input_tokens": 0,
+                "reasoning_output_tokens": 10,
+            }
+            for _ in range(2)
+        ],
         "reasoning_output_tokens": 20,
         "cache_hit_rate": 0.2,
         "prompt_cache_key_present": False,
@@ -8464,7 +8761,7 @@ def test_cli_ask_context_agent_override_live_sdk_runs_typed_agent(
     assert len(attempt_records) == 1
     assert len(agent_records) == 1
     assert agent_records[0]["dry_run"] == 0
-    assert agent_records[0]["model"] == "sdk-live:gpt-5.4-mini"
+    assert agent_records[0]["model"] == "sdk-live:gpt-6-luna"
     attempt_output = json.loads(attempt_records[0]["output_json"])
     assert attempt_output["links"]["agent_run_id"] == agent_records[0]["id"]
 
@@ -9244,6 +9541,153 @@ def test_cli_selected_context_revision_dispatches_exact_linked_work_item(
     assert captured["input_text"] == "Shorten the same draft to at most 65 words."
     assert captured["explicit_work_item_id"] == work_item.id
     assert captured["requested_route"] == "outreach_composer"
+
+
+@pytest.mark.parametrize("graph_enabled", [False, True])
+def test_cli_authenticated_blocked_read_only_retry_reuses_linked_work_item(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, graph_enabled: bool,
+) -> None:
+    from keystone_agents import langgraph_workflow
+
+    database_url = f"sqlite:///{tmp_path / 'blocked-linked.db'}"
+    context_path = tmp_path / "slack-history-context.json"
+    context_path.write_text(json.dumps({
+        "schema": "keystone.slack.history_context.v1",
+        "channel_id": "C-SYNTHETIC", "thread_ts": "1770000000.000100",
+        "request_ts": "1770000000.000300",
+        "read_context": "The same thread selected a public source for review.",
+    }), encoding="utf-8")
+    item = WorkItem(
+        id="wi_blocked_source_retry", kind=WorkItemKind.OPPORTUNITY,
+        status=WorkItemStatus.BLOCKED, current_route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        title="Assess one supplied source", request_text="Assess the supplied source.",
+        target=WorkItemTarget(name="Selected public source", metadata={
+            "slack_context": {"channel_id": "C-SYNTHETIC", "thread_ts": "1770000000.000100"},
+        }),
+        artifact_refs=[WorkItemArtifactRef(
+            artifact_type="preprints_context_summary", artifact_id="source-1",
+            source_agent="preprints_context_agent", selected=True,
+        )],
+        blockers=[WorkItemBlocker(
+            code="opportunity_scout_execution_failed", message="The supplied input was too large.",
+        )],
+        next_action=WorkItemNextAction(
+            action="review_opportunity_scout_execution_failure",
+            agent=WorkItemRoute.OPPORTUNITY_SCOUT,
+        ),
+    )
+    store = SQLiteStore(database_url)
+    store.save_work_item(item)
+    plan = ManualRequestPlan(
+        source="llm", target_agent="opportunity_scout", intent="opportunity_search",
+        expected_artifact_type="opportunity_record", side_effect_policy="draft_or_read_only",
+        requires_durable_state=True,
+        ask_shape=AskShapePolicy(
+            prior_context_dependency="selected_context", permission_state="read_only",
+        ),
+    )
+    assert cli._manual_plan_retries_linked_blocked_work_item(
+        plan, work_item=item, authenticated_thread_link=True,
+    )
+    assert not cli._manual_plan_retries_linked_blocked_work_item(plan, work_item=item)
+    assert not cli._manual_plan_retries_linked_blocked_work_item(
+        plan.model_copy(update={"provider_operations": ["read"]}),
+        work_item=item, authenticated_thread_link=True,
+    )
+    assert not cli._manual_plan_retries_linked_blocked_work_item(
+        plan.model_copy(update={"target_agent": "business_research_analyst"}),
+        work_item=item, authenticated_thread_link=True,
+    )
+    assert not cli._manual_plan_retries_linked_blocked_work_item(
+        plan,
+        work_item=item.model_copy(update={"next_action": WorkItemNextAction(
+            action="review_opportunity_scout_execution_failure",
+        )}),
+        authenticated_thread_link=True,
+    )
+    preflight = cli.OrchestratorPreflight(
+        request_text="Continue the selected source assessment.", requested_agent=None,
+        advisory_only=False, selected_agent="opportunity_scout",
+        blocked_by_orchestrator=False, execution_allowed=True,
+        manual_request_plan=plan,
+        route_result=cli.route_request("Continue the selected source assessment.", manual_plan=plan),
+    )
+    monkeypatch.setattr(cli, "run_orchestrator_preflight", lambda *_args, **_kwargs: preflight)
+    monkeypatch.setenv("KEYSTONE_WORKITEM_LANGGRAPH", "true" if graph_enabled else "false")
+    captured: list[tuple[str, str | None]] = []
+    result = WorkflowRunResult(
+        work_item=item, route=WorkItemRoute.OPPORTUNITY_SCOUT,
+        status=WorkItemStatus.BLOCKED, advanced=False,
+        human_summary="The source assessment is still blocked.",
+    )
+
+    def fake_direct(request: WorkflowRunRequest, **_kwargs) -> WorkflowRunResult:
+        captured.append(("direct", request.work_item_id))
+        return result
+
+    def fake_graph(request: WorkflowRunRequest, **_kwargs) -> SimpleNamespace:
+        captured.append(("graph", request.work_item_id))
+        return SimpleNamespace(result=result)
+
+    monkeypatch.setattr(langgraph_workflow, "advance_work_item_manager_loop", fake_direct)
+    monkeypatch.setattr(langgraph_workflow, "run_work_item_langgraph", fake_graph)
+    args = cli.build_parser().parse_args([
+        "ask", "--database-url", database_url, "--context-file", str(context_path),
+        "--linked-work-item-id", item.id, "--no-live-sdk", "--json",
+        "Continue the selected source assessment.",
+    ])
+
+    assert cli._run_ask_with_current_environment(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["work_item"]["id"] == item.id
+    assert captured == [("graph" if graph_enabled else "direct", item.id)]
+    assert len(store.list_work_items(status=None)) == 1
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Summarize article #3 from the channel.",
+        "summarize #3 from yesterday",
+        "provide a quick summary of the #3 article posted yesterday above in this channel?",
+    ],
+)
+def test_empty_thread_messages_preserve_bounded_channel_history_for_route(
+    tmp_path: Path,
+    request_text: str,
+) -> None:
+    context_path = tmp_path / "channel-history-context.json"
+    source_url = "https://example.org/articles/model-review"
+    context_path.write_text(
+        json.dumps(
+            {
+                "schema": "keystone.slack.history_context.v1",
+                "channel_id": "C123",
+                "thread_ts": "1770000000.000400",
+                "request_ts": "1770000000.000400",
+                "thread_messages": [],
+                "read_context": (
+                    "Slack channel history digest:\n"
+                    f"- #3: How to Check Local Models — {source_url}"
+                    + ("\nOlder channel context." * 200)
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = cli._orchestrator_workflow_state_from_cli_context(
+        context_file_path=str(context_path),
+        request_text=request_text,
+    )
+
+    assert source_url in state["slack_thread_transcript"]
+    assert "recent_slack_thread" not in state
+    direct = cli._direct_specialist_execution_context(
+        request_text,
+        workflow_state=state,
+    )
+    assert source_url in direct["thread_transcript_tail"]
 
 
 def test_slack_history_context_preserves_root_and_speaker_roles_for_direct_and_graph_paths(
@@ -13213,6 +13657,28 @@ def test_context_agent_blocked_read_is_not_reported_as_blocked_write() -> None:
     assert "private_field" not in json.dumps(receipts)
 
 
+def test_context_agent_blocked_write_requires_mutation_evidence() -> None:
+    output = {
+        "agent_name": "airtable_context_agent",
+        "blockers": ["The exact write target needs approval."],
+    }
+
+    assert cli._context_agent_blocked_write_attempts(output) == []
+    assert cli._context_agent_blocked_write_attempts(
+        output,
+        tool_receipts=[{
+            "tool_name": "airtable_write_record", "operation": "update",
+            "status": "blocked", "provider_write": True,
+        }],
+    ) == ["airtable_context_agent: provider write or cleanup did not verify"]
+    assert cli._context_agent_blocked_write_attempts(
+        output,
+        tool_invocations=[{
+            "tool_name": "airtable_write_record", "status": "started",
+        }],
+    ) == ["airtable_context_agent: provider write attempt lacked a verified receipt"]
+
+
 def test_context_agent_lifecycle_receipt_keeps_bounded_verification() -> None:
     raw_result = SimpleNamespace(
         new_items=[
@@ -14974,6 +15440,278 @@ def test_context_agent_human_summary_includes_feed_item_summaries() -> None:
         "*Useful references:*\n"
         "  - AI model validation guide (https://example.test/ai-validation)"
     )
+
+
+def test_selected_preprint_card_uses_provider_identity_and_answer_scope_link() -> None:
+    provider = {
+        "candidate_id": "preprint-1",
+        "title": "Interpretation bias review in youth depression",
+        "source": "PsyArXiv",
+        "published_at": "2026-08-01T13:17:00Z",
+        "url": "https://example.test/preprint-1/",
+        "summary": (
+            "Saved summary of a preliminary review. "
+            "A moderate cross-sectional association was reported."
+        ),
+    }
+    output = {
+        "decision": {"selected_candidate_ids": ["preprint-1"]},
+        "articles": [{
+            "feed_item_id": "preprint-1",
+            "title": "Invented model title",
+            "source": "Invented venue",
+            "published_at": "2099-01-01",
+            "url": provider["url"],
+            "summary": "Invented model summary that the source did not provide.",
+            "methods_or_design": "Systematic review and meta-analysis; pooled evidence",
+            "key_findings": ["A moderate cross-sectional association was reported."],
+            "relevance_to_keystone": "Useful for evidence review.",
+            "limitations": ["Saved summary only; full article text was not verified."],
+        }],
+        "blockers": ["A required internal context grant is missing."],
+    }
+
+    text = cli.render_selected_signal_summary(
+        output, route="preprints_context_agent", provider_candidates=[provider],
+    )
+
+    assert "*Article:* Interpretation bias review in youth depression (PsyArXiv, 2026-08-01)" in text
+    assert "Invented model title" not in text
+    assert "Invented venue" not in text
+    assert "2099-01-01" not in text
+    assert text.index("*Our read of the saved summary:*") < text.index("*Evidence limits:*")
+    assert "*Needs attention:* A required internal context grant is missing." in text
+    assert text.count(provider["url"]) == 1
+    assert "Useful references" not in text
+    assert validate_output_constraints(
+        text, InterpretedOutputConstraints(include_source_urls=True, source_scope="answer")
+    ).passed
+
+    quick = cli.render_selected_signal_summary(
+        output, route="preprints_context_agent", provider_candidates=[provider], quick=True,
+    )
+    assert "*Article:*" not in quick and "*Answer:*" not in quick
+    assert "Saved summary only" in quick and "Needs attention:" in quick
+    assert "The saved summary reports: A moderate cross-sectional association" in quick
+    assert "Invented model summary" not in quick
+    assert quick.count(provider["url"]) == 1
+
+    unsupported_provider = {**provider, "summary": "Saved summary of a preliminary review."}
+    assert cli.render_selected_signal_summary(
+        output, route="preprints_context_agent",
+        provider_candidates=[unsupported_provider], quick=True,
+    ) == ""
+
+    long_provider = dict(provider)
+    long_provider["summary"] = (
+        "A preliminary review compared evidence across multiple age groups and "
+        + "reported its design and source-selection methods in enough detail to " * 3
+        + "occupy most of a short preview. "
+        + "The aim was to compare age groups before analyzing results. "
+        + "Additional methodological context came before the finding. "
+        + "A moderate cross-sectional association was reported for youth studies."
+    )
+    quick_long = cli.render_selected_signal_summary(
+        output, route="preprints_context_agent",
+        provider_candidates=[long_provider], quick=True,
+    )
+    assert "The saved summary reports: A moderate cross-sectional association" in quick_long
+    assert "The aim was to compare age groups" not in quick_long
+
+    numeric_output = {
+        **output,
+        "articles": [{
+            **output["articles"][0],
+            "key_findings": ["A moderate cross-sectional association (r=.34) was reported."],
+        }],
+    }
+    numeric_provider = {
+        **provider,
+        "summary": (
+            "This review aimed to estimate a moderate cross-sectional association "
+            "across age groups. A moderate cross-sectional association was found "
+            "in youth samples (r=0.34)."
+        ),
+    }
+    numeric_quick = cli.render_selected_signal_summary(
+        numeric_output, route="preprints_context_agent",
+        provider_candidates=[numeric_provider], quick=True,
+    )
+    assert "youth samples (r=0.34)" in numeric_quick
+    assert "aimed to estimate" not in numeric_quick
+    wrong_number = {
+        **numeric_output,
+        "articles": [{
+            **numeric_output["articles"][0],
+            "key_findings": ["A moderate cross-sectional association (r=.99) was reported."],
+        }],
+    }
+    assert cli.render_selected_signal_summary(
+        wrong_number, route="preprints_context_agent",
+        provider_candidates=[numeric_provider], quick=True,
+    ) == ""
+
+    count_first = {
+        **numeric_output,
+        "articles": [{
+            **numeric_output["articles"][0],
+            "key_findings": [
+                "30 eligible studies were included.",
+                "22 cross-sectional effects were pooled.",
+                "Interpretation bias was moderately associated with depression (r=.34).",
+            ],
+        }],
+    }
+    count_source = {
+        **provider,
+        "summary": (
+            "The review included 30 eligible studies. "
+            "The authors pooled 22 cross-sectional effects. "
+            "Interpretation bias was moderately associated with depression "
+            "(r=0.34) across the included samples."
+        ),
+    }
+    standard_result = cli.render_selected_signal_summary(
+        count_first, route="preprints_context_agent",
+        provider_candidates=[count_source],
+    )
+    quick_result = cli.render_selected_signal_summary(
+        count_first, route="preprints_context_agent",
+        provider_candidates=[count_source], quick=True,
+    )
+    for result in (standard_result, quick_result):
+        assert "moderately associated with depression (r=0.34)" in result
+        assert "30 eligible studies" not in result
+        assert result.count(provider["url"]) == 1
+    paraphrased_source = {
+        **count_source,
+        "summary": (
+            "The review included 30 eligible studies. "
+            "Bias correlated with depressive scores (r=0.34) in the pooled sample."
+        ),
+    }
+    paraphrased_result = cli.render_selected_signal_summary(
+        count_first, route="preprints_context_agent",
+        provider_candidates=[paraphrased_source],
+    )
+    assert "Bias correlated with depressive scores (r=0.34)" in paraphrased_result
+    assert "30 eligible studies" not in paraphrased_result
+    spoofed_effect = {
+        **count_first,
+        "articles": [{
+            **count_first["articles"][0],
+            "key_findings": [
+                "30 eligible studies were included.",
+                "Interpretation bias was strongly associated with depression (r=.99).",
+            ],
+        }],
+    }
+    safe_result = cli.render_selected_signal_summary(
+        spoofed_effect, route="preprints_context_agent",
+        provider_candidates=[count_source], quick=True,
+    )
+    assert "r=.99" not in safe_result and "r=0.34" not in safe_result
+
+    without_finding = {**output, "articles": [{**output["articles"][0], "key_findings": []}]}
+    source_fallback = cli.render_selected_signal_summary(
+        without_finding, route="preprints_context_agent",
+        provider_candidates=[long_provider], quick=True,
+    )
+    assert "occupy most of a short preview." in source_fallback
+    assert "Additional methodological context" not in source_fallback
+
+
+def test_selected_rss_card_omits_missing_sections_and_layout_honors_ask_shape() -> None:
+    provider = {
+        "candidate_id": "rss-1", "title": "New evaluation call",
+        "source": "Public feed", "url": "https://example.test/rss-1",
+        "summary": "A public call invited evaluation proposals.",
+    }
+    output = {
+        "decision": {"selected_candidate_ids": ["rss-1"]},
+        "articles": [{"feed_item_id": "rss-1", "url": provider["url"],
+                      "summary": "A public call invited evaluation proposals."}],
+    }
+    text = cli.render_selected_signal_summary(
+        output, route="rss_context_agent", provider_candidates=[provider],
+    )
+    assert "*Update:* New evaluation call (Public feed)" in text
+    assert "*Our read of the update:*" in text
+    assert "*Why it matters:*" not in text
+    assert "*Evidence limits:*" not in text
+    assert text.count(provider["url"]) == 1
+
+    shape = {"output_form": "brief", "evidence_depth": "quick", "ask_breadth": "narrow"}
+    assert cli.direct_answer_layout(
+        route="rss_context_agent", ask_shape=shape,
+        request_text="What changed?", selected_source_count=1,
+    ) == "quick"
+    assert cli.direct_answer_layout(
+        route="rss_context_agent", ask_shape={},
+        request_text="Quick question: what changed?", selected_source_count=1,
+    ) == "quick"
+    for restricted in (
+        {"ask_breadth": "broad"},
+        {"output_form": "bullets"},
+        {"output_constraints": {"sentence_count_mode": "exact", "sentence_count": 1}},
+        {"output_constraints": {"source_url_count_mode": "exact", "source_url_count": 2}},
+    ):
+        assert cli.direct_answer_layout(
+            route="rss_context_agent", ask_shape=restricted,
+            request_text="Quick question: what changed?", selected_source_count=1,
+        ) == "existing"
+    assert cli.direct_answer_layout(
+        route="rss_context_agent", ask_shape={},
+        request_text="What changed?", selected_source_count=2,
+    ) == "existing"
+
+
+def test_quick_direct_answer_keeps_later_source_and_limitation(
+    monkeypatch, capsys,
+) -> None:
+    plan = ManualRequestPlan(
+        source="llm", target_agent="chief_of_staff",
+        ask_shape={"evidence_depth": "quick", "output_form": "brief"},
+    )
+    answer = (
+        "*Answer:*\nThe result merits review.\n\n"
+        "*Detailed Summary:*\nThe saved summary does not verify the full text.\n\n"
+        "*Useful References:*\nhttps://example.test/study"
+    )
+
+    def fake_sdk(**_kwargs):
+        return SimpleNamespace(
+            output=cli.DirectAgentResponse(answer=answer),
+            usage={"requests": 1}, cost={}, budget_guard={}, request_cache={},
+        )
+
+    monkeypatch.setattr(cli, "run_typed_sdk_agent", fake_sdk)
+    result = cli._run_direct_supplied_context_response_live(
+        "chief_of_staff", "Quick question: what does the saved result show?",
+        json_output=True, manual_plan=plan, orchestrator_preflight=None,
+        sdk_session_spec=None, database_url=None,
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["human_summary"] == answer
+    assert "https://example.test/study" in payload["human_summary"]
+    assert "does not verify the full text" in payload["human_summary"]
+
+    def fake_short_sdk(**_kwargs):
+        return SimpleNamespace(
+            output=cli.DirectAgentResponse(answer="*Answer:*\nA short answer."),
+            usage={"requests": 1}, cost={}, budget_guard={}, request_cache={},
+        )
+
+    monkeypatch.setattr(cli, "run_typed_sdk_agent", fake_short_sdk)
+    result = cli._run_direct_supplied_context_response_live(
+        "chief_of_staff", "Quick question: what changed?",
+        json_output=True, manual_plan=plan, orchestrator_preflight=None,
+        sdk_session_spec=None, database_url=None,
+    )
+    simple = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert simple["human_summary"] == "A short answer."
 
 
 def test_cli_ask_gmail_triage_long_prompt_is_not_treated_as_fixture_path(
@@ -19862,6 +20600,43 @@ def test_live_child_decision_block_promotes_completed_tool_and_budget_evidence(
     ]
 
 
+@pytest.mark.parametrize(
+    ("public_status", "entry_status"),
+    [("blocked", "blocked"), ("done", "completed")],
+)
+def test_entry_attempt_records_public_result_status_without_changing_cli_exit(
+    capsys, tmp_path: Path, public_status: str, entry_status: str,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'blocked-entry.db'}"
+    args = SimpleNamespace(
+        command="ask", agent="orchestrator", database_url=database_url,
+        json=True, live_sdk=False, max_openai_requests=None, context_file="",
+    )
+    public = {
+        "status": public_status, "block_kind": "source_context_too_large" if public_status == "blocked" else "",
+        "human_summary": "The supplied context needs a smaller verified packet.",
+        "send_enabled": False,
+    }
+
+    def blocked_handler() -> int:
+        cli._start_entry_execution_attempt(args, request_text="Assess supplied evidence.")
+        cli._capture_entry_public_result(public)
+        print(json.dumps(public))
+        return 0
+
+    exit_code = cli._run_with_entry_telemetry(args, blocked_handler)
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out) == public
+    rows = [
+        row for row in SQLiteStore(database_url).fetch_all("agent_runs")
+        if row["agent_name"] == "kba_entrypoint"
+    ]
+    assert len(rows) == 1
+    assert rows[0]["status"] == entry_status
+    terminal = json.loads(rows[0]["output_json"])["terminal"]
+    assert terminal == {"status": entry_status, "exit_code": 0}
+
+
 def test_gmail_entry_accounting_separates_expected_reserved_actual_and_repairs(
     monkeypatch,
     capsys,
@@ -19934,6 +20709,9 @@ def test_gmail_entry_accounting_separates_expected_reserved_actual_and_repairs(
         "actual_child_requests": 4,
         "actual_child_requests_available": True,
         "actual_total_requests": 6,
+        "actual_total_requests_available": True,
+        "budget_consumed": None,
+        "budget_consumed_count_confirmed": None,
         "repair_status": {
             "orchestrator": {"status": "used", "count": 1},
             "tool_correction": {"status": "used", "count": 1},

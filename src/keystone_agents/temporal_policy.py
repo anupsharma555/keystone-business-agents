@@ -6,7 +6,8 @@ import re
 from typing import Any
 
 _TEMPORAL_TERM_RE = re.compile(
-    r"\b(?:current|currently|latest|newest|recent|recently|today|this\s+(?:week|month|year)|"
+    r"\b(?:current|currently|latest|newest|recent|recently|today|yesterday|tomorrow|"
+    r"(?:this|last|next)\s+(?:week|month|year)|"
     r"now|fresh|up\s+to\s+date|up-to-date|202[5-9]|203\d)\b",
     re.I,
 )

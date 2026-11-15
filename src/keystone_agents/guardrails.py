@@ -119,7 +119,7 @@ _NEGATED_UNSUPPORTED_CLAIM_CONTEXT_RE = re.compile(
     re.IGNORECASE,
 )
 _SECRET_PATTERNS = (
-    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"),
     re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}", re.IGNORECASE),
     re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----", re.IGNORECASE),
     re.compile(

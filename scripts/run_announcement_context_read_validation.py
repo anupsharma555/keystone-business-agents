@@ -8,6 +8,7 @@ import json
 from collections import Counter
 from typing import Any
 
+from keystone_agents.config import with_cli_environment
 from keystone_agents.tools.announcement_context_tools import (
     retrieve_preprint_announcement_history_impl,
     retrieve_rss_announcement_history_impl,
@@ -109,6 +110,7 @@ def run_validation(
     }
 
 
+@with_cli_environment()
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     result = run_validation(

@@ -3,6 +3,11 @@ from __future__ import annotations
 from keystone_agents.temporal_policy import temporal_depth_policy
 
 
+def test_relative_dates_require_fresh_evidence_for_research():
+    for text in ("What changed yesterday?", "Results from last week", "Schedule next month"):
+        assert temporal_depth_policy(text, requires_live_search=True)["temporal_intent"] is True
+
+
 def test_temporal_depth_policy_detects_current_request_and_budget_blocker() -> None:
     policy = temporal_depth_policy(
         "Find the latest 2026 behavioral health AI partnerships.",

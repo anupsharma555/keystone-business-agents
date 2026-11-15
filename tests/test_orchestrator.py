@@ -1939,6 +1939,24 @@ def test_llm_requested_without_runner_uses_deterministic_fallback() -> None:
     assert any("deterministic fallback" in note for note in result.audit_notes)
 
 
+@pytest.mark.parametrize("natural_ask", [
+    "Who won yesterday, the governing party or the opposition?",
+    "What changed in the rail timetable this week?",
+    "What are the latest results for the championship?",
+])
+def test_informational_ambiguity_can_reach_research_without_required_clarification(natural_ask):
+    def router(prompt, workflow_state):
+        payload = json.loads(prompt)
+        assert natural_ask in str(payload["request"])
+        assert any("investigate low-risk informational" in rule for rule in payload["hard_rules"])
+        return {"route": "business_research_analyst", "rationale": "Investigate likely scope with read-only sources, state assumptions, then offer narrowing."}
+
+    result = route_request(natural_ask, use_llm=True, llm_router=router)
+    assert result.route == "business_research_analyst"
+    assert not result.clarification_request
+    assert result.send_enabled is False
+
+
 def test_send_email_request_is_refused_before_llm_router() -> None:
     def fail_llm_router(_prompt: str, _workflow_state: object) -> dict[str, object]:
         raise AssertionError("LLM router must not run for send requests")

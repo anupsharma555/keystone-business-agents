@@ -462,6 +462,59 @@ def test_llm_gmail_plan_uses_typed_update_even_without_canonical_update_words() 
     assert plan.create_gmail_drafts is True
 
 
+@pytest.mark.parametrize("ask,operation", [
+    (
+        "Update the existing Gmail draft with subject 'Project follow-up' "
+        "for reviewer@example.com to be shorter. Do not send.", "update",
+    ),
+    ("Update the existing Gmail draft to make it shorter. Do not send.", "update"),
+    ("Update the existing Gmail draft; remove the greeting. Do not send.", "update"),
+    (
+        "Update the existing Gmail draft; add one sentence to the body. "
+        "Do not send.", "update",
+    ),
+    ("Change the subject of the existing Gmail draft. Do not send.", "update"),
+    ("Rewrite the body of the existing Gmail draft. Do not send.", "update"),
+    ("Create a Gmail draft for reviewer@example.com. Do not send.", "create"),
+])
+def test_supported_gmail_draft_lifecycle_keeps_no_send_provider_gate(
+    ask: str, operation: str,
+) -> None:
+    plan = infer_manual_request_plan(ask, requested_agent="gmail_triage")
+    assert plan.target_agent == "gmail_triage"
+    assert plan.intent == "gmail_triage"
+    assert plan.provider_system == "gmail"
+    assert plan.provider_operations == [operation]
+    assert plan.side_effect_policy == "draft_or_read_only"
+
+
+@pytest.mark.parametrize("ask", [
+    "Send the existing Gmail draft to reviewer@example.com.",
+    "Update the existing Gmail draft and send it to reviewer@example.com.",
+    "Update the existing Gmail draft and post the result to Slack.",
+    "Delete the existing Gmail draft. Do not send.",
+    "Update the existing Gmail draft and delete it. Do not send.",
+    "Create a Gmail draft and delete the prior draft. Do not send.",
+    "Update the existing Gmail draft and archive the message. Do not send.",
+    "Update the existing Gmail draft and label the message. Do not send.",
+    "Update the existing Gmail draft and mark the message read. Do not send.",
+    (
+        "Update the existing Gmail draft with subject Project follow-up, then "
+        "change the subject of another email. Do not send."
+    ),
+    (
+        "Update the existing Gmail draft, then rewrite the body of a different "
+        "message. Do not send."
+    ),
+])
+def test_gmail_draft_lifecycle_does_not_admit_send_or_unsupported_delete(
+    ask: str,
+) -> None:
+    plan = infer_manual_request_plan(ask, requested_agent="gmail_triage")
+    assert plan.intent == "blocked_send"
+    assert not plan.provider_operations
+
+
 def test_gmail_inline_reply_text_does_not_grant_provider_create() -> None:
     request = (
         "@KNI Gmail Triage Agent, read today's E2B email and write a short reply "
@@ -2343,6 +2396,31 @@ def test_context_agent_external_send_request_is_blocked() -> None:
     assert plan.target_agent == "rss_context_agent"
     assert plan.task_objective == "blocked_side_effect"
     assert plan.planner_warnings
+
+
+@pytest.mark.parametrize("source_object", [
+    "record #3", "document #3", "file #3", "sheet #3", "a collection entry",
+    "an item in this workspace",
+])
+def test_saving_local_research_task_for_source_is_not_external_write(
+    source_object: str,
+) -> None:
+    plan = infer_manual_request_plan(
+        f"Create a resumable research task for {source_object}. "
+        "Read only its linked article. Do not post elsewhere.",
+        requested_agent="orchestrator",
+    )
+    assert plan.intent != "blocked_send"
+    assert plan.side_effect_policy == "draft_or_read_only"
+
+
+def test_local_task_and_separate_provider_mutation_still_requires_write_gate() -> None:
+    plan = infer_manual_request_plan(
+        "Create a research task for item #3 and update the Airtable record for it.",
+        requested_agent="orchestrator",
+    )
+    assert plan.intent == "business_system_write"
+    assert plan.side_effect_policy == "internal_write_approval_required"
 
 
 def test_context_agent_internal_update_routes_to_owner_for_approval_gating() -> None:
@@ -5816,7 +5894,7 @@ def test_manual_planner_defaults_to_dedicated_openai_profile(
     configs = _planner_model_configs(requested_agent="gmail_triage")
 
     assert [(config.provider, config.model) for config in configs] == [
-        ("openai", "gpt-5.4-mini")
+        ("openai", "gpt-6-luna")
     ]
 
 
@@ -5831,7 +5909,7 @@ def test_manual_planner_unknown_policy_fails_safe_to_dedicated_openai(
     configs = _planner_model_configs(requested_agent="gmail_triage")
 
     assert [(config.provider, config.model) for config in configs] == [
-        ("openai", "gpt-5.4-mini")
+        ("openai", "gpt-6-luna")
     ]
 
 

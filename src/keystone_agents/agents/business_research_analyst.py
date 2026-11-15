@@ -55,7 +55,8 @@ from keystone_agents.models import (
     ResearchSDKInput,
     TypedAgentRunResult,
 )
-from keystone_agents.run import run_typed_sdk_agent
+from keystone_agents.run import run_typed_sdk_agent, sdk_run_failure_metadata
+from keystone_agents.runtime.request_budget import current_model_request_capacity
 from keystone_agents.runtime.tool_call_budget import ToolCallBudgetContract
 from keystone_agents.runtime.tool_execution import (
     ToolEvidenceGroup,
@@ -172,7 +173,19 @@ def _business_research_tool_execution_contract(
     provider_retrieval_required: bool,
     attach_tools: bool,
 ) -> ToolExecutionContract | None:
-    del manual_request_plan
+    plan = ExecutionIntentAuthority.from_value(manual_request_plan).plan
+    if (
+        attach_tools and plan is not None
+        and _required_business_research_tools_for_request(plan)
+        == ("extract_selected_urls_to_source_bundle", "read_web_source_window")
+    ):
+        return ToolExecutionContract.required(
+            ToolEvidenceGroup(
+                "selected_public_source_read",
+                ("extract_selected_urls_to_source_bundle", "read_web_source_window"),
+            ),
+            stage="business_research_selected_source_evidence",
+        )
     if not provider_retrieval_required or not attach_tools:
         return None
     return ToolExecutionContract.required(
@@ -762,6 +775,22 @@ def _business_research_analyst_company_profile_tools(
     return filter_tools_for_tier("business_research_analyst", tools, tool_tier)
 
 
+def is_public_topic_research_plan(
+    value: ManualRequestPlan | Mapping[str, Any] | None,
+) -> bool:
+    """Select the compact topic instructions only from the typed public-read plan."""
+    authority = ExecutionIntentAuthority.from_value(value)
+    plan = authority.plan
+    return bool(
+        authority.canonical and plan is not None
+        and plan.source == "canonical:orchestrator_public_research"
+        and plan.target_type == "topic"
+        and plan.requires_live_search
+        and plan.provider_system == "unspecified"
+        and plan.ask_shape.permission_state == "read_only"
+    )
+
+
 def build_business_research_analyst_focused_brief_agent(
     model: str | None = None,
     *,
@@ -776,7 +805,15 @@ def build_business_research_analyst_focused_brief_agent(
 ) -> Agent:
     """Build Business Research Analyst for BR-1 focused brief synthesis."""
 
-    if attach_tools:
+    if (
+        attach_tools and is_public_topic_research_plan(manual_request_plan)
+        and not include_all_skills
+    ):
+        instructions = compose_direct_instructions(
+            "keystone_profile.md", "safety_policy.md", "public_topic_research_compact.md",
+            skill_files=("evidence_attribution_and_claim_mapping", "tool_result_resilience"),
+        )
+    elif attach_tools:
         skill_files = select_agent_skill_names(
             "business_research_analyst",
             request_text=request_text,
@@ -967,6 +1004,19 @@ def _supplied_web_source_accesses(typed_input: Any) -> tuple[WebSourceAccess, ..
         packet = json.loads(getattr(typed_input, "source_context", "") or "{}")
     except (TypeError, ValueError):
         return ()
+    catalog = packet.get("source_catalog") if isinstance(packet, Mapping) else None
+    allowed: set[tuple[str, str]] | None = None
+    if isinstance(packet, Mapping) and "source_catalog" in packet:
+        if not isinstance(catalog, list):
+            raise ValueError("Supplied source catalog must contain explicit source identities.")
+        allowed = {
+            (item["source_id"], item["url"])
+            for item in catalog
+            if isinstance(item, Mapping)
+            and isinstance(item.get("source_id"), str)
+            and isinstance(item.get("url"), str)
+            and item["source_id"] and item["url"]
+        }
     found: dict[tuple[str, str, str], WebSourceAccess] = {}
     def visit(value: Any) -> None:
         if isinstance(value, Mapping):
@@ -975,7 +1025,15 @@ def _supplied_web_source_accesses(typed_input: Any) -> tuple[WebSourceAccess, ..
                 access = WebSourceAccess.model_validate(raw)
                 if value.get("source_id") and value["source_id"] != access.source_id:
                     raise ValueError("Web source access does not match its source identity.")
-                found[(access.source_id, access.selected_url, access.snapshot_sha256)] = access
+                if access.available:
+                    if (
+                        allowed is not None
+                        and (access.source_id, access.selected_url) not in allowed
+                    ):
+                        raise ValueError(
+                            "Web source access is outside the supplied source catalog."
+                        )
+                    found[(access.source_id, access.selected_url, access.snapshot_sha256)] = access
             for key, child in value.items():
                 if key != "web_source_access":
                     visit(child)
@@ -1251,6 +1309,36 @@ def comparison_input_from_result(
     )
 
 
+def _source_window_visibility_receipts(agent: Any) -> list[dict[str, Any]]:
+    receipts: dict[int, dict[str, Any]] = {}
+    for tool in getattr(agent, "tools", ()):
+        observer = getattr(tool, "keystone_source_window_visibility", None)
+        if not callable(observer):
+            continue
+        key = id(getattr(observer, "__self__", observer))
+        if key not in receipts:
+            receipts[key] = {**observer(), "tool_names": []}
+        receipts[key]["tool_names"].append(str(getattr(tool, "name", "")))
+    return list(receipts.values())
+
+
+def _run_research_sdk_with_visibility(**kwargs: Any) -> TypedAgentRunResult[Any]:
+    """Retain conditional-visibility observations on successful and failed runs."""
+    agent = kwargs["agent"]
+    try:
+        result = run_typed_sdk_agent(**kwargs)
+    except Exception as exc:
+        cache = sdk_run_failure_metadata(exc).get("request_cache")
+        receipts = _source_window_visibility_receipts(agent)
+        if isinstance(cache, dict) and receipts:
+            cache["source_window_visibility"] = receipts
+        raise
+    receipts = _source_window_visibility_receipts(agent)
+    if receipts and isinstance(getattr(result, "request_cache", None), dict):
+        result.request_cache["source_window_visibility"] = receipts
+    return result
+
+
 def run_business_research_analyst_sdk(
     typed_input: BusinessResearchSDKInput | str,
     *,
@@ -1302,7 +1390,7 @@ def run_business_research_analyst_sdk(
         tool_scope_mode=ToolScopeMode.REQUEST_SCOPED,
     )
     scope_receipt = tool_scope_receipt_for_agent(agent)
-    result = run_typed_sdk_agent(
+    result = _run_research_sdk_with_visibility(
         agent=agent,
         typed_input=typed_input_for_run,
         output_type=CompanyProfile,
@@ -1397,7 +1485,7 @@ def run_business_research_analyst_focused_brief_sdk(
             if isinstance(row, Mapping) and row.get("source_id") and row.get("url")
         ) if isinstance(packet, Mapping) else ()
     scope_receipt = tool_scope_receipt_for_agent(agent)
-    result = run_typed_sdk_agent(
+    result = _run_research_sdk_with_visibility(
         agent=agent,
         typed_input=typed_input_for_run,
         output_type=CompanyResearchFocusedBrief,
@@ -1484,7 +1572,7 @@ def run_business_research_analyst_research_brief_sdk(
         tool_scope_mode=ToolScopeMode.REQUEST_SCOPED,
     )
     scope_receipt = tool_scope_receipt_for_agent(agent)
-    result = run_typed_sdk_agent(
+    result = _run_research_sdk_with_visibility(
         agent=agent,
         typed_input=typed_input_for_run,
         output_type=ResearchBrief,
@@ -1567,7 +1655,7 @@ def run_business_research_analyst_comparison_sdk(
         tool_scope_mode=ToolScopeMode.REQUEST_SCOPED,
     )
     scope_receipt = tool_scope_receipt_for_agent(agent)
-    result = run_typed_sdk_agent(
+    result = _run_research_sdk_with_visibility(
         agent=agent,
         typed_input=typed_input_for_run,
         output_type=CompanyResearchComparison,
@@ -1598,6 +1686,28 @@ def run_business_research_analyst_comparison_sdk(
     return result
 
 
+def _research_source_context_with_capacity(context: str) -> str:
+    context = append_runtime_source_layer_policy_text(context, "business_research_analyst")
+    capacity = current_model_request_capacity(load_environment=False)
+    if capacity is None:
+        return context
+    receipt = capacity.receipt(required_future_requests=1)
+    instruction = (
+        "Reserve one model request for the final typed response. A source-window turn "
+        "requires capacity for that turn and a later final response. When only the "
+        "reserved response remains, synthesize from observed evidence and explicitly "
+        "disclose unread source coverage."
+    )
+    try:
+        packet = json.loads(context)
+    except (TypeError, ValueError):
+        packet = None
+    if isinstance(packet, dict):
+        return json.dumps({**packet, "model_request_capacity": receipt,
+                           "model_request_capacity_instruction": instruction})
+    return f"{context}\n\nModel request capacity: {json.dumps(receipt)}\n{instruction}"
+
+
 def _with_runtime_source_layer_policy(
     typed_input: BusinessResearchSDKInput
     | BusinessResearchFocusedBriefSDKInput
@@ -1612,14 +1722,18 @@ def _with_runtime_source_layer_policy(
     | str
 ):
     if isinstance(typed_input, str):
-        return typed_input
+        capacity = current_model_request_capacity(load_environment=False)
+        if capacity is None:
+            return typed_input
+        return (
+            f"{typed_input}\n\nModel request capacity: {json.dumps(capacity.receipt())}\n"
+            "Reserve one model request for the final typed response; disclose unread "
+            "source coverage if continuation cannot fit the remaining capacity."
+        )
     if isinstance(typed_input, BusinessResearchSDKInput):
         return replace(
             typed_input,
-            context=append_runtime_source_layer_policy_text(
-                typed_input.context,
-                "business_research_analyst",
-            ),
+            context=_research_source_context_with_capacity(typed_input.context),
         )
     if isinstance(
         typed_input,
@@ -1631,10 +1745,7 @@ def _with_runtime_source_layer_policy(
     ):
         return replace(
             typed_input,
-            source_context=append_runtime_source_layer_policy_text(
-                typed_input.source_context,
-                "business_research_analyst",
-            ),
+            source_context=_research_source_context_with_capacity(typed_input.source_context),
         )
     return typed_input
 

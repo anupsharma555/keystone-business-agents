@@ -16,6 +16,13 @@ EXPECTED_SKILLS = {
     "kba-live-sdk-smoke-and-cost",
     "kba-operational-validation",
     "kba-propagate-agent-fixes",
+    "kba-openweight-model-integration",
+}
+OPENWEIGHT_SKILL = "kba-openweight-model-integration"
+OPTIONAL_OPENWEIGHT_EXAMPLES = {
+    "docs/NEMOTRON_PILOT.md",
+    "docs/NEMOTRON_SKILL_DESIGN_REVIEW.md",
+    "docs/NEMOTRON_OLLAMA_GUI_SKILLS.md",
 }
 LOCAL_PATH_PREFIXES = (
     "AGENTS.md",
@@ -76,6 +83,10 @@ def test_repo_local_codex_skills_are_repo_scoped_and_actionable() -> None:
         frontmatter = _frontmatter(skill_path)
 
         assert frontmatter["name"] == skill_dir.name
+        assert "TODO" not in text
+        assert "[TODO" not in text
+        if skill_dir.name == OPENWEIGHT_SKILL:
+            continue
         assert (
             REPO_PATH in frontmatter["description"]
             or "keystone-business-agents repo" in frontmatter["description"]
@@ -87,8 +98,20 @@ def test_repo_local_codex_skills_are_repo_scoped_and_actionable() -> None:
         assert "## Request Shapes" in text
         assert "## Workflow" in text
         assert "## Verification" in text
-        assert "TODO" not in text
-        assert "[TODO" not in text
+
+
+def test_openweight_codex_skill_keeps_scoped_storage_and_integration_boundaries() -> None:
+    skill_path = SKILLS_ROOT / OPENWEIGHT_SKILL / "SKILL.md"
+    text = skill_path.read_text()
+    description = _frontmatter(skill_path)["description"]
+
+    assert "keystone-business-agents workspace" in description
+    assert "research alone does not authorize downloads or deployment" in description
+    assert "selected `keystone-business-agents` checkout or its authorized\nworktree" in text
+    assert "Download and import model weights directly to the selected external SSD" in text
+    assert "Do not download from a research-only request" in text
+    assert "Standalone setup does not change production providers, Slack" in text
+    assert "No silent cloud fallback is acceptable" in text
 
 
 def test_repo_local_codex_skill_ui_metadata_matches_skill_names() -> None:
@@ -105,17 +128,25 @@ def test_repo_local_codex_skill_references_exist_and_point_to_existing_files() -
     for skill_dir in _skill_dirs():
         skill_text = (skill_dir / "SKILL.md").read_text()
         reference_paths = sorted((skill_dir / "references").glob("*.md"))
+        local_paths = _local_code_paths(skill_text)
 
         assert reference_paths, f"{skill_dir} should keep detailed workflow maps in references/"
         for reference_path in reference_paths:
             assert f"references/{reference_path.name}" in skill_text
             reference_text = reference_path.read_text()
-            assert REPO_PATH in reference_text
+            if skill_dir.name != OPENWEIGHT_SKILL:
+                assert REPO_PATH in reference_text
             assert "TODO" not in reference_text
             assert "[TODO" not in reference_text
+            reference_local_paths = _local_code_paths(reference_text)
+            if skill_dir.name == OPENWEIGHT_SKILL and reference_path.name == "evaluation.md":
+                optional_intro = reference_text.split("## Bounded comparison", 1)[0]
+                assert "optional examples" in optional_intro
+                assert OPTIONAL_OPENWEIGHT_EXAMPLES <= _local_code_paths(optional_intro)
+                reference_local_paths -= OPTIONAL_OPENWEIGHT_EXAMPLES
+            local_paths.update(reference_local_paths)
 
-        reference_texts = "\n".join(p.read_text() for p in reference_paths)
-        for path_text in _local_code_paths(skill_text + reference_texts):
+        for path_text in local_paths:
             assert (PROJECT_ROOT / path_text).exists(), (
                 f"{skill_dir.name} references missing {path_text}"
             )

@@ -81,6 +81,8 @@ from keystone_agents.gmail_triage.priority_grouping import (
     rank_gmail_candidates_for_request,
 )
 from keystone_agents.instruction_following import (
+    canonical_source_url,
+    canonical_source_urls,
     instruction_following_blocker_text,
     output_constraints_from_plan,
     resolve_instruction_following_response,
@@ -142,6 +144,7 @@ from keystone_agents.planning.compatibility import (
     resolve_manual_request_owner,
 )
 from keystone_agents.planning.composition_admission import (
+    explicit_signal_source_selection,
     is_selected_public_url_read_plan,
 )
 from keystone_agents.presentation.renderers import render_gmail_selected_answer
@@ -179,6 +182,7 @@ from keystone_agents.schemas.company_profile import (
     CompanyProfile,
     SourceRecord,
 )
+from keystone_agents.schemas.composition_admission import VerifiedSignalContext
 from keystone_agents.schemas.email_triage import (
     GmailThreadSummaryMessage,
     GmailThreadSummaryResult,
@@ -1083,6 +1087,54 @@ def prepare_work_item_step(
         work_item_id=request.work_item_id,
         route=route,
     )
+    if request.linked_parent_work_item_id:
+        from keystone_agents.planning.selected_source_resume import (
+            matches_authenticated_slack_thread,
+        )
+        from keystone_agents.tools.website_extraction_tool import (
+            validate_retained_web_source_access,
+        )
+
+        parent = store.get_work_item(request.linked_parent_work_item_id)
+        relation = (request.orchestrator_preflight or {}).get("route_result") or {}
+        if (
+            request.work_item_id or parent is None or parent.id == work_item.id
+            or relation.get("routing_mode") != "llm"
+            or relation.get("linked_work_item_relation") != "branch_existing"
+            or not matches_authenticated_slack_thread(parent, request.context_file_path)
+        ):
+            raise ValueError("A branched WorkItem requires a validated current parent thread.")
+        selected_url = canonical_source_url(str(relation.get("selected_source_url") or ""))
+        selected_sources = [
+            source for source in parent.sources
+            if selected_url and source.source_id
+            and canonical_source_url(source.url) == selected_url
+        ]
+        if selected_url and selected_url == canonical_source_url(parent.target.url) and not selected_sources:
+            raise ValueError("The branch selected source is absent from its parent WorkItem.")
+        if selected_sources and (
+            len({source.source_id for source in selected_sources}) != 1
+            or any(source != selected_sources[0] for source in selected_sources[1:])
+        ):
+            raise ValueError("The branch selected source is ambiguous in its parent WorkItem.")
+        if selected_sources and selected_sources[0].web_source_access is not None:
+            if not validate_retained_web_source_access(selected_sources[0].web_source_access):
+                raise ValueError("The branch selected cached source failed integrity validation.")
+        work_item = work_item.model_copy(update={
+            "target": work_item.target.model_copy(update={
+                **({"url": selected_sources[0].url} if selected_sources else {}),
+                "metadata": {
+                    **work_item.target.metadata,
+                    "branch_parent_work_item": {
+                        "schema": "keystone.work_item_branch_parent.v1",
+                        "work_item_id": parent.id,
+                        **({"selected_source_id": selected_sources[0].source_id}
+                           if selected_sources else {}),
+                    },
+                },
+            }),
+            "sources": selected_sources,
+        })
     from keystone_agents.runtime.durable_execution import current_execution
 
     execution = current_execution()
@@ -1094,7 +1146,55 @@ def prepare_work_item_step(
         )
     if input_text and input_text.lower() not in {"continue", "resume"}:
         work_item = work_item.model_copy(update={"request_text": input_text})
+    from keystone_agents.planning.selected_source_resume import bind_selected_source_resume
+
+    saved_target = work_item.target
+    source_binding = bind_selected_source_resume(
+        plan=request.manual_request_plan, work_item=work_item,
+        work_item_id=request.work_item_id, current_request=input_text,
+        route_result=(request.orchestrator_preflight or {}).get("route_result"),
+        slack_context_path=request.context_file_path,
+    )
+    if source_binding is not None:
+        request = request.model_copy(update={
+            "manual_request_plan": source_binding.plan.model_dump(mode="json"),
+            "live_search": False,
+            "orchestrator_preflight": {
+                **(request.orchestrator_preflight or {}),
+                "selected_source_resume_binding": source_binding.provenance(),
+            },
+        })
     work_item = _apply_manual_request_plan(work_item, request.manual_request_plan)
+    if source_binding is not None:
+        work_item = work_item.model_copy(update={
+            "target": saved_target.model_copy(update={"metadata": {
+                **work_item.target.metadata,
+                "selected_source_resume_binding": source_binding.provenance(),
+            }}),
+        })
+        record_event(
+            work_item, event_type="selected_source_resume_bound",
+            actor="workflow_runner",
+            summary="Retained the exact current WorkItem's previously selected source identity.",
+            metadata=source_binding.provenance(), store=store,
+        )
+    same_work_item_resume = bool(
+        request.work_item_id
+        and input_text.lower() in {"continue", "resume"}
+        and not request.context_file_path
+        and request.context_file_snapshot is None
+        and request.external_context is None
+    )
+    if not same_work_item_resume and any(key in work_item.target.metadata for key in (
+        "verified_signal_source_binding", "verified_signal_context_error"
+    )):
+        metadata = {
+            key: value for key, value in work_item.target.metadata.items()
+            if key not in {"verified_signal_source_binding", "verified_signal_context_error"}
+        }
+        work_item = work_item.model_copy(update={
+            "target": work_item.target.model_copy(update={"metadata": metadata})
+        })
     request = _attach_reusable_slack_query_prompt(
         request,
         route=route,
@@ -1102,11 +1202,40 @@ def prepare_work_item_step(
         store=store,
     )
     external_context = _load_external_context(request)
+    verified_signal, signal_context_error = _work_item_selected_signal_context(
+        request, external_context, work_item=work_item, route=route, store=store,
+    )
     work_item = _apply_external_context(
         work_item,
         external_context,
         context_file_path=request.context_file_path,
+        verified_signal=verified_signal,
     )
+    # Retain completed model-requested reads across the shared direct/graph
+    # preparation boundary. A descriptor alone is a capability, not evidence.
+    preflight_state = (request.orchestrator_preflight or {}).get("workflow_state", {})
+    if not same_work_item_resume or (
+        isinstance(preflight_state, dict) and preflight_state.get("channel_context_evidence")
+    ):
+        retained = {
+            key: preflight_state[key]
+            for key in ("channel_context_evidence", "channel_context_usage")
+            if isinstance(preflight_state, dict) and preflight_state.get(key)
+        } if isinstance(preflight_state, dict) else {}
+        metadata = {
+            key: value for key, value in work_item.target.metadata.items()
+            if key not in {"channel_context_evidence", "channel_context_usage"}
+        }
+        work_item = work_item.model_copy(update={
+            "target": work_item.target.model_copy(update={
+                "metadata": {**metadata, **retained},
+            }),
+        })
+    if signal_context_error:
+        metadata = {**work_item.target.metadata, "verified_signal_context_error": signal_context_error}
+        work_item = work_item.model_copy(update={
+            "target": work_item.target.model_copy(update={"metadata": metadata})
+        })
     work_item = _attach_slack_prompt_context(work_item, latest_request=input_text)
     request = _normalize_workflow_request_for_context(request, work_item=work_item)
     sdk_session_spec = _sdk_session_spec_for_work_item(request, work_item)
@@ -1190,6 +1319,16 @@ def prepare_work_item_step(
 
 def run_prepared_work_item_specialist(prepared: PreparedWorkItemStep) -> WorkflowRunResult:
     """Run one specialist and convert schema failures into durable WorkItem state."""
+
+    from keystone_agents.runtime.continuity_policy import activate_continuity_policy
+
+    with activate_continuity_policy(_workflow_continuity_policy(prepared.request)):
+        return _run_prepared_specialist_with_admitted_continuity(prepared)
+
+
+def _run_prepared_specialist_with_admitted_continuity(
+    prepared: PreparedWorkItemStep,
+) -> WorkflowRunResult:
 
     try:
         result = _run_prepared_work_item_specialist_unchecked(prepared)
@@ -1361,6 +1500,17 @@ def _run_prepared_work_item_specialist_unchecked(
         ),
         None,
     )
+    signal_context_error = work_item.target.metadata.get("verified_signal_context_error")
+    if signal_context_error:
+        return _blocked_result(
+            work_item,
+            (WorkItemBlocker(code="verified_signal_context_unavailable", message=str(signal_context_error)),),
+            WorkItemNextAction(
+                action="provide_verified_signal_context", agent=route,
+                description="Select one completed same-thread signal source before continuing.",
+            ),
+            store=store, route=route,
+        )
     if source_bundle_mismatch is not None:
         return _blocked_result(
             work_item,
@@ -2951,6 +3101,17 @@ def _review_manager_loop_step(
             "review_decision": review_decision,
         }
     )
+    if (
+        review_decision == "warn"
+        and review_context["review_status"] == "fail"
+        and _verified_signal_scout_no_action(result, original_request)
+        and _verified_signal_no_action_record_template_gaps(review_context)
+    ):
+        # The generic record reviewer cannot score an accepted no-action answer.
+        # Preserve its raw finding while making the scoped advisory visible to
+        # public-result consistency checks.
+        review_context["raw_review_status"] = "fail"
+        review_context["review_status"] = "warn"
     target_metadata = dict(result.work_item.target.metadata)
     prior_reviews = [
         item for item in target_metadata.get("orchestrator_reviews", []) if isinstance(item, dict)
@@ -4066,6 +4227,9 @@ def _specialist_orchestrator_context_payload(
     context_source_manifest = work_item.target.metadata.get("context_source_manifest")
     if isinstance(context_source_manifest, dict):
         payload["context_source_manifest"] = context_source_manifest
+    for key in ("channel_context_evidence", "channel_context_usage"):
+        if work_item.target.metadata.get(key):
+            payload[key] = work_item.target.metadata[key]
     slack_context = work_item.target.metadata.get("slack_context")
     if isinstance(slack_context, dict):
         payload["slack_context"] = {
@@ -4087,6 +4251,35 @@ def _specialist_orchestrator_context_payload(
             )
             if slack_context.get(key) not in (None, "", [], {})
         }
+    from keystone_agents.runtime.continuity_policy import current_continuity_policy
+    from keystone_agents.runtime.operator_continuity import (
+        compact_optional_context,
+        compact_task_context,
+    )
+
+    continuity = current_continuity_policy()
+    if continuity is not None and continuity.eligible:
+        current_state = (request.orchestrator_preflight or {}).get("workflow_state", {})
+        current_state = current_state if isinstance(current_state, dict) else {}
+        payload.update(compact_optional_context(
+            compact_task_context(work_item), current_state.get("operator_context_evidence"),
+        ))
+        # Receipts remain in saved transport telemetry. Facts enter this model
+        # once in the bounded optional packet, not inside a second preflight copy.
+        if isinstance(payload.get("orchestrator_preflight"), dict):
+            preflight_copy = dict(payload["orchestrator_preflight"])
+            if isinstance(preflight_copy.get("workflow_state"), dict):
+                preflight_copy["workflow_state"] = {
+                    key: value for key, value in preflight_copy["workflow_state"].items()
+                    if key not in {"operator_context_evidence", "current_work_item"}
+                }
+            payload["orchestrator_preflight"] = preflight_copy
+        payload.pop("reusable_slack_query_prompt", None)
+        if isinstance(payload.get("slack_context"), dict):
+            payload["slack_context"] = {
+                key: value for key, value in payload["slack_context"].items()
+                if key not in {"read_context", "thread_transcript"}
+            }
     return payload
 
 
@@ -4775,8 +4968,6 @@ def _manager_review_failure_is_authoritative(
         and _manager_loop_opportunity_no_match_should_repair(original_request, result)
     ):
         return False
-    if not result.work_item.artifact_refs and not result.artifact_refs:
-        return True
     gaps = " ".join(str(gap or "").lower() for gap in review_context.get("observed_gaps") or [])
     critical_markers = (
         "term overlap is low",
@@ -4797,7 +4988,61 @@ def _manager_review_failure_is_authoritative(
         "source triage",
         "page extraction",
     )
-    return any(marker in gaps for marker in critical_markers)
+    if any(marker in gaps for marker in critical_markers):
+        return True
+    if original_request is not None and _verified_signal_scout_no_action(result, original_request):
+        if _verified_signal_no_action_record_template_gaps(review_context):
+            return False
+    if not result.work_item.artifact_refs and not result.artifact_refs:
+        return True
+    return False
+
+
+def _verified_signal_no_action_record_template_gaps(review_context: dict[str, Any]) -> bool:
+    """Identify only the deterministic review gaps caused by absent records."""
+
+    record_template_gaps = {
+        "Include scored records with sources and recommended next steps.",
+        "Add a concise summary or rationale field.",
+        "Tie the output more directly to the request and evidence.",
+    }
+    observed = review_context.get("observed_gaps")
+    return bool(
+        review_context.get("review_mode") == "deterministic"
+        and review_context.get("llm_review_used") is False
+        and isinstance(observed, list) and observed
+        and all(str(gap) in record_template_gaps for gap in observed)
+    )
+
+
+def _verified_signal_scout_no_action(
+    result: WorkflowRunResult,
+    request: WorkflowRunRequest,
+) -> bool:
+    """Keep a validated source-backed no-action answer from requiring a record."""
+
+    plan = _manual_request_plan_model(request.manual_request_plan)
+    binding = result.work_item.target.metadata.get("verified_signal_source_binding")
+    if (
+        plan is None or plan.expected_artifact_type != "none"
+        or plan.ask_shape.prior_context_dependency != "selected_context"
+        or request.live_search or result.route != WorkItemRoute.OPPORTUNITY_SCOUT
+        or result.status != WorkItemStatus.DONE or not result.advanced
+        or result.blockers or result.artifact_refs or result.work_item.artifact_refs
+        or result.next_action is not None
+        or not isinstance(binding, dict)
+    ):
+        return False
+    source_id = str(binding.get("source_id") or "")
+    source_url = canonical_source_url(binding.get("source_url"))
+    if not source_id or not source_url or not binding.get("source_run_id"):
+        return False
+    if not any(
+        source.source_id == source_id and canonical_source_url(source.url) == source_url
+        for source in result.work_item.sources
+    ):
+        return False
+    return set(canonical_source_urls(result.human_summary)) == {source_url}
 
 
 def _result_is_no_exact_match_advisory(result: WorkflowRunResult) -> bool:
@@ -5876,6 +6121,17 @@ def _route_from_manual_plan(
         return None
 
 
+def _workflow_continuity_policy(request: WorkflowRunRequest) -> Any:
+    from keystone_agents.runtime.continuity_policy import (
+        compact_continuity_enabled,
+        resolve_slack_compact_continuity_policy,
+    )
+
+    if not compact_continuity_enabled():
+        return resolve_slack_compact_continuity_policy(None)
+    return resolve_slack_compact_continuity_policy(_load_external_context(request))
+
+
 def _sdk_session_spec_for_work_item(request: WorkflowRunRequest, work_item: WorkItem) -> Any:
     context_scope = (
         context_payload_session_components(_load_external_context(request))
@@ -5892,7 +6148,9 @@ def _sdk_session_spec_for_work_item(request: WorkflowRunRequest, work_item: Work
     else:
         scope = "workitem"
         components = (work_item.id,)
-    return resolve_sdk_session_spec(
+    from keystone_agents.sdk_sessions import admit_sdk_session_spec
+
+    spec = resolve_sdk_session_spec(
         scope=scope,
         components=components,
         enabled=request.sdk_session_enabled,
@@ -5901,6 +6159,7 @@ def _sdk_session_spec_for_work_item(request: WorkflowRunRequest, work_item: Work
         history_limit=history_limit,
         default_enabled=request.live_sdk,
     )
+    return admit_sdk_session_spec(spec, _workflow_continuity_policy(request))
 
 
 def _apply_manual_request_plan(work_item: WorkItem, plan: dict | None) -> WorkItem:
@@ -6136,6 +6395,19 @@ def _maybe_synthesize_user_facing_response(
     *,
     request: WorkflowRunRequest,
     sdk_session: Any | None,
+    store: SQLiteStore | None = None,
+) -> WorkflowRunResult:
+    from keystone_agents.runtime.continuity_policy import activate_continuity_policy
+
+    with activate_continuity_policy(_workflow_continuity_policy(request)):
+        return _synthesize_user_facing_response_with_admitted_continuity(
+            result, request=request, sdk_session=sdk_session, store=store,
+        )
+
+
+def _synthesize_user_facing_response_with_admitted_continuity(
+    result: WorkflowRunResult,
+    *, request: WorkflowRunRequest, sdk_session: Any | None,
     store: SQLiteStore | None = None,
 ) -> WorkflowRunResult:
     if _result_has_canonical_user_facing_summary(result):
@@ -8499,6 +8771,8 @@ def _record_workflow_sdk_cost_event(
     run_stage: str = "",
     execution_telemetry: dict[str, Any] | None = None,
 ) -> None:
+    from keystone_agents.runtime.tool_diagnostics import compact_tool_diagnostics
+
     usage_payload = dict(usage or {})
     cost_payload = dict(cost or {})
     cache_payload = dict(request_cache or {})
@@ -8567,6 +8841,7 @@ def _record_workflow_sdk_cost_event(
                 or cost_payload.get("breakdown")
             ),
             "request_cache": {
+                **compact_tool_diagnostics(cache_payload),
                 "static_prefix_sha256": cache_payload.get("static_prefix_sha256"),
                 "instructions_sha256": cache_payload.get("instructions_sha256"),
                 "tool_names_sha256": cache_payload.get("tool_names_sha256"),
@@ -9405,11 +9680,138 @@ def _load_external_context(request: WorkflowRunRequest) -> dict[str, Any]:
     return deepcopy(payload)
 
 
+def _work_item_selected_signal_context(
+    request: WorkflowRunRequest,
+    context: dict[str, Any],
+    *,
+    work_item: WorkItem,
+    route: WorkItemRoute,
+    store: SQLiteStore | None,
+) -> tuple[VerifiedSignalContext | None, str]:
+    """Attest a selected Slack signal from the local run ledger before WorkItem use."""
+
+    plan = _manual_request_plan_model(request.manual_request_plan)
+    if (
+        plan is None
+        or plan.ask_shape.prior_context_dependency != "selected_context"
+        or route != WorkItemRoute.OPPORTUNITY_SCOUT
+    ):
+        return None, ""
+    if context.get("schema") != "keystone.slack.history_context.v1":
+        return None, ""
+    team_id = str(context.get("team_id") or "").strip()
+    channel_id = str(context.get("channel_id") or "").strip()
+    thread_ts = str(context.get("thread_ts") or "").strip()
+    request_ts = str(context.get("request_ts") or "").strip()
+    if not all((team_id, channel_id, thread_ts, request_ts)) or store is None:
+        return None, "Selected Slack source needs a complete thread binding and local run store."
+
+    # Import locally: slack_actions imports LangGraph, which imports this runner.
+    from keystone_agents.slack_actions import (
+        _causal_slack_thread_agent_runs,
+        signal_context_resolution_for_slack_thread,
+    )
+
+    verified, history = signal_context_resolution_for_slack_thread(
+        team_id=team_id, channel_id=channel_id, thread_ts=thread_ts,
+        before_request_ts=request_ts, request_text=latest_user_request(request.request_text),
+        database_url=store.database_url,
+    )
+    if verified is None:
+        if history:
+            return None, "The selected signal has no completed, verified same-thread source."
+        _, thread_history = signal_context_resolution_for_slack_thread(
+            team_id=team_id, channel_id=channel_id, thread_ts=thread_ts,
+            before_request_ts="9999999999.999999",
+            request_text=latest_user_request(request.request_text),
+            database_url=store.database_url,
+        )
+        if thread_history:
+            return None, "The selected signal source does not precede this Slack request."
+        typed_sources = any(
+            source.provider and source.provider != "slack"
+            and source.source_id and (source.evidence_excerpt or source.supported_claim)
+            for source in work_item.sources
+        )
+        approved_artifact_sources = any(
+            artifact.approval_state == ApprovalState.APPROVED_FOR_RESEARCH.value
+            and _artifact_source_refs(artifact)
+            for artifact in selected_artifacts(work_item)
+        )
+        live_research_allowed = bool(
+            request.live_search
+            and live_search_allowed_for_execution(
+                True, manual_plan=request.manual_request_plan,
+                request_text=request.request_text,
+            )
+        )
+        if typed_sources or approved_artifact_sources or live_research_allowed:
+            return None, ""
+        return None, "Selected context has no verified signal or typed WorkItem evidence."
+    if len(verified.selected_sources) != 1:
+        return None, "Select one exact verified signal source for this WorkItem."
+    if verified.verification_status != "verified":
+        return None, "The selected signal source is not verified."
+    completed_runs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for row in _causal_slack_thread_agent_runs(
+        team_id=team_id, channel_id=channel_id, thread_ts=thread_ts,
+        before_request_ts=request_ts, database_url=store.database_url,
+    ):
+        if str(row.get("status") or "").lower() != "success":
+            continue
+        try:
+            output = json.loads(row.get("output_json") or "{}")
+        except (TypeError, ValueError):
+            continue
+        public = output.get("public_result") if isinstance(output, dict) else None
+        if isinstance(public, dict) and public.get("completion_confirmed") is True and public.get("status") in {
+            "completed", "verified", "recovered"
+        }:
+            completed_runs.append((row, output))
+    latest_run_id = str(completed_runs[0][0].get("id") or "") if completed_runs else ""
+    if latest_run_id != verified.source_run_id:
+        selected_ids, explicit, mismatch = explicit_signal_source_selection(
+            verified, texts=(latest_user_request(request.request_text),),
+        )
+        latest_output = completed_runs[0][1] if completed_runs else {}
+        work_item_output = latest_output.get("work_item")
+        target_output = (
+            work_item_output.get("target") if isinstance(work_item_output, dict) else None
+        )
+        target_metadata = (
+            target_output.get("metadata") if isinstance(target_output, dict) else None
+        )
+        prior_binding = (
+            target_metadata.get("verified_signal_source_binding")
+            if isinstance(target_metadata, dict) else None
+        )
+        selected = verified.selected_sources[0]
+        same_lineage = bool(
+            isinstance(prior_binding, dict)
+            and prior_binding.get("source_run_id") == verified.source_run_id
+            and prior_binding.get("source_id") == selected.source_id
+            and canonical_source_url(prior_binding.get("source_url"))
+            == canonical_source_url(selected.url)
+            and prior_binding.get("source_request_ts") == verified.source_request_ts
+            and prior_binding.get("team_id") == team_id
+            and prior_binding.get("channel_id") == channel_id
+            and prior_binding.get("thread_ts") == thread_ts
+        )
+        exact_selection = bool(
+            explicit and not mismatch
+            and selected_ids == [selected.source_id]
+        )
+        if not same_lineage and not exact_selection:
+            return None, "A newer completed thread result makes the selected signal ambiguous."
+    return verified, ""
+
+
 def _apply_external_context(
     work_item: WorkItem,
     context: dict[str, Any],
     *,
     context_file_path: str,
+    verified_signal: VerifiedSignalContext | None = None,
 ) -> WorkItem:
     if not context:
         return work_item
@@ -9424,6 +9826,7 @@ def _apply_external_context(
             work_item,
             context,
             context_file_path=context_file_path,
+            verified_signal=verified_signal,
         )
     if str(context.get("schema") or "") == "keystone.work_item.source_bundle.v1":
         return _apply_work_item_source_bundle_context(
@@ -9967,6 +10370,7 @@ def _apply_slack_history_context(
     context: dict[str, Any],
     *,
     context_file_path: str,
+    verified_signal: VerifiedSignalContext | None = None,
 ) -> WorkItem:
     _assert_slack_context_matches_work_item_binding(work_item, context)
     read_context = _compact_context_text(context.get("read_context"), max_chars=4000)
@@ -10038,6 +10442,38 @@ def _apply_slack_history_context(
     ):
         target = target.model_copy(update={"name": context_target})
     sources = list(work_item.sources)
+    if verified_signal is not None:
+        selected = verified_signal.selected_sources[0]
+        limitations = [item[:700] for item in verified_signal.limitations[:4]]
+        interpretation = next(
+            (item for item in verified_signal.interpretations if item.source_id == selected.source_id),
+            None,
+        )
+        advisory_limits = [
+            f"Model-reported limitation (unverified): {item[:500]}"
+            for item in (interpretation.limitations[:3] if interpretation else [])
+        ]
+        selected = selected.model_copy(update={
+            "provider_candidate_id": selected.provider_candidate_id or selected.source_id,
+            "key_facts": list(dict.fromkeys([
+                *selected.key_facts, *limitations, *advisory_limits,
+            ]))[:8],
+        })
+        sources = [selected, *[
+            source for source in sources
+            if source.source_id != selected.source_id and source.url != selected.url
+        ]]
+        metadata["verified_signal_source_binding"] = {
+            "source_run_id": verified_signal.source_run_id,
+            "source_request_ts": verified_signal.source_request_ts,
+            "source_id": selected.source_id,
+            "source_url": selected.url,
+            "team_id": _compact_context_text(context.get("team_id"), max_chars=80),
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "request_ts": request_ts,
+        }
+        target = target.model_copy(update={"metadata": metadata})
     source_id = f"slack:{channel_id}:{thread_ts or request_ts}".strip(":")
     if read_context and source_id and all(source.source_id != source_id for source in sources):
         sources.append(
@@ -13461,6 +13897,12 @@ def _historical_feed_context_item(
 
 def _announcement_work_item_source(item: dict[str, Any], *, kind: str) -> WorkItemSourceRef:
     source_id = str(item.get("feed_item_id") or "")
+    key_facts = [str(item.get("summary") or "")[:500]] if item.get("summary") else []
+    if kind == "preprints" and item.get("saved_content_scope") == "linked_discovery_summary":
+        key_facts.append(
+            "Evidence is limited to the saved linked-discovery summary; "
+            "article full text has not been verified."
+        )
     return WorkItemSourceRef(
         title=str(item.get("title") or ""),
         url=str(item.get("url") or ""),
@@ -13474,7 +13916,7 @@ def _announcement_work_item_source(item: dict[str, Any], *, kind: str) -> WorkIt
         provider=str(item.get("source") or kind),
         extraction_status=str(item.get("evidence_status") or "metadata_only"),
         retrieved_at=utc_now_iso(),
-        key_facts=[str(item.get("summary") or "")[:500]] if item.get("summary") else [],
+        key_facts=key_facts,
     )
 
 
@@ -15179,8 +15621,32 @@ def _advance_chief_of_staff(
             "local_kni_evidence_query": focused_request_text,
         }
     chief_tool_receipts: list[dict[str, Any]] = []
+    verified_operator_capture = False
     if request.live_sdk:
         try:
+            from keystone_agents.agents.chief_of_staff import _latest_slack_followup_request
+            from keystone_agents.runtime.operator_continuity import (
+                capture_request_authorized,
+                compact_task_context,
+                operator_capability_from_state,
+            )
+
+            # Native graph stages have no child-process environment envelope.
+            # Bind the same capability from this request's frozen host context,
+            # never from saved WorkItem identity or model-authored fields.
+            operator_state = _load_external_context(request)
+            operator_state["current_work_item"] = compact_task_context(work_item)
+            preflight_state = (request.orchestrator_preflight or {}).get("workflow_state", {})
+            if isinstance(preflight_state, dict):
+                operator_state["approved_operator_context"] = (
+                    preflight_state.get("operator_context_evidence") or {}
+                ).get("model_context")
+            active_operator_request = _latest_slack_followup_request(request_text) or request_text
+            operator_capability = operator_capability_from_state(
+                operator_state, raw_request=active_operator_request,
+                database_url=request.database_url or database_url_from_env(),
+                capture_authorized=capture_request_authorized(active_operator_request, manual_plan),
+            )
             typed_result = run_chief_of_staff_sdk(
                 sdk_input,
                 live=True,
@@ -15190,10 +15656,20 @@ def _advance_chief_of_staff(
                 manual_request_plan=request.manual_request_plan,
                 context_flags=_slack_query_context_flags(request),
                 include_specialist_tools=include_specialist_tools,
+                **({"operator_context_capability": operator_capability}
+                   if operator_capability is not None else {}),
                 **({"attach_tools": False} if followup_source is not None else {}),
             )
             output = typed_result.output
             chief_tool_receipts = list(typed_result.tool_receipts)
+            verified_operator_capture = bool(
+                operator_capability is not None and operator_capability.capture_authorized
+                and operator_capability.evidence.get("capture_count") == 1
+                and any(
+                    receipt.get("verified") is True and isinstance(receipt.get("id"), int)
+                    for receipt in operator_capability.evidence.get("capture_receipts", [])
+                )
+            )
             if (
                 local_kni_evidence_packet is not None
                 and not _chief_output_mentions_local_kni_evidence_path(output)
@@ -15432,6 +15908,16 @@ def _advance_chief_of_staff(
             action="provide_chief_context",
             agent=WorkItemRoute.CHIEF_OF_STAFF,
             description=context_blocker.message,
+            requires_approval=False,
+        )
+    elif verified_operator_capture:
+        # A verified host-authorized local save already happened. Reviewing its
+        # result is not permission for another write, so no execution approval
+        # checkpoint is needed. Other Chief plans retain their existing gates.
+        next_action = WorkItemNextAction(
+            action="review_saved_memory",
+            agent=WorkItemRoute.CHIEF_OF_STAFF,
+            description="Review the saved internal preference or reference.",
             requires_approval=False,
         )
     else:
@@ -17837,6 +18323,52 @@ def _advance_research(
     # matrices. It must run before generic comparison/multi-target detection,
     # which can otherwise mistake requested sections or inline entities for a
     # discovery task and discard the supplied evidence contract.
+    if (
+        isinstance(manual_plan, dict)
+        and manual_plan.get("source") == "canonical:work_item_selected_source_resume"
+    ):
+        from keystone_agents.planning.selected_source_resume import bind_selected_source_resume
+
+        source_binding = bind_selected_source_resume(
+            plan=manual_plan, work_item=work_item, work_item_id=request.work_item_id,
+            current_request=request.request_text,
+            route_result=(request.orchestrator_preflight or {}).get("route_result"),
+            slack_context_path=request.context_file_path,
+        )
+        if source_binding is not None:
+            return _supplied_business_research_sdk_result(
+                work_item, request=request, store=store, sdk_session=sdk_session,
+                raw_request_text=raw_request_text,
+                retrieval_diagnostics={
+                    "selected_urls": [source_binding.source.url],
+                    "reused_saved_source": True,
+                    "broad_search_performed": False,
+                },
+                research_sources=(source_binding.source,),
+            )
+    branch_parent = work_item.target.metadata.get("branch_parent_work_item")
+    if (
+        isinstance(branch_parent, dict)
+        and branch_parent.get("schema") == "keystone.work_item_branch_parent.v1"
+        and branch_parent.get("selected_source_id")
+    ):
+        selected = [
+            source for source in work_item.sources
+            if source.source_id == branch_parent["selected_source_id"]
+            and canonical_source_url(source.url)
+            == canonical_source_url(work_item.target.url)
+        ]
+        if len(selected) == 1:
+            return _supplied_business_research_sdk_result(
+                work_item, request=request, store=store, sdk_session=sdk_session,
+                raw_request_text=raw_request_text,
+                retrieval_diagnostics={
+                    "selected_urls": [selected[0].url],
+                    "reused_saved_source": True,
+                    "broad_search_performed": False,
+                },
+                research_sources=(selected[0],),
+            )
     if _is_selected_url_business_research_request(
         work_item,
         request_text,
@@ -18736,7 +19268,9 @@ def _advance_selected_url_business_research(
         ]
         updated = work_item.model_copy(update={
             "sources": [*work_item.sources, *source_refs],
-            "target": work_item.target.model_copy(update={"name": target_label}),
+            "target": work_item.target.model_copy(update={
+                "name": target_label, "url": selected_urls[0],
+            }),
         })
         retrieval = {
             "selected_urls": selected_urls, "diagnostics": diagnostics,
@@ -18754,6 +19288,7 @@ def _advance_selected_url_business_research(
         return _supplied_business_research_sdk_result(
             updated, request=request, store=store, sdk_session=sdk_session,
             raw_request_text=raw_request_text or request_text, retrieval_diagnostics=retrieval,
+            research_sources=tuple(source_refs),
         )
 
     profile = synthesize_company_profile_from_source_bundle(
@@ -18874,8 +19409,10 @@ def _supplied_business_research_sdk_result(
     work_item: WorkItem, *, request: WorkflowRunRequest, store: SQLiteStore | None,
     sdk_session: Any | None = None, raw_request_text: str = "",
     inline_context: str = "", retrieval_diagnostics: dict[str, Any] | None = None,
+    research_sources: tuple[WorkItemSourceRef, ...] | None = None,
 ) -> WorkflowRunResult:
     from keystone_agents.business_research_analyst.supplied_context import (
+        project_explicit_research_evidence,
         render_supplied_research_brief,
         supplied_research_input,
         supplied_research_sources,
@@ -18883,10 +19420,23 @@ def _supplied_business_research_sdk_result(
 
     raw_request = raw_request_text or request.request_text or work_item.request_text
     try:
-        sources = supplied_research_sources(work_item, inline_context=inline_context)
+        # Slack references describe how a source was selected. Exact extraction
+        # supplies the substantive evidence; keep both in task state but only
+        # validate the acquired evidence as the research candidate universe.
+        evidence_item = (
+            project_explicit_research_evidence(work_item, research_sources)
+            if research_sources is not None else work_item
+        )
+        sources = supplied_research_sources(evidence_item, inline_context=inline_context)
+        orchestration_context = _specialist_orchestrator_context_payload(request, evidence_item)
+        if research_sources is not None:
+            # This derived brief was prepared against the broader saved task,
+            # including prior artifacts. The current request, plan and scoped
+            # context pack already carry the task without that stale summary.
+            orchestration_context.pop("reusable_slack_query_prompt", None)
         typed_input, citations = supplied_research_input(
-            work_item, raw_request=raw_request, sources=sources,
-            orchestration_context=_specialist_orchestrator_context_payload(request, work_item),
+            evidence_item, raw_request=raw_request, sources=sources,
+            orchestration_context=orchestration_context,
         )
         sdk_result = run_business_research_analyst_research_brief_sdk(
             typed_input, live=True, session=sdk_session,
@@ -18993,8 +19543,30 @@ def _supplied_business_research_sdk_result(
             "agent_decision_ownership": sdk_result.request_cache.get("decision_ownership", {}),
         },
     )
+    # This accepted SDK artifact supersedes only this route's prior execution
+    # failure. Keep source, approval, and other-route blockers authoritative.
+    work_item = resolve_blocker(work_item, "business_research_analyst_execution_failed")
+    binding = work_item.target.metadata.get("selected_source_resume_binding")
+    if (
+        isinstance(binding, dict)
+        and isinstance(request.manual_request_plan, dict)
+        and request.manual_request_plan.get("source")
+        == "canonical:work_item_selected_source_resume"
+        and request.work_item_id == work_item.id
+        and binding.get("schema") == "keystone.selected_source_resume_binding.v1"
+        and binding.get("work_item_id") == work_item.id
+        and canonical_source_url(binding.get("source_url"))
+        == canonical_source_url(work_item.target.url)
+        and any(
+            source.source_id == binding.get("source_id")
+            and source.url == binding.get("source_url")
+            for source in sources
+        )
+    ):
+        work_item = resolve_blocker(work_item, "business_research_analyst_agent_decision_invalid")
     updated = attach_artifact(work_item.model_copy(update={
-        "sources": list(sources), "last_agent": WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
+        "sources": _dedupe_work_item_sources([*work_item.sources, *sources]),
+        "last_agent": WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value,
         "next_action": WorkItemNextAction(
             action="draft_thread_local_reply" if draft_requested else "review_research_brief",
             agent=(WorkItemRoute.OUTREACH_COMPOSER if draft_requested
@@ -19018,7 +19590,10 @@ def _supplied_business_research_sdk_result(
         human_summary=render_supplied_research_brief(brief),
         user_facing_summary_authority=UserFacingSummaryAuthority.CANONICAL,
         tool_execution=dict(sdk_result.request_cache.get("tool_execution") or {}),
-        audit_notes=["Registered Research SDK used supplied evidence with no attached retrieval tools."],
+        audit_notes=[
+            "Registered Research SDK used supplied evidence and bounded retained-source "
+            "readers when available, without broad discovery."
+        ],
     )
 
 
@@ -19743,7 +20318,12 @@ def _dedupe_work_item_sources(sources: list[WorkItemSourceRef]) -> list[WorkItem
     deduped: list[WorkItemSourceRef] = []
     seen: set[tuple[str, str]] = set()
     for source in sources:
-        key = (str(source.source_id or ""), str(source.url or ""))
+        url = str(source.url or "")
+        try:
+            normalized_url = canonical_search_result_url(url) or url
+        except ValueError:
+            normalized_url = url
+        key = (str(source.source_id or ""), normalized_url)
         if key in seen:
             continue
         seen.add(key)
@@ -20845,8 +21425,8 @@ def _opportunity_supplied_sources(
     return list(by_url.values())
 
 
-def _check_supplied_opportunity_context_bound(context: Mapping[str, Any]) -> None:
-    """Bound all model-visible supplied text, including accepted artifact metadata."""
+def _supplied_opportunity_context_chars(context: Mapping[str, Any]) -> int:
+    """Count all model-visible supplied text, including accepted artifact metadata."""
     pending: list[Any] = [context]
     characters = 0
     while pending:
@@ -20857,16 +21437,36 @@ def _check_supplied_opportunity_context_bound(context: Mapping[str, Any]) -> Non
             pending.extend(item.values())
         elif isinstance(item, list | tuple):
             pending.extend(item)
-        # References and typed-pack structure get one additional Research-sized allowance.
-        if characters > 48_000:
-            raise OperatorReadableFailureError.input_contract(
-                "Supplied opportunity context exceeds the 48000-character input bound."
-            )
+    return characters
+
+
+def _check_supplied_opportunity_context_bound(context: Mapping[str, Any]) -> None:
+    """Fail when distinct supplied evidence remains larger than the model bound."""
+    if _supplied_opportunity_context_chars(context) > 48_000:
+        raise OperatorReadableFailureError.input_contract(
+            "Supplied opportunity context exceeds the 48000-character input bound "
+            "after exact duplicate context repair; distinct evidence was retained."
+        )
 
 
 def _supplied_opportunity_context_pack_projection(pack: Mapping[str, Any]) -> dict[str, Any]:
-    """Omit only exact summary duplicates from inference, preserving the durable pack."""
+    """Omit only exact model-view duplicates, preserving the durable pack."""
     projected = dict(pack)
+    if "retrieved_sources" in pack and "source_refs" in pack:
+        try:
+            duplicate_sources = json.dumps(
+                pack["retrieved_sources"], sort_keys=True, allow_nan=False,
+            ) == json.dumps(pack["source_refs"], sort_keys=True, allow_nan=False)
+        except (TypeError, ValueError):
+            duplicate_sources = False
+        if duplicate_sources:
+            projected.pop("retrieved_sources")
+    if (
+        isinstance(pack.get("objective"), str)
+        and isinstance(pack.get("request_text"), str)
+        and pack["objective"] == pack["request_text"]
+    ):
+        projected.pop("objective")
     summary = pack.get("summary")
     if not isinstance(summary, Mapping):
         return projected
@@ -20890,6 +21490,27 @@ def _supplied_opportunity_context_pack_projection(pack: Mapping[str, Any]) -> di
             projected_summary.pop(summary_key)
     projected["summary"] = projected_summary
     return projected
+
+
+def _supplied_opportunity_duplicate_slack_claim_projection(
+    source_rows: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Keep supplemental Slack evidence once when claim and excerpt are identical."""
+    projected: list[dict[str, Any]] = []
+    omitted: list[str] = []
+    for index, source in enumerate(source_rows):
+        row = dict(source)
+        if (
+            row.get("provider") == "slack"
+            and row.get("source_type") == "slack_message"
+            and isinstance(row.get("supported_claim"), str)
+            and row["supported_claim"]
+            and row["supported_claim"] == row.get("evidence_excerpt")
+        ):
+            row.pop("supported_claim")
+            omitted.append(f"supplied_sources[{index}].supported_claim")
+        projected.append(row)
+    return projected, omitted
 
 
 def _run_supplied_opportunity_sdk(
@@ -20975,10 +21596,42 @@ def _run_supplied_opportunity_sdk(
         output_consistency_validator=consistency,
     )
     context = _specialist_orchestrator_context_payload(request, work_item)
-    context["context_pack"] = _supplied_opportunity_context_pack_projection(
-        build_opportunity_context_pack(work_item).model_dump(mode="json")
+    full_pack = build_opportunity_context_pack(work_item).model_dump(mode="json")
+    context["context_pack"] = _supplied_opportunity_context_pack_projection(full_pack)
+    omitted_duplicates = [
+        f"context_pack.{key}" for key in full_pack if key not in context["context_pack"]
+    ]
+    omitted_duplicates.extend(
+        f"context_pack.summary.{key}"
+        for key in full_pack.get("summary", {})
+        if key not in context["context_pack"].get("summary", {})
     )
-    context["supplied_sources"] = [source.model_dump(mode="json") for source in sources]
+    slack_context = context.get("slack_context")
+    pack_target = context["context_pack"].get("target")
+    target_metadata = pack_target.get("metadata") if isinstance(pack_target, Mapping) else None
+    retained_slack = (
+        target_metadata.get("slack_context")
+        if isinstance(target_metadata, Mapping) else None
+    )
+    if (
+        isinstance(slack_context, Mapping)
+        and isinstance(retained_slack, Mapping)
+        and all(key in retained_slack for key in slack_context)
+    ):
+        try:
+            duplicate_slack = json.dumps(
+                slack_context, sort_keys=True, allow_nan=False,
+            ) == json.dumps(
+                {key: retained_slack[key] for key in slack_context},
+                sort_keys=True, allow_nan=False,
+            )
+        except (TypeError, ValueError):
+            duplicate_slack = False
+        if duplicate_slack:
+            context.pop("slack_context")
+            omitted_duplicates.append("slack_context")
+    full_source_rows = [source.model_dump(mode="json") for source in sources]
+    context["supplied_sources"] = full_source_rows
     context["candidate_universe"] = universe
     context["supplied_evidence_contract"] = {
         "candidate_kind": "source_evidence_not_opportunity_rows",
@@ -20993,6 +21646,161 @@ def _run_supplied_opportunity_sdk(
         "research_handoff": "Use accepted research_brief metadata in context_pack.selected_artifacts together with its original source_refs.",
         "provider_tools_attached": False, "external_actions_allowed": False,
     }
+    original_context = {**context, "context_pack": full_pack}
+    if "slack_context" in omitted_duplicates:
+        original_context["slack_context"] = slack_context
+    before_chars = _supplied_opportunity_context_chars(original_context)
+    if _supplied_opportunity_context_chars(context) > 48_000:
+        manifest = context.get("context_source_manifest")
+        retained_manifest = (
+            target_metadata.get("context_source_manifest")
+            if isinstance(target_metadata, Mapping) else None
+        )
+        if isinstance(manifest, Mapping) and isinstance(retained_manifest, Mapping):
+            try:
+                duplicate_manifest = json.dumps(
+                    manifest, sort_keys=True, allow_nan=False,
+                ) == json.dumps(retained_manifest, sort_keys=True, allow_nan=False)
+            except (TypeError, ValueError):
+                duplicate_manifest = False
+            if duplicate_manifest:
+                context.pop("context_source_manifest")
+                omitted_duplicates.append("context_source_manifest")
+    omitted_thread_fields: list[str] = []
+    omitted_thread_chars = 0
+    if _supplied_opportunity_context_chars(context) > 48_000:
+        binding = (
+            target_metadata.get("verified_signal_source_binding")
+            if isinstance(target_metadata, Mapping) else None
+        )
+        retained_slack = (
+            target_metadata.get("slack_context")
+            if isinstance(target_metadata, Mapping) else None
+        )
+        selected_source = next((
+            source for source in sources
+            if isinstance(binding, Mapping)
+            and source.source_id == binding.get("source_id")
+            and source.url == binding.get("source_url")
+            and source.evidence_excerpt
+        ), None)
+        messages = retained_slack.get("thread_messages") if isinstance(retained_slack, Mapping) else None
+        read_context = retained_slack.get("read_context") if isinstance(retained_slack, Mapping) else None
+        transcript = retained_slack.get("thread_transcript") if isinstance(retained_slack, Mapping) else None
+        messages_covered = bool(
+            isinstance(messages, list) and messages
+            and isinstance(read_context, str) and read_context
+            and isinstance(transcript, str) and transcript
+            and all(
+                isinstance(item, Mapping)
+                and isinstance(item.get("text"), str)
+                and item["text"].strip()
+                and item["text"].strip() in read_context
+                and item["text"].strip() in transcript
+                for item in messages
+            )
+        )
+        supplemental_slack = next((
+            source for source in sources
+            if source.provider == "slack"
+            and source.source_type == "slack_message"
+            and isinstance(read_context, str)
+            and read_context in source.evidence_excerpt
+        ), None)
+        transcript_redundant = bool(
+            isinstance(transcript, str)
+            and isinstance(retained_slack, Mapping)
+            and transcript == _slack_prompt_transcript(
+                dict(retained_slack),
+                latest_request=str(retained_slack.get("latest_user_follow_up") or ""),
+            )
+        )
+        if (
+            selected_source is not None
+            and supplemental_slack is not None
+            and messages_covered
+            and isinstance(retained_slack, Mapping)
+            and str(retained_slack.get("thread_root_request") or "").strip()
+            and str(retained_slack.get("latest_user_follow_up") or "").strip()
+            and str(context.get("raw_request") or "").strip()
+            and isinstance(pack_target, Mapping)
+            and isinstance(target_metadata, Mapping)
+        ):
+            compact_slack = dict(retained_slack)
+            fields_to_omit = (
+                ("read_context", "thread_transcript")
+                if transcript_redundant else ("read_context",)
+            )
+            for field_name in fields_to_omit:
+                if field_name in compact_slack:
+                    omitted_thread_chars += _supplied_opportunity_context_chars(
+                        {field_name: compact_slack[field_name]}
+                    )
+                    compact_slack.pop(field_name)
+                    omitted_thread_fields.append(field_name)
+            compact_metadata = {**target_metadata, "slack_context": compact_slack}
+            context["context_pack"]["target"] = {
+                **pack_target, "metadata": compact_metadata,
+            }
+            if context["context_pack"].get("request_text") == context.get("raw_request"):
+                context["context_pack"].pop("request_text")
+                omitted_duplicates.append("context_pack.request_text")
+            context["supplied_sources"], omitted_claims = (
+                _supplied_opportunity_duplicate_slack_claim_projection(
+                    context["supplied_sources"]
+                )
+            )
+            omitted_duplicates.extend(omitted_claims)
+    expected_target = deepcopy(full_pack.get("target"))
+    if omitted_thread_fields and isinstance(expected_target, dict):
+        expected_metadata = expected_target.get("metadata")
+        if isinstance(expected_metadata, dict):
+            expected_slack = expected_metadata.get("slack_context")
+            if isinstance(expected_slack, dict):
+                for field_name in omitted_thread_fields:
+                    expected_slack.pop(field_name, None)
+    source_identity_retained = bool(
+        context["context_pack"].get("source_refs") == full_pack.get("source_refs")
+        and context["context_pack"].get("target") == expected_target
+        and all(
+            row == (
+                {key: value for key, value in original.items() if key != "supported_claim"}
+                if f"supplied_sources[{index}].supported_claim" in omitted_duplicates
+                else original
+            )
+            for index, (row, original) in enumerate(
+                zip(context["supplied_sources"], full_source_rows, strict=True)
+            )
+        )
+    )
+    context_repair = {
+        "schema": "keystone.supplied_opportunity_context_repair.v1",
+        "before_chars": before_chars,
+        "after_chars": _supplied_opportunity_context_chars(context),
+        "omitted_duplicate_fields": omitted_duplicates,
+        "omitted_supplemental_thread_fields": omitted_thread_fields,
+        "omitted_supplemental_thread_chars": omitted_thread_chars,
+        "source_identity_retained": source_identity_retained,
+    }
+    within_bound = context_repair["after_chars"] <= 48_000
+    context_repair["within_bound"] = within_bound
+    if not source_identity_retained:
+        raise OperatorReadableFailureError.input_contract(
+            "Supplied opportunity context repair changed selected source identity."
+        )
+    if store is not None and before_chars > 48_000:
+        record_event(
+            work_item, event_type=(
+                "opportunity_context_repaired" if within_bound
+                else "opportunity_context_repair_insufficient"
+            ),
+            actor=WorkItemRoute.OPPORTUNITY_SCOUT.value,
+            summary=(
+                "Removed exact duplicate supplied context before Opportunity Scout."
+                if within_bound else "Distinct supplied context still exceeds the model bound."
+            ),
+            metadata=context_repair, store=store,
+        )
     _check_supplied_opportunity_context_bound(context)
     typed_input = OpportunityScoutSDKInput(
         topic=topic, max_results=max_records,
@@ -21040,6 +21848,7 @@ def _run_supplied_opportunity_sdk(
                 "model_provider": model_config.provider, "model_name": model_config.model,
                 "run_mode": "live_sdk",
                 "work_item_id": work_item.id, "source_provided": True,
+                "context_repair": context_repair,
             },
             model=model_config.model, dry_run=False,
             status="blocked" if typed.output.decision.needs_more_context else "success",
@@ -21059,6 +21868,7 @@ def _run_supplied_opportunity_sdk(
         "tool_execution": typed.request_cache.get("tool_execution") or {},
         "tool_receipts": list(typed.tool_receipts),
         "candidate_universe": universe,
+        "context_repair": context_repair,
         "retrieval_diagnostics": {
             "provider_summary": "source-provided WorkItem evidence; SDK reasoning only",
             "live_search": False, "provider_calls_made": 0,
@@ -21649,6 +22459,39 @@ def _advance_opportunity(
                 store=store,
             )
 
+    signal_binding = work_item.target.metadata.get("verified_signal_source_binding")
+    if supplied_sdk and source_provided_only and isinstance(signal_binding, dict):
+        selected_url = canonical_source_url(signal_binding.get("source_url"))
+        visible_urls = set(canonical_source_urls(scout_result.human_summary))
+        other_supported_urls: set[str] = set()
+        for artifact in selected_artifacts(work_item):
+            if artifact.approval_state != ApprovalState.APPROVED_FOR_RESEARCH.value:
+                continue
+            for raw_source in _artifact_source_refs(artifact):
+                try:
+                    source = WorkItemSourceRef.model_validate(raw_source)
+                except (TypeError, ValueError):
+                    continue
+                if source.url and source.extraction_status in {
+                    "verified", "extracted", "saved_content_available"
+                }:
+                    other_supported_urls.add(canonical_source_url(source.url))
+        allowed_urls = {selected_url, *other_supported_urls} if selected_url else set()
+        if not selected_url or selected_url not in visible_urls or visible_urls - allowed_urls:
+            return _blocked_result(
+                work_item,
+                (WorkItemBlocker(
+                    code="verified_signal_source_url_not_retained",
+                    message="Opportunity Scout did not retain the selected verified source URL in its answer.",
+                ),),
+                WorkItemNextAction(
+                    action="retry_with_verified_signal_citation",
+                    agent=WorkItemRoute.OPPORTUNITY_SCOUT,
+                    description="Retry the source-backed answer with the selected verified URL visible.",
+                ),
+                store=store, route=WorkItemRoute.OPPORTUNITY_SCOUT,
+            )
+
     saved_ids: list[str] = []
     if store is not None:
         saved_ids = [str(item_id) for item_id in store.save_opportunity_scout_result(scout_result)]
@@ -21859,7 +22702,7 @@ def _advance_opportunity(
     work_item = work_item.model_copy(
         update={
             "confidence": max(record.priority_score for record in scout_result.records) / 100,
-            "sources": [*work_item.sources, *source_refs],
+            "sources": _dedupe_work_item_sources([*work_item.sources, *source_refs]),
             "audit_notes": [*work_item.audit_notes, *audit_notes],
             "next_action": WorkItemNextAction(
                 action="review_opportunities",
@@ -27896,6 +28739,26 @@ def _blocked_human_summary(
         WorkItemRoute.CLARIFICATION: "Orchestrator",
     }.get(route, route.value)
     blocker_codes = {blocker.code for blocker in blockers}
+    if any(code.endswith("_agent_decision_invalid") for code in blocker_codes):
+        return "\n\n".join(
+            [
+                "*Finding:*\nNo new finding was accepted from this attempt.",
+                (
+                    "*Evidence limit:*\nThe specialist did not return a valid decision "
+                    "over the available evidence. Earlier evidence must not be treated "
+                    "as a completed answer from this attempt."
+                ),
+                (
+                    "*Task status:*\nBlocked for review. This attempt did not replace "
+                    "a previously accepted result."
+                ),
+                (
+                    "*Next action:*\nReview the recorded evidence and specialist decision, "
+                    "repair the failed step, then resume the same request. This failure "
+                    "does not require new user input or broader search permission."
+                ),
+            ]
+        )
     if "gmail_search_no_matches" in blocker_codes:
         return "\n\n".join([
             "Gmail search returned no matches",

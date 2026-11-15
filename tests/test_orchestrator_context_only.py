@@ -7,12 +7,147 @@ from types import SimpleNamespace
 
 import pytest
 from agents import AgentOutputSchema
+from agents.models.interface import Model
+from test_lazy_slack_context_backend_matrix import Provider, _message, _response
 
 from keystone_agents.agents import orchestrator as module
+from keystone_agents.agents.business_research_analyst import (
+    build_business_research_analyst_focused_brief_agent,
+)
 from keystone_agents.agents.gmail_triage import build_gmail_triage_agent
 from keystone_agents.entrypoints import cli_impl as cli
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.orchestrator import OrchestratorPlanningResult, OrchestratorResult
+from keystone_agents.sdk import build_local_run_config
+
+
+@pytest.mark.parametrize("natural_ask", [
+    "Who won yesterday, the governing party or the opposition?",
+    "What changed in the rail timetable this week?",
+    "What are the latest championship results?",
+])
+def test_model_public_research_intent_admits_search_after_manager_route(monkeypatch, natural_ask):
+    selected = OrchestratorResult(
+        route="business_research_analyst", workflow=["business_research_analyst"],
+        routing_mode="llm", requires_live_search=True,
+        rationale="Investigate the likely public scope before optional clarification.",
+    )
+    monkeypatch.setattr(module, "_route_ambiguous_with_llm", lambda *a, **kw: selected)
+    preflight = module.run_orchestrator_preflight(
+        natural_ask, requested_agent="chief_of_staff", live_orchestrator=True,
+    )
+    plan = preflight.manual_request_plan
+    assert plan.source == "canonical:orchestrator_public_research"
+    assert plan.objective == natural_ask
+    assert plan.requires_live_search
+    assert plan.ask_shape.permission_state == "read_only"
+    assert not plan.provider_operations
+    agent = build_business_research_analyst_focused_brief_agent(
+        request_text=natural_ask, manual_request_plan=plan,
+        tool_tier="deep_retrieval", tool_scope_mode="request_scoped",
+    )
+    names = {tool.name for tool in agent.tools}
+    assert "search_web" in names
+    assert not {"send_email", "airtable_write_record", "create_google_calendar_event"} & names
+
+
+@pytest.mark.parametrize("constraint", [
+    "Use only the supplied note. Do not search online.",
+    "External research is not approved.",
+])
+def test_model_research_hint_cannot_override_no_search(constraint):
+    prior = ManualRequestPlan(target_agent="chief_of_staff", objective=constraint)
+    selected = OrchestratorResult(
+        route="business_research_analyst", routing_mode="llm", requires_live_search=True,
+    )
+    assert module._public_research_manual_plan(prior, selected, constraint) is None
+
+
+def test_research_hint_cannot_promote_provider_write_scope():
+    prior = ManualRequestPlan(
+        target_agent="chief_of_staff", provider_system="google_calendar",
+        provider_operations=["create"], side_effect_policy="approval_required",
+    )
+    selected = OrchestratorResult(
+        route="business_research_analyst", routing_mode="llm", requires_live_search=True,
+    )
+    assert module._public_research_manual_plan(prior, selected, "Find current information") is None
+
+
+@pytest.mark.parametrize("suffix", ["", "\n- Next source", "\n\nOlder messages"])
+def test_model_selected_context_url_becomes_bounded_article_read_plan(suffix):
+    url = "https://example.org/article/local-model-review"
+    request = "Summarize item #3 from yesterday."
+    prior = ManualRequestPlan(target_agent="chief_of_staff", objective=request)
+    selected = OrchestratorResult(
+        route="business_research_analyst", routing_mode="llm",
+        workflow=["business_research_analyst"], selected_source_url=url,
+        rationale="Read the exact article identified in the channel digest.",
+    )
+    plan = module._public_research_manual_plan(
+        prior, selected, request,
+        workflow_state={"slack_thread_transcript": f"Yesterday's item #3: {url}{suffix}"},
+    )
+
+    assert plan is not None
+    assert plan.primary_target == url
+    assert plan.objective == request
+    assert plan.target_type == "url"
+    assert plan.expected_artifact_type == "source_summary"
+    assert plan.provider_operations == ["read"]
+    assert not plan.requires_live_search
+    assert plan.ask_shape.strict_filter_mode == "exact"
+
+    from keystone_agents.agents.business_research_analyst import (
+        _business_research_tool_execution_contract,
+    )
+    contract = _business_research_tool_execution_contract(
+        plan, provider_retrieval_required=False, attach_tools=True,
+    )
+    assert contract is not None
+    assert contract.required_groups[0].name == "selected_public_source_read"
+    assert "search_web" not in contract.required_groups[0].any_of_tool_names
+
+
+def test_channel_source_survives_workflow_state_normalization_and_merge():
+    url = "https://example.org/article/selected"
+    state = module._merge_workflow_state_context(
+        None,
+        {
+            "slack_thread_root": "Summarize the third article.",
+            "slack_thread_transcript": f"#3 selected article: {url}",
+        },
+    )
+    prompt = module._llm_route_prompt("Summarize #3", state)
+    assert url in prompt
+    assert "Summarize the third article." in prompt
+
+
+def test_model_selected_url_absent_from_input_cannot_gain_read_authority():
+    prior = ManualRequestPlan(target_agent="chief_of_staff")
+    selected = OrchestratorResult(
+        route="business_research_analyst", routing_mode="llm",
+        selected_source_url="https://example.org/invented",
+    )
+    assert module._public_research_manual_plan(prior, selected, "Summarize item #3") is None
+
+
+@pytest.mark.parametrize("source_url", [
+    "https://example.org/invented", "http://127.0.0.1/private", "file:///private/input",
+])
+def test_unverified_selected_source_blocks_before_specialist(monkeypatch, source_url):
+    selected = OrchestratorResult(
+        route="business_research_analyst", routing_mode="llm",
+        workflow=["business_research_analyst"], selected_source_url=source_url,
+    )
+    monkeypatch.setattr(module, "_route_ambiguous_with_llm", lambda *a, **kw: selected)
+    preflight = module.run_orchestrator_preflight(
+        "Summarize item #3", live_orchestrator=True,
+        workflow_state={"slack_thread_transcript": f"source candidate: {source_url}"}
+        if "example.org" not in source_url else {},
+    )
+    assert not preflight.execution_allowed
+    assert preflight.block_kind == "selected_source_identity_unverified"
 
 
 def _state(status="completed", correlation="same_thread"):
@@ -95,6 +230,60 @@ def test_context_only_decision_never_silently_becomes_a_provider_read(monkeypatc
     )
     assert not result.execution_allowed
     assert result.block_kind == "context_only_response_unavailable"
+
+
+@pytest.mark.parametrize("completed_result", [False, True])
+def test_context_only_choice_is_repaired_only_without_admitted_completed_result(
+    completed_result,
+):
+    class RouteModel(Model):
+        calls = 0
+
+        async def get_response(self, system_instructions, input, model_settings, tools,
+                               output_schema, handoffs, tracing, **kwargs):
+            self.calls += 1
+            return _response([_message(OrchestratorPlanningResult(
+                route="business_research_analyst",
+                workflow=["business_research_analyst"],
+                routing_mode="llm",
+                linked_work_item_relation="continue_existing",
+                context_only_response=self.calls == 1,
+                rationale="Continue the linked research task under its read-only gates.",
+                decision={
+                    "decision_owner": "orchestrator",
+                    "decision_stage": "orchestrator_route_selection",
+                    "selected_candidate_id": "business_research_analyst",
+                    "reasoning": "The linked research task belongs to this specialist.",
+                    "candidate_assessments": [{
+                        "candidate_id": "business_research_analyst",
+                        "disposition": "selected",
+                        "rationale": "The linked task belongs to Business Research.",
+                    }],
+                },
+            ))])
+
+        def stream_response(self, *args, **kwargs):
+            raise AssertionError("No stream expected")
+
+    model = RouteModel()
+    workflow_state = {"current_work_item": {
+        "id": "wi_synthetic", "status": "done", "route": "business_research_analyst",
+    }}
+    if completed_result:
+        workflow_state["prior_agent_runs"] = [{
+            "id": "synthetic-prior", "route": "business_research_analyst",
+            "status": "completed", "thread_correlation": "same_thread",
+            "summary": "The selected synthetic study reports a bounded result.",
+        }]
+    preflight = module.run_orchestrator_preflight(
+        "Try again.", live_orchestrator=True,
+        workflow_state=workflow_state,
+        run_config=build_local_run_config(Provider(model)),
+    )
+    assert model.calls == (1 if completed_result else 2)
+    assert preflight.route_result.context_only_response is completed_result
+    assert preflight.route_result.linked_work_item_relation == "continue_existing"
+    assert preflight.execution_allowed
 
 
 def test_free_text_rationale_does_not_promote_a_heuristic_plan(monkeypatch):

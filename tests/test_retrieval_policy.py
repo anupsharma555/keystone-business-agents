@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from threading import Barrier
+
+import pytest
+
 from keystone_agents.retrieval_policy import (
     HybridSearchProvider,
     RetrievalAutonomyHint,
@@ -12,9 +16,15 @@ from keystone_agents.retrieval_policy import (
     derive_request_autonomy_hint,
     filter_company_search_results_for_entity,
 )
+from keystone_agents.runtime.request_budget import (
+    ModelRequestBudgetExhausted,
+    activate_model_request_budget,
+    current_model_request_budget,
+)
 from keystone_agents.schemas.retrieval import RetrievalHint
 from keystone_agents.tools.search_provider import (
     SearchProviderError,
+    SearchRequest,
     SearchResult,
     SearxngSearchProvider,
 )
@@ -1052,3 +1062,40 @@ def test_hybrid_search_provider_uses_next_provider_after_provider_error() -> Non
             "message": "primary failed for company research",
         }
     ]
+
+
+@pytest.mark.parametrize("ceiling", [1, 2])
+def test_parallel_hosted_model_providers_share_parent_hard_budget(ceiling):
+    ready = Barrier(2)
+    invoked = []
+    ledgers = []
+
+    class ModelBackedProvider:
+        def search_web(self, query, num_results=5):
+            ledger = current_model_request_budget(load_environment=False)
+            ledgers.append(ledger)
+            ready.wait(timeout=5)
+            assert ledger is not None
+            ledger.consume(stage="synthetic_hosted_search:llm_start")
+            invoked.append(query)
+            return []
+
+    provider = HybridSearchProvider(
+        provider_sequence=("searxng", "agents-web-search"),
+        provider_factory=lambda _name: ModelBackedProvider(),
+        autonomy_hint=RetrievalAutonomyHint(source="test"),
+        quality_assessor=lambda results, _query: _assessment(
+            result_count=len(results), needs_precision_search=False,
+        ),
+        parallel_provider_fanout=True,
+    )
+    with activate_model_request_budget(ceiling) as parent:
+        if ceiling == 1:
+            with pytest.raises(ModelRequestBudgetExhausted):
+                provider._search_structured_parallel_provider_fanout(SearchRequest(query="test"))
+        else:
+            provider._search_structured_parallel_provider_fanout(SearchRequest(query="test"))
+        assert len(invoked) == ceiling
+        assert parent.consumed == ceiling
+        assert parent.remaining == 0
+        assert all(ledger is parent for ledger in ledgers)

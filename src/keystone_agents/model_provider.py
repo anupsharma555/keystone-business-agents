@@ -9,11 +9,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 DEFAULT_PROVIDER = "openai"
-DEFAULT_MODEL = "gpt-5.4-mini"
-OPENAI_BUSINESS_AGENT_DEFAULT_MODEL = "gpt-5.4-mini"
-OPENAI_ORCHESTRATOR_DEFAULT_MODEL = "gpt-5.4-mini"
-OPENAI_MANUAL_PLANNER_DEFAULT_MODEL = "gpt-5.4-mini"
-OPENAI_CHIEF_OF_STAFF_DEFAULT_MODEL = "gpt-5.4-mini"
+OPENAI_LUNA_MODEL = "gpt-6-luna"
+DEFAULT_MODEL = OPENAI_LUNA_MODEL
+OPENAI_BUSINESS_AGENT_DEFAULT_MODEL = OPENAI_LUNA_MODEL
+OPENAI_ORCHESTRATOR_DEFAULT_MODEL = OPENAI_LUNA_MODEL
+OPENAI_MANUAL_PLANNER_DEFAULT_MODEL = OPENAI_LUNA_MODEL
+OPENAI_CHIEF_OF_STAFF_DEFAULT_MODEL = OPENAI_LUNA_MODEL
 OPENAI_FALLBACK_DEFAULT_MODEL = OPENAI_BUSINESS_AGENT_DEFAULT_MODEL
 GEMINI_FLASH_DEFAULT_MODEL = "gemini-2.5-flash"
 GEMINI_GMAIL_TRIAGE_DEFAULT_MODEL = GEMINI_FLASH_DEFAULT_MODEL
@@ -46,16 +47,24 @@ def uses_terra_cache_controls(model: object) -> bool:
 
 
 def uses_gpt56_cache_controls(model: object) -> bool:
-    """Match reviewed Terra/Luna IDs without assuming compatibility of other aliases."""
-    return str(model or "").strip().lower() in {CANARY_TERRA_MODEL, CANARY_LUNA_MODEL}
+    """Match reviewed cache-policy IDs; retain the historical helper name for callers."""
+    return str(model or "").strip().lower() in {
+        CANARY_TERRA_MODEL,
+        CANARY_LUNA_MODEL,
+        OPENAI_LUNA_MODEL,
+    }
 
 
 def gmail_selection_reasoning_effort(model_override: str | None = None) -> str | None:
-    """Give the audited mini model a bounded reasoning budget for mailbox selection."""
+    """Give reviewed OpenAI selection models a bounded mailbox reasoning budget."""
     config = get_runtime_agent_model_config("gmail_triage", model_override=model_override)
-    if config.provider == "openai" and config.model == CANARY_ACCEPTANCE_OPENAI_MODEL:
+    if config.provider == "openai" and config.model in {
+        CANARY_ACCEPTANCE_OPENAI_MODEL,
+        OPENAI_LUNA_MODEL,
+    }:
         return "low"
     return None
+
 
 TRACE_METADATA_MAX_STRING_LENGTH = 200
 FORBIDDEN_TRACE_METADATA_KEY_TERMS = (

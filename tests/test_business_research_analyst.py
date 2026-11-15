@@ -1041,6 +1041,83 @@ def test_source_bundle_synthesis_uses_only_source_records() -> None:
     assert all(claim.source_id == "company:about" for claim in profile.claims)
 
 
+def test_selected_source_bundle_keeps_bounded_excerpt_and_exact_read_handle() -> None:
+    from keystone_agents.schemas.web_source import WebSourceAccess
+
+    url = "https://example.org/selected-article"
+    source_id = "web:selected-article"
+    excerpt = "Background evidence. " * 65 + "LATE_RESULT_SENTINEL " + "Methods. " * 260
+    excerpt = excerpt[:4000]
+    access = WebSourceAccess(
+        source_id=source_id,
+        selected_url=url,
+        resolved_url=url,
+        snapshot_sha256="a" * 64,
+        total_chars=6000,
+        start_char=0,
+        end_char=len(excerpt),
+        next_start_char=len(excerpt),
+    )
+    profile = synthesize_company_profile_from_source_bundle(
+        company_name="Selected article",
+        company_url=url,
+        source_bundle={
+            "company_name": "Selected article",
+            "company_url": url,
+            "sources": [{
+                "source_id": source_id,
+                "title": "Selected article",
+                "url": url,
+                "source_type": "website",
+                "supported_claims": ["The article reports a research method for review."],
+                "evidence_excerpt": excerpt,
+                "web_source_access": access.model_dump(mode="json"),
+                "confidence": 0.8,
+            }],
+        },
+    )
+
+    assert len(profile.sources) == 1
+    assert profile.sources[0].evidence_excerpt == excerpt
+    assert profile.sources[0].web_source_access == access
+    assert "LATE_RESULT_SENTINEL" in focused_brief_input_from_profile(profile).source_context
+
+
+def test_selected_source_bundle_rejects_mismatched_read_handle() -> None:
+    from keystone_agents.schemas.web_source import WebSourceAccess
+
+    url = "https://example.org/selected-article"
+    access = WebSourceAccess(
+        source_id="web:other",
+        selected_url=url,
+        resolved_url=url,
+        snapshot_sha256="a" * 64,
+        total_chars=1000,
+        start_char=0,
+        end_char=1000,
+        content_complete=True,
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        synthesize_company_profile_from_source_bundle(
+            company_name="Selected article",
+            company_url=url,
+            source_bundle={
+                "company_name": "Selected article",
+                "company_url": url,
+                "sources": [{
+                    "source_id": "web:selected",
+                    "title": "Selected article",
+                    "url": url,
+                    "source_type": "website",
+                    "supported_claims": ["The article reports a research method for review."],
+                    "evidence_excerpt": "Readable source evidence.",
+                    "web_source_access": access.model_dump(mode="json"),
+                    "confidence": 0.8,
+                }],
+            },
+        )
+
+
 def test_source_bundle_serialization_is_deterministic_for_identical_inputs() -> None:
     source_payloads = [
         {

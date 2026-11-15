@@ -188,6 +188,23 @@ def test_child_budget_reserves_remaining_and_releases_unused_allowance() -> None
     assert snapshot["reserved"] == 0
 
 
+def test_missing_child_usage_reserves_capacity_without_claiming_actual_requests() -> None:
+    with activate_model_request_budget(8) as ledger:
+        ledger.consume(stage="orchestrator:llm_start")
+        lease = reserve_child_model_request_budget(stage="research:child_process")
+        assert lease is not None
+        lease.settle(None)
+        snapshot = ledger.snapshot()
+    assert snapshot["consumed"] == 8
+    assert snapshot["remaining"] == 0
+    assert snapshot["consumed_count_confirmed"] is False
+    assert model_request_count_from_payload({"request_budget": snapshot}) is None
+    # Partial response usage cannot certify the missing child's total either.
+    assert model_request_count_from_payload({
+        "request_budget": snapshot, "usage": {"requests": 1},
+    }) is None
+
+
 def test_child_budget_preserves_child_exhaustion_stage() -> None:
     with activate_model_request_budget(2) as ledger:
         ledger.consume(stage="orchestrator:llm_start")
@@ -346,6 +363,28 @@ def test_failed_child_reports_enforced_root_request_total(
     assert payload["entry_request_accounting"]["actual_child_requests"] == 3
     assert payload["entry_request_accounting"]["actual_total_requests"] == 4
     assert snapshot["consumed"] == 4
+
+
+def test_failed_child_without_usage_reports_unknown_total(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(cli, "run_isolated_child_process", lambda *args, **kwargs: type(
+        "Completed", (), {"returncode": 1, "stdout": "", "stderr": "Child failed"},
+    )())
+    with activate_model_request_budget(8) as ledger:
+        ledger.consume(stage="orchestrator:llm_start")
+        exit_code = cli._run_ask_script_live(
+            "business_research_analyst", "Research the latest timetable.", ["unused-child"],
+            json_output=True, manual_plan=None,
+            database_url=f"sqlite:///{tmp_path / 'unknown-child.sqlite'}",
+        )
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 1
+    accounting = payload["entry_request_accounting"]
+    assert accounting["budget_consumed"] == 8
+    assert accounting["budget_consumed_count_confirmed"] is False
+    assert accounting["actual_total_requests"] is None
+    assert accounting["actual_total_requests_available"] is False
+    assert accounting["repair_status"]["tool_correction"]["status"] == "unavailable"
+    assert payload.get("openai_requests_made") is None
 
 
 def test_execution_attempt_terminal_telemetry_uses_enforced_ledger(tmp_path) -> None:

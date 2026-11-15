@@ -591,6 +591,143 @@ def test_company_projection_reaches_actual_focused_sdk_with_only_local_reads(mon
         )
 
 
+def test_selected_url_script_binds_reader_after_retrieval_without_network(monkeypatch):
+    from agents.models.interface import Model, ModelProvider, ModelResponse
+    from agents.usage import Usage
+    from openai.types.responses import (
+        ResponseFunctionToolCall,
+        ResponseOutputMessage,
+        ResponseOutputText,
+    )
+
+    import scripts.run_company_research as company_cli
+    from keystone_agents.sdk import build_local_run_config
+
+    text = (
+        "Introductory context. " * 70
+        + "LATE_RESULT_SENTINEL: the selected study reports a bounded result. "
+        + "Methods and eligibility. " * 160
+        + "FINAL_QUALIFIER_SENTINEL: the conclusion limits generalization."
+    )
+    assert 900 < text.index("LATE_RESULT_SENTINEL") < 4000
+    assert text.index("FINAL_QUALIFIER_SENTINEL") > 4000
+    original = web.build_selected_url_source_bundle
+    captured = {}
+
+    def selected_bundle(**kwargs):
+        result = original(
+            **kwargs,
+            extractor=lambda *_args, **_kwargs: extraction(text),
+        )
+        captured["access"] = result.source_bundle.sources[0].web_source_access
+        return result
+
+    monkeypatch.setattr(company_cli, "build_selected_url_source_bundle", selected_bundle)
+
+    class ScriptedModel(Model):
+        def __init__(self):
+            self.inputs = []
+
+        async def get_response(
+            self, system_instructions, input, model_settings, tools,
+            output_schema, handoffs, tracing, **kwargs,
+        ):
+            self.inputs.append(input)
+            assert [tool.name for tool in tools] == ["read_web_source_window"]
+            access = captured["access"]
+            if len(self.inputs) == 1:
+                prompt = json.dumps(input)
+                assert "LATE_RESULT_SENTINEL" in prompt
+                assert "FINAL_QUALIFIER_SENTINEL" not in prompt
+                output = [ResponseFunctionToolCall(
+                    type="function_call", name="read_web_source_window",
+                    call_id="read-later-window", status="completed",
+                    arguments=json.dumps({
+                        "source_id": access.source_id,
+                        "selected_url": access.selected_url,
+                        "expected_snapshot_sha256": access.snapshot_sha256,
+                        "start_char": access.next_start_char,
+                        "max_chars": 4000,
+                    }),
+                )]
+            else:
+                assert "FINAL_QUALIFIER_SENTINEL" in json.dumps(input)
+                source = captured["source"]
+                output = [ResponseOutputMessage(
+                    id="final", type="message", role="assistant", status="completed",
+                    content=[ResponseOutputText(
+                        type="output_text", annotations=[],
+                        text=json.dumps({
+                            "company_name": "Synthetic source",
+                            "answer": "The saved source qualifies its reported result.",
+                            "facts": [{
+                                "text": "The study reports a bounded result.",
+                                "source_ids": [source.source_id],
+                                "confidence": 0.8,
+                            }],
+                            "sources": [{
+                                "source_id": source.source_id, "title": source.title,
+                                "url": source.url, "source_type": source.source_type,
+                            }],
+                            "source_ids_used": [source.source_id],
+                            "decision": {
+                                "decision_owner": "specialist_agent",
+                                "decision_stage": "research_source_selection",
+                                "selected_candidate_ids": [source.source_id],
+                                "candidate_assessments": [{
+                                    "candidate_id": source.source_id,
+                                    "disposition": "selected",
+                                    "rationale": "Read the selected snapshot.",
+                                }],
+                                "reasoning": "The exact saved-source window supports the answer.",
+                                "needs_more_context": False,
+                            },
+                        }),
+                    )],
+                )]
+            return ModelResponse(
+                output=output, usage=Usage(requests=1),
+                response_id=f"scripted-{len(self.inputs)}",
+            )
+
+        def stream_response(self, *args, **kwargs):
+            raise NotImplementedError
+
+    model = ScriptedModel()
+
+    class Provider(ModelProvider):
+        def get_model(self, model_name):
+            return model
+
+    monkeypatch.setattr(
+        company_cli, "resolve_sdk_execution",
+        lambda *_args, **_kwargs: (build_local_run_config(Provider()), False),
+    )
+    args = company_cli.build_parser().parse_args([
+        "--company", "Synthetic source", "--company-url", URL,
+        "--request-text", "Review the selected study and its limitations.",
+        "--selected-url-extraction", "--no-live-search", "--no-dry-run",
+        "--live-sdk", "--focused-brief", "--compact-instructions", "--json",
+    ])
+    original_retrieve = company_cli.synthesize_company_profile_from_source_bundle
+
+    def profile_from_bundle(**kwargs):
+        profile = original_retrieve(**kwargs)
+        captured["source"] = profile.sources[0]
+        return profile
+
+    monkeypatch.setattr(
+        company_cli, "synthesize_company_profile_from_source_bundle", profile_from_bundle,
+    )
+    payload = company_cli._run_sdk_synthesis(args)
+
+    assert len(model.inputs) == 2
+    assert payload["output"]["source_ids_used"] == [captured["source"].source_id]
+    assert payload["request_cache"]["request_tool_scope"]["selected_tool_names"] == [
+        "read_web_source_window"
+    ]
+
+
 def test_local_read_scope_cannot_open_a_different_saved_source():
     _, allowed = web.project_web_source(extraction("Allowed source " * 1000), selected_url=URL)
     _, other = web.project_web_source(extraction("Other source " * 1000), selected_url=RESOLVED)

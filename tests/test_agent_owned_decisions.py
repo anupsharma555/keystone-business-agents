@@ -1196,8 +1196,38 @@ def test_named_opportunity_preflight_repairs_incompatible_company_route() -> Non
     assert decision["repair_attempted"] is True
     assert decision["validator_outcome"]["status"] == "accepted"
     assert decision["attempts"][0]["validator_outcome"]["reason_code"] == (
-        "selected_identity_not_in_candidate_set"
+        "specialist_intent_owner_mismatch"
     )
+
+
+def test_named_opportunity_preflight_allows_research_then_scout_workflow() -> None:
+    request = (
+        "Opportunity Scout, compare current funding openings from public sources "
+        "and recommend the strongest actionable one. Keep it read-only."
+    )
+    selected = _orchestrator_route_payload(selected_route="business_research_analyst")
+    selected.update({
+        "workflow": ["business_research_analyst", "opportunity_scout"],
+        "rationale": "Business Research gathers sources, then Opportunity Scout chooses.",
+    })
+    selected["decision"]["selected_candidate_ids"] = [
+        "business_research_analyst", "opportunity_scout",
+    ]
+    selected["decision"]["candidate_assessments"].append({
+        "candidate_id": "opportunity_scout", "disposition": "selected",
+        "rationale": "Owns the final opportunity choice.",
+    })
+    model = FakeModel(outputs=[[_structured_message(selected)]])
+    preflight = run_orchestrator_preflight(
+        request, requested_agent="opportunity_scout", live_manual_plan=False,
+        run_config=build_local_run_config(FakeProvider(model)),
+    )
+    assert preflight.route_result.workflow == [
+        "business_research_analyst", "opportunity_scout",
+    ]
+    assert len(model.calls) == 1
+    decision = preflight.sdk_usage_events[0]["request_cache"]["decision_ownership"]
+    assert decision["validator_outcome"]["status"] == "accepted"
 
 
 def test_orchestrator_execution_repairs_provider_selection_context_conflict() -> None:

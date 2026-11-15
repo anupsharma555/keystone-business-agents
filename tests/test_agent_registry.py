@@ -47,62 +47,62 @@ SKILLS_ROOT = PROJECT_ROOT / "src" / "keystone_agents" / "skills"
 
 STATIC_PREFIX_FINGERPRINTS = {
     "gmail_triage": {
-        "instructions_sha256": "cacc99d31ba51016195aa4ef7b5bc7c42274ffbdaa0520acad4ba47b0cf25792",
+        "instructions_sha256": "62c3ce49cbdfb1b764eb2007cb2e43f6e58bcf698bb7a8362b2542e8ce63e222",
         "tool_names_sha256": "7363ff1e9c76e8f477af66a812c9a8116691604c51ed68d1f70b93f6112b93b4",
         "output_schema_sha256": "42ef2b014989eb11bb8b3dcae8b8b3fd937e33272ae562e92eb9023c5dc6cde7"
     },
     "business_research_analyst": {
-        "instructions_sha256": "a140965a81e647d50d514e67822917bff6c89a6c1c487f29e94078326fde9f2e",
+        "instructions_sha256": "572a0bb7f9b12679ad2d0ca2789a07e39d3cd9d46a79f0c79f26be590e892605",
         "tool_names_sha256": "2f40cad113c0a5e031f969d39dbfde851cd27fa13abd6c8ac5b7d7cd612bdabe",
         "output_schema_sha256": "feaea1322b89b637193b4514a4774c031eb4a3d0ecaef162abe13116185c3fc8"
     },
     "rag_retrieval_specialist": {
-        "instructions_sha256": "1393cbbe8819cba28839355899da4271556d780ab3c47218c873c40c144970d9",
+        "instructions_sha256": "ccd72fb7471172dcae6fa99317ec85458cc783ae944155bb0cf4826a98f20ac9",
         "tool_names_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
         "output_schema_sha256": "0924032eaa83589b6e8a92c5d3c49fdc927995598184e4c6c6d43a673f8193d6"
     },
     "opportunity_scout": {
-        "instructions_sha256": "bb34ee463ec9ae0b81a7c70e9f82f33d20dcbc964352dd9afc85915089b01464",
+        "instructions_sha256": "67c22e8eb78b9bba871fd117977e03f58a1e873115e75ee97d5c2aefda3d5500",
         "tool_names_sha256": "11af4029345ccdcb3ec2287e1a91e53391d4ad9e44324574984c31e86d8ce399",
         "output_schema_sha256": "6619d4b688ba020b2492f169ca2a85fda8a4606a507dc223440a5a109bcd5668"
     },
     "outreach_composer": {
-        "instructions_sha256": "304e3718deab2a2947f3571a21da6599d8fa55d5e7c51dd31c379884422d2319",
+        "instructions_sha256": "f687b33660445b12146719fa01c4dc1e2cf883e9ab6d833463093097c21e093e",
         "tool_names_sha256": "5a7b62f096ae42d9499642af1f89b47f850f0ac89ee6feb500bcde203705f6b4",
         "output_schema_sha256": "43ecdc7e630e3b1a5f60de46a961a424eba0f8c4a791cd80b89d566ffe01bf2c"
     },
     "airtable_context_agent": {
-        "instructions_sha256": "ce993ccfb26bb6898c1774f1e49f304d8edcdbc1e67c85004c95a757144fcdb1",
+        "instructions_sha256": "c7680c56a14d144b7b4407fd7576fc7d642d4526ea498e515c9fa301cfb838cd",
         "tool_names_sha256": "def24ef9628ea20812b088d5dec602be8044e2d1f8777bb8f581b582f9f8a5a6",
         "output_schema_sha256": "0cc10736f7d15eda9511e39458c9a8f91ae093f2a3d876c1809569a86d659c62"
     },
     "google_workspace_context_agent": {
-        "instructions_sha256": "3a4686d69c6608fb21b9fcc6b9610e2b48ef4b9226059fd55f00dcd45f16ab84",
+        "instructions_sha256": "f4c2d62fe324c8bcd1a46812e30544f1c2bff115ad14478e6a803f43bc074220",
         "tool_names_sha256": "31f25b0b1bf5b672634cad9cb1434c0c2b4c5f722ba41a0a783e809e1cbecab3",
         "output_schema_sha256": "ab79b01b12622292bb3f6bdee32d6ea50e0bdce0ef73617de1f982d1ac0ee9f2"
     },
     "zotero_context_agent": {
-        "instructions_sha256": "6134743f50581f8b2b49ab386f321e55840eb261b6c02ea0e0b9043d5a4d3963",
+        "instructions_sha256": "7535e8432ad2a85dfb21f7c41d21a211f0bfb092426d16d218cf9933dae6b99e",
         "tool_names_sha256": "157efe138d475b9b0eb13961c0e598b47f58037480732babd614b98019ecc526",
         "output_schema_sha256": "3c77001f4b3b9255d7211ecf93cac61c46319283c777030ca276562be497ad6f"
     },
     "rss_context_agent": {
-        "instructions_sha256": "46a70062181d7a35a3b0a9587106d898bc9f55e4c40984841e04623a5ea6ec89",
+        "instructions_sha256": "a2b878535abc6e7a7e3c1789eed0b1683dd331cbec83b7d0a668f2d1ce5e2874",
         "tool_names_sha256": "bc30cef46242b8d0a15644b1a4101f798d7b2a954318d627d988c4c37ea44ee2",
         "output_schema_sha256": "f29520fe32adbc184aeac2351584d860891cd307feed3848ae151a93207c4498"
     },
     "preprints_context_agent": {
-        "instructions_sha256": "b3489cb9ffc47d3e997165f57e860cab09387edec7c74bb604a7e08242063995",
+        "instructions_sha256": "ff494d365e0b1794c71c0292cbde83f6c628f57dbe1f84b48b8ee711ede1824f",
         "tool_names_sha256": "e7f0e140b410b6c05354ae3b6e33ce424dfce60d09e205c4d9f7d80eb0b56e19",
         "output_schema_sha256": "7491586988c2e8b03a5811ae94699267786483b949548047b5be898787469e0a"
     },
     "orchestrator": {
-        "instructions_sha256": "86d67df008a57af5cdc795cc589612dfc6dc6df081ee54f6b99e5aeae9392462",
+        "instructions_sha256": "f8d55b61621b6deb84d113002fed604f30f0280caf13947d82b26f9ee49fc648",
         "tool_names_sha256": "d57d63506543d4ec46131f24a3f3e64a98fc50bf996a3c59629c5de66ee1f6c2",
-        "output_schema_sha256": "b661ecc6298a304709693b32f2cd7ee29bfadd54fbebe589c4bdd708c0993fa0"
+        "output_schema_sha256": "c137080ec53c4d97c92a04c2eefacb235bebc629de9715dccf0a595779b66a2f"
     },
     "chief_of_staff": {
-        "instructions_sha256": "e33c8a04ced2ff52fcf4c58132f66be97954d111eaa8909b65ee1921720acc04",
+        "instructions_sha256": "30e0233b3255c529684f42218620791a214b779c7d2a297059ef95440059d191",
         "tool_names_sha256": "8048af129fda950491143e09f38c94257de40e91ae96d9feedaed22f79334860",
         "output_schema_sha256": "2de4f02033461c076c09eb6b4b77a2ab623e6404dbacdfc6a4c7ffe9274590a4"
     }
@@ -472,7 +472,8 @@ def test_build_sdk_agent_applies_cache_friendly_defaults(monkeypatch) -> None:
     )
 
     assert getattr(agent.model_settings, "include_usage", None) is True
-    assert getattr(agent.model_settings, "prompt_cache_retention", None) == "24h"
+    assert getattr(agent.model_settings, "prompt_cache_retention", None) is None
+    assert agent.model_settings.preserve_raw_usage is True
 
 
 def test_build_sdk_agent_allows_cache_defaults_to_be_disabled(monkeypatch) -> None:
@@ -499,7 +500,8 @@ def test_registered_agents_use_cache_friendly_model_settings(monkeypatch) -> Non
         agent = spec.build_agent()
 
         assert getattr(agent.model_settings, "include_usage", None) is True
-        assert getattr(agent.model_settings, "prompt_cache_retention", None) == "24h"
+        assert getattr(agent.model_settings, "prompt_cache_retention", None) is None
+        assert agent.model_settings.preserve_raw_usage is True
 
 
 def test_registered_agent_tools_follow_controlled_tool_policy() -> None:
@@ -706,6 +708,10 @@ def test_signal_context_instructions_allow_only_bounded_empty_result_reformulati
     assert "abbreviation expansion" in instructions
     assert "Do not use an empty query" in instructions
     assert "yourself exactly once" not in instructions
+    assert "read-only preliminary selection" in instructions
+    assert "`evidence_gaps` and article `limitations`" in instructions
+    assert "leave `blockers` and `approval_needs` empty" in instructions
+    assert "operator explicitly requires evidence beyond the saved content" in instructions
 
 
 def test_direct_zotero_read_catalog_is_request_scoped() -> None:
