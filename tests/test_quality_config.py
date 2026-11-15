@@ -15,15 +15,19 @@ def test_dev_quality_tools_are_declared() -> None:
 def test_vulnerable_dependency_floors_are_constrained() -> None:
     text = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
+    assert text.count('"setuptools>=84.1.0"') == 2
+
     for requirement in (
-        '"aiohttp>=3.14.3"',
+        '"aiohttp>=3.14.4"',
         '"orjson>=3.11.6"',
-        '"pypdf>=6.16.1,<7"',
-        '"PyJWT>=2.13.0"',
+        '"pypdf>=6.21.4,<7"',
+        '"PyJWT>=2.15.1"',
         '"python-dotenv>=1.2.2"',
         '"python-multipart>=0.0.31"',
         '"starlette>=1.3.1"',
-        '"urllib3>=2.7.0"',
+        '"urllib3>=2.8.0"',
+        '"langgraph-checkpoint-sqlite>=3.1.2,<4"',
+        '"langgraph>=1.2.14,<2"',
     ):
         assert requirement in text
 

@@ -39,6 +39,18 @@ complete pinned set passes the advisory audit. Compatibility is validated in
 an isolated test environment; existing operator environments are not upgraded
 by a source merge. See the [upstream 4.14.2 changes](https://github.com/agronholm/anyio/releases/tag/4.14.2).
 
+The November 15 security refresh updates 16 existing pins within the same
+126-package development and orchestration set. Linux Python 3.11 and macOS
+Python 3.13 resolver reports contain no added or removed distribution, and a
+fresh audit of the exact refreshed pins reports zero known vulnerabilities in
+its feed. Primary-source review also found a LangGraph SQLite checkpoint
+advisory absent from that feed; the refreshed manifest includes its patched
+SQLite and checkpoint versions. An isolated installation passed `pip check`, an installed-package audit and
+8,370 offline tests (75 skipped). This does not upgrade an already installed
+operator environment or establish live-provider compatibility; remote CI is a
+separate final gate. See the
+[complete package and evidence review](../docs/DEPENDENCY_SECURITY_REFRESH.md).
+
 The optional `extraction` extra is outside this validated package set. Its
 cryptography bound now allows the security-fixed 50.x series, which is compatible
 with [pyOpenSSL 26.4](https://pypi.org/project/pyOpenSSL/26.4.0/)'s declared

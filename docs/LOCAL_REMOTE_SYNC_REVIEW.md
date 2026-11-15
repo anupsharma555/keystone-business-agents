@@ -4,7 +4,9 @@ The publication scope is the shared Slack context and continuity implementation,
 operating-model defaults, source/repair diagnostics, and README refresh. Local
 model experiments and separate comparison/vocabulary work are preserved outside
 this publication. No deployment, Slack message or live provider test is part of
-this Git synchronization.
+this Git synchronization. The existing CI dependency audit also requires the
+[security refresh](DEPENDENCY_SECURITY_REFRESH.md); both CI jobs now have the
+authorized 30-minute limit.
 
 ## Technical index
 
@@ -66,7 +68,7 @@ Two additional nonexperimental workstreams are outside the approved scope:
   and corresponding tests.
 
 These omissions are intentional, not evidence of remote parity for those
-workstreams. They need their own scoped publication. Environment files, local
+workstreams. They need their own scoped publication. Private environment files, local
 state, credentials, databases, logs and caches remain excluded by existing
 ignore rules; no ignore-rule change is needed.
 
@@ -94,6 +96,11 @@ modules are absent; direct cases remain active. With graph installed, all ten
 focused cases passed. A simulated missing-dependency process passed four direct
 cases and skipped six graph cases. The actual CI matrix is rerun on the final
 revision; simulation is not remote CI proof.
+
+The security-fixed environment independently passed the same full local suite
+(8,370 passed, 75 skipped), the 396-test focused gate, dependency consistency
+and its installed-package advisory audit. It retains all 126 distributions
+without additions; the running operator environment was not changed.
 
 Passing offline checks is distinct from live acceptance. The workspace rollout
 record retains failed and successful attempts plus pending other-channel,

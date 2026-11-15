@@ -256,7 +256,7 @@ Optional LangGraph runtime:
 .venv/bin/python -m pip install --no-build-isolation -e ".[orchestration]" -c constraints/ci.txt
 ```
 
-The orchestration extra includes LangGraph 1.2.11 or newer and the SQLite
+The orchestration extra includes LangGraph 1.2.14 or newer and the SQLite
 checkpointer. Saved graph runs use native checkpoints; direct execution retains
 the shared local operation journal. See the [V2 implementation report](docs/KBA_V2_IMPLEMENTATION.md)
 for inspection/resume commands and proof boundaries, and the
@@ -411,6 +411,8 @@ Start here for deeper details:
 - [OpenAI platform setup](docs/OPENAI_AGENT_PLATFORM_SETUP.md): OpenAI project setup, tracing,
   datasets, evals, and model migration notes.
 - [GitHub update runbook](docs/GITHUB_UPDATE_RUNBOOK.md): repeatable local-to-GitHub publish flow.
+- [Dependency security review](docs/DEPENDENCY_SECURITY_REFRESH.md): fixed constraints,
+  package decisions, advisory evidence and environment boundaries.
 
 Reference repositories used for architecture review are listed in the docs; no
 reference code is copied into this repository.
