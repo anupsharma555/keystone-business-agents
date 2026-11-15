@@ -17,6 +17,7 @@ _MUTATION_OPERATION = re.compile(
 # necessarily contain a mutation verb.
 _EXACT_MUTATION_OPERATIONS = {
     "apply_gmail_labels",
+    "capture_operator_memory",
     "extract_slide_copy",
     "mark_important",
     "mark_not_important",
@@ -27,6 +28,17 @@ _EXACT_MUTATION_OPERATIONS = {
     "unarchive",
     "unstar",
 }
+
+
+def receipt_is_local_memory_capture(receipt: Mapping[str, Any]) -> bool:
+    """Identify the fixed local-only tool receipt, never a caller's locality flag."""
+
+    return bool(
+        receipt.get("tool_name") == "capture_operator_memory"
+        and receipt.get("operation") == "capture_operator_memory"
+        and receipt.get("provider") == "local_memory"
+        and receipt.get("provider_write") is False
+    )
 
 
 def operation_is_mutation(value: object) -> bool:
@@ -80,5 +92,6 @@ def mutation_tool_names(receipts: Sequence[Mapping[str, Any]]) -> set[str]:
 __all__ = [
     "mutation_tool_names",
     "operation_is_mutation",
+    "receipt_is_local_memory_capture",
     "receipt_reports_possible_write",
 ]

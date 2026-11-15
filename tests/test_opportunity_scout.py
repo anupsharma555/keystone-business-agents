@@ -1873,13 +1873,30 @@ def test_verification_excerpt_retains_late_formal_opportunity_details() -> None:
     assert "Applications must be submitted electronically" in excerpt
 
 
-def test_opportunity_deadline_uses_next_upcoming_date_from_due_date_table() -> None:
+@pytest.mark.parametrize(
+    ("today", "expected"),
+    [
+        (date(2026, 9, 1), date(2026, 10, 15)),
+        (date(2026, 10, 15), date(2026, 10, 15)),
+        (date(2026, 11, 4), date(2027, 2, 17)),
+        (date(2027, 3, 1), date(2027, 2, 17)),
+    ],
+)
+def test_opportunity_deadline_uses_next_upcoming_date_from_due_date_table(
+    monkeypatch: pytest.MonkeyPatch, today: date, expected: date,
+) -> None:
+    class FixedDate(date):
+        @classmethod
+        def today(cls) -> date:
+            return today
+
+    monkeypatch.setattr(scout_module, "date", FixedDate)
     text = (
         "Application Due Dates\nFebruary 18, 2025\nJune 15, 2026\n"
         "October 15, 2026\nFebruary 17, 2027"
     )
 
-    assert scout_module._opportunity_deadline_from_text(text) == date(2026, 10, 15)
+    assert scout_module._opportunity_deadline_from_text(text) == expected
 
 
 def test_opportunity_details_prioritize_explicit_for_profit_eligibility_block() -> None:

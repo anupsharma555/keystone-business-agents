@@ -27,6 +27,10 @@ from keystone_agents.guardrails import (
     enforce_tool_output_guardrails,
     keystone_tool_guardrail_kwargs,
 )
+from keystone_agents.runtime.request_budget import (
+    current_model_request_budget,
+    current_model_request_capacity,
+)
 from keystone_agents.schemas.web_source import WebSourceAccess
 from keystone_agents.sdk import (
     ToolGuardrailFunctionOutput,
@@ -119,8 +123,10 @@ class SelectedUrlSourceBundleResult(BaseModel):
     coverage_note: str = (
         "Claims are selected previews, not complete evidence. For partial sources call "
         "read_web_source_window with source_id, selected_url, expected_snapshot_sha256 "
-        "from snapshot_sha256, and start_char from next_start_char. Repeat until complete "
-        "before ruling out later qualifications. Deferred URLs require another selected-URL call."
+        "from snapshot_sha256, and start_char from next_start_char. Read informative bounded "
+        "windows while reserving one model request for the final typed answer. If capacity "
+        "cannot cover the full source, state the unread coverage and do not rule out later "
+        "qualifications. Deferred URLs require another selected-URL call."
     )
     firecrawl_max_calls: int = Field(default=0, ge=0)
     firecrawl_calls_attempted: int = Field(default=0, ge=0)
@@ -218,6 +224,140 @@ def project_web_source(
     return text[:end], access
 
 
+class _SourceWindowRequestGate:
+    """Keep advertised calls valid through SDK dispatch, then reserve a final turn."""
+
+    def __init__(self) -> None:
+        self._ledger: Any = None
+        self._final_only = False
+        self._advertised = False
+        self._observations: list[dict[str, Any]] = []
+        self._evaluation_count = 0
+
+        @tool_input_guardrail(name="keystone_source_window_final_response_reserve")
+        def observe_dispatch(_data: Any) -> ToolGuardrailFunctionOutput:
+            # The SDK rechecks visibility after charging the model request but
+            # before these guardrails. Closing here preserves all calls already
+            # advertised in that response, including parallel local reads.
+            capacity = current_model_request_capacity(load_environment=False)
+            if (capacity is not None and capacity.remaining is not None
+                    and capacity.remaining <= capacity.reserved_final_response_requests):
+                self._final_only = True
+            return ToolGuardrailFunctionOutput.allow({"final_response_reserve_observed": True})
+
+        self.input_guardrail = observe_dispatch
+
+    def enabled(self, _context: Any, _agent: Any) -> bool:
+        ledger = current_model_request_budget(load_environment=False)
+        capacity = current_model_request_capacity(load_environment=False)
+        if ledger is not self._ledger:
+            self._ledger = ledger
+            self._final_only = False
+            self._advertised = False
+            self._observations.clear()
+            self._evaluation_count = 0
+        if capacity is None or capacity.remaining is None:
+            enabled = True
+        elif capacity.remaining > capacity.reserved_final_response_requests:
+            # Unused child allowances can return on this same ledger. A probe
+            # made while they were reserved must not permanently hide the tool.
+            self._final_only = False
+            self._advertised = True
+            enabled = True
+        else:
+            enabled = self._advertised and not self._final_only
+        self._evaluation_count += 1
+        if len(self._observations) < 12:
+            self._observations.append({
+                "limit": capacity.limit if capacity is not None else None,
+                "remaining": capacity.remaining if capacity is not None else None,
+                "consumed": capacity.consumed if capacity is not None else None,
+                "enabled": enabled,
+            })
+        return enabled
+
+    def visibility_receipt(self) -> dict[str, Any]:
+        return {
+            "schema": "keystone.source_window_visibility.v1",
+            "observation_kind": "is_enabled_callback_evaluations_not_provider_schema",
+            "evaluation_count": self._evaluation_count,
+            "observations": [dict(item) for item in self._observations],
+            "truncated": self._evaluation_count > len(self._observations),
+        }
+
+
+def _attach_source_window_visibility(tool: Any, gate: _SourceWindowRequestGate) -> Any:
+    tool.keystone_source_window_visibility = gate.visibility_receipt
+    sdk_tool = getattr(tool, "sdk_tool", None)
+    if sdk_tool is not None:
+        sdk_tool.keystone_source_window_visibility = gate.visibility_receipt
+    return tool
+
+
+def _with_source_window_capacity(result: dict[str, Any]) -> dict[str, Any]:
+    capacity = current_model_request_capacity(load_environment=False)
+    if capacity is None:
+        return result
+    result["model_request_capacity"] = capacity.receipt(
+        required_future_requests=1 if result.get("reached_end") else 2,
+    )
+    result["read_window_guidance"] = (
+        "Reserve the next model request for the final typed answer. Do not request more "
+        "windows; use only observed evidence and disclose unread coverage."
+        if capacity.remaining is not None
+        and capacity.remaining <= capacity.reserved_final_response_requests
+        else "Choose informative bounded windows and reserve one model request for the "
+        "final typed answer. Unread source text remains unverified."
+    )
+    return result
+
+
+def _load_retained_web_snapshot(
+    *, source_id: str, selected_url: str, snapshot_sha256: str,
+) -> dict[str, Any] | None:
+    """Load and integrity-check one immutable local snapshot, without fetching."""
+
+    path = _web_snapshot_dir() / f"{snapshot_sha256}.json"
+    try:
+        if path.is_symlink() or path.stat().st_size > MAX_WEB_SNAPSHOT_CHARS * 6 + 10000:
+            raise ValueError("Invalid snapshot file.")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or _web_snapshot_hash(payload) != snapshot_sha256
+        or payload.get("source_id") != source_id
+        or payload.get("selected_url") != selected_url
+        or not isinstance(payload.get("text"), str)
+    ):
+        raise WebsiteExtractionError("Source identity or snapshot integrity mismatch.")
+    return payload
+
+
+def validate_retained_web_source_access(access: WebSourceAccess | Mapping[str, Any]) -> bool:
+    """Verify cached identity/availability only; return no text or new read coverage."""
+
+    try:
+        bound = WebSourceAccess.model_validate(
+            access.model_dump(mode="json") if isinstance(access, WebSourceAccess) else access,
+        )
+        if not bound.available:
+            return False
+        selected = validate_public_http_url(bound.selected_url, resolve_hostname=False)
+        payload = _load_retained_web_snapshot(
+            source_id=bound.source_id, selected_url=selected,
+            snapshot_sha256=bound.snapshot_sha256,
+        )
+        return bool(
+            payload is not None and payload["text"]
+            and len(payload["text"]) == bound.total_chars
+            and payload.get("resolved_url") == bound.resolved_url
+        )
+    except (TypeError, ValueError, WebsiteExtractionError):
+        return False
+
+
 def read_web_source_window_impl(
     *,
     source_id: str,
@@ -234,32 +374,31 @@ def read_web_source_window_impl(
     selected = validate_public_http_url(selected_url, resolve_hostname=False)
     if not 0 <= start_char or not 1 <= max_chars <= MAX_SOURCE_EXCERPT_CHARS:
         raise WebsiteExtractionError("Invalid source window bounds.")
-    path = _web_snapshot_dir() / f"{digest}.json"
-    try:
-        if path.is_symlink() or path.stat().st_size > MAX_WEB_SNAPSHOT_CHARS * 6 + 10000:
-            raise ValueError("Invalid snapshot file.")
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {
+    payload = _load_retained_web_snapshot(
+        source_id=source_id, selected_url=selected, snapshot_sha256=digest,
+    )
+    if payload is None:
+        return _with_source_window_capacity({
             "status": "unavailable",
             "source_id": source_id,
             "selected_url": selected,
             "snapshot_sha256": digest,
             "content_complete": False,
             "limitation": "Exact local snapshot unavailable; no newer source was fetched.",
-        }
-    if (
-        _web_snapshot_hash(payload) != digest
-        or payload.get("source_id") != source_id
-        or payload.get("selected_url") != selected
-    ):
-        raise WebsiteExtractionError("Source identity or snapshot integrity mismatch.")
+        })
     text = payload["text"]
     if not isinstance(text, str) or start_char > len(text):
         raise WebsiteExtractionError("Source window starts beyond the extracted snapshot.")
     end = min(len(text), start_char + max_chars)
-    while len(json.dumps(text[start_char:end])) > MAX_SOURCE_EXCERPT_CHARS + 2:
-        end = start_char + (end - start_char) // 2
+    if len(json.dumps(text[start_char:end])) > MAX_SOURCE_EXCERPT_CHARS + 2:
+        low, high = start_char, end
+        while low < high:
+            middle = (low + high + 1) // 2
+            if len(json.dumps(text[start_char:middle])) <= MAX_SOURCE_EXCERPT_CHARS + 2:
+                low = middle
+            else:
+                high = middle - 1
+        end = low
     access = WebSourceAccess(
         source_id=source_id,
         selected_url=selected,
@@ -277,6 +416,7 @@ def read_web_source_window_impl(
         "web_source_access": access.model_dump(mode="json"),
         "reached_end": end == len(text),
     }
+    result = _with_source_window_capacity(result)
     enforce_public_source_output_guardrails("read_web_source_window", result)
     return result
 
@@ -295,8 +435,10 @@ def read_web_source_window(
 
     Copy source_id, selected_url and snapshot_sha256 from web_source_access;
     pass the latter as expected_snapshot_sha256. Start at next_start_char and
-    repeat until reached_end. Adjacent windows concatenate exactly; read an
-    overlapping range if a qualification or citation crosses a boundary.
+    continue toward reached_end while reserving one model request for the final
+    typed answer. Use larger informative bounded windows when capacity is tight;
+    report unread coverage when the budget cannot cover the source. Adjacent
+    windows concatenate exactly; overlap if a qualification crosses a boundary.
     """
 
     return read_web_source_window_impl(
@@ -315,8 +457,11 @@ def scoped_web_source_read_tool(accesses: Sequence[WebSourceAccess]) -> Any:
         (access.source_id, access.selected_url, access.snapshot_sha256)
         for access in accesses if access.available
     )
+    request_gate = _SourceWindowRequestGate()
+    guards = keystone_tool_guardrail_kwargs()
+    guards["tool_input_guardrails"].append(request_gate.input_guardrail)
 
-    @function_tool(**keystone_tool_guardrail_kwargs())
+    @function_tool(is_enabled=request_gate.enabled, **guards)
     def read_web_source_window(
         source_id: Annotated[str, Field(min_length=1, max_length=200)],
         selected_url: Annotated[str, Field(min_length=1, max_length=MAX_PUBLIC_URL_CHARS)],
@@ -324,12 +469,15 @@ def scoped_web_source_read_tool(accesses: Sequence[WebSourceAccess]) -> Any:
         start_char: Annotated[int, Field(ge=0)] = 0,
         max_chars: Annotated[
             int, Field(ge=1, le=MAX_SOURCE_EXCERPT_CHARS)
-        ] = DEFAULT_SOURCE_EXCERPT_CHARS,
+        ] = MAX_SOURCE_EXCERPT_CHARS,
     ) -> dict[str, Any]:
         """Read a bounded local window from a web snapshot supplied in this run.
 
         Copy source_id, selected_url, snapshot_sha256 and next_start_char from
-        web_source_access. No network, new URLs, or other saved sources are allowed.
+        web_source_access. The default window is 8000 characters, the existing cap.
+        Reserve one model request for the final typed answer; this tool is hidden
+        on that final reserved turn. State unread coverage rather than claiming a
+        complete read. No network, new URLs, or other saved sources are allowed.
         """
         if (source_id, selected_url, expected_snapshot_sha256) not in allowed:
             raise WebsiteExtractionError("Web source snapshot is outside this input scope.")
@@ -339,7 +487,7 @@ def scoped_web_source_read_tool(accesses: Sequence[WebSourceAccess]) -> Any:
             start_char=start_char, max_chars=max_chars,
         )
 
-    return read_web_source_window
+    return _attach_source_window_visibility(read_web_source_window, request_gate)
 
 
 @dataclass(frozen=True)
@@ -829,9 +977,18 @@ def selected_url_extraction_tools(selected_urls: Sequence[str]) -> tuple[Any, An
     extraction_guards["tool_output_guardrails"].append(returned_handle_guardrail)
     read_guards = keystone_tool_guardrail_kwargs()
     read_guards["tool_input_guardrails"].append(scope_guardrail)
+    request_gate = _SourceWindowRequestGate()
+    extraction_guards["tool_input_guardrails"].append(request_gate.input_guardrail)
+    read_guards["tool_input_guardrails"].append(request_gate.input_guardrail)
     return (
-        function_tool(**extraction_guards)(extract_in_scope),
-        function_tool(**read_guards)(read_in_scope),
+        _attach_source_window_visibility(
+            function_tool(is_enabled=request_gate.enabled, **extraction_guards)(extract_in_scope),
+            request_gate,
+        ),
+        _attach_source_window_visibility(
+            function_tool(is_enabled=request_gate.enabled, **read_guards)(read_in_scope),
+            request_gate,
+        ),
     )
 
 

@@ -1840,6 +1840,30 @@ def synthesize_company_profile_from_source_bundle(
         },
     )
     payload = profile.model_dump(mode="python")
+    # The generic fixture adapter keeps only a short source excerpt and does
+    # not carry retained web-source handles. Restore only exact, validated
+    # source identities from this bundle after deriving the profile's claims,
+    # ranking, and completeness fields.
+    retained_sources: list[SourceRecord] = []
+    for selected in profile.sources:
+        matching = [
+            source for source in bundle.sources
+            if source.source_id == selected.source_id and source.url == selected.url
+            and source.web_source_access is not None
+        ]
+        if len(matching) > 1:
+            raise ValueError("A selected source has conflicting retained access handles.")
+        if matching:
+            retained = matching[0]
+            access = retained.web_source_access
+            if access.source_id != selected.source_id or access.selected_url != selected.url:
+                raise ValueError("Retained source access does not match the selected source.")
+            selected = selected.model_copy(update={
+                "evidence_excerpt": retained.evidence_excerpt,
+                "web_source_access": access,
+            })
+        retained_sources.append(selected)
+    payload["sources"] = [source.model_dump(mode="python") for source in retained_sources]
     payload["contradictions"] = list(
         dict.fromkeys([*profile.contradictions, *bundle.contradictions])
     )

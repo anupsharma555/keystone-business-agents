@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Any
 
+from keystone_agents.receipts.mutations import receipt_is_local_memory_capture
 from keystone_agents.receipts.normalization import identity_fingerprint
 from keystone_agents.schemas.decision_ownership import (
     AgentDecisionRecord,
@@ -131,6 +133,8 @@ class AgentDecisionContract:
     output_normalizer: Callable[[Any], Mapping[str, Any] | None] | None = None
     allow_plausible_alternatives_after_selection: bool = False
     max_decision_repairs: int = 1
+    repair_candidates_from_model_input: bool = False
+    model_input_replay_read_tools: tuple[str, ...] = ()
 
 
 def bind_authoritative_tool_evidence(
@@ -196,6 +200,7 @@ class DecisionRepairEvidenceReplay:
     replay_serialized_chars: int = 0
     candidate_record_count: int = 0
     compaction_applied: bool = False
+    candidate_universe_source: str = "provider_receipts"
 
     @property
     def required(self) -> bool:
@@ -227,6 +232,7 @@ class DecisionRepairEvidenceReplay:
             "replayed_tool_names": list(self.replayed_tool_names),
             "disabled_read_tool_names": list(_ids(disabled_read_tool_names)),
             "candidate_ids": list(self.candidate_ids),
+            "candidate_universe_source": self.candidate_universe_source,
             "evidence_fingerprints": list(self.evidence_fingerprints),
             "aggregate_evidence_fingerprint": self.aggregate_fingerprint,
             "reason_code": self.reason_code,
@@ -954,12 +960,114 @@ def build_decision_repair_evidence_replay(
     )
 
 
+def _model_visible_web_source_accesses(
+    source_context: str,
+    original_model_input_text: str,
+    candidate_ids: tuple[str, ...],
+    expected_candidate_urls: Mapping[str, tuple[str, ...]],
+) -> dict[tuple[str, str], tuple[str, str, int]] | None:
+    """Recover only source handles in the exact original model-visible catalog."""
+
+    if not source_context:
+        return None
+    try:
+        leading = source_context.lstrip()
+        packet, end = json.JSONDecoder().raw_decode(leading)
+    except (TypeError, ValueError):
+        return None
+    visible_catalog = leading[:end]
+    if (
+        visible_catalog not in original_model_input_text
+        and json.dumps(visible_catalog, ensure_ascii=True)[1:-1]
+        not in original_model_input_text
+    ):
+        return None
+    if not isinstance(packet, Mapping) or not isinstance(packet.get("source_catalog"), list):
+        return None
+    catalog: dict[str, str] = {}
+    for row in packet["source_catalog"]:
+        if not isinstance(row, Mapping):
+            return None
+        source_id, url = str(row.get("source_id") or ""), str(row.get("url") or "")
+        if not source_id or not url or source_id in catalog:
+            return None
+        catalog[source_id] = url
+    if set(catalog) != set(candidate_ids):
+        return None
+    if any(
+        tuple(expected_candidate_urls.get(source_id, ())) != (catalog[source_id],)
+        for source_id in candidate_ids
+    ):
+        return None
+    accesses: dict[tuple[str, str], tuple[str, str, int]] = {}
+    stack: list[Any] = [packet]
+    visited = 0
+    while stack:
+        value = stack.pop()
+        visited += 1
+        if visited > 2000:
+            return None
+        if isinstance(value, Mapping):
+            access = value.get("web_source_access")
+            if isinstance(access, Mapping):
+                source_id = str(value.get("source_id") or "")
+                url = str(value.get("url") or "")
+                digest = str(access.get("snapshot_sha256") or "")
+                resolved = str(access.get("resolved_url") or "")
+                total = access.get("total_chars")
+                if (
+                    catalog.get(source_id) != url
+                    or access.get("source_id") != source_id
+                    or access.get("selected_url") != url
+                    or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                    or not resolved or type(total) is not int or total < 1
+                    or access.get("available") is not True
+                ):
+                    return None
+                key = (source_id, url)
+                identity = (digest, resolved, total)
+                if key in accesses and accesses[key] != identity:
+                    return None
+                accesses[key] = identity
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    return accesses
+
+
+def _source_window_matches_model_input(
+    output: Any,
+    accesses: Mapping[tuple[str, str], tuple[str, str, int]],
+) -> bool:
+    parsed = _parse_replay_output(output)
+    if not isinstance(parsed, Mapping) or parsed.get("status") != "success":
+        return False
+    access = parsed.get("web_source_access")
+    if (
+        not isinstance(access, Mapping)
+        or not isinstance(parsed.get("text"), str)
+        or not parsed["text"]
+    ):
+        return False
+    key = (str(access.get("source_id") or ""), str(access.get("selected_url") or ""))
+    return bool(
+        key in accesses
+        and accesses[key] == (
+            access.get("snapshot_sha256"), access.get("resolved_url"), access.get("total_chars")
+        )
+    )
+
+
 def build_cumulative_decision_repair_evidence_replay(
     raw_results: Iterable[Any],
     evidence: SpecialistDecisionEvidence,
     *,
     verified_candidate_fingerprints: Iterable[object] = (),
     attested_read_outputs: Iterable[Mapping[str, Any]] = (),
+    model_input_candidate_ids: Iterable[object] = (),
+    original_model_input_text: str = "",
+    model_input_replay_read_tools: Iterable[object] = (),
+    original_model_source_context: str = "",
 ) -> DecisionRepairEvidenceReplay:
     """Build one bounded replay from all completed provider/read attempts.
 
@@ -977,18 +1085,72 @@ def build_cumulative_decision_repair_evidence_replay(
         tool_result_succeeded,
     )
 
+    supplied_candidate_ids = _ids(model_input_candidate_ids)
+    model_input_owned = bool(supplied_candidate_ids)
+    extra_read_tools = _ids(model_input_replay_read_tools)
+    if extra_read_tools and (
+        not model_input_owned or set(extra_read_tools) != {"read_web_source_window"}
+    ):
+        return _unsafe_replay(
+            evidence, replayed_names=[],
+            reason_code="decision_repair_read_tool_scope_invalid",
+            feedback=(
+                "The model-input repair read-tool scope is not an approved "
+                "exact-source reader."
+            ),
+        )
+    source_access_scope = (
+        _model_visible_web_source_accesses(
+            original_model_source_context,
+            original_model_input_text,
+            supplied_candidate_ids,
+            evidence.provider_identities_by_candidate,
+        )
+        if extra_read_tools else None
+    )
+    if extra_read_tools and source_access_scope is None:
+        return _unsafe_replay(
+            evidence, replayed_names=[],
+            reason_code="decision_repair_model_input_source_scope_unavailable",
+            feedback=(
+                "The exact source catalog and snapshot access were not present "
+                "in the original model input."
+            ),
+        )
+
+    def operator_context_observation(tool_name: str, output: Any) -> bool:
+        parsed = _parse_replay_output(output)
+        return bool(
+            model_input_owned and tool_name == "query_operator_context"
+            and isinstance(parsed, Mapping) and isinstance(parsed.get("facts"), list)
+            and len(parsed["facts"]) <= 2
+            and parsed.get("status") in {
+                "ok", "empty", "partial", "memory_unavailable",
+                "query_required", "query_limit_reached",
+            }
+        )
+
     read_records: list[tuple[str, str, Any]] = []
     seen_read_outputs: set[tuple[str, str, str]] = set()
     for raw_result in raw_results:
-        records = tuple(
-            record
-            for record in sdk_tool_execution_records(raw_result)
-            if record.succeeded
-        )
+        records = sdk_tool_execution_records(raw_result)
         output_by_call_id = _tool_outputs_by_call_id(raw_result)
         for record in records:
             output = output_by_call_id.get(record.call_id)
+            if record.tool_name in extra_read_tools and not _source_window_matches_model_input(
+                output, source_access_scope or {}
+            ):
+                return _unsafe_replay(
+                    evidence, replayed_names=[],
+                    reason_code="decision_repair_source_window_unavailable_or_mismatched",
+                    feedback=(
+                        "A completed source window was unavailable or outside "
+                        "the original source snapshot scope."
+                    ),
+                )
             if output is None:
+                continue
+            if not record.succeeded and not operator_context_observation(record.tool_name, output):
                 continue
             if not (
                 is_provider_read_tool_name(record.tool_name)
@@ -1016,9 +1178,22 @@ def build_cumulative_decision_repair_evidence_replay(
     for entry in attested_read_outputs:
         tool_name = str(entry.get("tool_name") or "")
         output = entry.get("output")
+        if tool_name in extra_read_tools and not _source_window_matches_model_input(
+            output, source_access_scope or {}
+        ):
+            return _unsafe_replay(
+                evidence, replayed_names=[],
+                reason_code="decision_repair_source_window_unavailable_or_mismatched",
+                feedback=(
+                    "An attested source window was unavailable or outside "
+                    "the original source snapshot scope."
+                ),
+            )
         if (
             operation_is_mutation(tool_name) or not is_provider_read_tool_name(tool_name)
-            or not tool_result_succeeded(output)
+            or not (
+                tool_result_succeeded(output) or operator_context_observation(tool_name, output)
+            )
         ):
             continue
         fingerprint = sha256(json.dumps(
@@ -1028,14 +1203,28 @@ def build_cumulative_decision_repair_evidence_replay(
         if key not in seen_read_outputs:
             seen_read_outputs.add(key)
             read_records.append((f"attested:{fingerprint}", tool_name, output))
+    if model_input_owned and (
+        supplied_candidate_ids != evidence.candidate_ids
+        or any(
+            json.dumps(candidate_id) not in original_model_input_text
+            for candidate_id in supplied_candidate_ids
+        )
+    ):
+        return _unsafe_replay(
+            evidence,
+            replayed_names=[],
+            reason_code="decision_repair_model_input_candidate_universe_unavailable",
+            feedback=(
+                "The exact declared routing universe was not visible in the original model input."
+            ),
+        )
     if not read_records:
         return DecisionRepairEvidenceReplay(status="not_required")
-
     verified_fingerprints = set(_ids(verified_candidate_fingerprints))
     replay_candidate_ids = tuple(
         candidate_id
         for candidate_id in evidence.candidate_ids
-        if any(
+        if model_input_owned or any(
             identity_fingerprint(identity) in verified_fingerprints
             for identity in (
                 candidate_id,
@@ -1066,6 +1255,17 @@ def build_cumulative_decision_repair_evidence_replay(
     fingerprints: list[str] = []
     replayed_names: list[str] = []
     for _call_id, tool_name, output in read_records[:_REPLAY_MAX_OUTPUTS]:
+        if model_input_owned and tool_name not in {
+            "query_slack_channel_context", "read_slack_channel_context",
+            "query_operator_context", *extra_read_tools,
+        }:
+            return _unsafe_replay(
+                evidence, replayed_names=replayed_names,
+                reason_code="decision_repair_model_input_read_tool_unsupported",
+                feedback=(
+                    "This routing replay supports only completed scoped context queries and reads."
+                ),
+            )
         parsed = _parse_replay_output(output)
         if not isinstance(parsed, Mapping | list | tuple):
             return _unsafe_replay(
@@ -1080,7 +1280,23 @@ def build_cumulative_decision_repair_evidence_replay(
         sanitized = _sanitize_replay_value(
             parsed,
             protected_strings=replay_protected_identities,
+            **(
+                {
+                    "max_mapping_items": _REPLAY_MAX_SERIALIZED_CHARS,
+                    "max_list_items": _REPLAY_MAX_SERIALIZED_CHARS,
+                    "max_string_chars": _REPLAY_MAX_SERIALIZED_CHARS,
+                }
+                if model_input_owned else {}
+            ),
         )
+        if model_input_owned and sanitized != parsed:
+            return _unsafe_replay(
+                evidence, replayed_names=replayed_names,
+                reason_code="decision_repair_channel_evidence_not_preserved",
+                feedback=(
+                    "The completed bounded channel evidence could not be preserved safely in full."
+                ),
+            )
         if not isinstance(sanitized, dict | list) or not sanitized:
             return _unsafe_replay(
                 evidence,
@@ -1122,7 +1338,7 @@ def build_cumulative_decision_repair_evidence_replay(
         for entry in replay_entries
     )
     compaction_applied = source_serialized_chars > _REPLAY_MAX_SERIALIZED_CHARS
-    if compaction_applied:
+    if compaction_applied and not model_input_owned:
         replay_entries, serialized = _compact_replay_entries(
             replay_entries,
             protected_strings=replay_protected_identities,
@@ -1151,7 +1367,7 @@ def build_cumulative_decision_repair_evidence_replay(
         ).hexdigest()
         for entry in replay_entries
     ]
-    missing_candidates = [
+    missing_candidates = [] if model_input_owned else [
         candidate_id
         for candidate_id in replay_candidate_ids
         if not any(
@@ -1172,7 +1388,10 @@ def build_cumulative_decision_repair_evidence_replay(
                 "identity required for agent-owned repair."
             ),
         )
-    if not _has_descriptive_replay_evidence(replay_entries):
+    # Routing candidates are already described in the verified original input.
+    # An optional context query can honestly return no facts; preserve that exact
+    # result for repair without inventing evidence or repeating the query.
+    if not model_input_owned and not _has_descriptive_replay_evidence(replay_entries):
         return _unsafe_replay(
             evidence,
             replayed_names=replayed_names,
@@ -1182,7 +1401,7 @@ def build_cumulative_decision_repair_evidence_replay(
                 "Agent-owned repair requires candidate evidence, not an ID-only prompt."
             ),
         )
-    candidates_without_descriptive_evidence = [
+    candidates_without_descriptive_evidence = [] if model_input_owned else [
         candidate_id
         for candidate_id in replay_candidate_ids
         if not _has_descriptive_candidate_evidence(
@@ -1225,6 +1444,9 @@ def build_cumulative_decision_repair_evidence_replay(
         replay_serialized_chars=len(serialized),
         candidate_record_count=candidate_record_count,
         compaction_applied=compaction_applied,
+        candidate_universe_source=(
+            "original_model_input" if model_input_owned else "provider_receipts"
+        ),
     )
 
 
@@ -1786,6 +2008,10 @@ def verified_candidate_fingerprints_from_receipts(
     )
     for receipt in receipts:
         if not isinstance(receipt, Mapping):
+            continue
+        if receipt_is_local_memory_capture(receipt):
+            # A saved local record is mutation provenance, not a provider-read
+            # candidate for Chief workflow selection or another source choice.
             continue
         raw = receipt.get("identity_fingerprints") or []
         values = raw if isinstance(raw, list | tuple | set) else [raw]

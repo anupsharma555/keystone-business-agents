@@ -20,6 +20,7 @@ from keystone_agents.schemas.work_item import (
     WorkItem,
     WorkItemKind,
     WorkItemRoute,
+    WorkItemStatus,
 )
 from keystone_agents.sdk import build_local_run_config
 from keystone_agents.storage.sqlite_store import SQLiteStore
@@ -153,7 +154,12 @@ def test_cli_records_returned_preflight_before_work_item_and_counts_it_once(
             },
         )
         cli._register_entry_agent_run(linked_id)
-        item = WorkItem(kind=WorkItemKind.RESEARCH_BRIEF, title="Synthetic completed fixture")
+        item = WorkItem(
+            kind=WorkItemKind.RESEARCH_BRIEF,
+            status=WorkItemStatus.DONE,
+            current_route=WorkItemRoute.BUSINESS_RESEARCH_ANALYST,
+            title="Synthetic completed fixture",
+        )
         store.save_work_item(item)
         return WorkflowRunResult(
             work_item=item,
@@ -210,4 +216,7 @@ def test_cli_records_returned_preflight_before_work_item_and_counts_it_once(
         assert audit["links"]["work_item_id"] == ""
     else:
         assert row["status"] == "completed"
+        public = json.loads(streams.out)
+        assert public["status"] == "done"
+        assert public["public_result"]["status"] == "completed"
         assert len(audit["links"]["agent_run_ids"]) == 1

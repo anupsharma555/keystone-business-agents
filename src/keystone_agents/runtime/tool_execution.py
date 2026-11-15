@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 from keystone_agents.receipts.mutations import (
     operation_is_mutation,
+    receipt_is_local_memory_capture,
     receipt_reports_possible_write,
 )
 
@@ -277,7 +278,8 @@ def external_write_state_from_evidence(
         )
     ]
     mutation_receipts = [
-        receipt for receipt in normalized_receipts if receipt_reports_possible_write(receipt)
+        receipt for receipt in normalized_receipts
+        if receipt_reports_possible_write(receipt) and not receipt_is_local_memory_capture(receipt)
     ]
     if any(_receipt_proves_write(receipt) for receipt in mutation_receipts):
         return "performed"
@@ -288,7 +290,10 @@ def external_write_state_from_evidence(
         for item in tool_invocations
         if isinstance(item, Mapping)
     )
-    mutation_tool_observed = any(operation_is_mutation(name) for name in observed_tool_names)
+    mutation_tool_observed = any(
+        operation_is_mutation(name) and name != "capture_operator_memory"
+        for name in observed_tool_names
+    )
     if mutation_tool_observed or mutation_receipts:
         if mutation_receipts and all(
             _receipt_proves_no_write(receipt) for receipt in mutation_receipts

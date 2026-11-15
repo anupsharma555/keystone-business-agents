@@ -8,7 +8,9 @@ import keystone_agents.run as run_module
 from keystone_agents.execution_telemetry import ExecutionTelemetry
 from keystone_agents.model_provider import ModelConfig
 from keystone_agents.run import run_typed_sdk_agent
+from keystone_agents.runtime.decision_validation import AgentDecisionValidationError
 from keystone_agents.schemas.chief_of_staff import ChiefOfStaffResult
+from keystone_agents.schemas.decision_ownership import DecisionValidatorOutcome
 
 
 class _FakeAgent:
@@ -22,6 +24,24 @@ class _FakeAgent:
 
 def _output(summary: str) -> ChiefOfStaffResult:
     return ChiefOfStaffResult(mode="llm", summary=summary, audit_notes=[])
+
+
+def test_decision_validation_error_does_not_enter_structured_output_retry() -> None:
+    error = AgentDecisionValidationError(
+        DecisionValidatorOutcome(
+            status="rejected",
+            decision_stage="chief_delegation_selection",
+            selected_candidate_id="",
+            candidate_count=0,
+            reason_code="invalid_selection",
+            feedback="Structured output failed source validation.",
+        )
+    )
+
+    assert not run_module._is_sdk_structured_output_error(error)
+    assert run_module._is_sdk_structured_output_error(
+        ValueError("Structured output failed schema validation")
+    )
 
 
 def test_typed_sdk_result_exposes_privacy_safe_stage_telemetry(

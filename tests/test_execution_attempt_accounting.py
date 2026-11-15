@@ -4,9 +4,44 @@ from copy import deepcopy
 
 import pytest
 
-from keystone_agents.runtime.execution_attempt import start_execution_attempt
-from keystone_agents.runtime.request_budget import activate_model_request_budget
+from keystone_agents.runtime.durable_execution import ExecutionStore, activate_execution
+from keystone_agents.runtime.execution_attempt import (
+    bind_execution_attempt,
+    start_execution_attempt,
+)
+from keystone_agents.runtime.request_budget import (
+    activate_model_request_budget,
+    model_request_count_from_payload,
+    reserve_child_model_request_budget,
+)
 from keystone_agents.storage.sqlite_store import SQLiteStore
+
+
+def test_host_admission_diagnostic_is_persisted_without_public_reason_metadata(tmp_path):
+    from keystone_agents.operator_failures import (
+        OperatorReadableFailure,
+        OperatorReadableFailureError,
+    )
+
+    store = SQLiteStore(f"sqlite:///{tmp_path / 'host-admission.sqlite'}")
+    failure = OperatorReadableFailureError(OperatorReadableFailure(
+        kind="guardrail_block", summary="The saved task could not resume.",
+        reason="The host could not admit this continuation.", next_step="Review the saved state.",
+    ))
+    failure.keystone_host_continuation_admission = {
+        "layer": "host_continuation_admission", "plan_artifact": "research_brief",
+        "failed_gate_code": "blocked_retry_gate_denied", "private_body": "must-not-be-logged",
+    }
+    attempt = start_execution_attempt(
+        store=store, request_text="Synthetic follow-up", route_hint="orchestrator", live=False,
+    )
+    attempt.finalize(status="failed", exit_code=1, failure=failure)
+    saved = store.get_agent_run(attempt.run_id)["output"]
+    diagnostic = saved["internal_diagnostics"]["host_continuation_admission"]
+    assert diagnostic["failed_gate_code"] == "blocked_retry_gate_denied"
+    assert "private_body" not in diagnostic
+    assert "host_continuation_admission" not in failure.failure.to_dict()["reason"]
+    assert saved["failure"]["kind"] == "guardrail_block"
 
 
 def _preflight(*, execution_id: str = "planner-execution") -> dict:
@@ -75,6 +110,32 @@ def _finalize(store: SQLiteStore, rows: list[int], *, consumed: int) -> dict:
         return attempt.finalize(status="completed", exit_code=0, linked_agent_run_ids=rows)
 
 
+@pytest.mark.parametrize("observed_requests", [2, 8])
+def test_terminal_pessimistic_budget_stays_unknown_after_persistence(tmp_path, observed_requests):
+    store = SQLiteStore(f"sqlite:///{tmp_path / 'uncertain-budget.db'}")
+    child = store.save_agent_run(
+        agent_name="business_research_analyst", output=_child([], requests=observed_requests),
+    )
+    with activate_model_request_budget(8) as ledger:
+        attempt = start_execution_attempt(
+            store=store, request_text="Read the synthetic public evidence.",
+            route_hint="business_research_analyst", live=True, max_model_requests=8,
+        )
+        lease = reserve_child_model_request_budget(stage="research:child_process")
+        assert lease is not None
+        lease.settle(None)
+        result = attempt.finalize(status="failed", exit_code=1, linked_agent_run_id=child)
+        assert ledger.remaining == 0
+    stored = store.get_agent_run(result["attempt_id"])["output"]
+    budget = stored["request_budget"]
+    assert budget["consumed"] == 8
+    assert budget["consumed_count_confirmed"] is False
+    assert budget["observed_count_confirmed"] is False
+    assert budget["usage_reconciled_with_ledger"] is None
+    assert "child_budget_consumption_unconfirmed" in stored["unavailable_evidence"]
+    assert model_request_count_from_payload(stored) is None
+
+
 def test_entry_usage_includes_preflight_once_across_copied_child_outputs(tmp_path) -> None:
     store = SQLiteStore(f"sqlite:///{tmp_path / 'accounting.db'}")
     event = _preflight()
@@ -91,9 +152,44 @@ def test_entry_usage_includes_preflight_once_across_copied_child_outputs(tmp_pat
     assert result["decision_trace"]["agent_run_count"] == 2
     assert result["request_budget"]["observed_model_requests"] == 4
     assert result["request_budget"]["observed_count_confirmed"] is True
+    assert result["request_budget"]["durable_model_start_count"] is None
     assert sum(stage["consumption"]["usage"]["total_tokens"] for stage in stages) == 800
     assert sum(stage["consumption"]["cost"]["estimated_usd"] for stage in stages) == 0.008
     assert store.get_agent_run(result["attempt_id"])["output"] == result
+
+
+@pytest.mark.parametrize("include_hosted_usage", [False, True])
+def test_bound_durable_starts_include_hosted_models_without_double_count(
+    tmp_path, include_hosted_usage,
+):
+    store = SQLiteStore(f"sqlite:///{tmp_path / 'hosted-usage.db'}")
+    journal = ExecutionStore(tmp_path / "journal.db")
+    execution_id = journal.begin({"request": "Read public evidence"}, budget_limit=8)["id"]
+    rows = [store.save_agent_run(
+        agent_name="business_research_analyst", output=_child([_preflight()], requests=3),
+    )]
+    if include_hosted_usage:
+        rows.append(store.save_agent_run(
+            agent_name="search_provider_agents_web_search", output=_child([], requests=2),
+        ))
+    with activate_model_request_budget(8) as ledger, activate_execution(journal, execution_id):
+        attempt = start_execution_attempt(
+            store=store, request_text="Read public evidence",
+            route_hint="business_research_analyst",
+            live=True, max_model_requests=8,
+        )
+        bind_execution_attempt(attempt, execution_id)
+        for stage in ["orchestrator", "research", "hosted_search", "hosted_search",
+                      "research", "research"]:
+            journal.reserve_model(execution_id, stage)
+            ledger.consume(stage=stage)
+        result = attempt.finalize(status="completed", exit_code=0, linked_agent_run_ids=rows)
+    budget = result["request_budget"]
+    assert budget["durable_model_start_count"] == 6
+    assert budget["consumed"] == 6
+    assert budget["observed_model_requests"] == (6 if include_hosted_usage else 4)
+    assert budget["usage_reconciled_with_ledger"] is include_hosted_usage
+    assert budget["observed_count_confirmed"] is include_hosted_usage
 
 
 def test_entry_usage_counts_distinct_instruction_repair_once(tmp_path) -> None:

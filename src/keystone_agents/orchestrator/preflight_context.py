@@ -107,6 +107,7 @@ def source_bundle_routing_context(value: Any) -> dict[str, Any]:
 
 _PREFLIGHT_HANDOFF_KEYS = (
     "request_text",
+    "request_time",
     "requested_agent",
     "advisory_only",
     "selected_agent",
@@ -118,6 +119,9 @@ _PREFLIGHT_HANDOFF_KEYS = (
 
 _ROUTE_RESULT_HANDOFF_KEYS = (
     "route",
+    "linked_work_item_relation",
+    "selected_source_url",
+    "requires_live_search",
     "target_agent",
     "workflow",
     "routing_mode",
@@ -226,6 +230,19 @@ def compact_orchestrator_preflight_payload(preflight: Any | None) -> dict[str, A
     sdk_usage_events = _compact_sdk_usage_events(payload.get("sdk_usage_events"))
     if sdk_usage_events:
         compact["sdk_usage_events"] = sdk_usage_events
+    workflow_state = payload.get("workflow_state")
+    if isinstance(workflow_state, Mapping):
+        channel_state = {
+            key: workflow_state[key]
+            for key in (
+                "channel_context_capability", "channel_context_evidence", "channel_context_usage",
+                "operator_context_evidence", "operator_context_usage",
+                "current_work_item",
+            )
+            if workflow_state.get(key)
+        }
+        if channel_state:
+            compact["workflow_state"] = channel_state
     compact["preflight_memo"] = _preflight_memo_payload(compact)
     return compact
 
@@ -324,6 +341,8 @@ def _preflight_memo_payload(preflight: Mapping[str, Any]) -> dict[str, Any]:
     )
     return {
         "raw_request": preflight.get("request_text"),
+        "request_time": preflight.get("request_time"),
+        "request_timezone": "America/New_York",
         "manual_request_plan": preflight.get("manual_request_plan"),
         "advisory_only": preflight.get("advisory_only"),
         "selected_agent": preflight.get("selected_agent"),

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from keystone_agents.sdk import (
+    compose_direct_instructions,
     compose_instructions,
     list_prompt_metadata,
     list_skill_metadata,
@@ -29,7 +30,6 @@ from keystone_agents.writing_style import (
 PROMPT_DIR = Path("src/keystone_agents/prompts")
 SKILL_DIR = Path("src/keystone_agents/skills")
 SKILL_CONTRACT_EVAL_PATH = Path("evals/local/skill_contracts.jsonl")
-
 REQUIRED_PROMPTS = {
     "keystone_profile.md",
     "local_context.md",
@@ -65,6 +65,16 @@ def _read_repo_doc(path: str) -> str:
 
 def test_required_prompt_files_exist() -> None:
     assert {path.name for path in PROMPT_DIR.glob("*.md")} >= REQUIRED_PROMPTS
+
+
+@pytest.mark.parametrize("compose", [compose_instructions, compose_direct_instructions])
+@pytest.mark.parametrize("owner", ["orchestrator", "chief_of_staff", "business_research_analyst"])
+def test_read_only_investigation_policy_reaches_standard_and_compact_owners(compose, owner):
+    instructions = compose(f"{owner}.md")
+    assert "answer with sources, then optionally clarify" in instructions
+    assert "Clarify first only if useful investigation is impossible" in instructions
+    assert "preserve the\n  operator's explicit prohibitions" in instructions
+    assert "explicit live flags and scoped human approval" in instructions
 
 
 def test_prompt_metadata_exists_for_all_required_prompts() -> None:
@@ -520,7 +530,7 @@ def test_shared_agent_operating_architecture_covers_schemas_tools_helpers() -> N
     assert "disabled by default" in text
     assert "does not open a user-screen browser" in text
     assert "temporary non-persistent profile" in text
-    assert "gpt-5.4-mini" in text
+    assert "the configured runtime model interprets natural language" in text
     assert (
         "no live side effects unless the relevant tool, live flag, and approval scope allow them"
         in text

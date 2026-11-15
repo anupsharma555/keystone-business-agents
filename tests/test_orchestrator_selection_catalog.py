@@ -184,8 +184,9 @@ def test_same_runtime_scope_contract_supports_another_owner_and_source(monkeypat
         )
 
     payload = captured["typed_input"]
-    assert payload["allowed_routes"] == ["rss_context_agent", "clarification"]
+    assert payload["allowed_routes"] == ["rss_context_agent", "orchestrator", "clarification"]
     assert payload["effective_runtime_scope"]["owner_scopes"] == [
+        {"route": "orchestrator", "tool_names": [], "source_kinds": []},
         {
             "route": "rss_context_agent",
             "tool_names": ["retrieve_rss_announcement_history"],
@@ -194,6 +195,7 @@ def test_same_runtime_scope_contract_supports_another_owner_and_source(monkeypat
     ]
     assert captured["decision_contract"].pre_model_candidate_ids == (
         "rss_context_agent",
+        "orchestrator",
         "clarification",
     )
 
@@ -257,9 +259,10 @@ def test_restricted_scope_keeps_unavailable_explicit_owner_and_empty_scope_hones
             runtime_scope=empty_scope,
         )
     empty_payload = captured[-1]["typed_input"]
-    assert empty_payload["allowed_routes"] == ["clarification"]
-    assert empty_payload["specialist_catalog"] == []
+    assert empty_payload["allowed_routes"] == ["orchestrator", "clarification"]
+    assert [row["route"] for row in empty_payload["specialist_catalog"]] == ["orchestrator"]
     assert captured[-1]["decision_contract"].pre_model_candidate_ids == (
+        "orchestrator",
         "clarification",
     )
 

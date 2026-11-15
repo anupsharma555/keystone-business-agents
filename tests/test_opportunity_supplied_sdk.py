@@ -330,6 +330,60 @@ def test_supplied_opportunity_uses_registered_sdk_without_tools_and_persists_exa
     assert journal.get(request.execution_id)["consumed"] == 1
 
 
+def test_linked_preprint_scope_reaches_supplied_opportunity_model(
+    tmp_path, monkeypatch
+):
+    linked_item = {
+        "feed_item_id": "linked-preprint-1",
+        "title": "Synthetic preliminary study",
+        "url": "https://example.test/preprint-1",
+        "source": "synthetic-preprints",
+        "summary": "A saved discovery summary describes an evaluation question.",
+        "evidence_status": "discovery_candidate",
+        "saved_content_scope": "linked_discovery_summary",
+        "article_full_text_verified": False,
+    }
+    source = workflow._announcement_work_item_source(linked_item, kind="preprints")
+    assert source.source_id == linked_item["feed_item_id"]
+    assert source.url == linked_item["url"]
+    assert source.key_facts[0] == linked_item["summary"]
+    assert "article full text has not been verified" in source.key_facts[1]
+
+    store, _, request = _case(tmp_path, sources=[source])
+    output = _output()
+    output["records"][0]["sources"] = [
+        {
+            "source_id": source.source_id,
+            "provider_candidate_id": source.source_id,
+            "title": source.title,
+            "url": source.url,
+            "source_type": source.source_type,
+            "supported_signal": source.key_facts[0],
+        }
+    ]
+    output["decision"]["selected_candidate_ids"] = [source.source_id]
+    output["decision"]["candidate_assessments"] = [
+        {
+            "candidate_id": source.source_id,
+            "disposition": "selected",
+            "rationale": "The saved summary supports review, subject to its stated limit.",
+        }
+    ]
+    model = _inject(monkeypatch, [output])
+
+    with activate_model_request_budget(2) as budget:
+        result = workflow.advance_work_item(request)
+        assert budget.consumed == 1
+
+    model_input = str(model.calls[0])
+    assert linked_item["feed_item_id"] in model_input
+    assert linked_item["url"] in model_input
+    assert linked_item["summary"] in model_input
+    assert "article full text has not been verified" in model_input
+    assert result.work_item.sources[0].key_facts == source.key_facts
+    assert store.get_work_item(result.work_item.id) is not None
+
+
 @pytest.mark.parametrize("kind", ["empty", "identity_conflict"])
 def test_empty_or_conflicting_supplied_identity_packet_blocks_before_model(
     tmp_path, monkeypatch, kind
@@ -547,7 +601,7 @@ def test_formal_gate_cannot_replace_supplied_sdk_selection_when_live_search_is_d
     assert len(model.calls) == 1
     assert result.status == WorkItemStatus.BLOCKED and result.artifact_refs == []
     assert output["human_summary"] not in result.human_summary
-    assert "formal-opportunity selection" in result.human_summary
+    assert any("formal-opportunity selection" in blocker.message for blocker in result.blockers)
 
 
 def test_inference_projection_preserves_every_distinct_value_without_mutating_pack():
@@ -555,6 +609,9 @@ def test_inference_projection_preserves_every_distinct_value_without_mutating_pa
         "target": {"name": "Example Systems", "metadata": {"approved": False}},
         "approved_facts": [{"text": "Source-backed finding", "source_ids": ["source-current"]}],
         "source_refs": [{"source_id": "source-old"}, {"source_id": "source-current"}],
+        "retrieved_sources": [{"source_id": "source-old"}, {"source_id": "source-current"}],
+        "request_text": "Assess the supplied opportunity.",
+        "objective": "Assess the supplied opportunity.",
         "selected_artifacts": [{"metadata": {"research_brief": {"summary": "Model answer"}}}],
         "approval_gates": [{"approved": False}],
         "limitation_notes": ["No permission for external actions."],
@@ -576,8 +633,11 @@ def test_inference_projection_preserves_every_distinct_value_without_mutating_pa
         "title": "Distinct title retained",
         "next_action": {"requires_approval": True},
     }
+    assert "retrieved_sources" not in projected
+    assert "objective" not in projected
     assert {key: value for key, value in projected.items() if key != "summary"} == {
-        key: value for key, value in pack.items() if key != "summary"
+        key: value for key, value in pack.items()
+        if key not in {"summary", "retrieved_sources", "objective"}
     }
 
 
@@ -590,6 +650,8 @@ def test_inference_projection_preserves_every_distinct_value_without_mutating_pa
         ({"source_refs": ["first", "second"]}, {"sources": ["second", "first"]}),
         ({"approved_facts": ["approved finding"]}, {"facts": ["unapproved distinct finding"]}),
         ({"selected_artifacts": []}, {"artifact_refs": [{"metadata": {"unique": "Keep this"}}]}),
+        ({"retrieved_sources": [{"source_id": "different"}], "source_refs": []}, {}),
+        ({"objective": "Choose the strongest option.", "request_text": "Compare options."}, {}),
     ],
 )
 def test_inference_projection_retains_missing_counterparts_and_type_or_content_differences(
@@ -612,6 +674,35 @@ def test_inference_projection_does_not_hide_unique_oversized_summary_evidence():
     with pytest.raises(ValueError, match="48000-character"):
         workflow._check_supplied_opportunity_context_bound({"context_pack": projected})
     assert projected == pack
+
+
+def test_supplemental_slack_claim_projection_retains_distinct_evidence():
+    rows = [
+        {
+            "source_id": "selected", "url": "https://public.example/selected",
+            "provider": "preprints_context_agent", "source_type": "preprints_historical_context",
+            "supported_claim": "Saved summary", "evidence_excerpt": "Saved summary",
+        },
+        {
+            "source_id": "slack-duplicate", "provider": "slack",
+            "source_type": "slack_message", "supported_claim": "Prior thread text",
+            "evidence_excerpt": "Prior thread text", "key_facts": ["Prior thread text"],
+        },
+        {
+            "source_id": "slack-distinct", "provider": "slack",
+            "source_type": "slack_message", "supported_claim": "Distinct operator fact",
+            "evidence_excerpt": "Different excerpt",
+        },
+    ]
+    before = deepcopy(rows)
+    projected, omitted = workflow._supplied_opportunity_duplicate_slack_claim_projection(rows)
+    assert rows == before
+    assert projected[0] == rows[0]
+    assert projected[1] == {
+        key: value for key, value in rows[1].items() if key != "supported_claim"
+    }
+    assert projected[2] == rows[2]
+    assert omitted == ["supplied_sources[1].supported_claim"]
 
 
 @pytest.mark.parametrize("lane", ["direct", "graph"])
@@ -646,6 +737,12 @@ def test_large_accepted_research_handoff_reaches_sdk_once_with_complete_evidence
         decision={**_output()["decision"], "decision_stage": "research_source_selection"},
     )
     item.artifact_refs[0].metadata["research_brief"] = brief.model_dump(mode="json")
+    item.target.metadata["slack_context"] = {
+        "channel_id": "C-SYNTHETIC", "thread_ts": "1789000000.000100",
+        "request_ts": "1789000002.000100",
+        "read_context": "Earlier synthetic thread context. " * 120,
+        "thread_transcript": "Prior synthetic discussion. " * 70,
+    }
     store.save_work_item(item)
     artifact_before = item.artifact_refs[0].model_dump(mode="json")
     pack_before = build_opportunity_context_pack(item).model_dump(mode="json")
@@ -664,6 +761,11 @@ def test_large_accepted_research_handoff_reaches_sdk_once_with_complete_evidence
     workflow._check_supplied_opportunity_context_bound(context)
     assert pack["selected_artifacts"][0] == artifact_before
     assert pack["source_refs"] == pack_before["source_refs"]
+    assert pack["target"]["metadata"]["slack_context"]["read_context"] == (
+        item.target.metadata["slack_context"]["read_context"]
+    )
+    assert "retrieved_sources" not in pack
+    assert "slack_context" not in context
     assert pack["ordered_sources"] == pack_before["ordered_sources"]
     assert pack["approval_gates"] == pack_before["approval_gates"]
     assert pack["limitation_notes"] == pack_before["limitation_notes"]
@@ -673,6 +775,16 @@ def test_large_accepted_research_handoff_reaches_sdk_once_with_complete_evidence
     assert saved is not None
     assert saved.artifact_refs[0].model_dump(mode="json") == artifact_before
     assert build_opportunity_context_pack(item).model_dump(mode="json") == pack_before
+    repairs = [
+        event for event in store.list_work_item_events(item.id)
+        if event.event_type == "opportunity_context_repaired"
+    ]
+    assert len(repairs) == 1
+    receipt = repairs[0].metadata
+    assert receipt["before_chars"] > 48_000 >= receipt["after_chars"]
+    assert receipt["source_identity_retained"] is True
+    assert "slack_context" in receipt["omitted_duplicate_fields"]
+    assert "context_pack.retrieved_sources" in receipt["omitted_duplicate_fields"]
 
 
 def test_tool_free_score_placeholders_are_normalized_without_changing_the_selection(

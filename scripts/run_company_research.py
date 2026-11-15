@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from agents.exceptions import AgentsException
+
 from keystone_agents.agent_decision_contracts import (
     business_research_comparison_decision_contract,
     business_research_context_decision_contract,
@@ -25,6 +27,7 @@ from keystone_agents.agents.business_research_analyst import (
     comparison_context_from_result,
     comparison_input_from_result,
     focused_brief_input_from_profile,
+    is_public_topic_research_plan,
     research_account_from_search_results,
     run_business_research_analyst_comparison_sdk,
     run_business_research_analyst_focused_brief_sdk,
@@ -82,16 +85,22 @@ from keystone_agents.live_retrieval import (
     search_provider_label as _live_search_provider_label,
 )
 from keystone_agents.memory import retrieval_tool_performance_memory_item
-from keystone_agents.model_provider import get_runtime_agent_model_config
+from keystone_agents.model_provider import MissingOpenAIAPIKeyError, get_runtime_agent_model_config
 from keystone_agents.models import (
     BusinessResearchComparisonSDKInput,
     BusinessResearchFocusedBriefSDKInput,
     BusinessResearchSDKInput,
 )
+from keystone_agents.operator_failures import known_exception_to_operator_failure
 from keystone_agents.orchestrator.preflight_context import (
     apply_orchestrator_preflight_to_args,
     attach_orchestrator_preflight_payload,
     orchestrator_preflight_context_text,
+)
+from keystone_agents.presentation.renderers import (
+    direct_answer_layout,
+    research_answer_detail_lines,
+    research_answer_source_lines,
 )
 from keystone_agents.reporting import (
     render_company_comparison_report,
@@ -99,7 +108,12 @@ from keystone_agents.reporting import (
     render_company_profile_report,
     render_orchestrator_output_review,
 )
-from keystone_agents.run import SDKSynthesisOutcome, run_retrieved_sdk_synthesis
+from keystone_agents.run import (
+    SDKSynthesisOutcome,
+    run_retrieved_sdk_synthesis,
+    sdk_run_failure_metadata,
+)
+from keystone_agents.runtime.request_budget import current_model_request_budget_snapshot
 from keystone_agents.schemas.company_profile import (
     CompanyProfile,
     CompanyResearchComparison,
@@ -784,6 +798,9 @@ def _run_agent_owned_live_company_synthesis(
         if item
     )
     retrieval_hint = _explicit_retrieval_hint(args)
+    topic_research = focused_brief_requested and not comparison_requested and (
+        is_public_topic_research_plan(getattr(args, "manual_request_plan", None))
+    )
     if comparison_requested:
         typed_input: Any = BusinessResearchComparisonSDKInput(
             company_a=args.company,
@@ -797,6 +814,21 @@ def _run_agent_owned_live_company_synthesis(
             retrieval_hint=retrieval_hint,
         )
         runner = run_business_research_analyst_comparison_sdk
+    elif topic_research:
+        try:
+            topic_preflight = json.loads(preflight_context)
+        except (TypeError, ValueError):
+            topic_preflight = preflight_context
+        typed_input = BusinessResearchFocusedBriefSDKInput(
+            company_name=str(args.company or ""), brief_goal=raw_request,
+            topic_mode=True, retrieval_hint=retrieval_hint,
+            source_context=json.dumps({
+                "provider_guidance": provider_guidance,
+                "operator_context": founder_context,
+                "orchestrator_preflight": topic_preflight,
+            }, ensure_ascii=True),
+        )
+        runner = run_business_research_analyst_focused_brief_sdk
     elif focused_brief_requested:
         typed_input = BusinessResearchFocusedBriefSDKInput(
             company_name=str(args.company or ""),
@@ -1372,6 +1404,26 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
             )
         return typed_input
 
+    def focused_agent_with_selected_source(
+        profile: CompanyProfile | CompanyResearchComparison,
+        typed_input: BusinessResearchFocusedBriefSDKInput,
+    ):
+        if not isinstance(profile, CompanyProfile):
+            raise ValueError("Selected-URL synthesis requires one company profile.")
+        accesses = []
+        for source in profile.sources:
+            access = source.web_source_access
+            if access is None or not access.available:
+                continue
+            if access.source_id != source.source_id or access.selected_url != source.url:
+                raise ValueError("Selected source access does not match its profile source.")
+            accesses.append(access)
+        return build_business_research_analyst_focused_brief_agent(
+            attach_tools=False,
+            compact_instructions=args.compact_instructions,
+            web_source_accesses=tuple(accesses),
+        )
+
     def normalize_comparison(
         comparison: CompanyResearchComparison,
     ) -> BusinessResearchComparisonSDKInput:
@@ -1428,8 +1480,8 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
         decision_contract = business_research_comparison_decision_contract()
     elif focused_brief_requested:
         output_type = CompanyResearchFocusedBrief
-        # Retrieval is completed and normalized before this synthesis call. Keep the
-        # focused brief tool-free so a bounded Slack research ask uses one model turn.
+        # Generic focused briefs are tool-free. Selected-URL briefs may acquire
+        # one exact retained-source reader after retrieval is normalized.
         agent = build_business_research_analyst_focused_brief_agent(
             attach_tools=False,
             compact_instructions=args.compact_instructions,
@@ -1450,6 +1502,10 @@ def _run_sdk_synthesis(args: argparse.Namespace) -> dict[str, Any]:
         output_type=output_type,
         retrieve=retrieve,
         normalize=normalize,
+        agent_factory=(
+            focused_agent_with_selected_source
+            if args.selected_url_extraction and focused_brief_requested else None
+        ),
         input_summary=(
             f"{args.improvement_case} company research for {args.company}"
             if args.improvement_case
@@ -1679,11 +1735,9 @@ def _company_research_sdk_human_summary(payload: dict[str, Any]) -> str:
         return ""
     company = _summary_text(output.get("company_name")) or "The company"
     product = _summary_text(output.get("product"))
-    customers = _summary_text(output.get("customers"))
     traction = _summary_text(output.get("traction_signals"))
     why_it_matters = _summary_text(output.get("why_it_matters"))
     unknowns = _summary_list(output.get("unknowns"), limit=4)
-    facts = _summary_facts(output.get("facts"), limit=4)
     verified_sources = _verified_sources_for_payload(payload)
     source_value = verified_sources or output.get("sources")
     sources = _summary_sources(source_value, limit=5)
@@ -1715,6 +1769,27 @@ def _company_research_sdk_human_summary(payload: dict[str, Any]) -> str:
         if sources:
             sections.append("*Useful reference:*\n" + sources[0])
         return "\n\n".join(sections)
+
+    plan = payload.get("manual_request_plan") or {}
+    layout = direct_answer_layout(
+        route="business_research_analyst",
+        ask_shape=ask_shape if isinstance(ask_shape, dict) else {},
+        request_text=str(
+            payload.get("input")
+            or (plan.get("objective") if isinstance(plan, dict) else "")
+            or ""
+        ),
+    )
+    if layout == "quick" and structured_answer and len(verified_sources) == 1:
+        url = str(verified_sources[0].get("url") or "").strip()
+        answer = _truncate_summary(structured_answer, 340)
+        visible_urls = {
+            _canonical_source_url(match)
+            for match in re.findall(r"https?://[^\s<>)\]]+", answer)
+            if _canonical_source_url(match)
+        }
+        if _canonical_source_url(url) and visible_urls == {_canonical_source_url(url)}:
+            return answer
 
     answer_parts = []
     answer_without_repeated_unknowns, unknowns = _answer_with_consolidated_limitations(
@@ -1767,19 +1842,37 @@ def _company_research_sdk_human_summary(payload: dict[str, Any]) -> str:
                 ).strip()
         return visible_answer
 
-    detail_lines: list[str] = []
-    if product:
-        detail_lines.append(f"* Product/workflow: {_truncate_summary(product, 420)}")
-    if customers:
-        detail_lines.append(f"* Healthcare buyer fit: {_truncate_summary(customers, 420)}")
-    if traction:
-        detail_lines.append(f"* Evidence or deployment signals: {_truncate_summary(traction, 420)}")
-    if facts:
-        detail_lines.append("* Source-backed facts:")
-        detail_lines.extend(f"  * {fact}" for fact in facts)
-    if unknowns:
-        detail_lines.append("* Limitations / what remains unverified:")
-        detail_lines.extend(f"  * {_truncate_summary(item, 240)}" for item in unknowns)
+    detail_output = {
+        **output,
+        "product": product,
+        "customers": _summary_text(output.get("customers")),
+        "traction_signals": traction,
+        "unknowns": unknowns,
+        "facts": [
+            {**fact, "text": _summary_text(fact.get("text"))}
+            if isinstance(fact, dict) else fact
+            for fact in output.get("facts") or []
+        ],
+    }
+    detail_sources = source_value if isinstance(source_value, list) else []
+    if verified_sources and isinstance(output.get("sources"), list):
+        verified_urls = {
+            canonical for source in verified_sources
+            if (canonical := _canonical_source_url(source.get("url")))
+        }
+        detail_sources = [
+            *detail_sources,
+            *(
+                source for source in output["sources"]
+                if isinstance(source, dict)
+                and _canonical_source_url(source.get("url")) in verified_urls
+            ),
+        ]
+    detail_lines = research_answer_detail_lines(
+        detail_output,
+        detail_sources,
+        topic=isinstance(plan, dict) and plan.get("target_type") == "topic",
+    )
     if not detail_lines:
         detail_lines.append(
             "* No detailed source-backed fields were returned by the focused brief."
@@ -1789,8 +1882,9 @@ def _company_research_sdk_human_summary(payload: dict[str, Any]) -> str:
         "*Answer:*\n" + " ".join(answer_parts).strip(),
         "*Detailed Summary:*\n" + "\n".join(detail_lines).strip(),
     ]
-    if sources:
-        sections.append("*Useful references:*\n" + "\n".join(sources))
+    source_lines = research_answer_source_lines(detail_output, detail_sources)
+    if source_lines:
+        sections.append("*Sources:*\n" + "\n".join(source_lines))
     return "\n\n".join(section for section in sections if section.strip())
 
 
@@ -2218,6 +2312,21 @@ def main() -> int:
     args = _apply_interpreted_retrieval_mode(args)
     args = _apply_local_persistence_boundary(args)
 
+    # Invalid CLI/live-mode combinations are usage errors, not failed retrieval.
+    # Preserve their nonzero SystemExit contract before provider or SDK setup.
+    for enabled, flag in (
+        (args.live_search, "--live-search"),
+        (args.selected_url_extraction, "--selected-url-extraction"),
+    ):
+        if enabled:
+            try:
+                require_cli_live_confirmation(
+                    dry_run=args.dry_run, live_flag=True, flag_name=flag,
+                    live_action="live company research network access",
+                )
+            except RuntimeError as exc:
+                raise SystemExit(str(exc)) from exc
+
     if args.improvement_case and not sdk_execution_requested(args):
         raise SystemExit("--improvement-case requires --run-sdk or --live-sdk.")
     if args.focused_brief and not sdk_execution_requested(args):
@@ -2235,8 +2344,8 @@ def main() -> int:
     if sdk_execution_requested(args):
         try:
             payload = _run_sdk_synthesis(args)
-        except RuntimeError as exc:
-            raise SystemExit(str(exc)) from exc
+        except (RuntimeError, AgentsException) as exc:
+            return _research_failure_output(exc, json_output=args.json)
         _attach_local_persistence_boundary(payload, args)
         _persist_requested_result(args, payload)
         if args.markdown and not args.json:
@@ -2279,7 +2388,7 @@ def main() -> int:
             SearchProviderError,
             ValueError,
         ) as exc:
-            raise SystemExit(str(exc)) from exc
+            return _research_failure_output(exc, json_output=args.json)
         payload = comparison.model_dump(mode="json")
         payload["retrieval"] = retrieval
         if isinstance(retrieval, dict):
@@ -2351,7 +2460,7 @@ def main() -> int:
     try:
         profile, retrieval = _retrieve_company_profile(args)
     except (RuntimeError, SearchProviderConfigurationError, SearchProviderError, ValueError) as exc:
-        raise SystemExit(str(exc)) from exc
+        return _research_failure_output(exc, json_output=args.json)
     payload = profile.model_dump()
     payload["retrieval"] = retrieval
     payload["retrieval_diagnostics"] = retrieval.get("retrieval_diagnostics")
@@ -2422,6 +2531,32 @@ def main() -> int:
         if args.save:
             print(f"\nSaved: {payload['storage']}")
     return 0
+
+
+def _research_failure_output(exc: Exception, *, json_output: bool) -> int:
+    """Preserve audit-safe SDK evidence when a required research stage fails."""
+    if not json_output or isinstance(exc, MissingOpenAIAPIKeyError):
+        raise SystemExit(str(exc)) from exc
+    failure = known_exception_to_operator_failure(exc, context="Business Research Analyst run")
+    sdk_failure = sdk_run_failure_metadata(exc)
+    payload = {
+        "status": "failed",
+        "agent_name": "business_research_analyst",
+        "send_enabled": False,
+        "output": {"failure": failure.to_dict(), "summary": failure.summary},
+        "sdk_failure": sdk_failure,
+    }
+    for key in ("usage", "cost", "request_cache", "tool_execution", "tool_receipts",
+                "execution_telemetry"):
+        if key in sdk_failure:
+            payload[key] = sdk_failure[key]
+    budget = current_model_request_budget_snapshot()
+    if budget is not None:
+        payload["request_budget"] = budget
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+    print(failure.summary, file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 <!--
 prompt_name: repo_runtime_policy
-prompt_version: 2026-06-09.1
+prompt_version: 2026-11-04.1
 prompt_purpose: Compact runtime profile distilled from AGENTS.md for ordinary Keystone agent runs.
 prompt_safety_notes: Preserves no-send, no-PHI, dry-run, live-flag, approval, source-attribution, and tool-boundary rules from AGENTS.md.
 prompt_eval_datasets: tests/test_prompt_contracts.py, tests/test_agent_registry.py
@@ -50,6 +50,11 @@ sufficiency, exact write scopes, and live-provider boundaries.
   operator's explicit prohibitions.
 
 ## Tool And Search Boundaries
+
+For low-risk informational asks, investigate a reasonable interpretation using
+permitted reads; state assumptions, answer with sources, then optionally clarify.
+Clarify first only if useful investigation is impossible or safety, privacy, or
+write scope requires it.
 
 Tool modules own provider boundaries. Agents compose tools from
 `src/keystone_agents/tools/`; agent modules must not call provider SDKs or

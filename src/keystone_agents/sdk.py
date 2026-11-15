@@ -1520,7 +1520,7 @@ def _cache_friendly_model_settings(
 
 
 def _gpt56_cache_settings(settings: Any) -> Any:
-    """Use reviewed GPT-5.6 controls without changing older models' cache policy.
+    """Use reviewed GPT-5.6+ controls without changing older models' cache policy.
 
     https://developers.openai.com/api/docs/guides/prompt-caching
     No explicit TTL is needed: the model defaults to its supported 30m lifetime.

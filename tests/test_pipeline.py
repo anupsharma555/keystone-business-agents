@@ -197,7 +197,7 @@ def test_company_research_focused_brief_payload_exposes_clean_slack_summary() ->
 
     assert summary.startswith("*Answer:*\n")
     assert "\n\n*Detailed Summary:*\n" in summary
-    assert "\n\n*Useful references:*\n" in summary
+    assert "\n\n*Sources:*\n" in summary
     assert "https://www.abridge.com/product" in summary
     assert "Model:" not in summary
     assert "Retrieval diagnostics" not in summary
@@ -319,7 +319,7 @@ def test_company_research_focused_brief_preserves_structured_answer_in_slack() -
     assert "Anchor Health may be relevant to Keystone" not in answer
     assert "Key signal:" not in answer
     assert "*Detailed Summary:*" in summary
-    assert "*Useful references:*" in summary
+    assert "*Sources:*" in summary
 
     run_company_research._attach_company_research_display_text(payload, summary)
     attach_execution_public_result(payload)
@@ -593,7 +593,7 @@ def test_company_research_style_constraint_keeps_full_research_layout() -> None:
     summary = run_company_research._company_research_sdk_human_summary(payload)
 
     assert "*Detailed Summary:*" in summary
-    assert "*Useful references:*" in summary
+    assert "*Sources:*" in summary
 
 
 def test_company_research_focused_brief_summary_avoids_internal_jargon_and_fragments() -> None:

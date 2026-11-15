@@ -13,7 +13,7 @@ def test_gmail_pilot_rerun_contract_is_exact_bounded_and_no_write() -> None:
     assert readiness.case_id == "selected_gmail_thread_followup"
     assert len(readiness.natural_request_sha256) == 64
     assert readiness.backend == "langgraph"
-    assert readiness.model == "gpt-5.4-mini"
+    assert readiness.model == "gpt-6-luna"
     assert readiness.max_openai_requests == 2
     assert readiness.max_cost_usd == 0.10
     assert len(readiness.proof_nodeids) == 5

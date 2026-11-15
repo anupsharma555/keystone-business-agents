@@ -1,18 +1,28 @@
 # Keystone Business Agents
 
-`keystone-business-agents` is the agent layer for Keystone business development
-and operating workflows. The repo is meant to turn natural-language requests
-from CLI, Slack, scheduled jobs, and local operator workflows into structured,
-reviewable work across research, opportunity qualification, email triage,
-internal context lookup, and approval-gated outreach drafting.
+[![CI](https://github.com/anupsharma555/keystone-business-agents/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/anupsharma555/keystone-business-agents/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![OpenAI Agents SDK](https://img.shields.io/badge/OpenAI-Agents%20SDK-412991)](docs/AGENTS_SDK_CONFORMANCE.md)
+[![Local SQLite state](https://img.shields.io/badge/State-SQLite-003B57?logo=sqlite&logoColor=white)](docs/LANGGRAPH_OPTION.md)
 
-The project is built around a simple boundary: agents may research, reason,
-prepare artifacts, create drafts, and stage internal plans, but they do not send
-external messages or perform unapproved business-system writes.
+A structured agent layer for research, opportunity assessment, email triage and
+internal operations. Keystone Business Agents turns natural-language requests
+from Slack, the CLI and scheduled workflows into source-backed answers and
+saved tasks that people can inspect, review and continue.
 
-For a first local run, use [Setup](#setup) and [Common Commands](#common-commands).
-For operator modes, runtime versions, live flags, and troubleshooting, use
-`docs/RUNBOOK.md`.
+The Orchestrator interprets the request, specialists own the substantive work,
+and deterministic checks enforce source identity, permissions and approval
+boundaries. Local SQLite retains task state and execution evidence. Optional
+LangGraph execution adds checkpointed workflows without replacing those
+contracts.
+
+**Development defaults:** fixture-backed, dry-run-safe execution. Live model and
+provider access require configuration and explicit flags; outbound actions keep
+their own approval and scope checks. See [Safety and side effects](#safety-and-side-effects).
+
+[Setup](#setup) · [Commands](#common-commands) · [Architecture](#system-shape) ·
+[Slack continuity](#slack-context-and-task-continuity) · [Validation](#validation) ·
+[Documentation](#documentation)
 
 ## What This Repo Aims To Do
 
@@ -195,9 +205,36 @@ validation paths, handoff descriptions, and safety notes.
   source triage, evidence handling, tool-result resilience, handoff packaging,
   action boundaries, and output review.
 
+## Slack Context And Task Continuity
+
+Enrolled Slack workspaces can use bounded channel and thread context to resolve
+historical posts and interpret follow-ups. The Orchestrator distinguishes a
+continuation, a branch and a new request; the current operator request remains
+authoritative. Task and source identities are validated before an existing
+WorkItem is resumed.
+
+- **Relevant context:** approved operator facts and preferences are retrieved
+  within workspace, channel and operator scope. Raw session history is not
+  attached by default on the compact continuity path.
+- **Retained evidence:** exact-source reviews can reuse an integrity-checked
+  article snapshot and read bounded local windows without fetching a newer
+  source. Missing or conflicting evidence remains an explicit limitation.
+- **Bounded correction:** supported validation paths allow one correction using
+  the same verified evidence. Completed provider actions are not repeated just
+  to repair an answer.
+- **Readable results:** deterministic renderers organize structured answers for
+  Slack, including findings, evidence limits, task status and relevant next steps.
+
+These capabilities share implementation across enrolled channels. Coverage is
+path-specific: passing backend checks does not establish Slack delivery or
+recovery for every specialist and failure type. The [workspace rollout
+record](docs/WORKSPACE_CONTINUITY_ROLLOUT.md) documents observed runs, repairs and
+pending acceptance checks. The [compact continuity design](docs/COMPACT_CONTINUITY_IMPLEMENTATION_PLAN.md)
+explains context budgets, scoping and cache reuse.
+
 ## Setup
 
-Python 3.11 or newer is required.
+Python 3.11 or newer is required. Run commands from the repository root.
 
 ```bash
 python3 -m venv .venv
@@ -239,7 +276,10 @@ cp .env.example .env
 ```
 
 This repo uses `KEYSTONE_OPENAI_API_KEY` for live OpenAI SDK work. It does not
-assume that a generic `OPENAI_API_KEY` belongs to this project.
+assume that a generic `OPENAI_API_KEY` belongs to this project. Operating agents
+and the manual-request planner default to `gpt-6-luna`; explicit builder and
+per-agent configuration can override that default. Benchmark configurations may
+retain their own model. Keep `.env`, credentials and runtime databases local.
 
 ## Common Commands
 
@@ -259,14 +299,14 @@ Route or run a natural-language request:
 
 ```bash
 .venv/bin/python scripts/ask_agent.py @KNI orchestrator agent "find 5 behavioral health AI companies"
-.venv/bin/python scripts/ask_agent.py @KNI business research analyst "research Lindus Health"
+.venv/bin/python scripts/ask_agent.py @KNI business research analyst "research Example Analytics"
 ```
 
 Advance a stateful WorkItem:
 
 ```bash
 .venv/bin/python -m keystone_agents.cli work-items advance \
-  --input "research NeuroFlow" \
+  --input "research Example Analytics" \
   --database-url sqlite:////tmp/keystone_agents.db
 
 .venv/bin/python -m keystone_agents.cli work-items advance <work_item_id> \
@@ -307,6 +347,10 @@ guardrails.
 
 ## Validation
 
+Local tests use fixtures and mocked provider boundaries. Live API and Slack
+acceptance runs are separate, budgeted checks; do not infer them from a passing
+unit suite or the CI badge.
+
 Run the standard local gate:
 
 ```bash
@@ -321,7 +365,8 @@ For the broader quality gate:
 .venv/bin/python scripts/check_quality.py
 ```
 
-Before publishing local changes to GitHub, use `docs/GITHUB_UPDATE_RUNBOOK.md`.
+Before publishing, use the [GitHub update runbook](docs/GITHUB_UPDATE_RUNBOOK.md),
+including the staged-file guard and a secret scan after staging intentional new files.
 
 ## Project Map
 
@@ -351,21 +396,21 @@ Before publishing local changes to GitHub, use `docs/GITHUB_UPDATE_RUNBOOK.md`.
 
 Start here for deeper details:
 
-- `docs/INDEX.md`: documentation map.
-- `docs/RUNBOOK.md`: local operator checklist.
-- `docs/DEPLOYMENT.md`: setup, health checks, live integration flags, rollback,
+- [Index](docs/INDEX.md): documentation map.
+- [Runbook](docs/RUNBOOK.md): local operator checklist.
+- [Deployment](docs/DEPLOYMENT.md): setup, health checks, live integration flags, rollback,
   audit review, and cost controls.
-- `docs/LANGGRAPH_OPTION.md`: graph runtime position, node contract, backend
+- [LangGraph runtime](docs/LANGGRAPH_OPTION.md): graph runtime position, node contract, backend
   selection, diagnostics, and validation.
-- `docs/ARCHITECTURE_REORGANIZATION.md`: canonical implementation ownership,
+- [Architecture Reorganization](docs/ARCHITECTURE_REORGANIZATION.md): canonical implementation ownership,
   compatibility facades, migration status, and architecture validation.
-- `docs/SLACK_BUSINESS_AGENT_MODE.md`: Slack bridge configuration, scopes, and
+- [Slack Business Agent Mode](docs/SLACK_BUSINESS_AGENT_MODE.md): Slack bridge configuration, scopes, and
   approval boundaries.
-- `docs/AGENTS_SDK_CONFORMANCE.md`: how the local folder layout maps to Agents
+- [Agents SDK conformance](docs/AGENTS_SDK_CONFORMANCE.md): how the local folder layout maps to Agents
   SDK concepts.
-- `docs/OPENAI_AGENT_PLATFORM_SETUP.md`: OpenAI project setup, tracing,
+- [OpenAI platform setup](docs/OPENAI_AGENT_PLATFORM_SETUP.md): OpenAI project setup, tracing,
   datasets, evals, and model migration notes.
-- `docs/GITHUB_UPDATE_RUNBOOK.md`: repeatable local-to-GitHub publish flow.
+- [GitHub update runbook](docs/GITHUB_UPDATE_RUNBOOK.md): repeatable local-to-GitHub publish flow.
 
 Reference repositories used for architecture review are listed in the docs; no
 reference code is copied into this repository.

@@ -166,6 +166,14 @@ def continuation_owner_advice(
     prior_agent = request.continuation.prior_agent.strip()
     if not prior_agent or request.requested_agent_explicit:
         return ""
+    if (
+        plan.source == "canonical:orchestrator_context_only"
+        and plan.target_agent
+        and plan.target_agent != prior_agent
+    ):
+        # The Orchestrator already selected a different owner for a bounded
+        # provider-free answer. Prior thread ownership is advisory only.
+        return ""
     if plan.ask_shape.prior_context_dependency not in {"selected_context", "required"}:
         return ""
     if plan.ask_shape.output_form in {"draft", "plan"}:
@@ -206,6 +214,25 @@ def slack_work_item_control_requested(current_request: str) -> bool:
             normalized,
         )
     )
+
+
+def explicit_current_work_item_id(current_request: str) -> str:
+    """Resolve an exact ID in a current state-control command, never quoted history.
+
+    This binds a record for planning; it does not select a route or grant an
+    operation. Ambiguous single-record commands must not create a replacement.
+    """
+
+    current = latest_slack_operator_request(current_request)
+    if not re.match(
+        r"^(?:please\s+)?(?:continue|resume|retry|run\s+again)\b",
+        " ".join(current.lower().split()),
+    ):
+        return ""
+    identities = tuple(dict.fromkeys(re.findall(r"\bwi_[A-Za-z0-9_-]{1,160}\b", current)))
+    if len(identities) > 1:
+        raise ValueError("Specify one exact WorkItem for this state-control request.")
+    return identities[0] if identities else ""
 
 
 def _slack_continuation(
@@ -354,7 +381,7 @@ def _all_envelope_values(raw_request: str, label: str) -> list[str]:
     return [
         _strip_slack_entrypoint_decoration(" ".join(match.group(1).split()))
         for match in re.finditer(
-            rf"{re.escape(label)}:\s*(.*?){boundary}",
+            rf"{re.escape(label)}:(.*?){boundary}",
             raw_request,
             flags=re.IGNORECASE | re.DOTALL,
         )

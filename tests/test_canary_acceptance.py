@@ -831,7 +831,7 @@ def test_public_preprint_actual_core_read_builder_uses_reviewed_tool_scope(
         "public_acceptance_profile_allowlist"
     ]
     assert scope["source"].endswith("+public_acceptance_profile")
-    assert len(agent.instructions.encode("utf-8")) == 34_486
+    assert len(agent.instructions.encode("utf-8")) == 35_466
     admit_agent("preprints_context_agent")
     guarded_response_kwargs(
         client(),

@@ -383,11 +383,23 @@ class ExecutionAttempt:
         )
         enforced_budget = current_model_request_budget_snapshot()
         consumed = enforced_budget.get("consumed") if enforced_budget is not None else None
+        consumed_count_confirmed = (
+            enforced_budget.get("consumed_count_confirmed", True)
+            if enforced_budget is not None else request_count_confirmed
+        )
+        durable_model_starts = _bound_durable_model_starts(
+            str(original_payload.get("durable_execution_id") or "")
+        )
+        reconciliation_count = (
+            durable_model_starts if durable_model_starts is not None else consumed
+        )
         usage_reconciled = (
-            trace.model_request_count == int(consumed)
-            if consumed is not None
+            trace.model_request_count == int(reconciliation_count)
+            if reconciliation_count is not None and consumed_count_confirmed
             else None
         )
+        if not consumed_count_confirmed:
+            request_count_confirmed = False
         if usage_reconciled is False:
             request_count_confirmed = False
             trace = trace.model_copy(
@@ -436,6 +448,8 @@ class ExecutionAttempt:
             request_count_confirmed = False
         if usage_reconciled is False:
             unavailable.append("request_usage_reconciliation_incomplete")
+        if enforced_budget is not None and not consumed_count_confirmed:
+            unavailable.append("child_budget_consumption_unconfirmed")
         if not linked_rows:
             unavailable.append("specialist_agent_runs_not_linked")
         if not work_item_id:
@@ -483,7 +497,15 @@ class ExecutionAttempt:
                     else "not_configured"
                 ),
                 "observed_model_requests": trace.model_request_count,
+                "durable_model_start_count": durable_model_starts,
+                "model_start_count_source": (
+                    "bound_durable_execution" if durable_model_starts is not None else "unavailable"
+                ),
                 "observed_count_confirmed": request_count_confirmed,
+                "consumed_count_confirmed": (
+                    consumed_count_confirmed if enforced_budget is not None
+                    else request_count_confirmed
+                ),
                 "usage_reconciled_with_ledger": usage_reconciled,
                 "limit": (
                     enforced_budget.get("limit")
@@ -559,6 +581,17 @@ class ExecutionAttempt:
                 ),
                 "raw_traceback_retained": False,
             }
+            admission = getattr(failure, "keystone_host_continuation_admission", None)
+            if isinstance(admission, Mapping) and (
+                admission.get("layer") == "host_continuation_admission"
+            ):
+                payload["internal_diagnostics"]["host_continuation_admission"] = {
+                    key: value for key, value in admission.items()
+                    if key in {
+                        "layer", "plan_artifact", "task_artifact", "source_binding",
+                        "relation", "failed_gate_code",
+                    } and isinstance(value, str) and len(value) <= 100
+                }
         self.store.finalize_agent_run_attempt(
             self.run_id,
             output=payload,
@@ -840,6 +873,25 @@ def _linked_latency_ms(output: Mapping[str, Any]) -> float | None:
             if latency is not None:
                 return latency
     return None
+
+
+def _bound_durable_model_starts(execution_id: str) -> int | None:
+    """Read starts only from this attempt's exact active execution binding."""
+    if not execution_id:
+        return None
+    from keystone_agents.runtime.durable_execution import ExecutionConflict, current_execution
+
+    try:
+        execution = current_execution()
+        if execution is None or execution.execution_id != execution_id:
+            return None
+        with execution.store.connection() as connection:
+            return int(connection.execute(
+                "SELECT COUNT(*) FROM execution_model_attempts WHERE execution_id=?",
+                (execution_id,),
+            ).fetchone()[0])
+    except (ExecutionConflict, sqlite3.Error):
+        return None
 
 
 def _nested_mapping(value: Mapping[str, Any], key: str) -> dict[str, Any]:

@@ -43,6 +43,7 @@ from keystone_agents.agents.gmail_triage import is_gmail_schema_only_request
 from keystone_agents.agents.orchestrator import (
     OrchestratorPreflight,
     build_orchestrator_agent,
+    build_orchestrator_general_answer_agent,
     reconcile_orchestrator_work_item_inspection,
     review_specialist_output,
     route_request,
@@ -93,6 +94,7 @@ from keystone_agents.execution_request import (
     build_execution_request,
     continuation_owner_advice,
     execution_request_planning_text,
+    explicit_current_work_item_id,
     latest_slack_operator_request,
     normalize_slack_operator_turn_identity,
     slack_work_item_control_requested,
@@ -191,7 +193,10 @@ from keystone_agents.presentation.public_result import (
     ensure_work_item_user_facing_summary,
 )
 from keystone_agents.presentation.renderers import (
+    direct_answer_layout,
     render_markdown_table,
+    render_quick_direct_answer,
+    render_selected_signal_summary,
     render_work_item_result_text,
     sensitive_text_summary,
 )
@@ -216,11 +221,14 @@ from keystone_agents.receipts.mutations import (
 from keystone_agents.receipts.normalization import identity_fingerprint
 from keystone_agents.receipts.recovery import verified_provider_write_summary
 from keystone_agents.run import (
+    aggregate_sdk_usage_events,
     extract_sdk_usage,
     run_typed_sdk_agent,
     sdk_input_from_typed_input,
     sdk_run_failure_metadata,
 )
+from keystone_agents.runtime.article_answer_evidence import acquire_article_answer_evidence
+from keystone_agents.runtime.channel_answer_evidence import completed_channel_answer_evidence
 from keystone_agents.runtime.decision_validation import (
     AgentDecisionValidationError,
     SpecialistDecisionEvidence,
@@ -259,7 +267,9 @@ from keystone_agents.runtime.request_budget import (
     model_request_count_from_payload,
     reserve_child_model_request_budget,
 )
+from keystone_agents.runtime.search_answer_evidence import validate_search_answer_evidence
 from keystone_agents.runtime.signal_context import run_signal_context_sdk
+from keystone_agents.runtime.tool_call_budget import ToolCallBudgetContract
 from keystone_agents.runtime.tool_execution import (
     ToolEvidenceGroup,
     ToolExecutionContract,
@@ -299,6 +309,7 @@ from keystone_agents.schemas.operational_context import (
     RssContextResult,
     ZoteroContextResult,
 )
+from keystone_agents.schemas.orchestrator import OrchestratorGeneralAnswer
 from keystone_agents.schemas.work_item import (
     WorkflowRunRequest,
     WorkflowRunResult,
@@ -2384,9 +2395,15 @@ def _finalize_entry_execution_attempt(
     if attempt is None:
         return
     failure_metadata = sdk_run_failure_metadata(failure) if failure is not None else {}
+    public_status = str((scope.public_payload or {}).get("status") or "").strip().lower()
+    terminal_status = (
+        "failed" if failure is not None or result != 0
+        else "blocked" if public_status == "blocked"
+        else "completed"
+    )
     try:
         attempt.finalize(
-            status="completed" if result == 0 else "failed",
+            status=terminal_status,
             exit_code=result,
             linked_agent_run_id=scope.agent_run_id,
             linked_agent_run_ids=scope.agent_run_ids,
@@ -2454,6 +2471,17 @@ def _run_live_ask_with_environment(args: argparse.Namespace) -> int:
 
 
 def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
+    from keystone_agents.runtime.continuity_policy import (
+        activate_continuity_policy,
+        resolve_slack_compact_continuity_policy,
+    )
+
+    policy = resolve_slack_compact_continuity_policy(_slack_context_payload(args.context_file))
+    with activate_continuity_policy(policy):
+        return _run_ask_with_admitted_continuity(args)
+
+
+def _run_ask_with_admitted_continuity(args: argparse.Namespace) -> int:
     deadline_request_text = _ask_input(args)
     if (
         current_execution_deadline() is None
@@ -2467,11 +2495,6 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     raw_input = _ask_input(args)
     _start_entry_execution_attempt(args, request_text=raw_input)
     slack_context_input = _context_file_is_slack_context(args.context_file)
-    linked_work_item = _validated_slack_linked_work_item(
-        work_item_id=str(getattr(args, "linked_work_item_id", "") or "").strip(),
-        database_url=args.database_url,
-        context_file_path=args.context_file,
-    )
     execution_request = build_execution_request(
         raw_input,
         requested_agent=args.agent,
@@ -2520,6 +2543,28 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         semantic_input_text = (semantic_cost_directive.cleaned_text or semantic_input_text).strip()
     else:
         semantic_input_text = input_text
+    try:
+        explicit_state_target = (
+            explicit_current_work_item_id(semantic_input_text) if slack_context_input else ""
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    # A current exact target outranks a mutable adapter projection. Validate its
+    # existing authenticated thread binding before any planning model runs.
+    args.linked_work_item_id = explicit_state_target or str(
+        getattr(args, "linked_work_item_id", "") or ""
+    ).strip()
+    linked_work_item = _validated_slack_linked_work_item(
+        work_item_id=args.linked_work_item_id,
+        database_url=args.database_url,
+        context_file_path=args.context_file,
+    )
+    if explicit_state_target and linked_work_item is not None:
+        execution_request = execution_request.model_copy(update={
+            "continuation": execution_request.continuation.model_copy(update={
+                "work_item_id": linked_work_item.id,
+            }),
+        })
     if has_materialized_slack_attachment_context(input_text):
         attachment_bundle = local_file_input_bundle_from_text(input_text)
         if not attachment_bundle.has_inputs:
@@ -2602,6 +2647,10 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     mandatory_post_preflight_minimum = _mandatory_post_preflight_request_minimum(
         request_estimate
     )
+    if requested_route is None and args.agent is None and live_sdk:
+        # Before the route-only model decides, a generic manager estimate must
+        # not preempt a one-owner answer. Recheck the selected owner afterward.
+        mandatory_post_preflight_minimum = 1
     if calendar_route_eligible and live_sdk:
         # Calendar intent is already bounded enough to reserve the typed
         # Calendar interpreter/synthesis path instead of the generic manager
@@ -2633,6 +2682,10 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     if live_sdk and (available_requests is None or
                      available_requests >= specialist_reserve + preflight_allocation + 1):
         preflight_allocation += 1
+    if live_sdk and _slack_context_payload(args.context_file).get("channel_context_capability"):
+        # A scoped query/read loop may take several model turns before route
+        # selection. Reserve its bounded ceiling; charge only actual starts.
+        preflight_allocation = max(preflight_allocation, 5)
     preflight_budget_estimate = preflight_allocation + specialist_reserve
     if entry_scope := _ASK_ENTRY_TELEMETRY.get():
         entry_scope.admission_reserved_requests = preflight_budget_estimate
@@ -2657,6 +2710,7 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
         request_text=input_text,
         database_url=args.database_url,
         work_item=linked_work_item,
+        authenticated_linked_work_item=linked_work_item is not None,
     )
     execution_request = _execution_request_with_workflow_verified_objects(
         execution_request,
@@ -2732,6 +2786,14 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                                       if preflight_ledger is not None else ""),
                 )
         _capture_entry_preflight_observation(orchestrator_preflight)
+        selected_channel_state = getattr(orchestrator_preflight, "workflow_state", {})
+        if isinstance(selected_channel_state, Mapping):
+            for key in (
+                "channel_context_capability", "channel_context_evidence", "channel_context_usage",
+                "operator_context_evidence", "operator_context_usage",
+            ):
+                if selected_channel_state.get(key):
+                    direct_workflow_state[key] = selected_channel_state[key]
     orchestrator_preflight_ms = round(
         (perf_counter() - preflight_started_at) * 1000,
         3,
@@ -2775,6 +2837,77 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             }
         )
     manual_plan = orchestrator_preflight.manual_request_plan
+    source_resume_binding = None
+    # A current model-selected URL can bind an already selected local snapshot
+    # before the source-identity-only block. Other preflight gates stay final.
+    if (
+        not _preflight_blocks_execution(orchestrator_preflight)
+        or orchestrator_preflight.block_kind == "selected_source_identity_unverified"
+    ):
+        from keystone_agents.planning.selected_source_resume import bind_selected_source_resume
+
+        source_resume_binding = bind_selected_source_resume(
+            plan=manual_plan, work_item=linked_work_item,
+            work_item_id=args.linked_work_item_id, current_request=semantic_input_text,
+            route_result=orchestrator_preflight.route_result.model_dump(mode="json"),
+            slack_context_path=args.context_file,
+        )
+        if source_resume_binding is not None:
+            manual_plan = source_resume_binding.plan
+            source_block_resolved = (
+                orchestrator_preflight.block_kind == "selected_source_identity_unverified"
+            )
+            orchestrator_preflight = orchestrator_preflight.model_copy(update={
+                "manual_request_plan": manual_plan,
+                "workflow_state": {
+                    **orchestrator_preflight.workflow_state,
+                    "selected_source_resume_binding": source_resume_binding.provenance(),
+                },
+                **({
+                    "execution_allowed": True, "blocked_by_orchestrator": False,
+                    "block_kind": "", "block_reason": "",
+                } if source_block_resolved else {}),
+            })
+    linked_relation = str(
+        orchestrator_preflight.route_result.linked_work_item_relation or "unspecified"
+    )
+    if (
+        linked_work_item is not None
+        and orchestrator_preflight.route_result.routing_mode == "llm"
+        and (
+            linked_relation == "clarify"
+            or (linked_relation == "unspecified" and live_sdk and not explicit_state_target)
+        )
+    ):
+        return _print_ask_clarification(
+            "orchestrator", input_text,
+            orchestrator_preflight.route_result.clarification_request
+            or "Should I continue the linked WorkItem, branch from it, or start a new task?",
+            json_output=args.json,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            extra={"status": "needs_input", "route": "clarification", "block_kind": "linked_work_item_relation_unclear"},
+        )
+    if linked_relation in {"branch_existing", "new_request"} and linked_work_item is not None:
+        # The linked task informed only the model's relation decision. A branch
+        # receives scoped parent provenance below; an independent request gets
+        # none of the prior task's execution context.
+        downstream_input_text = semantic_input_text
+        linked_state_keys = (
+            "current_work_item", "historical_work_item_facts", "execution_continuation",
+            "prior_agent_runs", "linked_thread_context",
+        )
+        for key in linked_state_keys:
+            direct_workflow_state.pop(key, None)
+        orchestrator_preflight = orchestrator_preflight.model_copy(update={
+            "workflow_state": {
+                key: value for key, value in orchestrator_preflight.workflow_state.items()
+                if key not in linked_state_keys
+            },
+        })
+        if linked_relation == "new_request":
+            linked_work_item = None
+            args.linked_work_item_id = ""
     # Terminal planning outcomes need no downstream execution reservation.
     if _preflight_blocks_execution(orchestrator_preflight):
         return _print_ask_preflight_blocked(
@@ -2986,16 +3119,25 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
     direct_execution_context = _direct_specialist_execution_context(
         input_text,
         workflow_state=direct_workflow_state,
+        database_url=args.database_url,
         force_thread_context=slack_continuation,
         include_slack_scope=isinstance(
             direct_workflow_state.get("slack_context"), Mapping
         ),
         verified_signal_context=admitted_signal_context,
     )
-    if _manual_plan_reuses_linked_work_item(
-        manual_plan,
-        work_item=linked_work_item,
-    ):
+    reuse_admitted = retry_admitted = False
+    if linked_relation != "branch_existing":
+        reuse_admitted = _manual_plan_reuses_linked_work_item(
+            manual_plan, work_item=linked_work_item,
+            source_resume_binding=source_resume_binding,
+        )
+        retry_admitted = _manual_plan_retries_linked_blocked_work_item(
+            manual_plan,
+            work_item=linked_work_item,
+            authenticated_thread_link=bool(linked_work_item and args.linked_work_item_id),
+        )
+    if reuse_admitted or retry_admitted:
         return _run_ask_work_item(
             semantic_input_text,
             database_url=args.database_url,
@@ -3016,6 +3158,36 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
             cost_tracking_requested=cost_directive.requested,
             requested_route=str(manual_plan.target_agent or "").strip() or None,
             explicit_work_item_id=linked_work_item.id,
+        )
+    if linked_relation == "branch_existing" and linked_work_item is not None:
+        return _run_ask_work_item(
+            semantic_input_text,
+            database_url=args.database_url,
+            live_search=live_search,
+            live_sdk=live_sdk,
+            live_rss_slack_read=args.live_rss_slack_read,
+            max_results=args.max_results,
+            max_results_explicit=getattr(args, "max_results_explicit", False),
+            max_manager_steps=args.max_manager_steps,
+            json_output=args.json,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            context_file_path=args.context_file,
+            sdk_session_enabled=args.sdk_session,
+            sdk_session_id=args.sdk_session_id,
+            sdk_session_db_path=args.sdk_session_db,
+            sdk_session_history_limit=args.sdk_session_history_limit,
+            cost_tracking_requested=cost_directive.requested,
+            requested_route=str(manual_plan.target_agent or "").strip() or None,
+            linked_parent_work_item_id=linked_work_item.id,
+        )
+    if explicit_state_target or (
+        linked_relation == "continue_existing" and linked_work_item is not None
+    ):
+        raise _linked_work_item_admission_failure(
+            manual_plan, work_item=linked_work_item,
+            source_resume_binding=source_resume_binding,
+            linked_relation=linked_relation,
         )
     if live_sdk:
         lifecycle_route = interpreted_lifecycle_route
@@ -3122,6 +3294,9 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                         default_enabled=False,
                         context_file_path=args.context_file,
                     ),
+                    database_url=args.database_url,
+                    execution_context=direct_execution_context,
+                    explicit_live_search=bool(args.live_search),
                 )
             return _run_ask_specialist_live(
                 route,
@@ -3184,6 +3359,25 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 orchestrator_preflight=orchestrator_preflight,
                 database_url=args.database_url,
                 execution_context=direct_execution_context,
+            )
+        if (
+            live_sdk
+            and manual_plan.source == "canonical:orchestrator_general_answer"
+            and orchestrator_preflight.route_result.route == "orchestrator"
+        ):
+            return _run_ask_orchestrator(
+                downstream_input_text,
+                live_sdk=True,
+                json_output=args.json,
+                manual_plan=manual_plan,
+                orchestrator_preflight=orchestrator_preflight,
+                sdk_session_spec=_sdk_session_spec_for_ask(
+                    args, route="orchestrator", default_enabled=False,
+                    context_file_path=args.context_file,
+                ),
+                database_url=args.database_url,
+                execution_context=direct_execution_context,
+                explicit_live_search=bool(args.live_search),
             )
         return _run_ask_work_item(
             execution_input_text,
@@ -3264,6 +3458,9 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                 context_file_path=args.context_file,
             ),
             cost_tracking_requested=cost_directive.requested,
+            database_url=args.database_url,
+            execution_context=direct_execution_context,
+            explicit_live_search=bool(args.live_search),
         )
     if live_sdk:
         route = _route_with_manual_plan_advice(
@@ -3283,6 +3480,9 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                     context_file_path=args.context_file,
                 ),
                 cost_tracking_requested=cost_directive.requested,
+                database_url=args.database_url,
+                execution_context=direct_execution_context,
+                explicit_live_search=bool(args.live_search),
             )
         if manual_plan.intent == "browser_diagnostics" and manual_plan.target_agent in {
             "chief_of_staff",
@@ -3303,6 +3503,9 @@ def _run_ask_with_current_environment(args: argparse.Namespace) -> int:
                         context_file_path=args.context_file,
                     ),
                     cost_tracking_requested=cost_directive.requested,
+                    database_url=args.database_url,
+                    execution_context=direct_execution_context,
+                    explicit_live_search=bool(args.live_search),
                 )
         return _run_ask_specialist_live(
             route,
@@ -4555,6 +4758,16 @@ def _estimate_ask_openai_requests(
         }
     if _context_file_is_work_item_source_bundle(args.context_file):
         add_stage("outreach_composer_synthesis", 1, route="outreach_composer")
+    elif (
+        manual_plan is not None
+        and manual_plan.source == "canonical:orchestrator_general_answer"
+    ):
+        add_stage(
+            "orchestrator_general_answer_sdk",
+            3 if manual_plan.requires_live_search else 1,
+            min_requests=2 if manual_plan.requires_live_search else 1,
+            route="orchestrator",
+        )
     elif requested_route or args.agent is not None or manual_plan is not None:
         original_route = str(
             requested_route
@@ -4825,6 +5038,9 @@ def _estimate_ask_openai_requests(
         if len(post_preflight_mandatory_rows) == 1 else {}
     )
     shared_runtime_ceiling_eligible = bool(
+        manual_plan is not None
+        and manual_plan.source == "canonical:orchestrator_general_answer"
+        or
         (
             direct_specialist
             and str(single_sdk_owner.get("stage") or "").endswith("_direct_sdk")
@@ -5769,7 +5985,10 @@ def _sdk_session_spec_for_ask(
     else:
         scope = "ask"
         components = default_cli_ask_session_components(route)
-    return resolve_sdk_session_spec(
+    from keystone_agents.runtime.continuity_policy import resolve_slack_compact_continuity_policy
+    from keystone_agents.sdk_sessions import admit_sdk_session_spec
+
+    spec = resolve_sdk_session_spec(
         scope=scope,
         components=components,
         enabled=getattr(args, "sdk_session", None),
@@ -5777,6 +5996,9 @@ def _sdk_session_spec_for_ask(
         database_path=str(getattr(args, "sdk_session_db", "") or ""),
         history_limit=history_limit,
         default_enabled=default_enabled,
+    )
+    return admit_sdk_session_spec(
+        spec, resolve_slack_compact_continuity_policy(_slack_context_payload(context_file_path)),
     )
 
 
@@ -5897,6 +6119,7 @@ def _print_ask_preflight_blocked(
         redact_secrets(
             result.clarification_request
             or result.stop_reason
+            or orchestrator_preflight.block_reason
             or "Orchestrator preflight blocked specialist execution."
         )
     )
@@ -5939,6 +6162,33 @@ def _print_ask_preflight_blocked(
         payload["recommended_next_action"] = (
             "Attach or approve source-backed context in a WorkItem before live drafting."
         )
+    scope = _ASK_ENTRY_TELEMETRY.get()
+    if scope is not None and scope.execution_attempt is not None:
+        from keystone_agents.operator_failures import OperatorReadableFailure
+
+        # A blocked preflight has no specialist row. Preserve its exact entry
+        # identity through the bridge's existing private failure diagnostics so
+        # diagnosis cannot accidentally select an older task's completed run.
+        payload["execution_attempt_id"] = scope.execution_attempt.run_id
+        payload["failure"] = OperatorReadableFailure(
+            kind=orchestrator_preflight.block_kind or "preflight_blocked",
+            summary=public_message,
+            reason="",
+            next_step=str(payload.get("recommended_next_action") or ""),
+            retryable=False,
+            safe_to_continue=True,
+        ).to_dict()
+        events = (compact_preflight or {}).get("sdk_usage_events")
+        if isinstance(events, list) and events and all(
+            isinstance(event, Mapping) and isinstance(event.get("usage"), Mapping)
+            and event["usage"].get("available") is True
+            and type(event["usage"].get("requests")) is int
+            for event in events
+        ):
+            payload["usage"] = aggregate_sdk_usage_events(events)
+            payload["openai_requests"] = _orchestrator_preflight_request_count(
+                orchestrator_preflight,
+            )
     return _print_ask_live_payload(payload, json_output=json_output)
 
 
@@ -6145,13 +6395,18 @@ def _orchestrator_workflow_state_from_cli_context(
     request_text: str = "",
     database_url: str | None = None,
     work_item: WorkItem | None = None,
+    authenticated_linked_work_item: bool = False,
 ) -> dict[str, Any]:
     """Build bounded preflight context before the WorkItem runner mutates state."""
 
     state: dict[str, Any] = {}
     state_control_requested = slack_work_item_control_requested(request_text)
     if work_item is not None:
-        if (
+        if authenticated_linked_work_item:
+            from keystone_agents.runtime.operator_continuity import compact_task_context
+
+            state["current_work_item"] = compact_task_context(work_item)
+        elif (
             work_item.status
             in {
                 WorkItemStatus.NEEDS_CONTEXT,
@@ -6217,6 +6472,26 @@ def _orchestrator_workflow_state_from_cli_context(
         return state
 
     schema = str(payload.get("schema") or payload.get("schema_") or "").strip()
+    if authenticated_linked_work_item and work_item is not None:
+        from keystone_agents.planning.selected_source_resume import (
+            matches_authenticated_slack_thread,
+        )
+        from keystone_agents.runtime.operator_continuity import (
+            compact_latest_thread_attempt,
+            compact_linked_thread_context,
+        )
+
+        if matches_authenticated_slack_thread(work_item, context_file_path):
+            linked_thread_context = compact_linked_thread_context(
+                payload, linked_work_item_id=work_item.id,
+            )
+            if linked_thread_context:
+                state["linked_thread_context"] = linked_thread_context
+            latest_attempt = compact_latest_thread_attempt(
+                payload, linked_work_item_id=work_item.id,
+            )
+            if latest_attempt:
+                state["latest_thread_attempt"] = latest_attempt
     if schema == "keystone.slack.selected_message_context.v1":
         from keystone_agents.slack_actions import (
             SlackSelectedMessageContext,
@@ -6242,6 +6517,7 @@ def _orchestrator_workflow_state_from_cli_context(
         key: payload.get(key)
         for key in (
             "team_id",
+            "user_id",
             "channel_id",
             "channel_name",
             "selected_message_ts",
@@ -6254,6 +6530,21 @@ def _orchestrator_workflow_state_from_cli_context(
     }
     if slack_context:
         state["slack_context"] = slack_context
+    capability = payload.get("channel_context_capability")
+    if isinstance(capability, dict) and capability:
+        # The bound tools validate this descriptor against the entry identity
+        # and provider allowlist before querying. It carries no message bodies.
+        if (
+            capability.get("channel_id") == payload.get("channel_id")
+            and capability.get("request_ts") == payload.get("request_ts")
+        ):
+            state["channel_context_capability"] = dict(capability)
+            try:
+                state["request_time"] = datetime.fromtimestamp(
+                    float(capability["request_ts"]), ZoneInfo("America/New_York")
+                ).isoformat()
+            except (ValueError, OverflowError, OSError):
+                pass  # Tool admission validates malformed descriptors before use.
     attachment_context = _slack_attachment_manifest_context(payload)
     if attachment_context:
         state["slack_attachment_manifest"] = attachment_context
@@ -6277,7 +6568,7 @@ def _orchestrator_workflow_state_from_cli_context(
             state["slack_thread_transcript"] = _render_slack_history_messages(
                 sanitized_messages[-8:]
             )
-    elif transcript and (
+    if "slack_thread_transcript" not in state and transcript and (
         state_control_requested or not _slack_history_text_is_non_authoritative(transcript)
     ):
         state["slack_thread_transcript"] = transcript[:6000]
@@ -6485,6 +6776,13 @@ def _slack_prior_runs_for_planner(
 def _planner_current_work_item_context(work_item: WorkItem) -> dict[str, Any]:
     """Expose exact bounded WorkItem identity for same-object planner follow-ups."""
 
+    from keystone_agents.runtime.continuity_policy import current_continuity_policy
+    from keystone_agents.runtime.operator_continuity import compact_task_context
+
+    policy = current_continuity_policy()
+    if policy is not None and policy.eligible:
+        return compact_task_context(work_item)
+
     target = {
         key: value
         for key, value in {
@@ -6637,6 +6935,7 @@ def _direct_specialist_execution_context(
     input_text: str,
     *,
     workflow_state: dict[str, Any] | None,
+    database_url: str | None = None,
     force_thread_context: bool = False,
     include_slack_scope: bool = False,
     verified_signal_context: VerifiedSignalContext | None | object = (
@@ -6649,6 +6948,15 @@ def _direct_specialist_execution_context(
         return {}
     reference_context_allowed = bool(
         force_thread_context
+        or workflow_state.get("channel_context_evidence")
+        or workflow_state.get("operator_context_evidence")
+        or (
+            workflow_state.get("slack_thread_transcript")
+            and isinstance(workflow_state.get("slack_context"), dict)
+            and workflow_state["slack_context"].get("request_ts")
+            and workflow_state["slack_context"].get("request_ts")
+            == workflow_state["slack_context"].get("thread_ts")
+        )
         or _DIRECT_CONTEXT_REFERENCE_RE.search(input_text)
         or _DIRECT_CONTEXT_OBJECT_OPERATION_RE.search(input_text)
     )
@@ -6662,6 +6970,7 @@ def _direct_specialist_execution_context(
             key: _bounded_redacted_text(slack_context.get(key), max_chars=180)
             for key in (
                 "team_id",
+                "user_id",
                 "channel_id",
                 "channel_name",
                 "selected_message_ts",
@@ -6673,8 +6982,42 @@ def _direct_specialist_execution_context(
         if scope:
             context["slack_scope"] = scope
 
+    # Child scope must be rebound from the CURRENT host envelope. Task metadata
+    # and prior model answers never authorize access to another channel/user.
+    capability = workflow_state.get("channel_context_capability")
+    if isinstance(capability, dict):
+        context["channel_context_capability"] = capability
+    from keystone_agents.runtime.continuity_policy import resolve_slack_compact_continuity_policy
+    from keystone_agents.runtime.operator_continuity import (
+        compact_optional_context,
+        revalidated_operator_context_evidence,
+    )
+
+    continuity = resolve_slack_compact_continuity_policy(context)
+    if continuity.eligible:
+        context.update(compact_optional_context(
+            workflow_state.get("current_work_item"),
+            revalidated_operator_context_evidence(
+                context, workflow_state.get("operator_context_evidence"),
+                raw_request=input_text,
+                database_url=database_url or database_url_from_env(),
+            ),
+        ))
+
     if not reference_context_allowed:
         return context if len(context) > 1 else {}
+
+    channel_evidence = workflow_state.get("channel_context_evidence")
+    if isinstance(channel_evidence, list) and channel_evidence:
+        # This is normalized, bounded evidence returned by model-selected reads,
+        # separate from prose truncation and never permission for another channel.
+        context["channel_context_evidence"] = channel_evidence
+        context["channel_context_usage"] = workflow_state.get("channel_context_usage", {})
+
+    if continuity.eligible:
+        # Current channel reads and canonical handles replace unsolicited old
+        # answer summaries; additional history remains available by scoped query.
+        return context
 
     thread_root = _bounded_redacted_text(
         workflow_state.get("slack_thread_root"),
@@ -6784,8 +7127,9 @@ def _direct_specialist_execution_context(
 
     transcript = _bounded_redacted_text(
         workflow_state.get("slack_thread_transcript"),
-        max_chars=2400,
-        keep_tail=True,
+        # Channel source identities are listed near the start of the already
+        # bounded transcript; keeping only its tail drops the selected URL.
+        max_chars=6000,
     )
     if transcript:
         context["thread_transcript_tail"] = transcript
@@ -7060,11 +7404,32 @@ def _manual_plan_reuses_linked_work_item(
     manual_plan: ManualRequestPlan,
     *,
     work_item: WorkItem | None,
+    source_resume_binding: Any | None = None,
 ) -> bool:
     """Reuse linked state only for a safe revision of one selected artifact."""
 
     if work_item is None:
         return False
+    from keystone_agents.planning.selected_source_resume import SelectedSourceResumeBinding
+    from keystone_agents.tools.website_extraction_tool import validate_retained_web_source_access
+
+    if isinstance(source_resume_binding, SelectedSourceResumeBinding) and (
+        work_item.status in {WorkItemStatus.DONE, WorkItemStatus.IN_PROGRESS}
+        and source_resume_binding.work_item_id == work_item.id
+        and source_resume_binding.plan == manual_plan
+        and manual_plan.source == "canonical:work_item_selected_source_resume"
+        and manual_plan.target_agent == WorkItemRoute.BUSINESS_RESEARCH_ANALYST.value
+        and manual_plan.provider_operations == ["read"]
+        and canonical_source_urls(manual_plan.primary_target)
+        == canonical_source_urls(work_item.target.url)
+        and any(source == source_resume_binding.source for source in work_item.sources)
+        and source_resume_binding.source.web_source_access is not None
+        and not any(not blocker.resolved for blocker in work_item.blockers)
+        and not any(gate.required and gate.state == "pending" for gate in work_item.approval_gates)
+        and not (work_item.next_action and work_item.next_action.requires_approval)
+        and validate_retained_web_source_access(source_resume_binding.source.web_source_access)
+    ):
+        return True
     if work_item.status in {
         WorkItemStatus.BLOCKED,
         WorkItemStatus.ARCHIVED,
@@ -7089,6 +7454,121 @@ def _manual_plan_reuses_linked_work_item(
         and artifact.source_agent == target_agent
         for artifact in work_item.artifact_refs
     )
+
+
+def _linked_work_item_admission_failure(
+    manual_plan: ManualRequestPlan, *, work_item: WorkItem | None,
+    source_resume_binding: Any | None, linked_relation: str,
+):
+    """Report a host continuation gate without blaming the model's schema."""
+
+    from keystone_agents.operator_failures import (
+        OperatorReadableFailure,
+        OperatorReadableFailureError,
+    )
+
+    saved_artifact = "unknown"
+    if work_item is not None:
+        candidate = work_item.target.metadata.get("manual_expected_artifact_type")
+        if candidate in {"source_summary", "research_brief"}:
+            saved_artifact = candidate
+    gate_code = (
+        "selected_source_binding_not_admitted"
+        if source_resume_binding is None
+        and manual_plan.expected_artifact_type in {"source_summary", "research_brief"}
+        and manual_plan.target_type == "url"
+        else "blocked_retry_gate_denied"
+        if work_item is not None and work_item.status == WorkItemStatus.BLOCKED
+        else "linked_reuse_gate_denied"
+    )
+    diagnostic = {
+        "layer": "host_continuation_admission",
+        "plan_artifact": manual_plan.expected_artifact_type,
+        "task_artifact": saved_artifact,
+        "source_binding": "admitted" if source_resume_binding is not None else "not_admitted",
+        "relation": linked_relation if linked_relation in {
+            "unspecified", "continue_existing", "branch_existing", "new_request", "clarify",
+        } else "unknown",
+        "failed_gate_code": gate_code,
+    }
+    error = OperatorReadableFailureError(OperatorReadableFailure(
+        kind="guardrail_block",
+        summary=(
+            "The exact WorkItem could not be resumed under the validated plan and "
+            "current gates. No replacement WorkItem was created."
+        ),
+        reason="The saved task could not continue under its current source and permission checks.",
+        next_step="Review the retained plan, source binding, and task approval state before retrying.",
+        retryable=False, safe_to_continue=True,
+    ))
+    error.keystone_host_continuation_admission = diagnostic
+    return error
+
+
+def _manual_plan_retries_linked_blocked_work_item(
+    manual_plan: ManualRequestPlan,
+    *,
+    work_item: WorkItem | None,
+    authenticated_thread_link: bool = False,
+) -> bool:
+    """Resume one authenticated, read-only execution failure on its owning route."""
+
+    if not authenticated_thread_link or work_item is None:
+        return False
+    route = work_item.current_route.value
+    selected_source_read = bool(
+        route == "business_research_analyst"
+        and manual_plan.provider_operations == ["read"]
+        and manual_plan.target_type == "url"
+        and manual_plan.expected_artifact_type in {"source_summary", "research_brief"}
+        and canonical_source_urls(manual_plan.primary_target)
+        == canonical_source_urls(work_item.target.url)
+        and canonical_source_urls(work_item.target.url)
+    )
+    bound_source_resume = bool(
+        selected_source_read
+        and manual_plan.source == "canonical:work_item_selected_source_resume"
+    )
+    if bound_source_resume:
+        from keystone_agents.tools.website_extraction_tool import (
+            validate_retained_web_source_access,
+        )
+
+        if not any(
+            source.web_source_access is not None
+            and canonical_source_url(source.url) == canonical_source_url(work_item.target.url)
+            and validate_retained_web_source_access(source.web_source_access)
+            for source in work_item.sources
+        ):
+            return False
+    recoverable_codes = {f"{route}_execution_failed"}
+    recovery_actions = {f"review_{route}_execution_failure"}
+    if bound_source_resume:
+        recoverable_codes.add(f"{route}_agent_decision_invalid")
+        recovery_actions.add(f"retry_{route}_agent_decision")
+    if (
+        work_item.status != WorkItemStatus.BLOCKED
+        or route != manual_plan.target_agent
+        or manual_plan.ask_shape.prior_context_dependency != "selected_context"
+        or manual_plan.ask_shape.permission_state != "read_only"
+        or manual_plan.side_effect_policy not in {"read_only", "draft_or_read_only"}
+        or manual_plan.intent == "business_system_write"
+        or (manual_plan.provider_operations and not selected_source_read)
+        or manual_plan.provider_action_steps
+        or manual_plan.provider_context_requirements
+        or manual_plan.requires_live_search
+        or manual_plan.requires_approved_context
+        or work_item.approval_gates
+        or not work_item.blockers
+        or any(blocker.code not in recoverable_codes for blocker in work_item.blockers)
+        or work_item.next_action is None
+        or work_item.next_action.agent is None
+        or work_item.next_action.agent.value != route
+        or work_item.next_action.requires_approval
+        or work_item.next_action.action not in recovery_actions
+    ):
+        return False
+    return True
 
 
 def _eval_context_fields(context_file_path: str) -> dict[str, str]:
@@ -7244,6 +7724,7 @@ def _run_ask_work_item(
     cost_tracking_requested: bool = False,
     requested_route: str | None = None,
     explicit_work_item_id: str | None = None,
+    linked_parent_work_item_id: str | None = None,
 ) -> int:
     try:
         live_search = live_search_allowed_for_execution(
@@ -7269,9 +7750,26 @@ def _run_ask_work_item(
             if existing_work_item is not None
             else 0
         )
+        from keystone_agents.planning.selected_source_resume import bind_selected_source_resume
+
+        preflight_payload = _orchestrator_preflight_payload(orchestrator_preflight)
+        source_binding = bind_selected_source_resume(
+            plan=manual_plan, work_item=existing_work_item, work_item_id=work_item_id,
+            current_request=input_text,
+            route_result=(preflight_payload or {}).get("route_result"),
+            slack_context_path=context_file_path,
+        )
+        if source_binding is not None:
+            manual_plan = source_binding.plan
+            live_search = False
+            preflight_payload = {
+                **(preflight_payload or {}),
+                "selected_source_resume_binding": source_binding.provenance(),
+            }
         request = WorkflowRunRequest(
             request_text=input_text,
             work_item_id=work_item_id,
+            linked_parent_work_item_id=linked_parent_work_item_id,
             save=True,
             database_url=database_url,
             live_search=live_search,
@@ -7281,7 +7779,7 @@ def _run_ask_work_item(
             max_results_explicit=max_results_explicit,
             requested_route=requested_route,
             manual_request_plan=manual_plan.model_dump(mode="json") if manual_plan else None,
-            orchestrator_preflight=_orchestrator_preflight_payload(orchestrator_preflight),
+            orchestrator_preflight=preflight_payload,
             context_file_path=context_file_path,
             sdk_session_enabled=sdk_session_enabled,
             sdk_session_id=sdk_session_id,
@@ -8074,6 +8572,304 @@ def _print_manager_loop_feedback(event_type: str, payload: dict[str, Any]) -> No
         print(f"Manager loop: {payload.get('stop_reason')}")
 
 
+def _run_orchestrator_general_answer_live(
+    input_text: str,
+    *,
+    manual_plan: ManualRequestPlan,
+    orchestrator_preflight: OrchestratorPreflight,
+    sdk_session_spec: SDKSessionSpec | None,
+    database_url: str | None,
+    execution_context: dict[str, Any] | None,
+    json_output: bool,
+    explicit_live_search: bool,
+) -> int:
+    """Run an admitted Orchestrator answer after its route-only preflight."""
+
+    article_required = (
+        manual_plan.expected_artifact_type == "source_summary"
+        and manual_plan.target_type == "url"
+        and manual_plan.provider_operations == ["read"]
+        and not manual_plan.requires_live_search
+    )
+    channel_evidence = (
+        completed_channel_answer_evidence(orchestrator_preflight.workflow_state)
+        if not article_required and not manual_plan.requires_live_search else None
+    )
+    if (
+        manual_plan.target_agent != "orchestrator"
+        or manual_plan.workflow
+        or set(manual_plan.provider_operations).difference({"read"} if article_required else {"search"})
+        or manual_plan.provider_context_requirements
+        or manual_plan.provider_action_steps
+        or manual_plan.requires_durable_state
+        or (not article_required and bool(manual_plan.provider_operations) != manual_plan.requires_live_search)
+        or (
+            manual_plan.ask_shape.prior_context_dependency == "selected_context"
+            and channel_evidence is None
+        )
+    ):
+        raise ValueError("General answer plan cannot acquire provider or WorkItem context.")
+    search_required = manual_plan.requires_live_search
+    article_evidence = None
+    blocked_reason = ""
+    if article_required:
+        try:
+            article_evidence = acquire_article_answer_evidence(manual_plan.primary_target)
+        except Exception as exc:
+            from keystone_agents.tools.website_extraction_tool import WebsiteExtractionError
+
+            if not isinstance(exc, WebsiteExtractionError | ValueError):
+                raise
+            blocked_reason = str(redact_secrets(str(exc)))[:700]
+    if search_required and not (explicit_live_search and cli_default_live_research()):
+        blocked_reason = "Current source verification is needed before I can answer."
+    if blocked_reason:
+        blocked = {
+            "mode": "live_sdk", "entrypoint": "orchestrator_general_answer",
+            "selected_agent": "orchestrator", "agent_name": _agent_display_name("orchestrator"),
+            "input": input_text, "status": "blocked",
+            "block_kind": "selected_article_unavailable" if article_required else "current_source_needed",
+            "send_enabled": False, "completion_confirmed": False,
+            "manual_request_plan": manual_plan.model_dump(mode="json"),
+            "orchestrator_preflight": _orchestrator_preflight_payload(orchestrator_preflight),
+            "output_type": "OrchestratorGeneralAnswer",
+            "output": {"answer": blocked_reason},
+            "human_summary": blocked_reason,
+            "slack_display_text": blocked_reason,
+            "side_effects": {"external_write_performed": False, "slack_message_posted": False},
+        }
+        if article_required:
+            blocked["model_execution"] = "not_requested"
+            blocked["tool_execution"] = build_tool_execution_summary(
+                mode="workflow_selected_article_acquisition_failed",
+                workflow_called_helper_names=["build_selected_url_source_bundle"],
+                workflow_helper_call_count=1,
+                scope_source="orchestrator_general_answer",
+            )
+        _attach_slack_run_provenance(blocked, execution_context)
+        attach_execution_public_result(blocked)
+        if article_required:
+            try:
+                blocked["agent_run_id"] = SQLiteStore(
+                    database_url or database_url_from_env()
+                ).save_agent_run(
+                    agent_name="orchestrator", input_summary=input_text[:500],
+                    output=blocked, model="not_requested", dry_run=False, status="blocked",
+                )
+            except Exception as exc:
+                blocked["agent_run_persistence_error"] = type(exc).__name__
+        return _print_ask_live_payload(blocked, json_output=json_output)
+    agent = build_orchestrator_general_answer_agent(
+        live_search=search_required,
+        **({"selected_source_url": manual_plan.primary_target} if article_required else {}),
+    )
+    answer_input = {
+        "request": input_text,
+        "output_constraints": manual_plan.ask_shape.output_constraints.model_dump(mode="json"),
+        "answer_scope": (
+            "one_selected_public_article" if article_required else
+            "one_bounded_current_public_search" if search_required
+            else "retrieved_channel_messages_only" if channel_evidence
+            else "stable_general_knowledge_without_provider_evidence"
+        ),
+        **({"article_evidence": article_evidence.model_context} if article_evidence else {}),
+        **({"channel_evidence": channel_evidence.model_context,
+            "thread_root_request": _bounded_redacted_text(
+                (execution_context or {}).get("thread_root_request"), max_chars=2200,
+            )} if channel_evidence else {}),
+    }
+    from keystone_agents.runtime.continuity_policy import current_continuity_policy
+    from keystone_agents.runtime.operator_continuity import compact_optional_context
+
+    continuity = current_continuity_policy()
+    if continuity is not None and continuity.eligible:
+        answer_input.update(compact_optional_context(
+            (execution_context or {}).get("current_work_item"),
+            orchestrator_preflight.workflow_state.get("operator_context_evidence"),
+        ))
+    sdk_result = run_typed_sdk_agent(
+        agent=agent,
+        typed_input=answer_input,
+        output_type=OrchestratorGeneralAnswer,
+        live=True,
+        session=build_sdk_session(sdk_session_spec) if sdk_session_spec else None,
+        workflow_name="keystone.ask.orchestrator.general_answer",
+        trace_metadata={
+            "agent": "orchestrator",
+            "answer_scope": "selected_article" if article_required else "current_public_search" if search_required else "stable_general_knowledge",
+        },
+        max_turns=3 if search_required else 1,
+        tool_execution_contract=(
+            ToolExecutionContract.required(
+                ToolEvidenceGroup("public_search", ("search_web",)),
+                stage="orchestrator_general_answer",
+            ) if search_required else None
+        ),
+        tool_call_budget_contract=(
+            ToolCallBudgetContract(max_total_calls=1, stage="orchestrator_general_answer")
+            if search_required else None
+        ),
+    )
+    model_answer = sdk_result.output.answer.strip()
+    answer_usage = sdk_result.usage
+    answer_cost = sdk_result.cost
+    answer_validation: dict[str, Any] = {}
+    if channel_evidence is not None:
+        verdict = channel_evidence.answer_verdict(model_answer)
+        answer_validation = {"initial": verdict.telemetry(), "repair_attempted": False}
+        if model_answer and not sdk_result.output.needs_source and not verdict.passed:
+            # One tool-free model repair, retaining the same evidence and
+            # request budget. Python supplies feedback, never a selected source.
+            answer_validation["repair_attempted"] = True
+            usage_events = [{"usage": answer_usage}]
+            initial_cost = answer_cost
+            try:
+                repaired = run_typed_sdk_agent(
+                    agent=agent,
+                    typed_input={**answer_input, "candidate_answer": model_answer,
+                                 "validation_feedback": verdict.repair_feedback()},
+                    output_type=OrchestratorGeneralAnswer,
+                    live=True,
+                    inherit_env_session=False,
+                    workflow_name="keystone.ask.orchestrator.channel_answer_repair",
+                    max_turns=1,
+                    tool_correction_max_turns=0,
+                    decision_repair_max_turns=0,
+                )
+            except Exception as exc:
+                failure = sdk_run_failure_metadata(exc)
+                usage_events.append({"usage": failure.get("usage", {})})
+                answer_validation["repair_error_type"] = type(exc).__name__
+            else:
+                sdk_result = repaired
+                model_answer = repaired.output.answer.strip()
+                usage_events.append({"usage": repaired.usage})
+            answer_usage = aggregate_sdk_usage_events(usage_events)
+            config = get_runtime_agent_model_config("orchestrator")
+            answer_cost = estimate_usage_cost(
+                provider=str(initial_cost.get("pricing_provider") or config.provider),
+                model=str(initial_cost.get("pricing_model") or config.model),
+                usage=answer_usage,
+            )
+        answer_validation["final"] = channel_evidence.answer_verdict(model_answer).telemetry()
+    constraints = output_constraints_from_plan(manual_plan)
+    instruction_validation = validate_output_constraints(model_answer, constraints)
+    search_invocations = tool_invocation_journal() if search_required else []
+    search_receipts = tool_receipt_journal() if search_required else []
+    search_verdict = (
+        validate_search_answer_evidence(
+            (sdk_result.raw_result,), search_invocations, search_receipts, model_answer,
+        ) if search_required else None
+    )
+    unsourced_claim = (
+        not search_required and not article_required and channel_evidence is None
+        and bool(canonical_source_urls(model_answer))
+    )
+    article_verified = article_evidence is None or article_evidence.validates_answer(model_answer)
+    channel_verified = channel_evidence is None or channel_evidence.validates_answer(model_answer)
+    passed = bool(
+        model_answer and not sdk_result.output.needs_source
+        and not unsourced_claim and instruction_validation.passed
+        and article_verified
+        and channel_verified
+        and (search_verdict is None or search_verdict.passed)
+    )
+    answer = (
+        model_answer if passed
+        else "I could not verify an answer and its required source within the requested scope."
+    )
+    if passed and article_evidence is not None and article_evidence.partial:
+        answer += "\n\nEvidence limit: this summary uses a bounded excerpt of the extracted article text."
+        instruction_validation = validate_output_constraints(answer, constraints)
+        if not instruction_validation.passed:
+            passed = False
+            answer = "I could not satisfy the requested format while preserving the article's evidence limits."
+    tool_execution = build_tool_execution_summary(
+        mode=("workflow_acquired_article_then_model_synthesis" if article_required else "model_called_bounded_search" if search_required else "tool_free_model_synthesis"),
+        scope_source="orchestrator_general_answer",
+        selected_tool_names=["search_web"] if search_required else [],
+        model_called_tool_names=[
+            record.tool_name for record in sdk_tool_execution_records(sdk_result.raw_result)
+        ] if search_required else [],
+        provider_receipt_count=None if article_required else len(search_receipts),
+        workflow_called_helper_names=["build_selected_url_source_bundle"] if article_required else [],
+        workflow_helper_call_count=1 if article_required else 0,
+        preacquired_context_count=(
+            1 if article_evidence else len(channel_evidence.model_context["messages"])
+            if channel_evidence else 0
+        ),
+        preacquired_context_source=(
+            "selected_article_extraction" if article_evidence else
+            "orchestrator_preflight_slack_reads" if channel_evidence else ""
+        ),
+    )
+    payload: dict[str, Any] = {
+        "mode": "live_sdk",
+        "entrypoint": "orchestrator_general_answer",
+        "selected_agent": "orchestrator",
+        "agent_name": _agent_display_name("orchestrator"),
+        "input": input_text,
+        "status": "completed" if passed else "blocked",
+        "block_kind": "" if passed else (
+            "source_needed" if sdk_result.output.needs_source
+            else search_verdict.reason if search_verdict is not None and not search_verdict.passed
+            else "general_answer_unverified"
+        ),
+        "send_enabled": False,
+        "completion_confirmed": passed,
+        "manual_request_plan": manual_plan.model_dump(mode="json"),
+        "orchestrator_preflight": _orchestrator_preflight_payload(orchestrator_preflight),
+        "output_type": "OrchestratorGeneralAnswer",
+        "output": {
+            "answer": answer,
+            "needs_source": sdk_result.output.needs_source,
+            "source_need_reason": sdk_result.output.source_need_reason,
+        },
+        "human_summary": answer,
+        "slack_display_text": answer,
+        "display_text": answer,
+        "summary": answer,
+        "instruction_following": {"validation": instruction_validation.model_dump(mode="json")},
+        "usage": answer_usage,
+        "cost": answer_cost,
+        "request_cache": sdk_result.request_cache,
+        "tool_execution": tool_execution,
+        "tool_admission": {
+            "admitted": search_required or article_required, "tool_count": len(agent.tools),
+            "reason": "selected_article_extraction" if article_required else "bounded_public_search" if search_required else "stable_concept",
+        },
+        "side_effects": {"external_write_performed": False, "slack_message_posted": False},
+    }
+    if article_evidence is not None:
+        payload["article_answer_evidence"] = article_evidence.model_context
+    if channel_evidence is not None:
+        payload["channel_answer_evidence"] = channel_evidence.model_context
+        payload["answer_validation"] = answer_validation
+    if search_verdict is not None:
+        payload["search_answer_evidence"] = {
+            "passed": search_verdict.passed,
+            "reason": search_verdict.reason,
+            "returned_url_count": search_verdict.returned_url_count,
+            "visible_url_count": search_verdict.visible_url_count,
+            "returned_urls": list(search_verdict.returned_urls[:5]),
+        }
+    _attach_slack_run_provenance(payload, execution_context)
+    attach_execution_public_result(payload)
+    try:
+        run_id = SQLiteStore(database_url or database_url_from_env()).save_agent_run(
+            agent_name="orchestrator",
+            input_summary=input_text[:500],
+            output=payload,
+            model=f"sdk-live:{getattr(agent, 'model', '') or 'orchestrator'}",
+            dry_run=False,
+            status="success" if passed else "blocked",
+        )
+        payload["agent_run_id"] = run_id
+    except Exception as exc:  # pragma: no cover - diagnostics must not mask the answer
+        payload["agent_run_persistence_error"] = type(exc).__name__
+    return _print_ask_live_payload(payload, json_output=json_output)
+
+
 def _run_ask_orchestrator(
     input_text: str,
     *,
@@ -8084,7 +8880,25 @@ def _run_ask_orchestrator(
     sdk_session_spec: SDKSessionSpec | None = None,
     cost_tracking_requested: bool = False,
     database_url: str | None = None,
+    execution_context: dict[str, Any] | None = None,
+    explicit_live_search: bool = False,
 ) -> int:
+    if (
+        live_sdk and manual_plan is not None
+        and manual_plan.source == "canonical:orchestrator_general_answer"
+        and orchestrator_preflight is not None
+        and orchestrator_preflight.route_result.route == "orchestrator"
+    ):
+        return _run_orchestrator_general_answer_live(
+            input_text,
+            manual_plan=manual_plan,
+            orchestrator_preflight=orchestrator_preflight,
+            sdk_session_spec=sdk_session_spec,
+            database_url=database_url,
+            execution_context=execution_context,
+            json_output=json_output,
+            explicit_live_search=explicit_live_search,
+        )
     sdk_result = None
     if live_sdk:
         load_settings(force_dotenv=True)
@@ -9535,17 +10349,138 @@ def _context_agent_public_blockers(
     return [{"message": message} for message in messages]
 
 
+def _context_agent_read_only_signal_public_output(
+    route: str,
+    output: dict[str, Any],
+    *,
+    manual_plan: ManualRequestPlan | None,
+    decision_ownership: Mapping[str, Any],
+    signal_evidence: object,
+    external_write_state: str,
+    provider_write_admitted: bool,
+) -> dict[str, Any]:
+    """Keep selected signal evidence limits visible without inventing a write gate."""
+
+    if (
+        route not in {"rss_context_agent", "preprints_context_agent"}
+        or manual_plan is None
+        or manual_plan.ask_shape.permission_state != "read_only"
+        or manual_plan.task_objective != "context_lookup"
+        or manual_plan.ask_shape.evidence_depth == "deep"
+        or manual_plan.ask_shape.prior_context_dependency == "required"
+        or manual_plan.requires_live_search
+        or manual_plan.provider_action_steps
+        or manual_plan.provider_context_requirements
+        or any(operation != "read" for operation in manual_plan.provider_operations)
+        or provider_write_admitted
+        or external_write_state != "not_performed"
+        or not isinstance(signal_evidence, Mapping)
+        or not isinstance(output.get("decision"), Mapping)
+        or not isinstance(decision_ownership.get("validator_outcome"), Mapping)
+        or decision_ownership["validator_outcome"].get("status") != "accepted"
+    ):
+        return output
+    decision = output["decision"]
+    selected_ids = [str(value) for value in decision.get("selected_candidate_ids") or []]
+    if (
+        decision.get("needs_more_context") is True
+        or not selected_ids
+        or len(selected_ids) != len(set(selected_ids))
+        or set(selected_ids) != set(output.get("retrieved_item_ids") or [])
+    ):
+        return output
+    candidates = {
+        str(item.get("candidate_id") or ""): item
+        for item in signal_evidence.get("candidates") or []
+        if isinstance(item, Mapping)
+    }
+    sources = {
+        str(item.get("source_id") or ""): item
+        for item in output.get("sources") or []
+        if isinstance(item, Mapping)
+    }
+    completed_reads = {
+        str(item.get("feed_item_id") or "")
+        for item in signal_evidence.get("evidence_reads") or []
+        if isinstance(item, Mapping)
+        and item.get("status") == "success"
+        and item.get("content_status") == "saved_content_available"
+        and item.get("content_complete") is True
+        and type(item.get("text_char_count")) is int
+        and item["text_char_count"] > 0
+    }
+    if any(
+        selected_id not in candidates
+        or selected_id not in sources
+        or not canonical_source_url(candidates[selected_id].get("url"))
+        or not str(candidates[selected_id].get("summary") or "").strip()
+        or (
+            candidates[selected_id].get("selected_evidence_read_required") is True
+            and selected_id not in completed_reads
+        )
+        or canonical_source_url(sources[selected_id].get("location"))
+        != canonical_source_url(candidates[selected_id].get("url"))
+        for selected_id in selected_ids
+    ):
+        return output
+    return dict(output)
+
+
+def _context_agent_deep_signal_scope_blocker(
+    route: str,
+    output: Mapping[str, Any],
+    *,
+    manual_plan: ManualRequestPlan | None,
+    decision_ownership: Mapping[str, Any],
+    signal_evidence: object,
+) -> str:
+    """Block only an explicit deep ask against a selected saved-summary scope."""
+
+    if (
+        route not in {"rss_context_agent", "preprints_context_agent"}
+        or manual_plan is None
+        or manual_plan.ask_shape.evidence_depth != "deep"
+        or not isinstance(signal_evidence, Mapping)
+        or not isinstance(decision_ownership.get("validator_outcome"), Mapping)
+        or decision_ownership["validator_outcome"].get("status") != "accepted"
+    ):
+        return ""
+    decision = output.get("decision")
+    if not isinstance(decision, Mapping):
+        return ""
+    selected_ids = [str(value) for value in decision.get("selected_candidate_ids") or []]
+    if not selected_ids or decision.get("needs_more_context") is True:
+        return ""
+    candidates = {
+        str(item.get("candidate_id") or ""): item
+        for item in signal_evidence.get("candidates") or []
+        if isinstance(item, Mapping)
+    }
+    for selected_id in selected_ids:
+        candidate = candidates.get(selected_id, {})
+        scope = candidate.get("saved_content_scope")
+        if (
+            isinstance(scope, str)
+            and scope in {"linked_discovery_summary", "saved_evidence_snippet"}
+            and candidate.get("article_full_text_verified") is not True
+        ):
+            return (
+                "The selected saved source contains only a summary or snippet, without "
+                "verified full article text for the explicitly requested deep review. "
+                "The preliminary selection and source link remain available for review."
+            )
+    return ""
+
+
 def _context_agent_blocked_write_attempts(
     output: object,
     *,
     tool_receipts: list[dict[str, object]] | None = None,
+    tool_invocations: Sequence[Mapping[str, Any]] = (),
 ) -> list[str]:
     if not isinstance(output, dict):
         return []
     agent_name = str(output.get("agent_name") or "")
-    blockers = [str(item) for item in output.get("blockers") or [] if str(item)]
-    if blockers:
-        return [f"{agent_name}: blocked write request pending exact target and approval"]
     failed_receipts = [
         receipt
         for receipt in list(tool_receipts or [])
@@ -9555,6 +10490,12 @@ def _context_agent_blocked_write_attempts(
     ]
     if failed_receipts:
         return [f"{agent_name}: provider write or cleanup did not verify"]
+    if any(
+        str(item.get("status") or "") in {"started", "completed", "failed"}
+        and operation_is_mutation(item.get("tool_name"))
+        for item in tool_invocations
+    ):
+        return [f"{agent_name}: provider write attempt lacked a verified receipt"]
     return []
 
 
@@ -9783,6 +10724,9 @@ def _strict_requested_display_text(
 def _context_agent_human_summary(
     output: object,
     manual_plan: ManualRequestPlan | dict[str, object] | None = None,
+    *,
+    approval_needs_advisory: bool = False,
+    answer_source_urls: Sequence[str] = (),
 ) -> str:
     if not isinstance(output, dict):
         return ""
@@ -9790,6 +10734,16 @@ def _context_agent_human_summary(
     if strict_display:
         return strict_display
     summary = str(output.get("answer") or output.get("summary") or "").strip()
+    visible_answer_urls = set(canonical_source_urls(summary))
+    verified_answer_urls: list[str] = []
+    for url in answer_source_urls:
+        canonical = canonical_source_url(url)
+        if canonical and canonical not in visible_answer_urls:
+            verified_answer_urls.append(url)
+            visible_answer_urls.add(canonical)
+    if summary and verified_answer_urls:
+        label = "Source" if len(verified_answer_urls) == 1 else "Sources"
+        summary += f" ({label}: {', '.join(verified_answer_urls)})"
     approval_needs = [
         str(item).strip() for item in output.get("approval_needs") or [] if str(item).strip()
     ]
@@ -9830,7 +10784,11 @@ def _context_agent_human_summary(
         detail_lines.extend(theme_lines)
     reference_lines = _context_agent_reference_summary_lines(output)
     if approval_needs:
-        if len(approval_needs) == 1:
+        if approval_needs_advisory:
+            detail_lines.append(
+                "- Model suggested review; no execution approval gate was verified."
+            )
+        elif len(approval_needs) == 1:
             detail_lines.append(
                 f"- Approval/write boundary: {_ensure_terminal_punctuation(approval_needs[0])}"
             )
@@ -10363,11 +11321,24 @@ def _run_direct_supplied_context_response_live(
         manual_request_plan=manual_plan,
     )
     bounded_context = specialist_execution_context_text(execution_context)
+    signal_context = _verified_signal_context_from_execution_context(execution_context)
+    effective_plan = manual_plan
+    if signal_context is not None:
+        output_constraints = manual_plan.ask_shape.output_constraints.model_copy(
+            update={"include_source_urls": True}
+        )
+        effective_plan = manual_plan.model_copy(
+            update={
+                "ask_shape": manual_plan.ask_shape.model_copy(
+                    update={"output_constraints": output_constraints}
+                )
+            }
+        )
     typed_input = DirectAgentResponseInput(
         requested_agent=route,
         original_request=authoritative_request,
         selected_context=bounded_context,
-        output_constraints=manual_plan.ask_shape.output_constraints.model_dump(mode="json"),
+        output_constraints=effective_plan.ask_shape.output_constraints.model_dump(mode="json"),
     )
     result = run_typed_sdk_agent(
         agent=agent,
@@ -10387,15 +11358,23 @@ def _run_direct_supplied_context_response_live(
     bounded_evidence = "\n\n".join(
         part for part in (authoritative_request, bounded_context) if part
     )
+    direct_layout = direct_answer_layout(
+        route="direct_response",
+        ask_shape=effective_plan.ask_shape.model_dump(mode="python"),
+        request_text=authoritative_request,
+    )
+    candidate_answer = (
+        render_quick_direct_answer(result.output.answer)
+        if direct_layout == "quick" else result.output.answer
+    )
     instruction_resolution = resolve_instruction_following_response(
-        result.output.answer,
+        candidate_answer,
         original_request=authoritative_request,
-        manual_plan=manual_plan,
+        manual_plan=effective_plan,
         bounded_evidence=bounded_evidence,
         live=True,
         allow_length_expansion_repair=route != "outreach_composer",
     )
-    signal_context = _verified_signal_context_from_execution_context(execution_context)
     signal_context_validation = _validate_direct_signal_context_response(
         instruction_resolution.response_text,
         signal_context,
@@ -12226,6 +13205,41 @@ def _run_ask_context_agent_live(
         output_payload,
         tool_receipts,
     )
+    original_output_payload = output_payload
+    if not any(
+        (
+            provider_receipt_blocker,
+            airtable_write_blocker,
+            unverified_write_blocker,
+            write_decision_blocker,
+            tool_execution_blocker,
+        )
+    ):
+        output_payload = _context_agent_read_only_signal_public_output(
+            route,
+            output_payload,
+            manual_plan=manual_plan,
+            decision_ownership=decision_ownership,
+            signal_evidence=(
+                signal_sdk_result.request_cache.get("signal_decision_evidence")
+                if signal_sdk_result is not None
+                else None
+            ),
+            external_write_state=external_write_state,
+            provider_write_admitted=provider_write_admitted,
+        )
+    signal_read_only_answer = output_payload is not original_output_payload
+    signal_depth_blocker = _context_agent_deep_signal_scope_blocker(
+        route,
+        output_payload,
+        manual_plan=manual_plan,
+        decision_ownership=decision_ownership,
+        signal_evidence=(
+            signal_sdk_result.request_cache.get("signal_decision_evidence")
+            if signal_sdk_result is not None
+            else None
+        ),
+    )
     provider_verification = _context_agent_provider_verification(
         route,
         tool_receipts,
@@ -12364,9 +13378,51 @@ def _run_ask_context_agent_live(
         manual_plan,
         original_request=input_text,
     )
-    candidate_summary = strict_display or _context_agent_human_summary(
-        output_payload,
-        manual_plan,
+    selected_signal_candidates: list[dict[str, Any]] = []
+    if (
+        signal_read_only_answer
+        and signal_sdk_result is not None
+    ):
+        signal_evidence = signal_sdk_result.request_cache.get("signal_decision_evidence")
+        if isinstance(signal_evidence, Mapping):
+            selected_ids = set(output_payload["decision"]["selected_candidate_ids"])
+            selected_signal_candidates = [
+                dict(candidate)
+                for candidate in signal_evidence.get("candidates") or []
+                if isinstance(candidate, Mapping)
+                and candidate.get("candidate_id") in selected_ids
+                and canonical_source_url(candidate.get("url"))
+            ]
+    selected_signal_urls = list(dict.fromkeys(
+        str(candidate.get("url") or "") for candidate in selected_signal_candidates
+    ))
+    layout = direct_answer_layout(
+        route=route,
+        ask_shape=manual_plan.ask_shape.model_dump(mode="python") if manual_plan else {},
+        request_text=input_text,
+        selected_source_count=len(selected_signal_candidates),
+    )
+    compact_signal_summary = (
+        render_selected_signal_summary(
+            output_payload, route=route,
+            provider_candidates=selected_signal_candidates,
+            quick=layout == "quick",
+        )
+        if signal_read_only_answer
+        and layout in {"quick", "selected_signal"}
+        else ""
+    )
+    answer_source_urls = (
+        selected_signal_urls
+        if manual_plan is not None
+        and manual_plan.ask_shape.output_constraints.include_source_urls
+        and manual_plan.ask_shape.output_constraints.source_scope == "answer"
+        else []
+    )
+    candidate_summary = strict_display or compact_signal_summary or _context_agent_human_summary(
+        output_payload, manual_plan,
+        approval_needs_advisory=signal_read_only_answer,
+        answer_source_urls=answer_source_urls,
     )
     instruction_resolution = resolve_instruction_following_response(
         candidate_summary,
@@ -12418,7 +13474,15 @@ def _run_ask_context_agent_live(
             ).strip()
     payload = {
         "mode": "live_sdk",
-        "status": "blocked" if execution_blocker else "done",
+        "status": (
+            "blocked"
+            if execution_blocker or signal_depth_blocker
+            else "partial"
+            if signal_read_only_answer and _context_agent_output_has_blockers(output_payload)
+            else "blocked"
+            if _context_agent_output_has_blockers(output_payload)
+            else "done"
+        ),
         "block_kind": (
             "zotero_provider_read_required"
             if provider_receipt_blocker
@@ -12430,6 +13494,12 @@ def _run_ask_context_agent_live(
             if write_decision_blocker
             else "required_tool_execution_missing"
             if tool_execution_blocker
+            else "signal_requested_depth_unavailable"
+            if signal_depth_blocker
+            else "signal_read_only_output_limited"
+            if signal_read_only_answer and _context_agent_output_has_blockers(output_payload)
+            else "context_agent_output_blocked"
+            if _context_agent_output_has_blockers(output_payload)
             else ""
         ),
         "selected_agent": route,
@@ -12477,7 +13547,7 @@ def _run_ask_context_agent_live(
         "instruction_following": instruction_resolution.metadata(),
         "blockers": _context_agent_public_blockers(
             output_payload,
-            execution_blocker=execution_blocker,
+            execution_blocker=execution_blocker or signal_depth_blocker,
         ),
         "side_effects": {
             "schema": "keystone.promptfoo.side_effects.v1",
@@ -12494,9 +13564,14 @@ def _run_ask_context_agent_live(
             "blocked_write_attempts": _context_agent_blocked_write_attempts(
                 output_payload,
                 tool_receipts=tool_receipts,
+                tool_invocations=invocation_rows,
             ),
             "approval_ref": ",".join(approval_references),
-            "evidence_complete": not bool(execution_blocker),
+            "evidence_complete": not bool(
+                execution_blocker
+                or signal_depth_blocker
+                or _context_agent_output_has_blockers(output_payload)
+            ),
         },
     }
     attach_verified_continuation_objects(payload, tool_receipts)
@@ -12554,6 +13629,11 @@ def _run_ask_context_agent_live(
     # Persist the same completed public contract that the Slack adapter receives.
     # Verified provider scope remains internal and contains no raw record fields.
     attach_execution_public_result(payload)
+    if signal_read_only_answer and payload["status"] == "partial":
+        payload["public_result"]["failure_summary"] = (
+            "A selected read-only signal answer is available, with unresolved "
+            "limitations shown in the result."
+        )
     persistence_payload = json.loads(json.dumps(payload, default=str))
     if signal_sdk_result is not None:
         signal_request_cache = dict(signal_sdk_result.request_cache or {})
@@ -17204,7 +18284,7 @@ def _attach_direct_specialist_entry_observability(
         and isinstance(request_cache.get("decision_ownership"), Mapping)
         else {}
     )
-    child_evidence_available = isinstance(child_mapping, Mapping)
+    child_evidence_available = bool(child_mapping)
     tool_corrections = _bounded_repair_count(
         request_cache.get("tool_corrections") if isinstance(request_cache, Mapping) else None
     )
@@ -17257,7 +18337,10 @@ def _attach_direct_specialist_entry_observability(
     enforced_consumed = budget_snapshot.get("consumed")
     actual_total_requests = (
         int(enforced_consumed)
-        if isinstance(enforced_consumed, int) and enforced_consumed >= 0
+        if (
+            isinstance(enforced_consumed, int) and enforced_consumed >= 0
+            and budget_snapshot.get("consumed_count_confirmed") is not False
+        )
         else preflight_requests + child_requests
         if preflight_requests is not None and child_requests is not None
         else None
@@ -17273,6 +18356,9 @@ def _attach_direct_specialist_entry_observability(
         "actual_child_requests": child_requests,
         "actual_child_requests_available": child_requests is not None,
         "actual_total_requests": actual_total_requests,
+        "actual_total_requests_available": actual_total_requests is not None,
+        "budget_consumed": enforced_consumed,
+        "budget_consumed_count_confirmed": budget_snapshot.get("consumed_count_confirmed"),
         "repair_status": {
             "orchestrator": _repair_status(orchestrator_repairs),
             "tool_correction": _repair_status(tool_corrections),
@@ -17420,7 +18506,16 @@ def _run_ask_script_live(
     cost_tracking_requested: bool = False,
     database_url: str | None = None,
 ) -> int:
+    from keystone_agents.runtime.continuity_policy import resolve_slack_compact_continuity_policy
     from keystone_agents.runtime.durable_execution import execution_child_environment
+    from keystone_agents.sdk_sessions import admit_sdk_session_spec
+
+    admitted_session_spec = admit_sdk_session_spec(
+        sdk_session_spec or SDKSessionSpec(enabled=False),
+        resolve_slack_compact_continuity_policy(execution_context),
+    )
+    if admitted_session_spec.history_admission_reason:
+        sdk_session_spec = admitted_session_spec
 
     env = None
     execution_deadline = current_execution_deadline()

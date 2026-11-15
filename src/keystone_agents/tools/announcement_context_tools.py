@@ -15,7 +15,10 @@ from urllib import parse, request
 
 from keystone_agents.context_env import context_env_value, resolve_context_env_value
 from keystone_agents.guardrails import keystone_tool_guardrail_kwargs
-from keystone_agents.schemas.announcement_feed import AnnouncementFeedItem
+from keystone_agents.schemas.announcement_feed import (
+    AnnouncementFeedEvidence,
+    AnnouncementFeedItem,
+)
 from keystone_agents.sdk import function_tool
 from keystone_agents.storage.sqlite_store import SQLiteStore, database_url_from_env
 
@@ -548,7 +551,12 @@ def _evidence_id(evidence: object) -> str:
     return f"evidence:{_canonical_json_sha256(payload)[:24]}"
 
 
-def _evidence_index_entry(evidence: object, *, position: int) -> dict[str, Any]:
+def _evidence_index_entry(
+    evidence: object,
+    *,
+    position: int,
+    saved_content_scope: str = "saved_evidence_snippet",
+) -> dict[str, Any]:
     snippet = str(getattr(evidence, "snippet", "") or "")
     source_url = str(getattr(evidence, "url", "") or "")
     metadata = getattr(evidence, "metadata", {})
@@ -568,7 +576,7 @@ def _evidence_index_entry(evidence: object, *, position: int) -> dict[str, Any]:
         "authoritative_metadata_in_selected_read": True,
         "source": str(getattr(evidence, "source", "") or "")[:160],
         "status": str(getattr(evidence, "status", "") or "")[:80],
-        "saved_content_scope": "saved_evidence_snippet",
+        "saved_content_scope": saved_content_scope,
         "saved_content_available": bool(snippet),
         "saved_content_char_count": len(snippet),
         "reported_source_char_count": max(
@@ -583,12 +591,17 @@ def _evidence_index_page(
     item: AnnouncementFeedItem,
     *,
     start: int = 0,
+    saved_content_scope: str = "saved_evidence_snippet",
 ) -> tuple[list[dict[str, Any]], int]:
     entries: list[dict[str, Any]] = []
     used_chars = 0
     cursor = min(max(0, int(start)), len(item.evidence))
     while cursor < len(item.evidence) and len(entries) < MAX_EVIDENCE_INDEX_ITEMS:
-        entry = _evidence_index_entry(item.evidence[cursor], position=cursor + 1)
+        entry = _evidence_index_entry(
+            item.evidence[cursor],
+            position=cursor + 1,
+            saved_content_scope=saved_content_scope,
+        )
         entry_chars = len(
             json.dumps(entry, ensure_ascii=True, sort_keys=True, default=str)
         )
@@ -604,11 +617,15 @@ def _evidence_index_payload(
     item: AnnouncementFeedItem,
     *,
     start: int = 0,
+    snapshot_sha256: str = "",
+    saved_content_scope: str = "saved_evidence_snippet",
 ) -> dict[str, Any]:
-    entries, end = _evidence_index_page(item, start=start)
+    entries, end = _evidence_index_page(
+        item, start=start, saved_content_scope=saved_content_scope,
+    )
     full_count = len(item.evidence)
     has_more = end < full_count
-    snapshot = _feed_item_snapshot(item)
+    snapshot = snapshot_sha256 or _feed_item_snapshot(item)
     return {
         "entries": entries,
         "coverage": {
@@ -799,55 +816,119 @@ def read_announcement_feed_evidence_impl(
             "send_enabled": False,
         }
 
+    profile_binding = None
     if kind == "preprints" and os.environ.get("KEYSTONE_CANARY_ACCEPTANCE_PROFILE"):
         from keystone_agents.canary_acceptance import public_preprint_snapshot_binding
 
-        if public_preprint_snapshot_binding() is not None:
+        profile_binding = public_preprint_snapshot_binding()
+
+    resolved_database_url = database_url or database_url_from_env()
+    item = None
+    if profile_binding is None:
+        try:
+            item = SQLiteStore(resolved_database_url).get_announcement_feed_item(item_id)
+        except Exception as exc:
+            return {
+                "status": "blocked",
+                "operation": "read_saved_announcement_evidence",
+                "kind": kind,
+                "feed_item_id": item_id,
+                "text": "",
+                "limitations": [
+                    "Saved announcement evidence could not be read from local application data."
+                ],
+                "diagnostics": [
+                    {
+                        "key": "storage_error",
+                        "value": type(exc).__name__,
+                        "note": str(exc)[:500],
+                    }
+                ],
+                "send_enabled": False,
+            }
+    linked_row, linked_status = (
+        _linked_preprint_exact_row(
+            item_id,
+            source_path=profile_binding[0] if profile_binding else None,
+        )
+        if kind == "preprints"
+        else (None, "not_configured")
+    )
+    linked_item = None
+    linked_snapshot = ""
+    if linked_row is not None and linked_row.get("candidate_type") == "preprint":
+        linked_item = _linked_preprint_evidence_item(linked_row)
+        linked_snapshot = _linked_preprint_snapshot(linked_row)
+    if profile_binding is not None and linked_item is None:
+        return {
+            "status": (
+                "blocked" if linked_status == "source_unavailable" else "source_scope_mismatch"
+            ),
+            "operation": "read_saved_announcement_evidence",
+            "kind": kind,
+            "feed_item_id": item_id,
+            "text": "",
+            "metadata_text": "",
+            "limitations": [
+                (
+                    "The reviewed public preprint snapshot is unavailable for exact reading."
+                    if linked_status == "source_unavailable"
+                    else "The active acceptance profile permits exact reads only from its "
+                    "reviewed public preprint snapshot."
+                )
+            ],
+            "send_enabled": False,
+        }
+    if item is not None and linked_row is not None:
+        canonical_snapshot = _feed_item_snapshot(item)
+        if expected_snapshot == canonical_snapshot:
+            linked_item = None
+        elif linked_item is not None and expected_snapshot == linked_snapshot:
+            item = None
+        else:
             return {
                 "status": "source_scope_mismatch",
                 "operation": "read_saved_announcement_evidence",
                 "kind": kind,
                 "feed_item_id": item_id,
                 "text": "",
-                "metadata_text": "",
                 "limitations": [
-                    "The active acceptance profile is bound to a reviewed public "
-                    "preprint snapshot. Canonical application-database evidence reads "
-                    "cannot be substituted for that source."
+                    "The exact ID exists in more than one source. Supply the source "
+                    "snapshot digest returned by the selected history record."
                 ],
                 "send_enabled": False,
             }
-
-    resolved_database_url = database_url or database_url_from_env()
-    try:
-        item = SQLiteStore(resolved_database_url).get_announcement_feed_item(item_id)
-    except Exception as exc:
+    linked_source = item is None and linked_item is not None
+    if linked_source:
+        item = linked_item
+    saved_content_scope = (
+        "linked_discovery_summary" if linked_source else "saved_evidence_snippet"
+    )
+    if item is None and linked_status == "source_unavailable":
         return {
             "status": "blocked",
             "operation": "read_saved_announcement_evidence",
             "kind": kind,
             "feed_item_id": item_id,
             "text": "",
-            "limitations": [
-                "Saved announcement evidence could not be read from local application data."
-            ],
-            "diagnostics": [
-                {
-                    "key": "storage_error",
-                    "value": type(exc).__name__,
-                    "note": str(exc)[:500],
-                }
-            ],
+            "limitations": ["The configured linked preprint evidence store is unavailable."],
             "send_enabled": False,
         }
     if item is None:
+        wrong_kind = linked_row is not None
         return {
-            "status": "not_found",
+            "status": "source_scope_mismatch" if wrong_kind else "not_found",
             "operation": "read_saved_announcement_evidence",
             "kind": kind,
             "feed_item_id": item_id,
             "text": "",
-            "limitations": ["No saved announcement item matched the exact feed_item_id."],
+            "limitations": [
+                (
+                    "The exact linked candidate exists but is outside preprints scope."
+                    if wrong_kind
+                    else "No saved announcement item matched the exact feed_item_id."
+                )
+            ],
             "send_enabled": False,
         }
     if not _feed_item_matches_kind(item, kind):
@@ -863,10 +944,14 @@ def read_announcement_feed_evidence_impl(
             "send_enabled": False,
         }
 
-    snapshot = _feed_item_snapshot(item)
+    snapshot = linked_snapshot if linked_source else _feed_item_snapshot(item)
     source_snapshot = {
         "sha256": snapshot,
-        "basis": "canonical_saved_feed_item_and_ordered_evidence",
+        "basis": (
+            "linked_discovery_candidate_content_fields"
+            if linked_source
+            else "canonical_saved_feed_item_and_ordered_evidence"
+        ),
         "expected_sha256": expected_snapshot,
         "matches_expected": snapshot == expected_snapshot if expected_snapshot else None,
     }
@@ -885,7 +970,12 @@ def read_announcement_feed_evidence_impl(
             "send_enabled": False,
         }
 
-    index_payload = _evidence_index_payload(item, start=bounded_index_start)
+    index_payload = _evidence_index_payload(
+        item,
+        start=bounded_index_start,
+        snapshot_sha256=snapshot,
+        saved_content_scope=saved_content_scope,
+    )
     common = {
         "operation": "read_saved_announcement_evidence",
         "kind": kind,
@@ -901,7 +991,7 @@ def read_announcement_feed_evidence_impl(
         "source_snapshot": source_snapshot,
         "evidence_index": index_payload["entries"],
         "evidence_index_coverage": index_payload["coverage"],
-        "saved_content_scope": "saved_evidence_snippet",
+        "saved_content_scope": saved_content_scope,
         "article_full_text_verified": False,
         "send_enabled": False,
     }
@@ -921,6 +1011,21 @@ def read_announcement_feed_evidence_impl(
                 "available": bool(index_payload["coverage"]["has_more"]),
                 "next_request": index_payload["coverage"]["next_request"],
             },
+        }
+    if linked_source and not expected_snapshot:
+        return {
+            **common,
+            "status": "continuation_identity_required",
+            "read_mode": "evidence_content",
+            "evidence_id": selected_evidence_id,
+            "text": "",
+            "content_status": "snapshot_identity_required",
+            "content_complete": False,
+            "limitations": [
+                "A linked discovery evidence read requires the exact source_snapshot.sha256 "
+                "returned by the selected history candidate."
+            ],
+            "continuation": {"available": False, "next_request": None},
         }
 
     matched_position = -1
@@ -977,6 +1082,15 @@ def read_announcement_feed_evidence_impl(
     metadata_has_more = metadata_window_end < len(full_metadata_text)
     metadata_text = full_metadata_text[metadata_window_start:metadata_window_end]
     limitations: list[str] = []
+    if linked_source:
+        limitations.append(
+            "This is only the saved linked-discovery summary, not verified article full text."
+        )
+        if not item.url or item.title == "(title unavailable)":
+            limitations.append(
+                "The linked discovery record lacks a source URL or title; treat its "
+                "evidence as incomplete."
+            )
     if not full_text:
         content_status = (
             "empty_saved_record"
@@ -1024,14 +1138,18 @@ def read_announcement_feed_evidence_impl(
         if continuation_available
         else None
     )
+    linked_incomplete = linked_source and (
+        not full_text or not item.url or item.title == "(title unavailable)"
+    )
     return {
         **common,
-        "status": "success",
+        "status": "partial" if linked_incomplete else "success",
         "read_mode": "evidence_content",
         "evidence": {
             **_evidence_index_entry(
                 matched_evidence,
                 position=matched_position + 1,
+                saved_content_scope=saved_content_scope,
             ),
         },
         "evidence_id": selected_evidence_id,
@@ -1235,17 +1353,9 @@ def _linked_preprint_discovery_items(
     source_path: Path | None = None,
     source_sha256: str = "",
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    if source_path is not None:
-        path = source_path
-        resolution_source = "acceptance_profile"
-    else:
-        resolution = resolve_context_env_value("DISCOVERY_STORE_PATH")
-        if not resolution.value:
-            return [], []
-        path = Path(resolution.value).expanduser()
-        if not path.is_absolute() and resolution.source_repo is not None:
-            path = resolution.source_repo / path
-        resolution_source = resolution.source
+    path, resolution_source = _linked_preprint_store_path(source_path=source_path)
+    if path is None:
+        return [], []
     if not path.is_file():
         return [], [
             {
@@ -1318,8 +1428,8 @@ def _linked_preprint_discovery_items(
         else "0"
     )
     sql = (
-        "SELECT candidate_id, source, source_item_id, title, summary, published, "
-        f"url, topics_json, status, metadata_json, {score_sql} AS match_score "
+        "SELECT candidate_id, candidate_type, source, source_item_id, title, summary, published, "
+        f"url, topics_json, status, last_seen_at, metadata_json, {score_sql} AS match_score "
         "FROM discovery_candidates WHERE candidate_type = 'preprint' "
     )
     params: list[Any] = [normalized_query] if query_terms else []
@@ -1394,7 +1504,12 @@ def _linked_preprint_discovery_items(
             }
         ]
 
-    payloads = [_linked_preprint_payload(dict(row)) for row in rows]
+    payloads = [
+        _linked_preprint_payload(
+            dict(row), include_exact_read=not bool(canary_snapshot_sha256),
+        )
+        for row in rows
+    ]
     return payloads, [
         {
             "key": "linked_discovery_store",
@@ -1476,7 +1591,112 @@ def _linked_preprint_discovery_items(
     ]
 
 
-def _linked_preprint_payload(row: dict[str, Any]) -> dict[str, Any]:
+def _linked_preprint_store_path(*, source_path: Path | None = None) -> tuple[Path | None, str]:
+    if source_path is not None:
+        return source_path, "acceptance_profile"
+    resolution = resolve_context_env_value("DISCOVERY_STORE_PATH")
+    if not resolution.value:
+        return None, resolution.source
+    path = Path(resolution.value).expanduser()
+    if not path.is_absolute() and resolution.source_repo is not None:
+        path = resolution.source_repo / path
+    return path, resolution.source
+
+
+def _linked_preprint_exact_row(
+    candidate_id: str,
+    *,
+    source_path: Path | None = None,
+) -> tuple[dict[str, Any] | None, str]:
+    """Read one exact candidate from the same read-only store used by discovery."""
+
+    path, _source = _linked_preprint_store_path(source_path=source_path)
+    if path is None:
+        return None, "not_configured"
+    if not path.is_file():
+        return None, "source_unavailable"
+    try:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT candidate_id, candidate_type, source, source_item_id, title, "
+                "summary, published, url, topics_json, status, last_seen_at, "
+                "metadata_json FROM discovery_candidates WHERE candidate_id = ? LIMIT 1",
+                (candidate_id,),
+            ).fetchone()
+    except (sqlite3.Error, OSError):
+        return None, "source_unavailable"
+    return (dict(row), "found") if row is not None else (None, "not_found")
+
+
+def _linked_preprint_evidence_item(row: Mapping[str, Any]) -> AnnouncementFeedItem:
+    """Normalize a saved discovery summary without claiming full-article coverage."""
+
+    metadata = _json_dict(row.get("metadata_json"))
+    identifiers = {
+        key: str(metadata[key]).strip()
+        for key in ("doi", "arxiv_id", "biorxiv_id", "medrxiv_id")
+        if isinstance(metadata.get(key), str) and str(metadata[key]).strip()
+    }
+    summary = str(row.get("summary") or "").strip()
+    evidence = AnnouncementFeedEvidence(
+        kind="discovery_summary",
+        title=str(row.get("title") or "").strip() or "(title unavailable)",
+        url=str(row.get("url") or "").strip(),
+        snippet=summary,
+        source=str(row.get("source") or "").strip(),
+        status="success" if summary else "unavailable",
+        char_count=len(summary),
+        metadata={
+            "candidate_id": str(row.get("candidate_id") or "").strip(),
+            "source_item_id": str(row.get("source_item_id") or "").strip(),
+            **identifiers,
+        },
+    )
+    return AnnouncementFeedItem(
+        canonical_key=str(row.get("candidate_id") or "").strip(),
+        publication_id=str(row.get("source_item_id") or "").strip(),
+        doi=identifiers.get("doi", ""),
+        arxiv_id=identifiers.get("arxiv_id", ""),
+        biorxiv_id=identifiers.get("biorxiv_id", ""),
+        medrxiv_id=identifiers.get("medrxiv_id", ""),
+        title=str(row.get("title") or "").strip() or "(title unavailable)",
+        url=str(row.get("url") or "").strip(),
+        source=str(row.get("source") or "").strip(),
+        feed="preprints",
+        published_at=str(row.get("published") or "").strip(),
+        tags=_json_list(row.get("topics_json")),
+        summary=summary,
+        evidence=[evidence],
+    )
+
+
+def _linked_preprint_snapshot(row: Mapping[str, Any]) -> str:
+    """Hash saved content and identity, excluding rank and rescan bookkeeping."""
+
+    return _canonical_json_sha256(
+        {
+            key: row.get(key)
+            for key in (
+                "candidate_id",
+                "candidate_type",
+                "source",
+                "source_item_id",
+                "title",
+                "summary",
+                "published",
+                "url",
+                "topics_json",
+                "status",
+                "metadata_json",
+            )
+        }
+    )
+
+
+def _linked_preprint_payload(
+    row: dict[str, Any], *, include_exact_read: bool = True,
+) -> dict[str, Any]:
     topics = _json_list(row.get("topics_json"))
     metadata = _json_dict(row.get("metadata_json"))
     publication_ids = list(
@@ -1497,7 +1717,7 @@ def _linked_preprint_payload(row: dict[str, Any]) -> dict[str, Any]:
     published = str(row.get("published") or "").strip()
     url = str(row.get("url") or "").strip()
     summary = str(row.get("summary") or "").strip()
-    return {
+    payload = {
         "feed_item_id": candidate_id,
         "title": str(row.get("title") or "").strip(),
         "url": url,
@@ -1520,6 +1740,29 @@ def _linked_preprint_payload(row: dict[str, Any]) -> dict[str, Any]:
         "slack_link": "",
         "source_ids": [value for value in (candidate_id, *publication_ids, url) if value],
     }
+    if include_exact_read:
+        item = _linked_preprint_evidence_item(row)
+        snapshot = _linked_preprint_snapshot(row)
+        evidence_index = _evidence_index_payload(
+            item,
+            snapshot_sha256=snapshot,
+            saved_content_scope="linked_discovery_summary",
+        )
+        payload.update(
+            {
+                "evidence_count": 1,
+                "evidence_index": evidence_index["entries"],
+                "evidence_index_coverage": evidence_index["coverage"],
+                "selected_evidence_read_required": True,
+                "saved_content_scope": "linked_discovery_summary",
+                "article_full_text_verified": False,
+                "source_snapshot": {
+                    "sha256": snapshot,
+                    "basis": "linked_discovery_candidate_content_fields",
+                },
+            }
+        )
+    return payload
 
 
 def _json_list(value: Any) -> list[str]:
@@ -1785,7 +2028,7 @@ def read_preprint_announcement_evidence_impl(
     expected_snapshot_sha256: str = "",
     database_url: str | None = None,
 ) -> dict[str, Any]:
-    """Read bounded saved evidence for one exact canonical preprint item."""
+    """Read one exact canonical item or snapshot-bound linked discovery summary."""
 
     return read_announcement_feed_evidence_impl(
         feed_item_id,
@@ -1911,10 +2154,12 @@ def read_preprint_announcement_evidence(
     max_chars: int = 4_000,
     expected_snapshot_sha256: str = "",
 ) -> str:
-    """Read bounded saved evidence for one exact canonical preprint history item.
+    """Read bounded evidence for one exact saved preprint history item.
 
-    Pass one ``evidence_id`` from the discovery index to read saved content.
-    Omit it only when following an evidence-index continuation. Follow returned
+    Pass ``feed_item_id``, one ``evidence_id``, and
+    ``expected_snapshot_sha256`` from the selected discovery candidate to read
+    a linked preprint's saved summary. This does not retrieve article full text.
+    Omit ``evidence_id`` only to inspect an evidence index. Follow returned
     continuation arguments exactly and stop on a changed snapshot.
     """
 

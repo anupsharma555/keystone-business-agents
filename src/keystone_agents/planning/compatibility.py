@@ -596,6 +596,10 @@ def infer_manual_request_plan(
         desired_count = max(desired_count, len(workflow))
     if workflow and normalized_agent == "chief_of_staff" and not gmail_agent_owned_reply:
         target_agent = "chief_of_staff"
+    gmail_draft_operation = (
+        _supported_gmail_draft_operation(text)
+        if target_agent == "gmail_triage" else None
+    )
     inferred_target_type = (
         "business_system_context"
         if finance_expense_receipt_target is not None
@@ -633,7 +637,10 @@ def infer_manual_request_plan(
         if opportunity_workflow
         else "route_request"
         if workflow
-        else _intent_for_target(target_agent, text, workflow_allowed=workflow_allowed)
+        else _intent_for_target(
+            target_agent, text, workflow_allowed=workflow_allowed,
+            gmail_draft_operation=gmail_draft_operation,
+        )
     )
     airtable_record_plan_requested = bool(
         opportunity_workflow and "airtable_context_agent" in opportunity_workflow
@@ -748,6 +755,8 @@ def infer_manual_request_plan(
             or zotero_selection_rank is not None
             else []
             if airtable_record_plan_requested
+            else [gmail_draft_operation]
+            if gmail_draft_operation is not None and intent == "gmail_triage"
             else _fallback_provider_operations(
                 text,
                 intent=intent,
@@ -2053,6 +2062,63 @@ def request_forbids_live_research(text: str) -> bool:
             re.I,
         )
     )
+
+
+def request_forbids_external_source_read(text: str) -> bool:
+    """Keep an exact article read distinct from broad search permission.
+
+    A ban on other sources narrows selection; a ban on opening the selected
+    article, live provider calls, or a preview-only answer denies page reads.
+    """
+
+    source = _without_reported_quoted_text(text)
+    normalized = " ".join(source.lower().split())
+    if re.search(
+        r"\b(?:use|rely\s+on|answer\s+from)\s+only(?:\s+on)?\s+"
+        r"(?:(?:the|that|this)\s+)?(?:"
+        r"(?:slack|channel|historical|provided|supplied)\s+"
+        r"(?:post|message|thread|preview)|"
+        r"(?:cached|saved|existing)\s+(?:(?:article|source|page)\s+)?snapshot|"
+        r"link\s+titles?|"
+        r"(?:supplied|provided|shown)\s+(?:preview|excerpt|snippet|context|"
+        r"text|note|thread)|preview|excerpt|snippet)\b",
+        normalized,
+    ):
+        return True
+    if re.search(
+        r"\b(?:external|live)\s+research\b[^.;\n]{0,80}\b"
+        r"(?:not\s+(?:approved|allowed|permitted)|disabled|off-limits)\b",
+        normalized,
+    ):
+        return True
+    for constraint in _explicit_negative_constraints(source):
+        if re.search(
+            r"\b(?:new|fresh)\s+(?:page\s+)?extraction\b|"
+            r"\bre[- ]?extract(?:ion|ing)?\b",
+            constraint,
+        ):
+            return True
+        if re.search(
+            r"\b(?:live\s+(?:api|provider|tool)\s*(?:calls?|use|access)?|"
+            r"external\s+(?:tools?|page\s+reads?|source\s+reads?)|"
+            r"provider\s+calls?)\b",
+            constraint,
+        ):
+            return True
+        for match in re.finditer(
+            r"\b(?:read|reading|open|opening|fetch|fetching|visit|visiting|"
+            r"load|loading|extract|extracting|access|accessing|follow|following|"
+            r"use|using)\b"
+            r"(?P<object>[^,;.!?\n]{0,80})\b"
+            r"(?:articles?|pages?|sources?|urls?|links?|websites?|webpages?)\b",
+            constraint,
+        ):
+            if not re.search(
+                r"\b(?:other|additional|unrelated|different|outside|extra|more)\b",
+                match.group("object"),
+            ):
+                return True
+    return False
 
 
 def live_search_allowed_for_execution(
@@ -5585,11 +5651,89 @@ def _looks_like_underspecified_modify_request(text: str) -> bool:
     )
 
 
+def _supported_gmail_draft_operation(text: str) -> str | None:
+    """Admit one typed draft write when all positive actions target that draft."""
+
+    from keystone_agents.gmail_triage.execution_plan import infer_gmail_execution_plan
+
+    plan = infer_gmail_execution_plan(text)
+    operation = {"update_draft": "update", "draft_reply": "create"}.get(plan.operation)
+    if operation is None or plan.side_effect_policy != "scoped_gmail_draft_write_no_send":
+        return None
+    positive = _provider_operation_evidence_text(text)
+    if re.search(r"\b(?:send|post|publish|deliver|share|schedule)\b", positive):
+        return None
+    actions = list(re.finditer(
+        r"\b(?:add|archive|attach|change|create|delete|edit|forward|insert|label|"
+        r"make|mark|modify|move|put|remove|replace|revise|rewrite|save|set|trash|"
+        r"update|upload|write)\b",
+        positive,
+    ))
+    provider_object = re.compile(
+        r"\b(?:gmail|draft|email|message|thread|label|mailbox|record|row|file|"
+        r"document|sheet|folder|event|calendar|airtable|drive|slack)\b",
+    )
+    content_object = re.compile(
+        r"\b(?:body|subject|greeting|sentence|paragraph|line|word|opening|"
+        r"closing|signoff|salutation|tone|length|phrase|text|copy|signature|"
+        r"title|intro|ending)\b",
+    )
+    primary_used = False
+    for index, action in enumerate(actions):
+        end = min(len(positive), action.end() + 100)
+        if index + 1 < len(actions):
+            end = min(end, actions[index + 1].start())
+        separator = re.search(r"[.;!?\n]", positive[action.end():end])
+        if separator:
+            end = action.end() + separator.start()
+        span = positive[action.end():end]
+        provider = provider_object.search(span)
+        content = content_object.search(span)
+        if primary_used and re.search(
+            r"\b(?:another|different|other)\s+" + provider_object.pattern,
+            span,
+        ):
+            return None
+        target_is_provider = provider is not None and (
+            content is None or provider.start() < content.start()
+        )
+        verb = action.group(0)
+        if target_is_provider:
+            primary_verb = (
+                verb in {"update", "edit", "change", "modify", "revise", "rewrite", "make"}
+                if operation == "update" else
+                verb in {"create", "add", "make", "put", "save", "write"}
+            )
+            if primary_verb and not primary_used and provider.group(0) in {
+                "gmail", "draft", "email",
+            }:
+                primary_used = True
+                continue
+            return None
+        if (
+            not primary_used and operation == "update" and content is not None
+            and provider is not None
+            and verb in {"update", "edit", "change", "modify", "revise", "rewrite"}
+        ):
+            # "Change the subject of the existing draft" still targets one
+            # verified draft; the first noun is an editable field within it.
+            primary_used = True
+            continue
+        if verb in {
+            "delete", "remove", "trash", "archive", "forward", "label", "mark",
+            "move", "attach", "upload",
+        }:
+            if content is None or re.search(r"^\s*(?:(?:the|this|that)\s+)?(?:it|them)\b", span):
+                return None
+    return operation if primary_used else None
+
+
 def _intent_for_target(
     target_agent: ManualTargetAgent,
     text: str,
     *,
     workflow_allowed: bool = True,
+    gmail_draft_operation: str | None = None,
 ) -> ManualRequestIntent:
     lower = _without_negated_route_action_clauses(text).lower()
     if target_agent == "clarification":
@@ -5641,6 +5785,8 @@ def _intent_for_target(
         and _looks_like_internal_business_system_mutation(text)
     ):
         return "business_system_write"
+    if target_agent == "gmail_triage" and gmail_draft_operation is not None:
+        return "gmail_triage"
     if _looks_like_blocked_side_effect_request(
         text
     ) and not _looks_like_discovery_outreach_workflow(text):
@@ -6100,19 +6246,16 @@ def _looks_like_blocked_side_effect_request(text: str) -> bool:
 
 
 def _looks_like_external_write_side_effect(text: str) -> bool:
-    cleaned = " ".join(normalize_match_text(text).split()).strip()
+    positive = positive_capability_text(text)
+    if _looks_like_write_plan_only_request(text):
+        return False
+    # Keep negative restrictions out of positive mutation evidence. A later
+    # "do not post" must not erase an earlier affirmative provider write.
+    cleaned = " ".join(positive.split()).strip()
     if not cleaned:
         return False
     lower = cleaned.lower()
     lower = re.sub(r"\bprior\s+post\b", "prior message", lower)
-    if re.search(
-        r"\b(?:do\s+not|don't|dont|never|no)\b[\s\S]{0,180}"
-        r"\b(?:add|attach|change|create|delete|deliver|edit|export|insert|modify|"
-        r"move|publish|remove|rename|reschedule|save|schedule|send|share|shift|"
-        r"update|write)\b",
-        lower,
-    ):
-        return False
     write_verb = (
         r"(?:add|attach|change|create|delete|deliver|edit|export|insert|modify|"
         r"move|publish|remove|rename|reschedule|save|schedule|send|share|shift|"
@@ -6127,16 +6270,51 @@ def _looks_like_external_write_side_effect(text: str) -> bool:
     target_object = (
         r"(?:record|row|table|tracker|field|file|doc|document|sheet|folder|attachment|"
         r"airtable|drive|workspace|gmail\s+draft|slack|crm|calendar|meeting|event|"
-        r"collection|item|library|slide|deck|presentation)"
+        r"collection|library|slide|deck|presentation)"
     )
-    return bool(
-        re.search(rf"\b{write_verb}\b[^.!?;\n]{{0,100}}\b{target_object}\b", lower)
-        or re.search(rf"\b{target_object}\b[^.!?;\n]{{0,100}}\b{write_verb}\b", lower)
-        or re.search(
-            r"\bschedule\b[^.!?;\n]{0,80}\b(?:meeting|event|call|follow-up|follow up)\b",
-            lower,
-        )
+    local_output = re.compile(
+        r"\b(?:task|work\s*item|workflow|artifact|brief|report|review|analysis|"
+        r"summary|draft|plan|note|message)\b",
     )
+    target = re.compile(rf"\b{target_object}\b")
+    verbs = list(re.finditer(rf"\b{write_verb}\b", lower))
+    for index, verb in enumerate(verbs):
+        end = min(len(lower), verb.end() + 100)
+        for separator in ".!?;\n":
+            position = lower.find(separator, verb.end(), end)
+            if position >= 0:
+                end = min(end, position)
+        if index + 1 < len(verbs):
+            end = min(end, verbs[index + 1].start())
+        window = lower[verb.end():end]
+        # A named artifact can contain an action noun (for example a sheet
+        # score export). Keep it separate from an imperative export command.
+        prefix = re.split(r"[.!?;,\n]", lower[:verb.start()])[-1]
+        if (
+            re.match(r"\s+(?:named|called|titled)\b", window)
+            and re.search(r"\b(?:doc|document|sheet|file|artifact)\b", prefix)
+            and not re.search(r"\b(?:and|then|also|please|to|you)\s*$", prefix)
+        ):
+            continue
+        first_target = target.search(window)
+        local_head = local_output.search(window)
+        if local_head and (first_target is None or local_head.start() < first_target.start()):
+            # A local task/report can refer to a provider record as its source.
+            # Only an explicit provider destination makes this operation a write.
+            tail = window[local_head.end():local_head.end() + 32]
+            if not re.search(
+                r"\b(?:to|in|into|on|under|within)\s+(?:(?:an?|the|my)\s+)?"
+                r"(?:airtable|google\s+drive|drive|gmail|slack|crm|calendar|"
+                r"zotero|google\s+workspace)\b",
+                tail,
+            ):
+                continue
+        if first_target:
+            return True
+    return bool(re.search(
+        r"\bschedule\b[^.!?;\n]{0,80}\b(?:meeting|event|call|follow-up|follow up)\b",
+        lower,
+    ))
 
 
 def _looks_like_internal_business_system_mutation(text: str) -> bool:
@@ -6182,6 +6360,12 @@ def _looks_like_write_plan_only_request(text: str) -> bool:
             r"\b(?:execute|perform|apply|carry\s+out|go\s+ahead\s+and|"
             r"create\s+it\s+now|do\s+it\s+now)\b",
             normalized,
+        )
+        or re.search(
+            r"\b(?:and|then|also)\s+(?:please\s+)?"
+            r"(?:add|attach|change|create|delete|edit|modify|post|publish|"
+            r"save|send|share|update|write)\b",
+            positive_capability_text(text), re.I,
         )
     )
     return asks_for_plan and not requests_execution

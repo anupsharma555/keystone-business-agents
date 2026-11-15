@@ -80,6 +80,12 @@ Each registered agent also declares one specialist contract bundle:
 - Orchestrator: `orchestrator_specialist_contracts`
 - Chief of Staff: `chief_of_staff_specialist_contracts`
 
+The Orchestrator's same unique skill is loaded into both route-only preflight
+and its bounded general-answer phase. It distinguishes stable concept answers
+from saved provider-corpus handoffs and current public research. Python still
+owns tool admission and source URL validation; skill text grants no search or
+write authority.
+
 The canonical full catalog lives in `src/keystone_agents/skill_sets.py` and is
 mirrored through `AgentSpec.skills` for agent cards and CLI inspection.
 The current audited disposition for each Codex-facing and runtime skill lives in

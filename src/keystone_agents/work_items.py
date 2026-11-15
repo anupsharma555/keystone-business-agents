@@ -1123,6 +1123,19 @@ def hydrate_context_pack_memory(
 ) -> ContextPack:
     """Attach bounded approved prompt-safe memory without changing readiness gates."""
 
+    from keystone_agents.runtime.continuity_policy import current_continuity_policy
+
+    policy = current_continuity_policy()
+    if policy is not None and policy.eligible:
+        # The pilot admits optional facts only through its scoped query tool.
+        # These fields belong to hydration, unlike canonical WorkItem facts,
+        # sources, artifacts, constraints, and approval/readiness state.
+        return pack.model_copy(update={
+            field: [] for field in (
+                "relevant_memory_refs", "approved_company_facts", "retrieval_performance_notes",
+                "prior_opportunity_refs", "outreach_style_examples", "approval_history_refs",
+            ) if field in type(pack).model_fields
+        })
     if store is None:
         return pack
     query = _memory_query(work_item)

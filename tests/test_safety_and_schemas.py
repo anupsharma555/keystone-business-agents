@@ -120,6 +120,30 @@ def test_input_guardrail_allows_medical_terms_in_admitted_public_evidence() -> N
     assert "professional_advice" not in result.output_info["risk_flags"]
 
 
+@pytest.mark.parametrize(
+    "source_context,blocked",
+    [
+        ("https://example.org/ask-ai-to-improve-a-long-document/", False),
+        ("A task-oriented-public-source-description belongs here.", False),
+        ("sk-" + "SyntheticKeyValue" * 3, True),
+        ("https://example.org/page?value=sk-" + "SyntheticKeyValue" * 3, True),
+    ],
+)
+def test_public_evidence_secret_scan_requires_key_token_boundary(
+    source_context: str, blocked: bool,
+) -> None:
+    prompt = BusinessResearchFocusedBriefSDKInput(
+        company_name="Selected public article",
+        brief_goal="Summarize the selected article.",
+        source_context=source_context,
+    ).to_prompt()
+
+    result = keystone_input_guardrail.guardrail_function(None, None, prompt)
+
+    assert result.tripwire_triggered is blocked
+    assert ("secret" in result.output_info["risk_flags"]) is blocked
+
+
 def test_input_guardrail_still_blocks_advice_in_operator_goal() -> None:
     prompt = BusinessResearchFocusedBriefSDKInput(
         company_name="NIMH public page",

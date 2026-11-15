@@ -268,6 +268,7 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
             "tools.md",
             "local_context.md",
             "business_research_analyst.md",
+            "public_topic_research_compact.md",
         ),
         skills=AGENT_SKILL_NAMES["business_research_analyst"],
         tools=(
@@ -315,6 +316,8 @@ SPECIALIST_AGENT_SPECS: tuple[AgentSpec, ...] = (
         ),
         validation_paths=(
             "tests/test_business_research_analyst.py",
+            "tests/test_topic_research_instructions.py",
+            "tests/test_research_answer_presentation.py",
             "tests/test_supplied_research_sdk.py",
             "tests/test_request_tool_scope.py",
             "tests/test_source_triage.py",
@@ -830,6 +833,7 @@ ORCHESTRATOR_AGENT_SPEC = AgentSpec(
         "safety_policy.md",
         "tools.md",
         "orchestrator.md",
+        "orchestrator_general_answer.md",
     ),
     skills=AGENT_SKILL_NAMES["orchestrator"],
     tools=(
@@ -856,11 +860,22 @@ ORCHESTRATOR_AGENT_SPEC = AgentSpec(
         "file_search",
         "business_research_analyst_research_brief",
         "opportunity_scout_read_only",
+        "query_slack_channel_context",
+        "read_slack_channel_context",
+        "query_operator_context",
     ),
     live_flags_required=("--live-sdk", "KEYSTONE_GOOGLE_CALENDAR_ALLOW_WRITES=true"),
     eval_datasets=("evals/local/orchestrator_routing.jsonl", "evals/local/safety_refusals.jsonl"),
     validation_paths=(
         "tests/test_orchestrator.py",
+        "tests/test_orchestrator_general_answer.py",
+        "tests/test_compact_continuity_source_resume.py",
+        "tests/test_workspace_readonly_task_routing.py",
+        "tests/test_channel_answer_evidence.py",
+        "tests/test_slack_cos_graph_backend.py",
+        "tests/test_orchestrator_selected_article.py",
+        "tests/test_slack_channel_context_tools.py",
+        "tests/test_lazy_slack_context_backend_matrix.py",
         "tests/test_orchestrator_supplied_context.py",
         "tests/test_orchestrator_schema_edge_cases.py",
         "tests/test_orchestrator_context_only.py",
@@ -881,11 +896,17 @@ ORCHESTRATOR_AGENT_SPEC = AgentSpec(
     handoff_description=(
         "Read raw Keystone requests first, plan or route to the correct specialist, "
         "pass compact preflight context across Slack/child boundaries, and review "
-        "specialist outputs while preserving approval gates and no-send policy."
+        "specialist outputs while preserving model-selected saved-task requirements, "
+        "approval gates, and no-send policy. "
+        "A separate bounded answer phase uses OrchestratorGeneralAnswer for simple "
+        "questions and summaries of one selected public article."
     ),
     safety_notes=(
         "Python safety gates remain authoritative",
+        "Route-only preflight has no answer tools; general answer has no tools or one live-gated search_web call",
+        "Selected article answers use one identity-validated host extraction and cite its exact URL",
         "Context-only response decisions require completed same-thread evidence and grant no tools",
+        "Public-research intent admits bounded read tools only; live flags and no-search constraints remain authoritative",
         "Planner/Orchestrator context is advisory for specialists, not approval",
         "Child handoffs use compact preflight payloads instead of raw Slack state",
         "Manager-loop reviews feed final response synthesis",
@@ -955,6 +976,8 @@ CHIEF_OF_STAFF_AGENT_SPEC = AgentSpec(
     optional_tools=(
         "file_search",
         "google_drive_media_ocr_read",
+        "query_operator_context",
+        "capture_operator_memory",
         *(specialist_agent_tool_name(spec.route_name) for spec in SPECIALIST_AGENT_SPECS),
     ),
     live_flags_required=("--live-sdk", "KEYSTONE_GOOGLE_CALENDAR_ALLOW_WRITES=true"),

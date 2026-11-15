@@ -616,8 +616,7 @@ def _apply_contextual_route_hint(
     )
     current_capability_owner = (
         str(fallback.target_agent)
-        if fallback.target_agent != prior_owner
-        and (
+        if (
             fallback.provider_system != "unspecified"
             or fallback.target_agent in {"opportunity_scout", "outreach_composer"}
             or fallback.intent in {"browser_diagnostics", "reference_capture"}
@@ -647,6 +646,11 @@ def _apply_contextual_route_hint(
         provider_affinity=provider_affinity,
         prior_owner=prior_owner,
     )
+    if current_capability_owner == target and prior_write_plan is None:
+        # Context may identify an owner, but it must not replace the coherent
+        # current operation already selecting that owner with a generic lane.
+        # Exact approved provider-write continuations still reconcile below.
+        return fallback
     write_requested = bool(
         fallback.ask_shape.permission_state != "read_only"
         and (

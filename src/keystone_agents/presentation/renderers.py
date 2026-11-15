@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel
 
+from keystone_agents.instruction_following import canonical_source_url
 from keystone_agents.schemas.company_profile import CompanyProfile, CompanyResearchFocusedBrief
 from keystone_agents.schemas.email_triage import EmailTriageResult, GmailPriorityGroupingResult
 from keystone_agents.schemas.gmail_query import GmailReadContextResult
@@ -48,6 +50,223 @@ def _as_report_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def direct_answer_layout(
+    *, route: str, ask_shape: dict[str, Any], request_text: str,
+    selected_source_count: int = 0,
+) -> str:
+    """Choose a small display variant from typed ask shape and result scope."""
+
+    constraints = ask_shape.get("output_constraints")
+    constraints = constraints if isinstance(constraints, dict) else {}
+    if (
+        ask_shape.get("ask_breadth") == "broad"
+        or ask_shape.get("evidence_depth") == "deep"
+        or ask_shape.get("output_form") not in {None, "unspecified", "brief"}
+        or constraints.get("required_sections")
+        or constraints.get("require_section_headings")
+        or any(
+            constraints.get(key) not in {None, "unspecified"}
+            for key in (
+                "word_count_mode", "sentence_count_mode", "item_count_mode",
+                "source_url_count_mode", "word_count", "sentence_count",
+                "maximum_words", "minimum_words", "maximum_items", "minimum_items",
+                "source_url_count",
+            )
+        )
+    ):
+        return "existing"
+    depth = ask_shape.get("evidence_depth")
+    quick_hint = bool(
+        depth in {None, "unspecified"}
+        and re.match(r"^\s*quick question\b", str(request_text or ""), flags=re.I)
+    )
+    quick = depth == "quick" or quick_hint
+    if route in {"rss_context_agent", "preprints_context_agent"}:
+        if selected_source_count != 1:
+            return "existing"
+        return "quick" if quick else "selected_signal"
+    if route in {"business_research_analyst", "direct_response"} and quick:
+        return "quick"
+    return "existing"
+
+
+def render_quick_direct_answer(text: str) -> str:
+    """Remove only a bare Answer label; retain later evidence and limitations."""
+
+    answer = _clean(text)
+    match = re.match(r"^\s*(?:\*\*|\*)?Answer:(?:\*\*|\*)?\s*\n?", answer, re.I)
+    if match is None:
+        return answer
+    body = answer[match.end():]
+    later_sections = re.search(
+        r"(?im)^\s*(?:\*\*|\*)?(?:Detailed Summary|Useful References|Run Notes):"
+        r"(?:\*\*|\*)?\s*$",
+        body,
+    )
+    if later_sections is not None:
+        return answer
+    return body.strip() or answer
+
+
+def render_selected_signal_summary(
+    output: dict[str, Any], *, route: str, provider_candidates: list[dict[str, Any]],
+    quick: bool = False,
+) -> str:
+    """Render a brief single-signal answer with provider-owned identity."""
+
+    decision = output.get("decision")
+    articles = output.get("articles")
+    if (
+        route not in {"rss_context_agent", "preprints_context_agent"}
+        or not isinstance(decision, dict)
+        or not isinstance(articles, list)
+    ):
+        return ""
+    selected_ids = decision.get("selected_candidate_ids")
+    if not isinstance(selected_ids, list) or len(selected_ids) != 1:
+        return ""
+    selected = [
+        item for item in articles
+        if isinstance(item, dict) and item.get("feed_item_id") == selected_ids[0]
+    ]
+    provider = [
+        item for item in provider_candidates
+        if isinstance(item, dict) and item.get("candidate_id") == selected_ids[0]
+    ]
+    if len(selected) != 1 or len(provider) != 1:
+        return ""
+    article = selected[0]
+    candidate = provider[0]
+    title = " ".join(_clean(candidate.get("title")).split())[:300]
+    url = _clean(candidate.get("url"))
+    parsed = urlsplit(url)
+    if (
+        not title or parsed.scheme not in {"http", "https"} or not parsed.netloc
+        or canonical_source_url(article.get("url")) != canonical_source_url(url)
+    ):
+        return ""
+
+    def compact(value: Any, *, width: int) -> str:
+        text = " ".join(_clean(value).split())
+        if len(text) <= width:
+            return text
+        return text[:width].rsplit(" ", 1)[0].rstrip(".,;: ") + "..."
+
+    source = compact(candidate.get("source"), width=100)
+    published = _clean(candidate.get("published_at"))
+    date = published[:10] if re.fullmatch(r"\d{4}-\d{2}-\d{2}", published[:10]) else ""
+    metadata = ", ".join(value for value in (source, date) if value)
+    article_line = f"{title} ({metadata})" if metadata else title
+
+    source_summary = " ".join(_clean(candidate.get("summary")).split())
+    source_sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", source_summary)
+        if sentence.strip().endswith((".", "!", "?")) and len(sentence.strip()) <= 650
+    ][:24]
+    findings = article.get("key_findings")
+    model_findings = [
+        compact(value, width=260)
+        for value in findings if str(value).strip()
+    ] if isinstance(findings, list) else []
+
+    def numeric_terms(value: str) -> set[str]:
+        values = re.findall(r"(?<![A-Za-z0-9])(?:\d*\.\d+|\d+)(?![A-Za-z0-9])", value)
+        decimals = [number for number in values if "." in number]
+        return {
+            (
+                ("0" + number if number.startswith(".") else number)
+                .rstrip("0").rstrip(".")
+                if "." in number else number
+            )
+            for number in (decimals or values)
+        }
+
+    def content_terms(value: str) -> set[str]:
+        terms = set(re.findall(r"\b[a-z][a-z0-9]{3,}\b", value.lower()))
+        return terms - {
+            "about", "across", "among", "based", "found", "reported", "shows",
+            "study", "studies", "there", "these", "which", "with",
+        }
+
+    ranked_results: list[tuple[int, str]] = []
+    for finding in model_findings[:8]:
+        finding_terms = content_terms(finding)
+        finding_numbers = numeric_terms(finding)
+        decimal_result = bool(re.search(r"(?<!\w)\d*\.\d+", finding))
+        for sentence in source_sentences:
+            shared = finding_terms & content_terms(sentence)
+            matched_numbers = finding_numbers & numeric_terms(sentence)
+            if finding_numbers and not matched_numbers:
+                continue
+            if len(shared) < 2 and not (decimal_result and matched_numbers):
+                continue
+            ranked_results.append((len(shared) + (10 if decimal_result else 0), sentence))
+    source_result = max(ranked_results, default=(0, ""))[1]
+    description = source_result or " ".join(source_sentences[:2])
+    if not description or len(description) > 650:
+        description = ""
+    relevance = compact(
+        article.get("relevance_to_keystone") or article.get("selection_reason"),
+        width=260,
+    )
+    raw_limits = [
+        *(article.get("limitations") if isinstance(article.get("limitations"), list) else []),
+        *(output.get("evidence_gaps") if isinstance(output.get("evidence_gaps"), list) else []),
+    ]
+    limits: list[str] = []
+    seen_limits: set[str] = set()
+    for value in raw_limits:
+        limit = compact(value, width=230)
+        if limit and limit.casefold() not in seen_limits:
+            limits.append(limit)
+            seen_limits.add(limit.casefold())
+        if len(limits) == 3:
+            break
+    if not description:
+        return ""
+    if quick:
+        if model_findings and not source_result:
+            return ""
+        label = "saved summary" if route == "preprints_context_agent" else "saved update"
+        sentences = [f"{title}: The {label} reports: {_ensure_sentence(description)}"]
+        if limits:
+            sentences.append(_ensure_sentence(limits[0]))
+        raw_blockers = output.get("blockers")
+        if isinstance(raw_blockers, list) and raw_blockers:
+            blocker = compact(raw_blockers[0], width=180)
+            if blocker:
+                sentences.append(f"Needs attention: {_ensure_sentence(blocker)}")
+        sentences.append(f"Source: {url}")
+        return " ".join(sentences)
+    preprint = route == "preprints_context_agent"
+    lines = [
+        "*Answer:*",
+        f"*{'Article' if preprint else 'Update'}:* {article_line} - {url}",
+        f"*{'Our read of the saved summary' if preprint else 'Our read of the update'}:* "
+        f"{description}",
+    ]
+    if relevance:
+        lines.append(f"*{'Why review' if preprint else 'Why it matters'}:* {relevance}")
+    if limits:
+        lines.append("*Evidence limits:* " + " ".join(_ensure_sentence(value) for value in limits))
+    raw_blockers = output.get("blockers")
+    if isinstance(raw_blockers, list) and raw_blockers:
+        blocker = compact(raw_blockers[0], width=230)
+        if blocker:
+            lines.append(f"*Needs attention:* {_ensure_sentence(blocker)}")
+    if output.get("approval_needs"):
+        lines.append(
+            "*Review note:* Model suggested review; "
+            "no execution approval gate was verified."
+        )
+    return "\n".join(lines)
+
+
+def _ensure_sentence(value: str) -> str:
+    return value if value.endswith((".", "!", "?")) else f"{value}."
 
 
 def to_json(value: Any) -> str:
@@ -4193,6 +4412,172 @@ def render_company_profile_report(profile: CompanyProfile | dict[str, Any]) -> s
         _source_list(sources),
     ]
     return "\n".join(lines)
+
+
+def _research_answer_url_key(value: Any) -> str:
+    url = str(value or "").strip()
+    if not re.fullmatch(r"https?://[^\s<>|]+", url, re.I):
+        return ""
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return ""
+    if not host:
+        return ""
+    return urlunsplit((
+        parsed.scheme.lower(),
+        f"{host.lower().removeprefix('www.')}{f':{port}' if port is not None else ''}",
+        parsed.path.rstrip("/") or "/",
+        parsed.query,
+        "",
+    ))
+
+
+_RESEARCH_ANSWER_MAX_REFS_PER_FACT = 12
+
+
+def _research_answer_source_index(
+    output: dict[str, Any], sources: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Index displayed fact sources first, then fill the compact source list."""
+
+    by_id: dict[str, dict[str, Any]] = {}
+    representative_by_url: dict[str, dict[str, Any]] = {}
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        if source.get("source_id"):
+            by_id.setdefault(str(source["source_id"]), source)
+        if key := _research_answer_url_key(source.get("url")):
+            representative_by_url.setdefault(key, source)
+    ordered: list[dict[str, Any]] = []
+    numbers_by_url: dict[str, int] = {}
+
+    def add(source: dict[str, Any]) -> int | None:
+        key = _research_answer_url_key(source.get("url"))
+        if not key:
+            return None
+        if key not in numbers_by_url:
+            ordered.append(representative_by_url[key])
+            numbers_by_url[key] = len(ordered)
+        return numbers_by_url[key]
+
+    for fact in (output.get("facts") or [])[:4]:
+        if not isinstance(fact, dict) or not _clean(fact.get("text")):
+            continue
+        for source_id in (fact.get("source_ids") or [])[:_RESEARCH_ANSWER_MAX_REFS_PER_FACT]:
+            identity = str(source_id)
+            if source := by_id.get(identity):
+                add(source)
+    for source in sources:
+        if len(ordered) >= 5:
+            break
+        if isinstance(source, dict):
+            add(source)
+
+    numbers_by_id = {
+        source_id: numbers_by_url[key]
+        for source_id, source in by_id.items()
+        if (key := _research_answer_url_key(source.get("url"))) in numbers_by_url
+    }
+    return ordered, numbers_by_id
+
+
+def research_answer_source_lines(
+    output: dict[str, Any], sources: list[dict[str, Any]],
+) -> list[str]:
+    """Return numbered Slack links matching the displayed fact references."""
+
+    indexed, _ = _research_answer_source_index(output, sources)
+    lines = []
+    for number, source in enumerate(indexed, 1):
+        url = str(source.get("url") or "").strip()
+        title = " ".join((_clean(source.get("title")) or "Source").split())[:100]
+        label = title.replace("|", " ").replace("<", "").replace(">", "")
+        lines.append(f"{number}. <{url}|{label}>")
+    return lines
+
+
+def research_answer_detail_lines(
+    output: dict[str, Any], sources: list[dict[str, Any]], *, topic: bool = False,
+) -> list[str]:
+    """Present research evidence without exposing internal citation identities."""
+
+    def applicable(text: str) -> bool:
+        return not re.fullmatch(
+            r"(?:(?:leadership|product|customers|healthcare buyer fit|traction signals) "
+            r"(?:is |are )?)?(?:not applicable|n/?a)"
+            r"(?:(?: for| to) this (?:request|question|topic))?"
+            r"(?: and remains unknown)?[.!]?", text.strip(), re.I,
+        )
+
+    def bounded(text: str, limit: int) -> str:
+        if len(text) <= limit:
+            return text
+        suffix = " … [excerpt; qualifications may follow]"
+        prefix = text[:limit - len(suffix)].rsplit(" ", 1)[0]
+        prefix = re.sub(r"https?://\S*$", "", prefix).rstrip()
+        return prefix + suffix
+
+    lines: list[str] = []
+    for field, company_label, topic_label in (
+        ("product", "Product/workflow", "Context"),
+        ("customers", "Healthcare buyer fit", "Audience"),
+        ("traction_signals", "Evidence or deployment signals", "Evidence"),
+    ):
+        text = _clean(output.get(field))
+        if text and (not topic or applicable(text)):
+            lines.append(f"* {topic_label if topic else company_label}: {bounded(text, 420)}")
+    _, numbers_by_id = _research_answer_source_index(output, sources)
+    valid_source_ids = {
+        str(source.get("source_id"))
+        for source in sources
+        if isinstance(source, dict)
+        and source.get("source_id")
+        and _research_answer_url_key(source.get("url"))
+    }
+    fact_lines = []
+    for fact in (output.get("facts") or [])[:4]:
+        if not isinstance(fact, dict) or not _clean(fact.get("text")):
+            continue
+        references = []
+        source_ids = fact.get("source_ids") or []
+        missing = not source_ids
+        for source_id in source_ids[:_RESEARCH_ANSWER_MAX_REFS_PER_FACT]:
+            number = numbers_by_id.get(str(source_id))
+            if number is None:
+                missing = True
+                continue
+            reference = f"[{number}]"
+            if reference not in references:
+                references.append(reference)
+        if any(
+            str(source_id) not in valid_source_ids
+            for source_id in source_ids[_RESEARCH_ANSWER_MAX_REFS_PER_FACT:]
+        ):
+            missing = True
+        citation = "; ".join([
+            *references,
+            *(["Source verification needed"] if missing else []),
+            *(
+                ["Additional source references omitted"]
+                if len(source_ids) > _RESEARCH_ANSWER_MAX_REFS_PER_FACT else []
+            ),
+        ])
+        fact_lines.append(f"  * {bounded(_clean(fact.get('text')), 260)} ({citation})")
+    if fact_lines:
+        lines.extend(["* Source-backed facts:", *fact_lines])
+    unknowns = [_clean(item) for item in output.get("unknowns") or [] if _clean(item)]
+    if topic:
+        unknowns = [item for item in unknowns if applicable(item)]
+    if unknowns:
+        lines.extend([
+            "* Limitations / what remains unverified:",
+            *[f"  * {bounded(x, 240)}" for x in unknowns[:4]],
+        ])
+    return lines
 
 
 def render_company_focused_brief(

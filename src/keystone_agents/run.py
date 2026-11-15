@@ -319,7 +319,15 @@ def run_typed_sdk_agent(
         model_name=model_name,
     )
     agent = agent_with_isolated_tool_state(agent)
-    resolved_session = (
+    from keystone_agents.runtime.continuity_policy import (
+        continuity_policy_from_specialist_environment,
+        current_continuity_policy,
+    )
+
+    continuity_policy = (
+        current_continuity_policy() or continuity_policy_from_specialist_environment()
+    )
+    resolved_session = None if continuity_policy.eligible else (
         session
         if session is not None
         else build_sdk_session_from_env()
@@ -349,6 +357,8 @@ def run_typed_sdk_agent(
         session=resolved_session,
         max_turns=max_turns,
     )
+    if continuity_policy.eligible:
+        request_cache["raw_sdk_history_admission"] = continuity_policy.metadata()
     validation_diagnostics = OutputValidationDiagnostics(output_type)
     agent = agent_with_output_diagnostics(agent, validation_diagnostics)
     request_cache["semantic_attempt_turn_limits"] = {
@@ -807,6 +817,23 @@ def run_typed_sdk_agent(
                                 verified_decision_fingerprints
                             ),
                             attested_read_outputs=attested_replay_entries,
+                            model_input_candidate_ids=(
+                                decision_contract.pre_model_candidate_ids
+                                if decision_contract.repair_candidates_from_model_input
+                                else ()
+                            ),
+                            original_model_input_text=pre_model_source_audit_prompt,
+                            model_input_replay_read_tools=(
+                                decision_contract.model_input_replay_read_tools
+                                if decision_contract.repair_candidates_from_model_input
+                                else ()
+                            ),
+                            original_model_source_context=(
+                                str(getattr(typed_input, "source_context", "") or "")
+                                if decision_contract.repair_candidates_from_model_input
+                                and decision_contract.model_input_replay_read_tools
+                                else ""
+                            ),
                         )
                         if replay.required and not replay.ready:
                             replay_telemetry = replay.telemetry()
@@ -814,6 +841,10 @@ def run_typed_sdk_agent(
                             request_cache["decision_ownership"]["repair_evidence"] = (
                                 replay_telemetry
                             )
+                            if decision_contract.repair_candidates_from_model_input:
+                                request_cache["decision_ownership"]["initial_validator_outcome"] = (
+                                    decision_outcome.model_dump(mode="json")
+                                )
                             blocked_outcome = decision_outcome.model_copy(
                                 update={
                                     "status": "rejected",
@@ -822,6 +853,9 @@ def run_typed_sdk_agent(
                                 }
                             )
                             request_cache["decision_ownership"]["validator_outcome"] = (
+                                blocked_outcome.model_dump(mode="json")
+                            )
+                            decision_attempt["validator_outcome"] = (
                                 blocked_outcome.model_dump(mode="json")
                             )
                             raise AgentDecisionValidationError(blocked_outcome)
@@ -2054,6 +2088,10 @@ def _sdk_structured_output_max_retries(
 
 
 def _is_sdk_structured_output_error(exc: BaseException) -> bool:
+    # Decision validation has its own bounded correction path. Classifying its
+    # feedback as an SDK schema failure can retry the same stage/attempt twice.
+    if isinstance(exc, AgentDecisionValidationError):
+        return False
     if response_terminal_diagnostics(exc):
         return False
     error_type = type(exc).__name__.lower()
@@ -2334,6 +2372,14 @@ def _failed_sdk_attempt_usage(exc: BaseException) -> dict[str, Any]:
         else "The failed SDK invocation did not expose numeric token usage."
     )
     return usage
+
+
+def aggregate_sdk_usage_events(
+    events: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Combine bounded answer/repair phases with the harness's usage semantics."""
+
+    return _aggregate_sdk_attempt_usage(events)
 
 
 def _aggregate_sdk_attempt_usage(
@@ -2821,6 +2867,7 @@ def run_retrieved_sdk_synthesis(
     output_type: type[TOutput],
     retrieve: Callable[[], TRaw],
     normalize: Callable[[TRaw], Any],
+    agent_factory: Callable[[TRaw, Any], AgentLike] | None = None,
     finalize_output: Callable[[TRaw, TOutput], Any] | None = None,
     input_summary: str,
     input_audit_payload: Mapping[str, Any] | None = None,
@@ -2903,14 +2950,14 @@ def run_retrieved_sdk_synthesis(
         tool_scope_trace_metadata_for_agent,
     )
 
-    scope_receipt = tool_scope_receipt_for_agent(agent)
-    scope_trace = tool_scope_trace_metadata_for_agent(agent)
-    resolved_trace_metadata = sdk_synthesis_trace_metadata(
+    # Reject unsafe caller trace metadata before retrieval, even when the
+    # final tool scope must wait for normalized source context.
+    sdk_synthesis_trace_metadata(
         agent_name=agent.name,
         live=live and run_config is None,
         save=save,
         workflow=workflow,
-        extra={**dict(trace_metadata or {}), **scope_trace},
+        extra=dict(trace_metadata or {}),
     )
     # Retrieval performed outside the model loop is still part of this run's
     # evidence boundary. Isolate its receipts so model-selected identities can
@@ -2920,6 +2967,23 @@ def run_retrieved_sdk_synthesis(
     raw_context = retrieve()
     preacquired_tool_receipts = tuple(tool_receipt_journal())
     typed_input = normalize(raw_context)
+    if agent_factory is not None:
+        scoped_agent = agent_factory(raw_context, typed_input)
+        if (
+            scoped_agent.name != agent.name
+            or getattr(scoped_agent, "model", None) != getattr(agent, "model", None)
+        ):
+            raise ValueError("A context-bound synthesis agent must retain its name and model.")
+        agent = scoped_agent
+    scope_receipt = tool_scope_receipt_for_agent(agent)
+    scope_trace = tool_scope_trace_metadata_for_agent(agent)
+    resolved_trace_metadata = sdk_synthesis_trace_metadata(
+        agent_name=agent.name,
+        live=live and run_config is None,
+        save=save,
+        workflow=workflow,
+        extra={**dict(trace_metadata or {}), **scope_trace},
+    )
     resolved_decision_contract = (
         decision_contract(raw_context, typed_input)
         if callable(decision_contract)

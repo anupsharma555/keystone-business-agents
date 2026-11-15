@@ -292,6 +292,10 @@ def _slack_record_summary(row: dict[str, Any]) -> dict[str, Any]:
     usage = usage if isinstance(usage, dict) else {}
     cost = telemetry.get("cost") if isinstance(telemetry, dict) else {}
     cost = cost if isinstance(cost, dict) else {}
+    failure = telemetry.get("failure") if isinstance(telemetry, dict) else {}
+    failure = failure if isinstance(failure, dict) else {}
+    attempt_id = failure.get("execution_attempt_id")
+    attempt_id = attempt_id if type(attempt_id) is int and attempt_id > 0 else None
     request_text = str(row.get("request_text") or "")
     continuity = _continuity_fields(request_text)
     return {
@@ -302,6 +306,7 @@ def _slack_record_summary(row: dict[str, Any]) -> dict[str, Any]:
         "route": row.get("route") or "",
         "status": row.get("status") or "",
         "work_item_id": row.get("work_item_id") or "",
+        "execution_attempt_id": attempt_id,
         "request": _clip(continuity.get("current_request") or request_text, 1_000),
         "previous_request": continuity.get("previous_request") or "",
         "continuation_envelope_summary": (_clip(request_text, 1_000) if continuity else ""),
@@ -495,6 +500,81 @@ def _plan_summary(payload: object) -> dict[str, Any]:
     }
 
 
+def _decision_validation_summary(payload: object) -> dict[str, Any]:
+    """Expose host validation diagnostics without copying feedback or source values."""
+    ownership = _first_dict(payload, {"decision_ownership"})
+    if not ownership:
+        return {}
+    attempts = ownership.get("attempts") or []
+    attempts = attempts if isinstance(attempts, list) else []
+    first = attempts[0] if attempts and isinstance(attempts[0], dict) else {}
+    events = first.get("events") or []
+    initial_event = next((
+        event for event in events
+        if isinstance(event, dict) and event.get("event_type") == "validator_result"
+    ), {})
+    first_outcome = first.get("validator_outcome") or {}
+    first_outcome = first_outcome if isinstance(first_outcome, dict) else {}
+    initial = ownership.get("initial_validator_outcome") or (
+        initial_event
+        if initial_event and initial_event.get("reason_code") != first_outcome.get("reason_code")
+        else first_outcome or initial_event
+    )
+    initial = initial if isinstance(initial, dict) else {}
+    final = ownership.get("validator_outcome") or {}
+    final = final if isinstance(final, dict) else {}
+    replay = ownership.get("repair_evidence") or {}
+    replay = replay if isinstance(replay, dict) else {}
+
+    def code(value: object) -> str:
+        text = str(value or "")
+        return text if re.fullmatch(r"[a-z0-9_]{1,100}", text) else ""
+
+    issues: list[dict[str, str]] = []
+    citation_counts: dict[str, int] = {}
+    citation_fingerprints: dict[str, str] = {}
+    feedback = str(initial.get("feedback") or "")
+    if "citation_diagnostics=" in feedback:
+        try:
+            diagnostics, _ = json.JSONDecoder().raw_decode(
+                feedback.split("citation_diagnostics=", 1)[1].lstrip()
+            )
+        except (ValueError, TypeError):
+            diagnostics = {}
+        if isinstance(diagnostics, dict):
+            for key in ("expected_count", "returned_count", "cited_count"):
+                value = diagnostics.get(key)
+                if type(value) is int and value >= 0:
+                    citation_counts[key] = value
+            for key in ("expected_fingerprint", "returned_fingerprint"):
+                value = diagnostics.get(key)
+                if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{12}", value):
+                    citation_fingerprints[key] = value
+        raw_issues = diagnostics.get("issues") if isinstance(diagnostics, dict) else []
+        for issue in raw_issues[:8] if isinstance(raw_issues, list) else []:
+            if not isinstance(issue, dict):
+                continue
+            field = str(issue.get("field") or "")
+            if re.fullmatch(
+                r"(?:sources|facts|claims|article_summaries|source_ids_used|unknowns)"
+                r"(?:\[\d+\]|\.(?:source_id|source_ids|url))*", field,
+            ) and code(issue.get("category")):
+                issues.append({"field": field, "category": code(issue["category"])})
+    return {
+        "initial_reason_code": code(initial.get("reason_code")),
+        "final_reason_code": code(final.get("reason_code")),
+        "final_status": code(final.get("status")),
+        "repair_attempted": ownership.get("repair_attempted") is True,
+        "attempt_count": len(attempts),
+        "repair_evidence_status": code(replay.get("status")),
+        "repair_evidence_mode": code(replay.get("mode")),
+        "candidate_universe_source": code(replay.get("candidate_universe_source")),
+        "citation_issues": issues,
+        "citation_counts": citation_counts,
+        "citation_fingerprints": citation_fingerprints,
+    }
+
+
 def _agent_run_summary(row: dict[str, Any]) -> dict[str, Any]:
     payload = _json(row.get("output_json"), {})
     script_payload = payload.get("script_payload") if isinstance(payload, dict) else {}
@@ -540,6 +620,29 @@ def _agent_run_summary(row: dict[str, Any]) -> dict[str, Any]:
     preflight = _first_dict(payload, {"orchestrator_preflight"})
     route_result = preflight.get("route_result") if isinstance(preflight, dict) else {}
     route_result = route_result if isinstance(route_result, dict) else {}
+    failure = _first_dict(payload, {"failure"})
+    admission = _first_dict(payload, {"host_continuation_admission"}) or _json(
+        failure.get("reason"), {},
+    )
+    admission = admission if isinstance(admission, dict) else {}
+    host_admission: dict[str, str] = {}
+    if admission.get("layer") == "host_continuation_admission":
+        allowed = {
+            "plan_artifact": {"source_summary", "research_brief", "company_profile",
+                              "opportunity_record", "outreach_draft", "none", "unknown"},
+            "task_artifact": {"source_summary", "research_brief", "company_profile",
+                              "opportunity_record", "outreach_draft", "none", "unknown"},
+            "source_binding": {"admitted", "not_admitted"},
+            "relation": {"unspecified", "continue_existing", "branch_existing",
+                         "new_request", "clarify"},
+            "failed_gate_code": {"selected_source_binding_not_admitted",
+                                 "blocked_retry_gate_denied", "linked_reuse_gate_denied"},
+        }
+        host_admission = {"layer": "host_continuation_admission"}
+        for key, values in allowed.items():
+            value = admission.get(key)
+            if isinstance(value, str) and value in values:
+                host_admission[key] = value
     return {
         "id": row.get("id"),
         "agent_name": row.get("agent_name") or "",
@@ -551,6 +654,8 @@ def _agent_run_summary(row: dict[str, Any]) -> dict[str, Any]:
         "created_at_utc": row.get("created_at_utc") or row.get("created_at") or "",
         "created_at_et": row.get("created_at_et") or "",
         "plan": _plan_summary(payload),
+        "validation": _decision_validation_summary(payload),
+        "host_admission": host_admission,
         "preflight": {
             "requested_agent": preflight.get("requested_agent") or "",
             "selected_agent": preflight.get("selected_agent") or "",
@@ -708,6 +813,72 @@ def _collect_kba(
         return agent_runs, tool_events, work_item, work_events, warnings
     finally:
         connection.close()
+
+
+def _collect_durable_execution(
+    database: Path, *, agent_run_ids: list[int], scan_limit: int,
+) -> list[dict[str, Any]]:
+    """Join exact entry/child identities to content-free durable evidence.
+
+    Read results prove a persisted tool stage, not model selection or external
+    provider success. Model-start rows likewise do not prove billable responses.
+    """
+    state = _connect_read_only(database)
+    journal = _connect_read_only(database.with_name(f"{database.name}.execution.sqlite3"))
+    try:
+        if state is None or journal is None or not agent_run_ids:
+            return []
+        if not _table_exists(state, "agent_runs") or not _table_exists(journal, "executions"):
+            return []
+        selected = {str(value) for value in agent_run_ids}
+        summaries = []
+        seen = set()
+        for entry in _rows(state, "SELECT id, output_json FROM agent_runs "
+                           "WHERE agent_name='kba_entrypoint' ORDER BY id DESC LIMIT ?",
+                           (scan_limit,)):
+            payload = _json(entry.get("output_json"), {})
+            links = payload.get("links") or {}
+            linked = {str(value) for value in links.get("agent_run_ids", [])}
+            linked.add(str(links.get("agent_run_id", "")))
+            if str(entry["id"]) not in selected and not selected.intersection(linked):
+                continue
+            execution_id = payload.get("durable_execution_id")
+            if not execution_id or execution_id in seen:
+                continue
+            rows = _rows(journal, "SELECT id, status, consumed FROM executions WHERE id=?",
+                         (execution_id,))
+            if not rows:
+                continue
+            seen.add(execution_id)
+            stages = (
+                _rows(journal, "SELECT stage_id FROM execution_stages WHERE execution_id=?",
+                      (execution_id,))
+                if _table_exists(journal, "execution_stages") else []
+            )
+            reads = sorted({row["stage_id"].removeprefix("tool_read:") for row in stages
+                            if re.fullmatch(r"tool_read:[A-Za-z0-9_]+", row["stage_id"])})
+            starts = (
+                _rows(journal, "SELECT COUNT(*) AS count FROM execution_model_attempts "
+                      "WHERE execution_id=?", (execution_id,))[0]["count"]
+                if _table_exists(journal, "execution_model_attempts") else None
+            )
+            budget = payload.get("request_budget") or {}
+            summaries.append({
+                "execution_id": execution_id,
+                "entry_agent_run_id": entry["id"],
+                "status": rows[0]["status"],
+                "model_start_count": starts,
+                "persisted_read_tool_names": reads,
+                "entry_budget_consumed": budget.get("consumed"),
+                "response_usage_confirmed": budget.get("observed_count_confirmed"),
+                "provider_receipt_count": None,
+            })
+        return summaries
+    finally:
+        if state is not None:
+            state.close()
+        if journal is not None:
+            journal.close()
 
 
 def _external_payloads(paths: list[Path]) -> list[dict[str, Any]]:
@@ -1215,6 +1386,31 @@ def _markdown(report: dict[str, Any]) -> str:
                 f"`{plan.get('intent') or 'unknown'}`, provider "
                 f"`{plan.get('provider_system') or 'unknown'}`."
             )
+            validation = run.get("validation") or {}
+            admission = run.get("host_admission") or {}
+            if admission:
+                lines.append(
+                    "  Host continuation gate: "
+                    f"`{admission.get('failed_gate_code', 'unknown')}`; "
+                    f"artifact `{admission.get('plan_artifact', 'unknown')}` / "
+                    f"saved `{admission.get('task_artifact', 'unknown')}`; "
+                    f"source binding `{admission.get('source_binding', 'unknown')}`."
+                )
+            if validation:
+                lines.append(
+                    "  Validation: initial "
+                    f"`{validation.get('initial_reason_code') or 'not recorded'}`; "
+                    f"final `{validation.get('final_status') or 'unknown'}` "
+                    f"(`{validation.get('final_reason_code') or 'no reason code'}`); "
+                    f"repair attempted `{validation.get('repair_attempted')}`; "
+                    f"evidence `{validation.get('candidate_universe_source') or 'not recorded'}`."
+                )
+                if validation.get("citation_issues"):
+                    fields = ", ".join(
+                        f"`{issue['field']}` ({issue['category']})"
+                        for issue in validation["citation_issues"]
+                    )
+                    lines.append(f"  Citation fields: {fields}.")
     else:
         lines.append("- No correlated KBA agent-run row was found.")
     if slack.get("continuity"):
@@ -1314,6 +1510,22 @@ def _markdown(report: dict[str, Any]) -> str:
             lines.append(f"- **{finding['layer']}** — {finding['detail']} (`{finding['code']}`)")
     else:
         lines.append("- No contradiction was detected in the collected local evidence.")
+    durable = report.get("durable_executions") or []
+    if durable:
+        lines.extend(["", "## Durable execution journal", ""])
+        for row in durable:
+            reads = ", ".join(row["persisted_read_tool_names"]) or "none recorded"
+            lines.append(
+                f"- Entry `{row['entry_agent_run_id']}`: "
+                f"model starts=`{row['model_start_count']}`, "
+                f"entry budget consumed=`{row['entry_budget_consumed']}`; "
+                f"persisted read tools: `{reads}`."
+            )
+        lines.append(
+            "- Model starts and budget consumption are not successful-response or billed "
+            "request counts. Persisted read stages do not establish model selection or "
+            "external-provider success; absent child summaries remain incomplete."
+        )
     lines.extend(["", "## Missing evidence", ""])
     if report.get("evidence_gaps"):
         lines.extend(f"- {gap}" for gap in report["evidence_gaps"])
@@ -1393,11 +1605,18 @@ def main(argv: list[str] | None = None) -> int:
     channel_id = str((slack or {}).get("channel_id") or args.channel_id)
     thread_ts = str((slack or {}).get("thread_ts") or args.thread_ts)
     work_item_id = str(args.work_item_id or (slack or {}).get("work_item_id") or "")
+    # A preflight failure can retain the previous thread's WorkItem projection.
+    # Its exact entry attempt is stronger correlation than that historical link.
+    selected_attempt = next(
+        (row for row in attempts if row.get("request_ts") == args.request_ts),
+        slack if slack and slack.get("request_ts") == args.request_ts else {},
+    ) if args.request_ts else slack or {}
+    agent_run_id = args.agent_run_id or selected_attempt.get("execution_attempt_id")
     agent_runs, tool_events, work_item, work_events, kba_warnings = _collect_kba(
         args.kba_db,
         channel_id=channel_id,
         thread_ts=thread_ts,
-        agent_run_id=args.agent_run_id,
+        agent_run_id=agent_run_id,
         work_item_id=work_item_id,
         scan_limit=max(1, args.scan_limit),
     )
@@ -1410,7 +1629,7 @@ def main(argv: list[str] | None = None) -> int:
             args.request_ts,
             (slack or {}).get("request_ts"),
             work_item_id,
-            args.agent_run_id,
+            agent_run_id,
         ),
         scan_limit=max(1, args.scan_limit),
     )
@@ -1427,6 +1646,11 @@ def main(argv: list[str] | None = None) -> int:
         "slack_attempts": attempts,
         "slack_runtime": slack_runtime,
         "agent_runs": agent_runs,
+        "durable_executions": _collect_durable_execution(
+            args.kba_db,
+            agent_run_ids=[row["id"] for row in agent_runs if isinstance(row.get("id"), int)],
+            scan_limit=max(1, args.scan_limit),
+        ),
         "tool_events": tool_events,
         "work_item": work_item,
         "work_item_events": work_events,

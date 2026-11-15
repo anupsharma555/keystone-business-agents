@@ -14,6 +14,19 @@ from keystone_agents.presentation.public_result import (
 from keystone_agents.storage.sqlite_store import SQLiteStore
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("status", ["needs_input", "blocked", "failed"])
+def test_actionable_message_survives_terminal_rendering_and_serialization(nested, status):
+    question = "Which of the two matching records should be updated?"
+    content = {"status": status, "message": question, "send_enabled": False}
+    payload = {"script_payload": content} if nested else content
+    for _ in range(3):
+        result = attach_execution_public_result(payload)
+        assert result.text == question
+        assert result.completion_confirmed is False
+        payload = json.loads(json.dumps(payload))
+
+
 @pytest.mark.parametrize(
     ("child_status", "expected_status"),
     [

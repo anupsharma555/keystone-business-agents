@@ -3654,6 +3654,27 @@ def test_retrieved_sdk_synthesis_rejects_unsafe_trace_metadata_before_retrieval(
     assert model.calls == []
 
 
+def test_retrieved_sdk_synthesis_rejects_context_bound_agent_identity_before_model() -> None:
+    model = FakeModel(outputs=[[_structured_message(_email_triage_payload())]])
+    provider = FakeProvider(model)
+    agent = build_gmail_triage_agent()
+    with pytest.raises(ValueError, match="retain its name and model"):
+        run_retrieved_sdk_synthesis(
+            agent=agent,
+            output_type=EmailTriageResult,
+            retrieve=lambda: {"subject": "Synthetic subject", "body": "Synthetic body"},
+            normalize=lambda raw: GmailTriageSDKInput(
+                subject=raw["subject"], body=raw["body"],
+            ),
+            agent_factory=lambda _raw, _typed: SimpleNamespace(
+                name="different_agent", model=getattr(agent, "model", None),
+            ),
+            input_summary="synthetic context-bound identity check",
+            run_config=build_local_run_config(provider),
+        )
+    assert model.calls == []
+
+
 def test_retrieved_sdk_synthesis_rejects_sensitive_trace_payloads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

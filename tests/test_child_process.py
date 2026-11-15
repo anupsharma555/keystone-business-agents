@@ -62,3 +62,35 @@ def test_run_isolated_child_process_kills_process_group_on_timeout(
     assert killed == [(456, child_process.signal.SIGKILL)]
     assert exc_info.value.output == "partial"
     assert exc_info.value.stderr == "timed out"
+
+
+def test_timeout_cleanup_is_bounded_when_descendant_keeps_pipe_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from io import StringIO
+
+    class FakeProcess:
+        pid = 789
+        returncode = 0  # Leader exited; a descendant still owns stdout.
+        stdout = StringIO()
+        stderr = StringIO()
+        timeouts: list[float | None] = []
+
+        def communicate(self, *, timeout=None):
+            self.timeouts.append(timeout)
+            raise subprocess.TimeoutExpired(["child"], timeout, output=b"partial")
+
+        def poll(self):
+            return self.returncode
+
+    process = FakeProcess()
+    killed: list[int] = []
+    monkeypatch.setattr(child_process.subprocess, "Popen", lambda *_a, **_kw: process)
+    monkeypatch.setattr(child_process.os, "killpg", lambda pid, _sig: killed.append(pid))
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        child_process.run_isolated_child_process(["child"], timeout=1)
+
+    assert process.timeouts == [1, 5]
+    assert killed == [789]
+    assert process.stdout.closed and process.stderr.closed

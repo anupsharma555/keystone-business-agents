@@ -13,6 +13,7 @@ from keystone_agents.guardrails import (
     keystone_tool_guardrail_kwargs,
 )
 from keystone_agents.schemas.approval import ApprovalQueueItem, ApprovalQueueStatus
+from keystone_agents.schemas.memory_scope import MemoryCaptureProvenance, SlackMemoryScope
 from keystone_agents.schemas.outreach import (
     OutreachChannel,
     build_initial_outreach_tracking_record,
@@ -245,14 +246,22 @@ class StorageTool:
             )
         ]
 
-    def save_memory_item(self, item: Any) -> dict[str, Any]:
+    def save_memory_item(
+        self, item: Any, *, trusted_scope: SlackMemoryScope | None = None,
+        capture_provenance: MemoryCaptureProvenance | None = None,
+    ) -> dict[str, Any]:
+        payload = item if trusted_scope is None and capture_provenance is None else {
+            "item": item, "trusted_scope": trusted_scope, "capture_provenance": capture_provenance,
+        }
         return self._audited_mutation(
             "save_memory_item",
-            item,
+            payload,
             lambda: {
                 "status": "saved",
                 "table": "memory_items",
-                "id": self.store.save_memory_item(item),
+                "id": self.store.save_memory_item(
+                    item, trusted_scope=trusted_scope, capture_provenance=capture_provenance,
+                ),
             },
         )
 
@@ -329,9 +338,11 @@ class StorageTool:
         *,
         object_key: str | None = None,
         memory_types: list[str] | None = None,
+        memory_ids: list[int] | None = None,
         limit: int = 5,
         approved_only: bool = True,
         safe_for_prompt: bool = True,
+        admission_scope: SlackMemoryScope | None = None,
     ) -> list[dict[str, Any]]:
         return [
             item.model_dump(mode="json")
@@ -339,9 +350,11 @@ class StorageTool:
                 query=query,
                 object_key=object_key,
                 memory_types=memory_types,
+                memory_ids=memory_ids,
                 limit=limit,
                 approved_only=approved_only,
                 safe_for_prompt=safe_for_prompt,
+                admission_scope=admission_scope,
             )
         ]
 

@@ -31,6 +31,7 @@ from keystone_agents.sdk import (
 
 TERRA = CANARY_TERRA_MODEL
 LUNA = CANARY_LUNA_MODEL
+LUNA6 = "gpt-6-luna"
 
 
 def usage(input_tokens=1000, cached=200, writes=300, output=100):
@@ -54,6 +55,9 @@ def usage(input_tokens=1000, cached=200, writes=300, output=100):
         (LUNA, 1000, 0.000299, 0),
         (LUNA, 272000, 0.054499, 0),
         (LUNA, 272001, 0.1089384, 1),
+        (LUNA6, 1000, 0.0001395, 0),
+        (LUNA6, 272000, 0.0272395, 0),
+        (LUNA6, 272001, 0.0544542, 1),
     ],
 )
 def test_reviewed_models_price_cache_writes_and_exact_context_boundary(
@@ -92,21 +96,22 @@ def test_terra_prices_each_request_not_combined_context_and_never_counts_entries
         {"service_tier": "fast"},
     ],
 )
-@pytest.mark.parametrize("model", [TERRA, LUNA])
+@pytest.mark.parametrize("model", [TERRA, LUNA, LUNA6])
 def test_reviewed_models_refuse_incomplete_or_unsupported_accounting(updates, model):
     cost = estimate_usage_cost(provider="openai", model=model, usage={**usage(), **updates})
     assert cost["amount_usd"] is None
     assert cost["complete"] is False
 
 
-@pytest.mark.parametrize("model", [TERRA, LUNA])
-def test_reviewed_model_support_is_explicit_and_does_not_change_defaults(model):
-    assert DEFAULT_MODEL == "gpt-5.4-mini"
+@pytest.mark.parametrize("model", [TERRA, LUNA, LUNA6])
+def test_reviewed_model_support_is_explicit_with_luna_operating_default(model):
+    assert DEFAULT_MODEL == "gpt-6-luna"
     assert pricing_metadata_available(provider="openai", model=model)
     assert not pricing_metadata_available(provider="openai", model=f"{model}-pro")
     assert uses_gpt56_cache_controls(model)
     assert not uses_gpt56_cache_controls(f"{model}-pro")
-    assert not uses_gpt56_cache_controls(DEFAULT_MODEL)
+    assert uses_gpt56_cache_controls(DEFAULT_MODEL)
+    assert not uses_gpt56_cache_controls("gpt-5.4-mini")
     ModelConfig(
         provider="openai", model=model, api_key="synthetic-test-key"
     ).require_live_execution_ready()
@@ -191,7 +196,9 @@ def mock_provider(requests, *, valid=True, answer_payload=None, model=TERRA):
 
 
 @pytest.mark.parametrize("private", [False, True])
-@pytest.mark.parametrize("model,expected_cost", [(TERRA, 0.00299), (LUNA, 0.000299)])
+@pytest.mark.parametrize(
+    "model,expected_cost", [(TERRA, 0.00299), (LUNA, 0.000299), (LUNA6, 0.0001395)]
+)
 def test_real_sdk_serializes_reviewed_controls_and_preserves_accounting_without_network(
     private, model, expected_cost, monkeypatch
 ):
@@ -224,7 +231,9 @@ def test_real_sdk_serializes_reviewed_controls_and_preserves_accounting_without_
     assert result.output.answer == "ready"
 
 
-@pytest.mark.parametrize("model,expected_cost", [(TERRA, 0.00299), (LUNA, 0.000299)])
+@pytest.mark.parametrize(
+    "model,expected_cost", [(TERRA, 0.00299), (LUNA, 0.000299), (LUNA6, 0.0001395)]
+)
 def test_failed_reviewed_model_output_retains_cache_write_usage(model, expected_cost):
     requests = []
     agent = build_sdk_agent(
@@ -249,7 +258,7 @@ def test_failed_reviewed_model_output_retains_cache_write_usage(model, expected_
 
 
 @pytest.mark.parametrize("effort", ["none", "low", "medium", "high", "xhigh", "max"])
-@pytest.mark.parametrize("model", [TERRA, LUNA])
+@pytest.mark.parametrize("model", [TERRA, LUNA, LUNA6])
 def test_existing_sdk_settings_accept_documented_reasoning_efforts(effort, model):
     agent = build_sdk_agent(
         "synthetic_terra_test",

@@ -13,7 +13,7 @@ Keystone agents should follow a Schema + Tools + Helpers + Memory + Model Synthe
 - Typed tools own integrations: use attached tools for provider access. Do not invent hidden access to Airtable, Gmail, Calendar, Google Workspace, Slack, web search, or local files.
 - Deterministic helpers own exact operations: arithmetic, normalization, record matching, filtering, deduplication, source ranking, data-quality checks, and write payload construction should be computed through bounded helper logic or structured tool outputs.
 - Memory and project context guide continuity: retrieve approved memory and local context when the request depends on known preferences, schemas, prior decisions, or operational history. Memory is context, not hidden authority.
-- Model synthesis owns interpretation: the configured runtime model, currently gpt-5.4-mini for OpenAI-backed Keystone operating agents during integration testing, interprets natural language, selects tools, resolves ambiguity, explains assumptions, analyzes results, and writes readable summaries from bounded structured inputs.
+- Model synthesis owns interpretation: the configured runtime model interprets natural language, selects tools, resolves ambiguity, explains assumptions, analyzes results, and writes readable summaries from bounded structured inputs.
 - Handoffs are explicit: specialists may recommend the next Keystone route, missing context, and whether a deeper paid search pass is worth it, but the Orchestrator or manager loop owns cross-agent execution, approval gates, and cost-depth escalation.
 
 ## Direct Write Execution Semantics

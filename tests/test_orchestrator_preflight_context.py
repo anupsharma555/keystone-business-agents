@@ -514,6 +514,7 @@ def test_preflight_memo_includes_temporal_depth_policy() -> None:
     env = orchestrator_preflight_env(
         {
             "request_text": "Find the latest 2026 behavioral health AI partnerships.",
+            "request_time": "2026-11-04T09:00:00-05:00",
             "advisory_only": True,
             "execution_allowed": True,
             "route_result": {"route": "opportunity_scout", "refused": False},
@@ -522,6 +523,8 @@ def test_preflight_memo_includes_temporal_depth_policy() -> None:
 
     preflight = json.loads(env[ORCHESTRATOR_PREFLIGHT_ENV])
     policy = preflight["preflight_memo"]["temporal_depth_policy"]
+    assert preflight["preflight_memo"]["request_time"] == "2026-11-04T09:00:00-05:00"
+    assert preflight["preflight_memo"]["request_timezone"] == "America/New_York"
 
     assert policy["schema"] == "keystone.temporal_depth_policy.v1"
     assert policy["temporal_intent"] is True
@@ -587,3 +590,23 @@ def test_preflight_memo_does_not_treat_calendar_now_as_web_freshness() -> None:
 
     assert policy["temporal_intent"] is False
     assert policy["trigger_terms"] == []
+
+
+def test_linked_relation_and_selected_source_survive_child_transport(monkeypatch):
+    preflight = {
+        'request_text': 'Continue this.', 'selected_agent': 'business_research_analyst',
+        'execution_allowed': True,
+        'route_result': {
+            'route': 'business_research_analyst', 'routing_mode': 'llm',
+            'linked_work_item_relation': 'continue_existing',
+            'selected_source_url': 'https://example.org/selected-source',
+        },
+    }
+    env = orchestrator_preflight_env(preflight)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    route = load_orchestrator_route_result_from_env()
+    assert route['linked_work_item_relation'] == 'continue_existing'
+    assert route['selected_source_url'] == 'https://example.org/selected-source'
+    public = json.loads(env[ORCHESTRATOR_PREFLIGHT_ENV])
+    assert public['route_result']['linked_work_item_relation'] == 'continue_existing'

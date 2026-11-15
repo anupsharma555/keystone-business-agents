@@ -729,8 +729,17 @@ class BusinessResearchFocusedBriefSDKInput:
     brief_goal: str = (
         "Prepare a concise research brief for possible Keystone partnership or advisory relevance."
     )
+    topic_mode: bool = False
 
     def to_prompt(self) -> str:
+        if self.topic_mode:
+            return json.dumps({
+                "request": self.brief_goal,
+                "source_context": self.source_context,
+                "retrieval_hint": (
+                    self.retrieval_hint.model_dump(mode="json") if self.retrieval_hint else None
+                ),
+            }, ensure_ascii=True)
         lines = [
             "Produce the Business Research Analyst BR-1 focused brief.",
             self.brief_goal,

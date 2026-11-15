@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -2677,6 +2678,7 @@ def main(argv: list[str] | None = None) -> int:
 def _handle_uncaught_exception(exc: Exception, argv: list[str] | None = None) -> int:
     failure = known_exception_to_operator_failure(exc, context="Chief of Staff run")
     if "--json" in set(argv or []):
+        sdk_failure = _audit_safe_sdk_failure(exc)
         print(
             json.dumps(
                 {
@@ -2686,6 +2688,7 @@ def _handle_uncaught_exception(exc: Exception, argv: list[str] | None = None) ->
                         "summary": failure.summary,
                         "next_step": failure.next_step,
                     },
+                    **sdk_failure,
                 },
                 ensure_ascii=True,
                 indent=2,
@@ -2696,6 +2699,139 @@ def _handle_uncaught_exception(exc: Exception, argv: list[str] | None = None) ->
     print(f"Reason: {failure.reason}", file=sys.stderr)
     print(f"Next step: {failure.next_step}", file=sys.stderr)
     return 1
+
+
+def _audit_safe_sdk_failure(exc: Exception) -> dict[str, object]:
+    """Forward failed SDK counts and validation codes, never model or tool content."""
+
+    source = sdk_run_failure_metadata(exc)
+    if not source:
+        return {}
+
+    def count(value: object) -> int | None:
+        return value if type(value) is int and 0 <= value <= 1_000_000_000 else None
+
+    def amount(value: object) -> float | None:
+        if type(value) not in (int, float) or not 0 <= value <= 1_000_000_000:
+            return None
+        return float(value) if math.isfinite(value) else None
+
+    def code(value: object) -> str:
+        text = str(value or "")
+        return text if re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", text) else ""
+
+    def usage(value: object) -> dict[str, object]:
+        raw = value if isinstance(value, dict) else {}
+        result: dict[str, object] = {}
+        for key in ("available", "complete", "provider_request_count_confirmed"):
+            if type(raw.get(key)) is bool:
+                result[key] = raw[key]
+        for key in (
+            "attempt_count", "requests", "input_tokens", "output_tokens", "total_tokens",
+            "cached_input_tokens", "cache_write_input_tokens", "reasoning_output_tokens",
+            "model_attempts_started",
+        ):
+            number = count(raw.get(key))
+            if number is not None:
+                result[key] = number
+        return result
+
+    safe_usage = usage(source.get("usage"))
+    raw_cost = source.get("cost") if isinstance(source.get("cost"), dict) else {}
+    safe_cost: dict[str, object] = {}
+    for key in ("available", "complete"):
+        if type(raw_cost.get(key)) is bool:
+            safe_cost[key] = raw_cost[key]
+    for key in ("amount_usd", "estimated_usd", "actual_usd"):
+        number = amount(raw_cost.get(key))
+        if number is not None:
+            safe_cost[key] = number
+
+    raw_cache = source.get("request_cache")
+    raw_cache = raw_cache if isinstance(raw_cache, dict) else {}
+    safe_cache: dict[str, object] = {}
+    failed_attempts = count(raw_cache.get("failed_model_attempts"))
+    if failed_attempts is not None:
+        safe_cache["failed_model_attempts"] = failed_attempts
+    raw_events = raw_cache.get("model_attempt_usage")
+    if isinstance(raw_events, list):
+        safe_events = []
+        for event in raw_events[:20]:
+            if not isinstance(event, dict):
+                continue
+            attempt_index = count(event.get("attempt_index"))
+            if attempt_index is not None:
+                safe_events.append({
+                    "attempt_index": attempt_index,
+                    "usage": usage(event.get("usage")),
+                })
+        safe_cache["model_attempt_usage"] = safe_events
+    raw_budget = raw_cache.get("request_budget")
+    if isinstance(raw_budget, dict) and raw_budget.get("schema") == "keystone.model_request_budget.v1":
+        budget: dict[str, object] = {"schema": "keystone.model_request_budget.v1"}
+        for key in ("limit", "consumed", "parent_consumed", "remaining", "reserved"):
+            number = count(raw_budget.get(key))
+            if number is not None:
+                budget[key] = number
+        for key in ("consumed_count_confirmed", "exhausted"):
+            if type(raw_budget.get(key)) is bool:
+                budget[key] = raw_budget[key]
+        safe_cache["request_budget"] = budget
+    postcondition = source.get("tool_execution_postcondition")
+    if not isinstance(postcondition, dict):
+        postcondition = raw_cache.get("tool_execution_postcondition")
+    if isinstance(postcondition, dict):
+        safe_postcondition: dict[str, object] = {
+            "schema": "keystone.tool_execution_postcondition.v1",
+        }
+        if type(postcondition.get("satisfied")) is bool:
+            safe_postcondition["satisfied"] = postcondition["satisfied"]
+        for key in ("mode", "stage"):
+            value = code(postcondition.get(key))
+            if value:
+                safe_postcondition[key] = value
+        for key in (
+            "attempted_tool_names", "completed_tool_names", "receipt_tool_names",
+            "missing_groups", "prohibited_tool_names",
+        ):
+            values = postcondition.get(key)
+            if isinstance(values, list):
+                safe_postcondition[key] = [
+                    value for raw in values[:20] if (value := code(raw))
+                ]
+        safe_cache["tool_execution_postcondition"] = safe_postcondition
+
+    safe_failure: dict[str, object] = {
+        "schema": "keystone.sdk_run_failure.v1",
+        "error_class": type(exc).__name__,
+    }
+    failure_kind = code(source.get("failure_kind"))
+    if failure_kind:
+        safe_failure["failure_kind"] = failure_kind
+    attempt_count = count(source.get("attempt_count"))
+    if attempt_count is not None:
+        safe_failure["attempt_count"] = attempt_count
+    if safe_usage:
+        safe_failure["usage"] = safe_usage
+    if safe_cost:
+        safe_failure["cost"] = safe_cost
+    if safe_cache:
+        safe_failure["request_cache"] = safe_cache
+    if "tool_execution_postcondition" in safe_cache:
+        safe_failure["validation_schema"] = "keystone.tool_execution_postcondition.v1"
+        safe_failure["validation_reason"] = (
+            "tool_execution_postcondition_unsatisfied"
+            if safe_cache["tool_execution_postcondition"].get("satisfied") is False
+            else "tool_execution_postcondition_unavailable"
+        )
+    result: dict[str, object] = {"sdk_failure": safe_failure}
+    for key, value in (("usage", safe_usage), ("cost", safe_cost),
+                       ("request_cache", safe_cache)):
+        if value:
+            result[key] = value
+    if "request_budget" in safe_cache:
+        result["request_budget"] = safe_cache["request_budget"]
+    return result
 
 
 if __name__ == "__main__":

@@ -202,7 +202,13 @@ def known_exception_to_operator_failure(
             retryable=False,
             safe_to_continue=True,
         )
-    if error_type == "ToolGuardrailViolation" or "guardrail" in lowered:
+    if error_type in {
+        "ToolGuardrailViolation",
+        "InputGuardrailTripwireTriggered",
+        "OutputGuardrailTripwireTriggered",
+        "ToolInputGuardrailTripwireTriggered",
+        "ToolOutputGuardrailTripwireTriggered",
+    } or "guardrail" in lowered:
         return OperatorReadableFailure(
             kind="guardrail_block",
             summary=(

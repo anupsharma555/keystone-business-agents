@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,7 @@ from keystone_agents.agent_tool_policy import (
     GOOGLE_WORKSPACE_WRITE_TOOLS,
     INTERNAL_WRITE_TOOL_NAMES,
     PUBLISH_TOOL_NAMES,
+    ToolTier,
     tool_name_for_policy,
 )
 from keystone_agents.authority.semantic import (
@@ -70,6 +72,9 @@ from keystone_agents.run import run_typed_sdk_agent
 from keystone_agents.runtime.tool_execution import (
     ToolEvidenceGroup,
     ToolExecutionContract,
+    ToolExecutionContractError,
+    ToolExecutionMode,
+    ToolExecutionOutcome,
 )
 from keystone_agents.schemas.automation import (
     AutomationArtifactRef,
@@ -87,6 +92,7 @@ from keystone_agents.schemas.chief_of_staff import (
     ChiefSlackCommandResolution,
 )
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
+from keystone_agents.schemas.memory import ChiefOfStaffMemoryContext
 from keystone_agents.sdk import (
     Agent,
     build_model_settings,
@@ -1257,6 +1263,7 @@ def _chief_of_staff_sdk_input_for_request(
     *,
     raw_request_text: str,
     manual_request_plan: ManualRequestPlan | None = None,
+    operator_context_capability: Any | None = None,
 ) -> str | dict[str, Any]:
     """Make Slack follow-up intent explicit before rendering the SDK prompt."""
 
@@ -1269,8 +1276,10 @@ def _chief_of_staff_sdk_input_for_request(
             manual_request_plan=manual_request_plan,
         )
         if isinstance(prepared_input, Mapping):
-            return {**prepared_input, "raw_request": active_request}
-        return prepared_input
+            return _chief_pilot_input_context(
+                {**prepared_input, "raw_request": active_request}, operator_context_capability,
+            )
+        return _chief_pilot_input_context(prepared_input, operator_context_capability)
 
     data: dict[str, Any]
     if isinstance(typed_input, Mapping):
@@ -1299,6 +1308,13 @@ def _chief_of_staff_sdk_input_for_request(
             "to satisfy the current Chief output contract, while leaving all sends, posts, "
             "and writes disabled. Leave sources empty unless a source was actually used."
         )
+        if _chief_compact_pilot_eligible():
+            data["direct_supplied_context_instruction"] = (
+                "Answer the current supplied-context request directly. Optional "
+                "query_operator_context may add relevant approved operator guidance; "
+                "otherwise use the supplied facts without tools or research. Keep all "
+                "sends, posts, and external writes disabled."
+            )
     if re.search(
         r"\b(checklist|ordered|steps?|next\s+\d+|next\s+three)\b",
         active_request,
@@ -1309,11 +1325,11 @@ def _chief_of_staff_sdk_input_for_request(
             "sentence and put the checklist items in recommended_actions in the "
             "requested order. Each action should be specific enough to run or verify."
         )
-    return _with_finance_expense_receipt_context(
+    return _chief_pilot_input_context(_with_finance_expense_receipt_context(
         data,
         active_request,
         manual_request_plan=manual_request_plan,
-    )
+    ), operator_context_capability)
 
 
 def _with_finance_expense_receipt_context(
@@ -4849,13 +4865,16 @@ def _natural_language_intent_result(
     durable_handoff: ChiefDurableHandoff | None = None,
     context_handoffs: list[ChiefContextHandoff] | None = None,
 ) -> ChiefOfStaffResult:
-    memory_context = build_chief_of_staff_memory_context(
+    compact_pilot = _chief_compact_pilot_eligible()
+    memory_context = ChiefOfStaffMemoryContext(
+        missing_reason="Optional memory requires an explicit scoped query in this pilot.",
+    ) if compact_pilot else build_chief_of_staff_memory_context(
         query=text,
         route=workflow_type,
         object_key=_extract_memory_object_key(text) or None,
         database_url=database_url or database_url_from_env(),
     )
-    memory_actions = _memory_action_lines(memory_context)
+    memory_actions = [] if compact_pilot else _memory_action_lines(memory_context)
     memory_audit_note = (
         f"Retrieved {len(memory_context.records)} approved Chief of Staff memory item(s)."
         if memory_context.records
@@ -4891,7 +4910,9 @@ def _natural_language_intent_result(
             *_docs_for_topic(text),
             *_memory_source_refs(memory_context.records),
         ],
-        context_sources_considered=list(dict.fromkeys([*context_sources, "keystone_memory"])),
+        context_sources_considered=list(dict.fromkeys([
+            *context_sources, *([] if compact_pilot else ["keystone_memory"]),
+        ])),
         repo_context_used=_repo_context_for_capability(workflow_type),
         memory_context=memory_context,
         audit_notes=[
@@ -5355,6 +5376,16 @@ def plan_chief_of_staff_request(
         return planned(
             _plan_semantic_chief_recovery(request_plan),
             action="preserved_semantic_plan_during_recovery",
+        )
+
+    if _chief_compact_pilot_eligible() and (
+        _looks_like_chief_memory_capture_request(text)
+        or _looks_like_chief_memory_review_request(text)
+        or _looks_like_reference_capture_request(text)
+    ):
+        return planned(
+            _plan_semantic_chief_recovery(request_plan),
+            action="scoped_memory_requires_sdk_tool_execution",
         )
 
     if _looks_like_slack_history_digest_request(text):
@@ -6172,6 +6203,104 @@ def _plan_business_artifact_write_request(text: str) -> ChiefOfStaffResult:
     )
 
 
+def _chief_compact_pilot_eligible() -> bool:
+    from keystone_agents.runtime.continuity_policy import (
+        continuity_policy_from_specialist_environment,
+        current_continuity_policy,
+    )
+
+    policy = current_continuity_policy()
+    if policy is None:
+        policy = continuity_policy_from_specialist_environment()
+    return policy.eligible
+
+
+def _chief_pilot_input_context(value: Any, operator_capability: Any | None = None) -> Any:
+    """Render admitted optional context once, from trusted host bindings only."""
+    if not _chief_compact_pilot_eligible() and operator_capability is None:
+        return value
+    from keystone_agents.orchestrator.preflight_context import (
+        load_specialist_execution_context_from_env,
+    )
+    from keystone_agents.runtime.operator_continuity import compact_optional_context
+
+    data = dict(value) if isinstance(value, Mapping) else {"request": str(value)}
+    for key in ("operator_context_evidence", "operator_context_usage", "current_work_item",
+                "approved_operator_context", "operator_memory_capture_sources"):
+        data.pop(key, None)
+    context = data.get("execution_context")
+    if isinstance(context, Mapping):
+        context = dict(context)
+        for key in ("operator_context_evidence", "operator_context_usage", "current_work_item",
+                    "approved_operator_context", "operator_memory_capture_sources"):
+            context.pop(key, None)
+        data["execution_context"] = context
+    preflight = data.get("orchestrator_preflight")
+    if isinstance(preflight, Mapping):
+        preflight = dict(preflight)
+        state = dict(preflight.get("workflow_state") or {})
+        for key in ("operator_context_evidence", "operator_context_usage", "current_work_item",
+                    "approved_operator_context", "operator_memory_capture_sources"):
+            state.pop(key, None)
+        preflight["workflow_state"] = state
+        data["orchestrator_preflight"] = preflight
+    trusted = load_specialist_execution_context_from_env() or {}
+    evidence = (
+        operator_capability.evidence if operator_capability is not None
+        else {"model_context": trusted.get("approved_operator_context")}
+    )
+    orchestration = data.get("orchestrator_context")
+    if isinstance(orchestration, Mapping):
+        orchestration = dict(orchestration)
+        for key in ("operator_context_evidence", "operator_context_usage", "approved_operator_context",
+                    "operator_memory_capture_sources"):
+            orchestration.pop(key, None)
+        data["orchestrator_context"] = orchestration
+    data.update(compact_optional_context(
+        trusted.get("current_work_item"),
+        evidence,
+    ))
+    if operator_capability is not None and operator_capability.capture_authorized:
+        capture_sources = operator_capability.descriptor.get("allowed_capture_sources")
+        if capture_sources:
+            data["operator_memory_capture_sources"] = capture_sources
+    return data
+
+
+def _chief_operator_capability(
+    supplied: Any | None, *, request_text: str, manual_request_plan: ManualRequestPlan | None,
+) -> Any | None:
+    """Resolve only explicit host objects or the existing trusted child envelope."""
+    from keystone_agents.orchestrator.preflight_context import (
+        load_specialist_execution_context_from_env,
+    )
+    from keystone_agents.runtime.operator_continuity import (
+        capture_request_authorized,
+        operator_capability_from_state,
+    )
+
+    if supplied is None:
+        if not _chief_compact_pilot_eligible():
+            return None
+        supplied = operator_capability_from_state(
+            load_specialist_execution_context_from_env(), raw_request=request_text,
+            database_url=database_url_from_env(),
+            capture_authorized=capture_request_authorized(request_text, manual_request_plan),
+        )
+    if supplied is not None and supplied.evidence.get("raw_request_sha256") != hashlib.sha256(
+        request_text.encode("utf-8")
+    ).hexdigest():
+        raise ValueError("Operator context capability does not match the current Chief request.")
+    if (
+        supplied is not None and supplied.capture_authorized
+        and capture_request_authorized(request_text, manual_request_plan)
+        and manual_request_plan is not None
+        and manual_request_plan.target_agent != "chief_of_staff"
+    ):
+        raise ValueError("Scoped memory capture requires current Chief of Staff ownership.")
+    return supplied
+
+
 def build_chief_of_staff_agent(
     model: str | None = None,
     *,
@@ -6186,8 +6315,21 @@ def build_chief_of_staff_agent(
     attach_tools: bool = True,
     nested_live_execution: bool = False,
     tool_scope_mode: ToolScopeMode | str = ToolScopeMode.AUTO,
+    operator_context_capability: Any | None = None,
 ) -> Agent:
     """Build the KNI Chief of Staff SDK agent."""
+
+    from keystone_agents.runtime.operator_continuity import capture_request_authorized
+
+    active_request = _latest_slack_followup_request(request_text) or request_text
+    operator_capability = _chief_operator_capability(
+        operator_context_capability, request_text=active_request,
+        manual_request_plan=manual_request_plan,
+    )
+    capture_required = bool(
+        operator_capability is not None and operator_capability.capture_authorized
+        and capture_request_authorized(active_request, manual_request_plan)
+    )
 
     budget = quality_budget or chief_of_staff_quality_budget(
         quality_mode,
@@ -6206,7 +6348,9 @@ def build_chief_of_staff_agent(
             "chief_of_staff_supplied_synthesis_compact.md",
         )
         if direct_supplied_synthesis
-        else compose_instructions(
+        else (compose_direct_instructions if (
+            _chief_compact_pilot_eligible() or operator_capability is not None
+        ) else compose_instructions)(
             "keystone_profile.md",
             "safety_policy.md",
             "tools.md",
@@ -6235,7 +6379,7 @@ def build_chief_of_staff_agent(
             include_routes=selected_specialist_routes,
             live_execution=nested_live_execution,
         )
-        if resolved_include_specialist_tools
+        if resolved_include_specialist_tools and not capture_required
         and (selected_specialist_routes is None or selected_specialist_routes)
         else []
     )
@@ -6253,10 +6397,25 @@ def build_chief_of_staff_agent(
         if resolved_attach_tools
         else []
     )
+    if _chief_compact_pilot_eligible() or operator_capability is not None:
+        candidate_tools = [
+            tool for tool in candidate_tools
+            if getattr(tool, "name", "") != "retrieve_chief_of_staff_memory"
+        ]
+    optional_tools = [
+        tool for tool in (operator_capability.tools if operator_capability is not None else [])
+        if getattr(tool, "name", "") != "capture_operator_memory" or capture_required
+    ]
+    candidate_tools = optional_tools if capture_required else [*candidate_tools, *optional_tools]
     resolved_scope_mode = tool_scope_mode
     scope_authority = ExecutionIntentAuthority.from_value(manual_request_plan)
     if str(tool_scope_mode) == ToolScopeMode.AUTO.value:
-        if (
+        if capture_required:
+            # Host identity, explicit current authorization and typed ownership
+            # already compiled this surface to the two scoped closures. An
+            # absent advisory mention must not remove that bound capability.
+            resolved_scope_mode = ToolScopeMode.FULL
+        elif (
             scope_authority.canonical
             and len(candidate_tools) <= 15
             and (
@@ -6273,10 +6432,15 @@ def build_chief_of_staff_agent(
         "chief_of_staff",
         candidate_tools,
         manual_request_plan=manual_request_plan,
-        tool_tier=budget.tool_tier or ("deep_retrieval" if specialist_tools else None),
+        # The current host-authorized capture bundle contains only scoped query
+        # and capture closures. Its required write must survive a read-only
+        # quality ceiling; this does not add any other write candidates.
+        tool_tier=(ToolTier.INTERNAL_WRITE if capture_required else
+                   budget.tool_tier or ("deep_retrieval" if specialist_tools else None)),
         mode=resolved_scope_mode,
         required_tool_names=(
             *(str(getattr(tool, "name", "") or "") for tool in specialist_tools),
+            *(str(getattr(tool, "name", "") or "") for tool in optional_tools),
             *(
                 ("read_linked_article",)
                 if explicit_full_article_read_requested(request_text)
@@ -6322,6 +6486,7 @@ def run_chief_of_staff_sdk(
     include_specialist_tools: bool | None = None,
     specialist_tool_mode: SpecialistToolMode = "read_plan",
     attach_tools: bool = True,
+    operator_context_capability: Any | None = None,
 ) -> TypedAgentRunResult[ChiefOfStaffResult]:
     """Run Chief of Staff through the shared typed SDK harness."""
 
@@ -6337,12 +6502,25 @@ def run_chief_of_staff_sdk(
     else:
         request_text = str(typed_input or "")
     request_plan = _chief_request_plan(request_text, manual_request_plan)
-    typed_input_for_run = _chief_of_staff_sdk_input_for_request(
-        typed_input,
-        raw_request_text=request_text,
+    active_request_text = _latest_slack_followup_request(request_text) or request_text
+    from keystone_agents.runtime.operator_continuity import capture_request_authorized
+
+    operator_capability = _chief_operator_capability(
+        operator_context_capability, request_text=active_request_text,
         manual_request_plan=request_plan,
     )
-    active_request_text = _latest_slack_followup_request(request_text) or request_text
+    capture_required = bool(
+        (_chief_compact_pilot_eligible() or operator_capability is not None)
+        and capture_request_authorized(active_request_text, request_plan)
+    )
+    if capture_required:
+        if operator_capability is None or not operator_capability.capture_authorized:
+            raise ValueError("Scoped memory capture requires the current host-bound capability.")
+        force_sdk_interpretation = True
+    typed_input_for_run = _chief_of_staff_sdk_input_for_request(
+        typed_input, raw_request_text=request_text, manual_request_plan=request_plan,
+        operator_context_capability=operator_capability,
+    )
     if include_specialist_tools is None:
         include_specialist_tools = chief_of_staff_should_use_specialist_tools(
             active_request_text,
@@ -6445,6 +6623,10 @@ def run_chief_of_staff_sdk(
         live_sdk=live,
         manual_request_plan=request_plan,
     )
+    if operator_capability is not None and operator_capability.tools:
+        # A tool response needs a subsequent synthesis turn. This changes only
+        # the SDK-loop ceiling; the shared request ledger remains authoritative.
+        budget = budget.model_copy(update={"max_turns": max(3, budget.max_turns or 3)})
     agent = build_chief_of_staff_agent(
         model=model,
         quality_budget=budget,
@@ -6455,8 +6637,13 @@ def run_chief_of_staff_sdk(
         context_flags=context_flags,
         attach_tools=attach_tools,
         nested_live_execution=live,
+        operator_context_capability=operator_capability,
     )
     scope_receipt = tool_scope_receipt_for_agent(agent)
+    if capture_required and "capture_operator_memory" not in {
+        getattr(tool, "name", "") for tool in agent.tools
+    }:
+        raise ValueError("Required scoped memory capture tool was not admitted.")
     if (
         live
         and attach_tools
@@ -6514,7 +6701,10 @@ def run_chief_of_staff_sdk(
             **tool_scope_trace_metadata_for_agent(agent),
         },
         tool_execution_contract=(
-            _chief_work_item_execution_contract(active_request_text)
+            ToolExecutionContract.required(
+                ToolEvidenceGroup("scoped_memory_capture", ("capture_operator_memory",)),
+                stage="chief_scoped_memory_capture",
+            ) if capture_required else _chief_work_item_execution_contract(active_request_text)
             if live
             and run_config is None
             and is_read_only_work_item_inspection_plan(request_plan)
@@ -6527,6 +6717,45 @@ def run_chief_of_staff_sdk(
     request_cache = getattr(result, "request_cache", None)
     if isinstance(request_cache, dict):
         request_cache["request_tool_scope"] = scope_receipt
+        if operator_capability is not None:
+            request_cache["operator_context_evidence"] = dict(operator_capability.evidence)
+            request_cache["operator_context_usage"] = dict(operator_capability.usage)
+    model_selected_capture = bool(
+        _chief_compact_pilot_eligible()
+        and "workflow:reference-capture" in result.output.decision.selected_candidate_ids
+        and capture_request_authorized(active_request_text, {"intent": "reference_capture"})
+    )
+    capture_authorized = bool(
+        operator_capability is not None and operator_capability.capture_authorized
+    )
+    capture_verified = bool(
+        capture_authorized and operator_capability.evidence.get("capture_count") == 1
+        and any(
+            receipt.get("verified") is True and isinstance(receipt.get("id"), int)
+            for receipt in operator_capability.evidence.get("capture_receipts", [])
+        )
+    )
+    if (capture_required or model_selected_capture) and not capture_verified:
+        from keystone_agents.run import _attach_sdk_run_failure_metadata
+
+        outcome = ToolExecutionOutcome(
+            mode=ToolExecutionMode.REQUIRED, stage="chief_scoped_memory_capture", satisfied=False,
+            missing_groups=(
+                *(("current_host_capture_authorization",) if not capture_authorized else ()),
+                "verified_scoped_memory_capture",
+            ),
+        )
+        error = ToolExecutionContractError(outcome)
+        request_cache["tool_execution_postcondition"] = outcome.receipt()
+        _attach_sdk_run_failure_metadata(error, {
+            "schema": "keystone.sdk_run_failure.v1", "agent_name": "chief_of_staff",
+            "failure_kind": "required_tool_execution_missing", "attempt_count": 1,
+            "usage": result.usage, "cost": result.cost, "budget_guard": result.budget_guard,
+            "request_cache": request_cache, "tool_receipts": result.tool_receipts,
+            "tool_execution_postcondition": outcome.receipt(),
+            "execution_telemetry": result.execution_telemetry,
+        })
+        raise error
     note = (
         f"Chief of Staff quality budget used: {budget.mode.value}; "
         f"max_turns={budget.max_turns}; reasoning_effort={budget.reasoning_effort}."

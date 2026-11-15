@@ -48,6 +48,13 @@ from keystone_agents.schemas.contact_context import ContactRecord, CRMAccountCon
 from keystone_agents.schemas.email_style import EmailStyleProfile
 from keystone_agents.schemas.feedback import FeedbackRecord
 from keystone_agents.schemas.memory import MemoryItem, normalize_memory_key
+from keystone_agents.schemas.memory_scope import (
+    MEMORY_CAPTURE_KEY,
+    MEMORY_SCOPE_KEY,
+    SCOPED_FACT_TYPES,
+    MemoryCaptureProvenance,
+    SlackMemoryScope,
+)
 from keystone_agents.schemas.opportunity import OpportunityRecord
 from keystone_agents.schemas.outreach import FollowUpScheduleRecord, OutreachTrackingRecord
 from keystone_agents.schemas.outreach_examples import (
@@ -3500,12 +3507,51 @@ class SQLiteStore:
             ).fetchall()
         return [EmailStyleProfile.model_validate(_json_dict(row["profile_json"])) for row in rows]
 
-    def save_memory_item(self, item: Any) -> int:
+    def save_memory_item(
+        self, item: Any, *, trusted_scope: SlackMemoryScope | None = None,
+        capture_provenance: MemoryCaptureProvenance | None = None,
+    ) -> int:
         """Save one approved or pending local memory item and update its search index."""
 
         record = MemoryItem.model_validate(_as_dict(item))
+        reserved = {MEMORY_SCOPE_KEY, MEMORY_CAPTURE_KEY}.intersection(record.metadata)
+        if trusted_scope is None:
+            if reserved or capture_provenance is not None:
+                raise ValueError("Scoped memory metadata requires a trusted host scope.")
+        else:
+            scope = SlackMemoryScope.model_validate(trusted_scope)
+            if capture_provenance is None:
+                raise ValueError("Scoped memory requires current capture provenance.")
+            provenance = MemoryCaptureProvenance.model_validate(capture_provenance)
+            if record.id is not None or record.supersedes_memory_id is not None:
+                raise ValueError("Scoped memory capture supports creation only.")
+            bindings = {
+                MEMORY_SCOPE_KEY: scope.model_dump(mode="json"),
+                MEMORY_CAPTURE_KEY: provenance.model_dump(mode="json"),
+            }
+            if any(record.metadata[key] != bindings[key] for key in reserved):
+                raise ValueError("Memory scope metadata conflicts with trusted host bindings.")
+            record = record.model_copy(update={"metadata": {**record.metadata, **bindings}})
         created = _time_metadata(record.created_at)
         with self.managed_connection() as connection:
+            if trusted_scope is not None:
+                # Serialize lookup and insert without a migration or another store.
+                if not connection.in_transaction:
+                    connection.execute("BEGIN IMMEDIATE")
+                for row in connection.execute("SELECT * FROM memory_items"):
+                    existing = self._memory_item_from_row(dict(row))
+                    existing_capture = existing.metadata.get(MEMORY_CAPTURE_KEY)
+                    if (
+                        existing.metadata.get(MEMORY_SCOPE_KEY) == bindings[MEMORY_SCOPE_KEY]
+                        and isinstance(existing_capture, Mapping)
+                        and existing_capture.get("request_fingerprint")
+                        == provenance.request_fingerprint
+                    ):
+                        if existing.model_dump(exclude={"id", "created_at"}) != record.model_dump(
+                            exclude={"id", "created_at"}
+                        ):
+                            raise ValueError("Capture request already stored different memory.")
+                        return int(existing.id)
             cursor = connection.execute(
                 """
                 INSERT INTO memory_items
@@ -3633,12 +3679,24 @@ class SQLiteStore:
         *,
         object_key: str | None = None,
         memory_types: list[str] | None = None,
+        memory_ids: list[int] | None = None,
         limit: int = 5,
         approved_only: bool = True,
         safe_for_prompt: bool = True,
+        admission_scope: SlackMemoryScope | None = None,
     ) -> list[MemoryItem]:
         """Rank eligible current memory; list_memory_items remains the historical view."""
 
+        scope = SlackMemoryScope.model_validate(admission_scope) if admission_scope is not None else None
+        if scope is not None:
+            approved_only = safe_for_prompt = True
+        if memory_ids is not None:
+            if (len(memory_ids) > 4 or any(
+                type(memory_id) is not int or memory_id <= 0 for memory_id in memory_ids
+            )):
+                raise ValueError("Memory IDs must contain at most four positive integers.")
+            if not memory_ids:
+                return []
         conditions: list[str] = []
         params: list[Any] = []
         approved_states = [
@@ -3654,6 +3712,9 @@ class SQLiteStore:
             resolved_types = [_redact_string(memory_type) for memory_type in memory_types]
             conditions.append(f"i.memory_type IN ({', '.join('?' for _ in resolved_types)})")
             params.extend(resolved_types)
+        if memory_ids is not None:
+            conditions.append(f"m.id IN ({', '.join('?' for _ in memory_ids)})")
+            params.extend(memory_ids)
         if approved_only:
             conditions.append(f"m.approval_state IN ({', '.join('?' for _ in approved_states)})")
             params.extend(approved_states)
@@ -3688,6 +3749,16 @@ class SQLiteStore:
         for row in rows:
             row_dict = dict(row)
             item = self._memory_item_from_row(row_dict)
+            if scope is not None and (
+                item.memory_type not in SCOPED_FACT_TYPES
+                or item.metadata.get(MEMORY_SCOPE_KEY) != scope.model_dump(mode="json")
+            ):
+                continue
+            if scope is not None:
+                try:
+                    MemoryCaptureProvenance.model_validate(item.metadata.get(MEMORY_CAPTURE_KEY))
+                except ValueError:
+                    continue
             if _memory_item_is_expired(item, now=now):
                 continue
             score = _score_memory_row(

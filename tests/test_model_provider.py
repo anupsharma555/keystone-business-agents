@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 import keystone_agents.run as agent_run
 import keystone_agents.sdk as sdk
+from keystone_agents.agent_registry import REGISTERED_AGENT_SPECS
 from keystone_agents.config import load_settings
 from keystone_agents.model_provider import (
     DEFAULT_MODEL,
@@ -21,6 +22,7 @@ from keystone_agents.model_provider import (
     OPENAI_CHIEF_OF_STAFF_DEFAULT_MODEL,
     OPENAI_MANUAL_PLANNER_DEFAULT_MODEL,
     OPENAI_ORCHESTRATOR_DEFAULT_MODEL,
+    RUNTIME_AGENT_MODEL_SPECS,
     MissingOpenAIAPIKeyError,
     ModelConfig,
     ModelProviderConfigurationError,
@@ -30,6 +32,7 @@ from keystone_agents.model_provider import (
     get_gemini_fallback_model_config,
     get_runtime_agent_model_config,
     get_trace_config,
+    gmail_selection_reasoning_effort,
     mask_secret,
 )
 from keystone_agents.sdk import (
@@ -104,7 +107,7 @@ def test_get_model_config_defaults_without_api_key(monkeypatch: pytest.MonkeyPat
     config = get_model_config()
 
     assert config.provider == DEFAULT_PROVIDER
-    assert DEFAULT_MODEL == "gpt-5.4-mini"
+    assert DEFAULT_MODEL == "gpt-6-luna"
     assert config.model == DEFAULT_MODEL
     assert config.base_url is None
     assert config.api_key_present is False
@@ -122,8 +125,69 @@ def test_manual_planner_profile_defaults_to_dedicated_openai_model(
 
     assert config.provider == "openai"
     assert config.model == OPENAI_MANUAL_PLANNER_DEFAULT_MODEL
-    assert config.model == "gpt-5.4-mini"
+    assert config.model == "gpt-6-luna"
     assert config.base_url is None
+
+
+@pytest.mark.parametrize("agent_name", tuple(RUNTIME_AGENT_MODEL_SPECS))
+def test_all_runtime_profiles_default_to_luna(
+    monkeypatch: pytest.MonkeyPatch, agent_name: str
+) -> None:
+    clear_model_env(monkeypatch)
+
+    config = get_runtime_agent_model_config(agent_name)
+
+    assert config.provider == "openai"
+    assert config.model == "gpt-6-luna"
+
+
+@pytest.mark.parametrize("agent_name", tuple(RUNTIME_AGENT_MODEL_SPECS))
+def test_runtime_profile_overrides_remain_explicit(
+    monkeypatch: pytest.MonkeyPatch, agent_name: str
+) -> None:
+    clear_model_env(monkeypatch)
+    monkeypatch.setenv("KEYSTONE_OPENAI_MODEL", "global-model")
+    monkeypatch.setenv(RUNTIME_AGENT_MODEL_SPECS[agent_name].model_env, "agent-model")
+
+    assert get_runtime_agent_model_config(agent_name).model == "agent-model"
+    assert (
+        get_runtime_agent_model_config(agent_name, model_override="explicit-model").model
+        == "explicit-model"
+    )
+
+
+@pytest.mark.parametrize("spec", REGISTERED_AGENT_SPECS, ids=lambda spec: spec.route_name)
+def test_registered_operating_agent_builders_default_to_luna(
+    monkeypatch: pytest.MonkeyPatch, spec: Any
+) -> None:
+    clear_model_env(monkeypatch)
+
+    assert get_runtime_agent_model_config(spec.route_name).model == "gpt-6-luna"
+    assert spec.build_agent().model == "gpt-6-luna"
+    assert spec.build_agent(model="explicit-model").model == "explicit-model"
+
+
+@pytest.mark.parametrize("model", (None, "gpt-6-luna", "gpt-5.4-mini"))
+def test_gmail_selection_keeps_low_reasoning_for_reviewed_openai_models(
+    monkeypatch: pytest.MonkeyPatch, model: str | None
+) -> None:
+    clear_model_env(monkeypatch)
+
+    assert gmail_selection_reasoning_effort(model) == "low"
+
+
+def test_gmail_selection_preserves_explicit_gemini_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_model_env(monkeypatch)
+    monkeypatch.setenv("KEYSTONE_GMAIL_TRIAGE_MODEL_PROVIDER", "gemini")
+    monkeypatch.setenv("KEYSTONE_GMAIL_TRIAGE_MODEL", "gemini-2.5-flash")
+
+    config = get_runtime_agent_model_config("gmail_triage")
+
+    assert config.provider == "gemini"
+    assert config.model == "gemini-2.5-flash"
+    assert gmail_selection_reasoning_effort() is None
 
 
 def test_validate_sdk_available() -> None:
@@ -552,13 +616,13 @@ def test_business_agent_model_defaults_are_scoped(
 ) -> None:
     clear_model_env(monkeypatch)
 
-    assert OPENAI_ORCHESTRATOR_DEFAULT_MODEL == "gpt-5.4-mini"
+    assert OPENAI_ORCHESTRATOR_DEFAULT_MODEL == "gpt-6-luna"
     assert get_runtime_agent_model_config("orchestrator").model == (
         OPENAI_ORCHESTRATOR_DEFAULT_MODEL
     )
     gmail = get_runtime_agent_model_config("gmail_triage")
     outreach = get_runtime_agent_model_config("outreach_composer")
-    assert OPENAI_BUSINESS_AGENT_DEFAULT_MODEL == "gpt-5.4-mini"
+    assert OPENAI_BUSINESS_AGENT_DEFAULT_MODEL == "gpt-6-luna"
     assert gmail.provider == "openai"
     assert gmail.model == OPENAI_BUSINESS_AGENT_DEFAULT_MODEL
     assert outreach.provider == "openai"
@@ -569,7 +633,7 @@ def test_business_agent_model_defaults_are_scoped(
     assert get_runtime_agent_model_config("opportunity_scout").model == (
         OPENAI_BUSINESS_AGENT_DEFAULT_MODEL
     )
-    assert OPENAI_CHIEF_OF_STAFF_DEFAULT_MODEL == "gpt-5.4-mini"
+    assert OPENAI_CHIEF_OF_STAFF_DEFAULT_MODEL == "gpt-6-luna"
     assert get_runtime_agent_model_config("chief_of_staff").model == (
         OPENAI_CHIEF_OF_STAFF_DEFAULT_MODEL
     )

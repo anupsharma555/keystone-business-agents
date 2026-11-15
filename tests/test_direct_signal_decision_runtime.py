@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,9 +14,16 @@ from keystone_agents.models import TypedAgentRunResult
 from keystone_agents.run import sdk_run_failure_metadata
 from keystone_agents.runtime.signal_context import (
     SignalAgentDecisionError,
+    _combined_signal_request_cache,
+    _sanitized_signal_decision_evidence,
     run_signal_context_sdk,
     signal_decision_evidence,
     validate_signal_agent_decision,
+)
+from keystone_agents.runtime.tool_execution import sdk_tool_execution_records
+from keystone_agents.schemas.announcement_feed import (
+    AnnouncementFeedEvidence,
+    AnnouncementFeedItem,
 )
 from keystone_agents.schemas.manual_request_plan import ManualRequestPlan
 from keystone_agents.schemas.operational_context import (
@@ -23,6 +31,7 @@ from keystone_agents.schemas.operational_context import (
     RssContextResult,
 )
 from keystone_agents.sdk import build_local_run_config
+from keystone_agents.storage.sqlite_store import SQLiteStore
 from keystone_agents.tools import announcement_context_tools
 
 try:
@@ -35,6 +44,29 @@ try:
     )
 except ImportError:
     pytestmark = pytest.mark.skip(reason="OpenAI Agents SDK fake-model hooks unavailable.")
+
+
+def test_signal_evidence_omits_malformed_saved_content_scope() -> None:
+    evidence = _sanitized_signal_decision_evidence(
+        {
+            "candidate_ids": ["candidate-1"],
+            "candidates": [
+                {
+                    "candidate_id": "candidate-1",
+                    "raw_item": {
+                        "source_snapshot": {"sha256": "a" * 64},
+                        "evidence_index": [{"evidence_id": "evidence:" + "b" * 24}],
+                        "saved_content_scope": ["linked_discovery_summary"],
+                        "article_full_text_verified": "true",
+                    },
+                }
+            ],
+        }
+    )
+    candidate = evidence["candidates"][0]
+    assert candidate["source_snapshot_sha256"] == "a" * 64
+    assert "saved_content_scope" not in candidate
+    assert "article_full_text_verified" not in candidate
 
 
 class FakeModel(Model):
@@ -152,6 +184,44 @@ def _result_payload(
             "limitations": ["The decision used bounded stored signal history."],
         },
     }
+
+
+def _saved_preprint_candidates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    database_url = f"sqlite:///{tmp_path / 'signal-evidence.db'}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    store = SQLiteStore(database_url)
+    for index in range(8):
+        store.save_announcement_feed_item(
+            AnnouncementFeedItem(
+                canonical_key=f"synthetic-preprint-{index}",
+                title=f"Psychiatric validation candidate {index}",
+                url=f"https://example.test/preprints/{index}",
+                source="preprints",
+                feed="preprints",
+                published_at=f"2026-09-{index + 1:02d}",
+                summary=f"Saved candidate {index} summary.",
+                evidence=[
+                    AnnouncementFeedEvidence(
+                        kind="search",
+                        title=f"Source {index}",
+                        url=f"https://example.test/preprints/{index}",
+                        snippet=f"Exact saved psychiatric validation evidence {index}.",
+                    )
+                ],
+            )
+        )
+    history = announcement_context_tools.retrieve_preprint_announcement_history_impl(
+        query="psychiatric validation", limit=8, database_url=database_url,
+    )
+    assert len(history["items"]) == 8
+    candidates = [
+        {
+            key: item[key]
+            for key in ("feed_item_id", "title", "url", "source", "published_at", "summary")
+        }
+        for item in history["items"]
+    ]
+    return history["items"], candidates
 
 
 @pytest.mark.parametrize(
@@ -367,6 +437,86 @@ def test_signal_runtime_repairs_once_with_read_only_tool_scope(
     )
 
 
+def test_signal_single_history_stage_retains_observed_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        announcement_context_tools,
+        "retrieve_rss_announcement_history_impl",
+        lambda **_kwargs: {
+            "status": "success", "kind": "rss", "item_count": 0,
+            "items": [], "send_enabled": False,
+        },
+    )
+    output = RssContextResult(
+        mode="llm",
+        summary="No matching saved announcement items were found.",
+        decision={
+            "decision_owner": "specialist_agent",
+            "decision_stage": "signal_relevance_selection",
+            "reasoning": "The bounded history read returned no matching candidates.",
+            "needs_more_context": True,
+            "limitations": ["No saved announcement matched the request."],
+        },
+    )
+    model = FakeModel(
+        [
+            [
+                _tool_call(
+                    "retrieve_rss_announcement_history",
+                    {"query": "behavioral health", "limit": 8},
+                    call_id="single-history-1",
+                )
+            ],
+            [_structured_message(output.model_dump(mode="json"))],
+        ]
+    )
+
+    result = run_signal_context_sdk(
+        "rss", "Check saved behavioral health announcements.",
+        run_config=build_local_run_config(FakeProvider(model)),
+    )
+
+    assert len(model.calls) == 2
+    assert len(result.request_cache["signal_stage_request_caches"]) == 1
+    assert result.request_cache["tool_execution"]["model_tool_call_count"] == 1
+    assert result.request_cache["tool_execution"]["tool_output_count"] == 1
+    assert result.request_cache["tool_execution"]["provider_receipt_count"] == 1
+    assert result.request_cache["tool_execution"]["receipt_observation_count"] == 1
+
+
+def test_signal_combined_receipts_deduplicate_identical_stage_payloads() -> None:
+    receipt = {"tool_name": "retrieve_rss_announcement_history", "status": "success"}
+    stage_cache = {
+        "tool_execution": {
+            "selected_tool_names": ["retrieve_rss_announcement_history"],
+            "model_called_tool_names": ["retrieve_rss_announcement_history"],
+            "model_tool_call_count": 1,
+            "tool_output_count": 1,
+            "distinct_persisted_receipt_count": 1,
+            "receipt_observation_count": 1,
+        }
+    }
+    stages = [
+        TypedAgentRunResult(
+            agent_name="rss_context_agent",
+            output=RssContextResult(),
+            raw_result=SimpleNamespace(new_items=[]),
+            live=False,
+            request_cache=stage_cache,
+            tool_receipts=[receipt],
+        )
+        for _ in range(2)
+    ]
+
+    combined = _combined_signal_request_cache(stages)
+
+    assert combined["tool_execution"]["model_tool_call_count"] == 2
+    assert combined["tool_execution"]["tool_output_count"] == 2
+    assert combined["tool_execution"]["distinct_persisted_receipt_count"] == 1
+    assert combined["tool_execution"]["receipt_observation_count"] == 2
+
+
 def test_preprints_signal_repair_reuses_first_candidate_universe_without_second_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -445,6 +595,764 @@ def test_preprints_signal_repair_reuses_first_candidate_universe_without_second_
     assert result.request_cache["decision_ownership"]["attempts"][1]["events"][0][
         "tool_mode"
     ] == "verified_context_tool_free"
+
+
+def test_signal_missing_saved_evidence_uses_candidate_bound_read_correction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history, candidates = _saved_preprint_candidates(tmp_path, monkeypatch)
+    selected = history[0]
+    selected_id = selected["feed_item_id"]
+    initial = _result_payload(candidates, selected_id=selected_id)
+    corrected = _result_payload(candidates, selected_id=selected_id)
+    model = FakeModel(
+        [
+            [
+                _tool_call(
+                    "retrieve_preprint_announcement_history",
+                    {"query": "psychiatric validation", "history_scope": "discovery", "limit": 8},
+                    call_id="history-1",
+                )
+            ],
+            [_structured_message(initial)],
+            [
+                _tool_call(
+                    "read_preprint_announcement_evidence",
+                    {
+                        "feed_item_id": selected_id,
+                        "evidence_id": selected["evidence_index"][0]["evidence_id"],
+                        "expected_snapshot_sha256": selected["source_snapshot"]["sha256"],
+                    },
+                    call_id="exact-read-1",
+                )
+            ],
+            [_structured_message(corrected)],
+        ]
+    )
+
+    result = run_signal_context_sdk(
+        "preprints",
+        "Which saved psychiatric validation paper merits review?",
+        run_config=build_local_run_config(FakeProvider(model)),
+    )
+
+    assert len(model.calls) == 4
+    assert model.calls[2]["tool_names"] == ["read_preprint_announcement_evidence"]
+    assert "evidence_ids" in str(model.calls[2]["input"])
+    assert "exact_read_handles" not in str(model.calls[2]["input"])
+    assert selected["source_snapshot"]["sha256"] in str(model.calls[2]["input"])
+    assert result.final_output.decision.selected_candidate_ids == [selected_id]
+    assert len(result.final_output.decision.candidate_assessments) == 8
+    assert result.request_cache["decision_ownership"]["validator_outcome"]["status"] == (
+        "accepted"
+    )
+    assert result.request_cache["signal_decision_evidence"]["candidate_count"] == 8
+    assert result.request_cache["signal_decision_evidence"]["history_tool_call_count"] == 1
+    assert result.request_cache["signal_decision_evidence"]["evidence_read_call_count"] == 1
+    assert result.request_cache["decision_repair_evidence"]["enabled_read_tool_names"] == [
+        "read_preprint_announcement_evidence"
+    ]
+    assert result.request_cache["signal_stage_request_caches"][1]["role"] == (
+        "candidate_bound_exact_read_correction"
+    )
+    assert result.request_cache["signal_stage_request_caches"][1]["tool_execution"][
+        "model_called_tool_names"
+    ] == ["read_preprint_announcement_evidence"]
+    stages = result.request_cache["signal_stage_request_caches"]
+    assert result.request_cache["tool_execution"]["model_tool_call_count"] == sum(
+        stage["tool_execution"]["model_tool_call_count"] for stage in stages
+    ) == 2
+    assert result.request_cache["tool_execution"]["tool_output_count"] == sum(
+        stage["tool_execution"]["tool_output_count"] for stage in stages
+    ) == 2
+    assert result.request_cache["tool_execution"]["provider_receipt_count"] == 2
+    assert result.request_cache["tool_execution"]["receipt_observation_count"] >= 2
+    assert result.request_cache["tool_call_budget"]["total_consumed"] == sum(
+        stage["tool_call_budget"]["total_consumed"] for stage in stages
+    ) == 2
+    assert len(result.request_cache["tool_invocations"]) == sum(
+        len(stage["tool_invocations"]) for stage in stages
+    )
+    assert result.request_cache["decision_repair_evidence"]["exact_evidence_read_count"] == 1
+    assert result.request_cache["decision_repair_evidence"]["provider_calls_during_repair"] == 0
+    assert [record.tool_name for record in sdk_tool_execution_records(result.raw_result)] == [
+        "retrieve_preprint_announcement_history",
+        "read_preprint_announcement_evidence",
+    ]
+    assert all(record.succeeded for record in sdk_tool_execution_records(result.raw_result))
+    assert result.usage["requests"] == 4
+
+
+def test_signal_exact_read_correction_allows_three_serial_reads_then_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history, candidates = _saved_preprint_candidates(tmp_path, monkeypatch)
+    selected_items = history[:3]
+    selected_ids = [item["feed_item_id"] for item in selected_items]
+    decision = _result_payload(candidates, selected_id=selected_ids[0])
+    decision["retrieved_item_ids"] = selected_ids
+    decision["articles"] = [
+        {
+            **candidate,
+            "relevance_status": "selected",
+            "selection_reason": "Directly matches the monitoring objective.",
+            "relevance_to_keystone": "Useful for KNI evidence monitoring.",
+        }
+        for candidate in candidates[:3]
+    ]
+    decision["decision"]["selected_candidate_ids"] = selected_ids
+    for assessment in decision["decision"]["candidate_assessments"]:
+        if assessment["candidate_id"] in selected_ids:
+            assessment["disposition"] = "selected"
+    model = FakeModel(
+        [
+            [
+                _tool_call(
+                    "retrieve_preprint_announcement_history",
+                    {"query": "psychiatric validation", "history_scope": "discovery", "limit": 8},
+                    call_id="history-three-1",
+                )
+            ],
+            [_structured_message(decision)],
+            *[
+                [
+                    _tool_call(
+                        "read_preprint_announcement_evidence",
+                        {
+                            "feed_item_id": item["feed_item_id"],
+                            "evidence_id": item["evidence_index"][0]["evidence_id"],
+                            "expected_snapshot_sha256": item["source_snapshot"]["sha256"],
+                        },
+                        call_id=f"exact-three-{index}",
+                    )
+                ]
+                for index, item in enumerate(selected_items, start=1)
+            ],
+            [_structured_message(decision)],
+        ]
+    )
+
+    result = run_signal_context_sdk(
+        "preprints",
+        "Compare the strongest saved psychiatric validation papers.",
+        run_config=build_local_run_config(FakeProvider(model)),
+    )
+
+    assert len(model.calls) == 6
+    assert all(
+        call["tool_names"] == ["read_preprint_announcement_evidence"]
+        for call in model.calls[2:]
+    )
+    assert result.final_output.decision.selected_candidate_ids == selected_ids
+    assert result.request_cache["decision_ownership"]["validator_outcome"]["status"] == "accepted"
+    assert result.request_cache["signal_decision_evidence"]["evidence_read_call_count"] == 3
+    assert result.request_cache["decision_repair_evidence"]["exact_evidence_read_count"] == 3
+    stages = result.request_cache["signal_stage_request_caches"]
+    assert [stage["tool_execution"]["model_tool_call_count"] for stage in stages] == [1, 3]
+    assert result.request_cache["tool_execution"]["model_tool_call_count"] == 4
+    assert result.request_cache["tool_execution"]["tool_output_count"] == 4
+    assert result.request_cache["tool_execution"]["provider_receipt_count"] == sum(
+        stage["tool_execution"]["distinct_persisted_receipt_count"]
+        for stage in stages
+    ) == 2
+    assert result.request_cache["tool_execution"]["receipt_observation_count"] >= 4
+    assert result.request_cache["tool_call_budget"]["total_consumed"] == 4
+    budget = result.request_cache["tool_call_budget"]
+    assert budget["consumed"]["read_preprint_announcement_evidence"] == 3
+    assert budget["limits"]["read_preprint_announcement_evidence"] == 3
+    assert len(result.request_cache["tool_invocations"]) == sum(
+        len(stage["tool_invocations"]) for stage in stages
+    )
+    assert result.usage["requests"] == 6
+
+
+def _linked_preprint_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    count: int,
+) -> tuple[Path, list[dict[str, Any]], list[dict[str, Any]]]:
+    discovery_path = tmp_path / "linked-discovery.sqlite"
+    database_url = f"sqlite:///{tmp_path / 'empty-announcements.db'}"
+    monkeypatch.setenv("DISCOVERY_STORE_PATH", str(discovery_path))
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    with sqlite3.connect(discovery_path) as connection:
+        connection.execute(
+            """CREATE TABLE discovery_candidates (
+                candidate_id TEXT PRIMARY KEY, candidate_type TEXT NOT NULL,
+                source TEXT NOT NULL, source_item_id TEXT NOT NULL,
+                title TEXT, summary TEXT, published TEXT NOT NULL,
+                url TEXT NOT NULL, topics_json TEXT, status TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL, metadata_json TEXT
+            )"""
+        )
+        connection.executemany(
+            "INSERT INTO discovery_candidates VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    f"preprint:linked:{index}", "preprint", "Example Preprints",
+                    f"synthetic-{index}", f"Depression clinical evidence {index}",
+                    f"Synthetic depression evidence summary {index}.", "2026-09-01",
+                    f"https://example.test/preprints/linked-{index}", "[]", "candidate",
+                    "2026-09-01T12:00:00Z", "{}",
+                )
+                for index in range(count)
+            ],
+        )
+    history_result = announcement_context_tools.retrieve_preprint_announcement_history_impl(
+        query="depression", limit=count, database_url=database_url,
+    )
+    history = history_result["items"]
+    assert len(history) == count
+    candidates = [
+        {
+            key: item[key]
+            for key in ("feed_item_id", "title", "url", "source", "published_at", "summary")
+        }
+        for item in history
+    ]
+    return discovery_path, history, candidates
+
+
+def test_signal_exact_read_correction_preserves_linked_discovery_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    discovery_path, history, candidates = _linked_preprint_candidates(
+        tmp_path, monkeypatch, count=8
+    )
+    selected = history[0]
+    selected_id = selected["feed_item_id"]
+    decision = _result_payload(candidates, selected_id=selected_id)
+    source_bytes = discovery_path.read_bytes()
+    model = FakeModel(
+        [
+            [
+                _tool_call(
+                    "retrieve_preprint_announcement_history",
+                    {"query": "depression", "history_scope": "discovery", "limit": 8},
+                    call_id="linked-history-1",
+                )
+            ],
+            [_structured_message(decision)],
+            [
+                _tool_call(
+                    "read_preprint_announcement_evidence",
+                    {
+                        "feed_item_id": selected_id,
+                        "evidence_id": selected["evidence_index"][0]["evidence_id"],
+                        "expected_snapshot_sha256": selected["source_snapshot"]["sha256"],
+                    },
+                    call_id="linked-exact-1",
+                )
+            ],
+            [_structured_message(decision)],
+        ]
+    )
+
+    result = run_signal_context_sdk(
+        "preprints",
+        "Which saved depression preprint merits review?",
+        run_config=build_local_run_config(FakeProvider(model)),
+    )
+
+    evidence = result.request_cache["signal_decision_evidence"]
+    assert evidence["candidate_ids"] == [item["feed_item_id"] for item in history]
+    assert len(result.final_output.decision.candidate_assessments) == 8
+    assert evidence["evidence_reads"][0]["feed_item_id"] == selected_id
+    assert evidence["evidence_reads"][0]["snapshot_sha256"] == (
+        selected["source_snapshot"]["sha256"]
+    )
+    assert evidence["evidence_reads"][0]["status"] == "success"
+    assert result.final_output.articles[0].url == selected["url"]
+    assert evidence["candidates"][0]["url"] == selected["url"]
+    assert evidence["candidates"][0]["saved_content_scope"] == (
+        "linked_discovery_summary"
+    )
+    assert evidence["candidates"][0]["article_full_text_verified"] is False
+    assert result.request_cache["decision_ownership"]["validator_outcome"]["status"] == (
+        "accepted"
+    )
+    assert discovery_path.read_bytes() == source_bytes
+    assert all(
+        "prepare_signal_lifecycle_checkpoint" not in call["tool_names"]
+        and "advance_signal_lifecycle_checkpoint" not in call["tool_names"]
+        for call in model.calls
+    )
+
+
+def test_signal_wrong_owner_still_gets_bound_exact_read_correction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    discovery_path, history, candidates = _linked_preprint_candidates(
+        tmp_path, monkeypatch, count=5
+    )
+    selected = history[0]
+    selected_id = selected["feed_item_id"]
+    initial = _result_payload(
+        candidates,
+        selected_id=selected_id,
+        assessed_ids=[item["feed_item_id"] for item in history[:4]],
+    )
+    initial["decision"]["decision_owner"] = "chief_of_staff"
+    corrected = _result_payload(candidates, selected_id=selected_id)
+    before = discovery_path.read_bytes()
+    model = FakeModel(
+        [
+            [
+                _tool_call(
+                    "retrieve_preprint_announcement_history",
+                    {"query": "depression", "history_scope": "discovery", "limit": 5},
+                    call_id="owner-history-1",
+                )
+            ],
+            [_structured_message(initial)],
+            [
+                _tool_call(
+                    "read_preprint_announcement_evidence",
+                    {
+                        "feed_item_id": selected_id,
+                        "evidence_id": selected["evidence_index"][0]["evidence_id"],
+                        "expected_snapshot_sha256": selected["source_snapshot"]["sha256"],
+                    },
+                    call_id="owner-exact-1",
+                )
+            ],
+            [_structured_message(corrected)],
+        ]
+    )
+
+    result = run_signal_context_sdk(
+        "preprints", "Which saved depression preprint merits review?",
+        run_config=build_local_run_config(FakeProvider(model)),
+    )
+
+    ownership = result.request_cache["decision_ownership"]
+    assert ownership["attempts"][0]["validator_outcome"]["reason_code"] == (
+        "signal_decision_owner_mismatch"
+    )
+    assert ownership["validator_outcome"]["status"] == "accepted"
+    assert result.final_output.decision.decision_owner == "specialist_agent"
+    assert len(result.final_output.decision.candidate_assessments) == 5
+    assert result.final_output.decision.selected_candidate_ids == [selected_id]
+    assert model.calls[2]["tool_names"] == ["read_preprint_announcement_evidence"]
+    assert "decision_owner=specialist_agent" in str(model.calls[2]["input"])
+    assert "decision_stage=signal_relevance_selection" in str(model.calls[2]["input"])
+    assert result.request_cache["signal_decision_evidence"]["evidence_reads"][0][
+        "snapshot_sha256"
+    ] == selected["source_snapshot"]["sha256"]
+    assert result.final_output.articles[0].url == selected["url"]
+    assert discovery_path.read_bytes() == before
+    assert all(
+        "prepare_signal_lifecycle_checkpoint" not in call["tool_names"]
+        for call in model.calls
+    )
+
+
+@pytest.mark.parametrize("invalid_selection", ["fabricated_id", "missing_handle"])
+def test_signal_wrong_owner_does_not_read_unbound_selected_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_selection: str,
+) -> None:
+    _path, history, candidates = _linked_preprint_candidates(
+        tmp_path, monkeypatch, count=5
+    )
+    selected_id = history[0]["feed_item_id"]
+    if invalid_selection == "missing_handle":
+        original_history = announcement_context_tools.retrieve_preprint_announcement_history_impl
+
+        def history_without_handle(**kwargs: Any) -> dict[str, Any]:
+            payload = original_history(**kwargs)
+            payload["items"][0].pop("evidence_index", None)
+            return payload
+
+        monkeypatch.setattr(
+            announcement_context_tools,
+            "retrieve_preprint_announcement_history_impl",
+            history_without_handle,
+        )
+    initial = _result_payload(candidates, selected_id=selected_id)
+    initial["decision"]["decision_owner"] = "chief_of_staff"
+    corrected = _result_payload(candidates, selected_id=selected_id)
+    if invalid_selection == "fabricated_id":
+        fabricated_id = "preprint:linked:unknown"
+        for payload in (initial, corrected):
+            payload["retrieved_item_ids"] = [fabricated_id]
+            payload["articles"][0]["feed_item_id"] = fabricated_id
+            payload["decision"]["selected_candidate_ids"] = [fabricated_id]
+            payload["decision"]["candidate_assessments"][0]["candidate_id"] = fabricated_id
+    source_reads = 0
+    original_read = announcement_context_tools.read_preprint_announcement_evidence_impl
+
+    def counted_read(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal source_reads
+        source_reads += 1
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(
+        announcement_context_tools,
+        "read_preprint_announcement_evidence_impl", counted_read,
+    )
+    model = FakeModel(
+        [
+            [
+                _tool_call(
+                    "retrieve_preprint_announcement_history",
+                    {"query": "depression", "history_scope": "discovery", "limit": 5},
+                    call_id="unbound-history-1",
+                )
+            ],
+            [_structured_message(initial)],
+            [_structured_message(corrected)],
+        ]
+    )
+
+    with pytest.raises(SignalAgentDecisionError) as exc_info:
+        run_signal_context_sdk(
+            "preprints", "Which saved depression preprint merits review?",
+            run_config=build_local_run_config(FakeProvider(model)),
+        )
+
+    cache = sdk_run_failure_metadata(exc_info.value)["request_cache"]
+    assert len(model.calls) == 3
+    assert model.calls[2]["tool_names"] == []
+    assert source_reads == 0
+    assert cache["decision_repair_evidence"]["enabled_read_tool_names"] == []
+    assert cache["signal_decision_evidence"]["evidence_read_call_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("invalid_scope", "first_reason"),
+    [
+        ("too_many_candidates", "signal_candidate_set_out_of_bounds"),
+        ("unchanged_second_query", "signal_history_reformulation_invalid"),
+        ("conflicting_source", "signal_decision_owner_mismatch"),
+    ],
+)
+def test_signal_wrong_owner_cannot_read_outside_valid_history_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_scope: str,
+    first_reason: str,
+) -> None:
+    count = 21 if invalid_scope == "too_many_candidates" else 5
+    _path, history, candidates = _linked_preprint_candidates(
+        tmp_path, monkeypatch, count=count
+    )
+    selected_id = history[0]["feed_item_id"]
+    assessed_ids = [item["feed_item_id"] for item in history[:20]]
+    initial = _result_payload(
+        candidates, selected_id=selected_id, assessed_ids=assessed_ids,
+    )
+    initial["decision"]["decision_owner"] = "chief_of_staff"
+    corrected = _result_payload(
+        candidates, selected_id=selected_id, assessed_ids=assessed_ids,
+    )
+    if invalid_scope == "unchanged_second_query":
+        original_history = announcement_context_tools.retrieve_preprint_announcement_history_impl
+        history_reads = 0
+
+        def empty_then_history(**kwargs: Any) -> dict[str, Any]:
+            nonlocal history_reads
+            history_reads += 1
+            if history_reads == 1:
+                return {
+                    "status": "success", "kind": "preprints", "query": "depression",
+                    "item_count": 0, "items": [], "send_enabled": False,
+                }
+            return original_history(**kwargs)
+
+        monkeypatch.setattr(
+            announcement_context_tools,
+            "retrieve_preprint_announcement_history_impl", empty_then_history,
+        )
+    source_reads = 0
+    original_read = announcement_context_tools.read_preprint_announcement_evidence_impl
+
+    def counted_read(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal source_reads
+        source_reads += 1
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(
+        announcement_context_tools,
+        "read_preprint_announcement_evidence_impl", counted_read,
+    )
+    history_calls = [
+        [
+            _tool_call(
+                "retrieve_preprint_announcement_history",
+                {"query": "depression", "history_scope": "discovery", "limit": count},
+                call_id=f"invalid-history-{index}",
+            )
+        ]
+        for index in range(2 if invalid_scope == "unchanged_second_query" else 1)
+    ]
+    model = FakeModel(
+        [*history_calls, [_structured_message(initial)], [_structured_message(corrected)]]
+    )
+    request = (
+        "Use only source:OtherFeed to find a depression preprint."
+        if invalid_scope == "conflicting_source"
+        else "Which saved depression preprint merits review?"
+    )
+
+    with pytest.raises(SignalAgentDecisionError) as exc_info:
+        run_signal_context_sdk(
+            "preprints", request, run_config=build_local_run_config(FakeProvider(model)),
+        )
+
+    cache = sdk_run_failure_metadata(exc_info.value)["request_cache"]
+    assert cache["decision_ownership"]["attempts"][0]["validator_outcome"][
+        "reason_code"
+    ] == first_reason
+    assert model.calls[-1]["tool_names"] == []
+    assert source_reads == 0
+    assert cache["signal_decision_evidence"]["evidence_read_call_count"] == 0
+
+
+@pytest.mark.parametrize(
+    "bad_argument", ["feed_item_id", "evidence_id", "expected_snapshot_sha256"]
+)
+def test_signal_exact_read_correction_blocks_unknown_identity_before_source_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_argument: str,
+) -> None:
+    history, candidates = _saved_preprint_candidates(tmp_path, monkeypatch)
+    selected = history[0]
+    selected_id = selected["feed_item_id"]
+    arguments = {
+        "feed_item_id": selected_id,
+        "evidence_id": selected["evidence_index"][0]["evidence_id"],
+        "expected_snapshot_sha256": selected["source_snapshot"]["sha256"],
+    }
+    arguments[bad_argument] = (
+        "synthetic-preprint-unknown"
+        if bad_argument == "feed_item_id"
+        else "evidence:" + "0" * 24
+        if bad_argument == "evidence_id"
+        else "0" * 64
+    )
+    provider_reads = 0
+    original = announcement_context_tools.read_preprint_announcement_evidence_impl
+
+    def counted_read(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal provider_reads
+        provider_reads += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        announcement_context_tools,
+        "read_preprint_announcement_evidence_impl",
+        counted_read,
+    )
+    decision = _result_payload(candidates, selected_id=selected_id)
+    model = FakeModel(
+        [
+            [
+                _tool_call(
+                    "retrieve_preprint_announcement_history",
+                    {"query": "psychiatric validation", "history_scope": "discovery", "limit": 8},
+                    call_id="history-bad-1",
+                )
+            ],
+            [_structured_message(decision)],
+            [
+                _tool_call(
+                    "read_preprint_announcement_evidence",
+                    arguments,
+                    call_id="bad-exact-read-1",
+                )
+            ],
+            [_structured_message(decision)],
+        ]
+    )
+
+    with pytest.raises(SignalAgentDecisionError) as exc_info:
+        run_signal_context_sdk(
+            "preprints",
+            "Which saved psychiatric validation paper merits review?",
+            run_config=build_local_run_config(FakeProvider(model)),
+        )
+
+    metadata = sdk_run_failure_metadata(exc_info.value)
+    assert provider_reads == 0
+    assert metadata["request_cache"]["decision_ownership"]["validator_outcome"][
+        "reason_code"
+    ] == "selected_signal_saved_evidence_not_read"
+    assert metadata["request_cache"]["signal_decision_evidence"]["evidence_reads"][0][
+        "status"
+    ] == "source_scope_mismatch"
+    assert metadata["usage"]["requests"] == 4
+    assert model.calls[2]["tool_names"] == ["read_preprint_announcement_evidence"]
+
+
+def test_signal_exact_read_correction_does_not_accept_partial_saved_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history, candidates = _saved_preprint_candidates(tmp_path, monkeypatch)
+    selected = history[0]
+    selected_id = selected["feed_item_id"]
+    monkeypatch.setattr(
+        announcement_context_tools,
+        "read_preprint_announcement_evidence_impl",
+        lambda *_args, **_kwargs: {
+            "status": "partial",
+            "read_mode": "evidence_content",
+            "feed_item_id": selected_id,
+            "evidence_id": selected["evidence_index"][0]["evidence_id"],
+            "text": "",
+            "content_status": "unavailable_saved_record",
+            "content_complete": False,
+            "send_enabled": False,
+        },
+    )
+    decision = _result_payload(candidates, selected_id=selected_id)
+    model = FakeModel(
+        [
+            [
+                _tool_call(
+                    "retrieve_preprint_announcement_history",
+                    {"query": "psychiatric validation", "history_scope": "discovery", "limit": 8},
+                    call_id="history-partial-1",
+                )
+            ],
+            [_structured_message(decision)],
+            [
+                _tool_call(
+                    "read_preprint_announcement_evidence",
+                    {
+                        "feed_item_id": selected_id,
+                        "evidence_id": selected["evidence_index"][0]["evidence_id"],
+                        "expected_snapshot_sha256": selected["source_snapshot"]["sha256"],
+                    },
+                    call_id="partial-exact-read-1",
+                )
+            ],
+            [_structured_message(decision)],
+        ]
+    )
+
+    with pytest.raises(SignalAgentDecisionError) as exc_info:
+        run_signal_context_sdk(
+            "preprints",
+            "Which saved psychiatric validation paper merits review?",
+            run_config=build_local_run_config(FakeProvider(model)),
+        )
+
+    metadata = sdk_run_failure_metadata(exc_info.value)
+    assert metadata["request_cache"]["decision_ownership"]["validator_outcome"][
+        "reason_code"
+    ] == "selected_signal_saved_evidence_not_read"
+    assert metadata["request_cache"]["signal_decision_evidence"]["evidence_reads"][0][
+        "status"
+    ] == "partial"
+
+
+def test_signal_exact_read_correction_requires_original_history_handles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history, candidates = _saved_preprint_candidates(tmp_path, monkeypatch)
+    original = announcement_context_tools.retrieve_preprint_announcement_history_impl
+
+    def missing_handles(**kwargs: Any) -> dict[str, Any]:
+        result = original(**kwargs)
+        for item in result["items"]:
+            item.pop("evidence_index", None)
+            item.pop("source_snapshot", None)
+        return result
+
+    monkeypatch.setattr(
+        announcement_context_tools,
+        "retrieve_preprint_announcement_history_impl",
+        missing_handles,
+    )
+    decision = _result_payload(candidates, selected_id=history[0]["feed_item_id"])
+    model = FakeModel(
+        [
+            [
+                _tool_call(
+                    "retrieve_preprint_announcement_history",
+                    {"query": "psychiatric validation", "history_scope": "discovery", "limit": 8},
+                    call_id="history-no-handles",
+                )
+            ],
+            [_structured_message(decision)],
+        ]
+    )
+
+    with pytest.raises(SignalAgentDecisionError) as exc_info:
+        run_signal_context_sdk(
+            "preprints",
+            "Which saved psychiatric validation paper merits review?",
+            run_config=build_local_run_config(FakeProvider(model)),
+        )
+
+    metadata = sdk_run_failure_metadata(exc_info.value)
+    assert len(model.calls) == 2
+    assert metadata["attempt_count"] == 1
+    assert metadata["usage"]["requests"] == 2
+    assert metadata["request_cache"]["decision_ownership"]["validator_outcome"][
+        "reason_code"
+    ] == "selected_signal_saved_evidence_not_read"
+
+
+def test_signal_exact_read_correction_still_requires_all_candidate_assessments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history, candidates = _saved_preprint_candidates(tmp_path, monkeypatch)
+    selected = history[0]
+    selected_id = selected["feed_item_id"]
+    initial = _result_payload(candidates, selected_id=selected_id)
+    incomplete = _result_payload(
+        candidates, selected_id=selected_id, assessed_ids=[selected_id],
+    )
+    model = FakeModel(
+        [
+            [
+                _tool_call(
+                    "retrieve_preprint_announcement_history",
+                    {"query": "psychiatric validation", "history_scope": "discovery", "limit": 8},
+                    call_id="history-incomplete-1",
+                )
+            ],
+            [_structured_message(initial)],
+            [
+                _tool_call(
+                    "read_preprint_announcement_evidence",
+                    {
+                        "feed_item_id": selected_id,
+                        "evidence_id": selected["evidence_index"][0]["evidence_id"],
+                        "expected_snapshot_sha256": selected["source_snapshot"]["sha256"],
+                    },
+                    call_id="read-incomplete-1",
+                )
+            ],
+            [_structured_message(incomplete)],
+        ]
+    )
+
+    with pytest.raises(SignalAgentDecisionError) as exc_info:
+        run_signal_context_sdk(
+            "preprints",
+            "Which saved psychiatric validation paper merits review?",
+            run_config=build_local_run_config(FakeProvider(model)),
+        )
+
+    metadata = sdk_run_failure_metadata(exc_info.value)
+    assert metadata["request_cache"]["signal_decision_evidence"]["evidence_read_call_count"] == 1
+    assert metadata["request_cache"]["decision_ownership"]["validator_outcome"][
+        "reason_code"
+    ] == "incomplete_signal_candidate_assessments"
+    assert metadata["usage"]["requests"] == 4
 
 
 def test_signal_runtime_allows_one_narrower_query_after_empty_result(

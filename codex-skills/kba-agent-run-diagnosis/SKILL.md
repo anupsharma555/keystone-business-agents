@@ -59,6 +59,17 @@ from the request and current code:
 The collector reads the Slack bridge state, KBA state, and configured local
 trace-summary database. It intentionally summarizes rather than dumping raw
 provider values, document bodies, message contents, tokens, or credentials.
+For structured-output failures, inspect the per-agent validation summary. It
+separates the initial citation/decision error from a later repair failure and
+shows recorded citation field paths, repair attempts and evidence provenance.
+Missing historical field diagnostics remain unknown; do not infer the offending
+model value from the final blocker. The report omits raw feedback and source
+values, so use the recorded fingerprints to correlate protected local evidence.
+It also joins exact entry/child run identities to the adjacent durable execution
+journal. Its separate journal section reports model starts and persisted read
+tool names without read contents. These are not successful-response counts,
+proof of model tool selection, or external provider receipts. Budget consumption
+may include pessimistic child reservations when response usage is unavailable.
 Its verdict is terminal-aware: the current Slack projection is authoritative
 when present, otherwise the newest selected Slack attempt, agent run, or WorkItem
 is used. A current failure returns `FAIL`; blocked, pending, or unknown
@@ -115,6 +126,11 @@ Treat `business_agent_slack_runs` as the per-attempt evidence source and
 `business_agent_slack_run_records` as the latest thread projection. If only the
 projection exists for a multi-turn thread, report earlier attempt details as
 `MISSING`; do not reconstruct them from the latest row.
+For failures before WorkItem binding, prefer the exact positive
+`telemetry.failure.execution_attempt_id` over a retained prior WorkItem link.
+That link can describe earlier thread context rather than the failed execution.
+Older failures without this field require independent exact-run correlation;
+do not relabel a previous successful child as the current failed attempt.
 
 At every step label the evidence `PROVEN`, `INFERRED`, `MISSING`,
 `INCONSISTENT`, or `NOT_APPLICABLE`. Never convert an inference into a fact
@@ -134,6 +150,10 @@ Do not derive expectations from the failed output alone.
 4. Compare expected versus candidate, attached, called, completed, and
    receipt-producing tools. Tool registration or attachment alone is not proof
    of execution.
+   Before a live retry, replay the retained plan shape and saved-state shape
+   through the public entrypoint, including omitted optional fields and existing
+   failure markers. A fixture that prepopulates the missing identity or narrows
+   the execution mode cannot validate the failing production path.
 5. Flag prompt-specific routing as a defect. Recommend a schema, context, tool,
    or shared admission-contract change instead of a phrase shortcut.
 

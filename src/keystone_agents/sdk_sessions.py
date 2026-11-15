@@ -6,10 +6,15 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from keystone_agents.runtime.continuity_policy import (
+    SlackCompactContinuityPolicy,
+    continuity_policy_from_specialist_environment,
+    current_continuity_policy,
+)
 from keystone_agents.sdk import build_sqlite_session
 
 SDK_SESSIONS_ENABLED_ENV = "KEYSTONE_SDK_SESSIONS"
@@ -35,6 +40,7 @@ class SDKSessionSpec:
     scope: str = ""
     source: str = ""
     history_limit: int = DEFAULT_SESSION_HISTORY_LIMIT
+    history_admission_reason: str = ""
 
     def log_metadata(self) -> dict[str, Any]:
         """Return audit-safe metadata without raw source identifiers."""
@@ -48,7 +54,28 @@ class SDKSessionSpec:
             "session_history_mode": "recent_items",
             "session_history_limit": self.history_limit if self.enabled else 0,
             "session_truncation_configured": self.enabled and self.history_limit > 0,
+            **({"history_admission_reason": self.history_admission_reason}
+               if self.history_admission_reason else {}),
         }
+
+
+def admit_sdk_session_spec(
+    spec: SDKSessionSpec,
+    policy: SlackCompactContinuityPolicy | None = None,
+) -> SDKSessionSpec:
+    """Omit raw history for an eligible current host scope, preserving other defaults."""
+
+    active = current_continuity_policy()
+    if active is not None and active.eligible:
+        policy = active
+    elif policy is None:
+        policy = active or continuity_policy_from_specialist_environment()
+    if policy is None or not policy.eligible:
+        return spec
+    return replace(
+        spec, enabled=False, session_id="", source="compact_continuity",
+        history_limit=0, history_admission_reason=policy.reason,
+    )
 
 
 def sdk_sessions_enabled(default: bool = False) -> bool:
@@ -115,20 +142,22 @@ def resolve_sdk_session_spec(
             default=default_enabled
         )
     if not enabled:
-        return SDKSessionSpec(enabled=False, scope=_safe_scope(scope), source="disabled")
+        return admit_sdk_session_spec(
+            SDKSessionSpec(enabled=False, scope=_safe_scope(scope), source="disabled"),
+        )
 
     resolved_components = (
         ("explicit", explicit_session_id) if explicit_session_id else tuple(components)
     )
     session_id = derive_sdk_session_id(scope, list(resolved_components))
-    return SDKSessionSpec(
+    return admit_sdk_session_spec(SDKSessionSpec(
         enabled=True,
         session_id=session_id,
         database_path=database_path.strip() or default_session_database_path(),
         scope=_safe_scope(scope),
         source="explicit" if explicit_session_id else "derived",
         history_limit=_resolve_history_limit(history_limit),
-    )
+    ))
 
 
 def sdk_session_env(spec: SDKSessionSpec) -> dict[str, str]:
@@ -154,6 +183,7 @@ def apply_sdk_session_env(spec: SDKSessionSpec) -> None:
 def build_sdk_session(spec: SDKSessionSpec) -> Any | None:
     """Build a local SDK session for a resolved spec."""
 
+    spec = admit_sdk_session_spec(spec)
     if not spec.enabled:
         return None
     session = build_sqlite_session(
@@ -167,6 +197,9 @@ def build_sdk_session(spec: SDKSessionSpec) -> Any | None:
 def build_sdk_session_from_env() -> Any | None:
     """Build a local SDK session from explicit session environment variables."""
 
+    policy = current_continuity_policy() or continuity_policy_from_specialist_environment()
+    if policy.eligible:
+        return None
     session_id = os.environ.get(SDK_SESSION_ID_ENV, "").strip()
     if not session_id or not sdk_sessions_enabled(default=True):
         return None

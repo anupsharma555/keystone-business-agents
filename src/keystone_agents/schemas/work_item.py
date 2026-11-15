@@ -223,6 +223,7 @@ class WorkflowRunRequest(BaseModel):
     origin_event_id: str = ""
     model_request_limit: int | None = Field(default=None, ge=0)
     work_item_id: str | None = None
+    linked_parent_work_item_id: str | None = None
     save: bool = True
     database_url: str | None = None
     live_search: bool = False

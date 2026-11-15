@@ -241,6 +241,10 @@ class ModelRequestBudget:
                 "limit": self.limit,
                 "consumed": self._consumed,
                 "parent_consumed": self.parent_consumed,
+                "consumed_count_confirmed": not any(
+                    event.get("status") == "child_budget_settled_pessimistically"
+                    for event in self._events
+                ),
                 "remaining": remaining,
                 "reserved": self._reserved,
                 "exhausted": bool(self._exhaustion_stage),
@@ -369,6 +373,10 @@ def model_request_count_from_payload(payload: object) -> int | None:
         return None
     counts: list[int] = []
     budget = model_request_budget_from_payload(payload)
+    if budget is not None and budget.get("consumed_count_confirmed") is False:
+        # A missing child report charges its allowance for safety. It cannot
+        # establish a complete invocation count for a caller settling this child.
+        return None
     if budget is not None:
         value = _nonnegative_int(budget.get("consumed"))
         if value is not None:

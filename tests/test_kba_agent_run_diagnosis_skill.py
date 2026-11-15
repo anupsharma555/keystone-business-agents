@@ -20,6 +20,133 @@ collector = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(collector)
 
 
+def test_validation_summary_keeps_initial_cause_separate_from_repair_failure():
+    payload = {"sdk_run_failure": {"request_cache": {"decision_ownership": {
+        "initial_validator_outcome": {
+            "reason_code": "supplied_research_citation_mismatch",
+            "feedback": 'Private text must not be copied. citation_diagnostics='
+            '{"issues":[{"field":"sources[0].url","category":"url_mismatch"}],'
+            '"expected_count":1,"returned_count":1,"expected_fingerprint":"abcdef123456",'
+            '"returned_value":"https://example.org/private-value"}',
+        },
+        "validator_outcome": {
+            "status": "rejected", "reason_code": "decision_repair_evidence_unavailable",
+        },
+        "repair_attempted": False, "attempts": [{}],
+        "repair_evidence": {"status": "unsafe", "candidate_universe_source": "provider_receipts"},
+    }}}}
+    summary = collector._agent_run_summary({"output_json": json.dumps(payload)})
+    validation = summary["validation"]
+    assert validation["initial_reason_code"] == "supplied_research_citation_mismatch"
+    assert validation["final_reason_code"] == "decision_repair_evidence_unavailable"
+    assert validation["citation_issues"] == [
+        {"field": "sources[0].url", "category": "url_mismatch"},
+    ]
+    assert validation["repair_attempted"] is False
+    assert validation["candidate_universe_source"] == "provider_receipts"
+    assert validation["citation_counts"] == {"expected_count": 1, "returned_count": 1}
+    assert validation["citation_fingerprints"] == {"expected_fingerprint": "abcdef123456"}
+    assert "private-value" not in json.dumps(summary)
+    assert "Private text" not in json.dumps(summary)
+
+
+def test_validation_summary_preserves_field_diagnostics_after_successful_repair():
+    initial = {
+        "reason_code": "supplied_research_citation_mismatch", "status": "repair_required",
+        "feedback": 'citation_diagnostics={"issues":[{"field":"facts[0].source_ids[0]",'
+        '"category":"cited_but_not_returned"}]}',
+    }
+    summary = collector._decision_validation_summary({"decision_ownership": {
+        "attempts": [{
+            "validator_outcome": initial,
+            "events": [{"event_type": "validator_result", "reason_code": initial["reason_code"]}],
+        }, {"validator_outcome": {"status": "accepted"}}],
+        "validator_outcome": {"status": "accepted"}, "repair_attempted": True,
+    }})
+    assert summary["initial_reason_code"] == initial["reason_code"]
+    assert summary["final_status"] == "accepted" and summary["repair_attempted"]
+    assert summary["citation_issues"] == [{
+        "field": "facts[0].source_ids[0]", "category": "cited_but_not_returned",
+    }]
+
+
+def test_collector_distinguishes_host_continuation_rejection_without_private_values():
+    admission = {
+        "layer": "host_continuation_admission", "plan_artifact": "research_brief",
+        "task_artifact": "research_brief", "source_binding": "not_admitted",
+        "relation": "continue_existing", "failed_gate_code": "blocked_retry_gate_denied",
+        "private_body": "synthetic private value that must remain absent",
+    }
+    row = {"output_json": json.dumps({"failure": {
+        "kind": "guardrail_block", "reason": json.dumps(admission),
+    }})}
+    summary = collector._agent_run_summary(row)
+    assert summary["host_admission"] == {
+        key: value for key, value in admission.items() if key != "private_body"
+    }
+    assert not summary["validation"]
+    assert admission["private_body"] not in json.dumps(summary)
+    private_row = {"output_json": json.dumps({"internal_diagnostics": {
+        "host_continuation_admission": admission,
+    }, "failure": {"reason": "The host could not admit this continuation."}})}
+    assert collector._agent_run_summary(private_row)["host_admission"] == summary["host_admission"]
+    admission["plan_artifact"] = ["malformed"]
+    row["output_json"] = json.dumps({"failure": {"reason": json.dumps(admission)}})
+    assert "plan_artifact" not in collector._agent_run_summary(row)["host_admission"]
+
+
+def test_durable_journal_joins_exact_child_without_leaking_read_content(tmp_path):
+    database = tmp_path / "business.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE agent_runs (id INTEGER, agent_name TEXT, output_json TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO agent_runs VALUES (?, ?, ?)",
+            (
+                1,
+                "kba_entrypoint",
+                json.dumps(
+                    {
+                        "durable_execution_id": "ex_test",
+                        "links": {"agent_run_ids": [2]},
+                        "request_budget": {"consumed": 8, "observed_count_confirmed": False},
+                    }
+                ),
+            ),
+        )
+    journal = database.with_name(f"{database.name}.execution.sqlite3")
+    with sqlite3.connect(journal) as connection:
+        connection.execute("CREATE TABLE executions (id TEXT, status TEXT, consumed INTEGER)")
+        connection.execute("INSERT INTO executions VALUES ('ex_test', 'failed', 5)")
+        connection.execute(
+            "CREATE TABLE execution_model_attempts (execution_id TEXT, ordinal INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO execution_model_attempts VALUES ('ex_test', ?)",
+            [(i,) for i in range(1, 6)],
+        )
+        connection.execute(
+            "CREATE TABLE execution_stages (execution_id TEXT, stage_id TEXT, output_json TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO execution_stages VALUES (?, ?, ?)",
+            (
+                "ex_test",
+                "tool_read:search_local_context",
+                '{"private": "synthetic-sensitive-body"}',
+            ),
+        )
+    rows = collector._collect_durable_execution(database, agent_run_ids=[2], scan_limit=10)
+    assert len(rows) == 1
+    assert rows[0]["model_start_count"] == 5
+    assert rows[0]["entry_budget_consumed"] == 8
+    assert rows[0]["persisted_read_tool_names"] == ["search_local_context"]
+    assert rows[0]["provider_receipt_count"] is None
+    assert "synthetic-sensitive-body" not in json.dumps(rows)
+    assert collector._collect_durable_execution(database, agent_run_ids=[3], scan_limit=10) == []
+
+
 def test_collector_proves_stale_slack_runtime_from_source_newer_than_hello(
     tmp_path: Path,
 ) -> None:
@@ -786,3 +913,49 @@ def test_followup_projection_is_not_a_persistence_defect_when_attempts_exist() -
 
     assert "mutable_thread_record" not in {finding["code"] for finding in findings}
     assert not any("original Slack attempt" in gap for gap in gaps)
+
+
+def test_failed_slack_attempt_correlates_exact_entry_before_stale_work_item(
+    tmp_path, capsys,
+):
+    slack_db, kba_db = tmp_path / 'slack.db', tmp_path / 'business.db'
+    _slack_database(slack_db, provider='example', tool_name='read_example', called=False)
+    _kba_database(kba_db)
+    with sqlite3.connect(slack_db) as connection:
+        connection.execute(
+            "UPDATE business_agent_slack_run_records SET status='failed', "
+            "work_item_id='wi_previous', telemetry_json=?",
+            (json.dumps({'failure': {'execution_attempt_id': 2}}),),
+        )
+    with sqlite3.connect(kba_db) as connection:
+        connection.executemany(
+            'INSERT INTO agent_runs (id,agent_name,output_json,status) VALUES (?,?,?,?)',
+            [
+                (1, 'business_research_analyst', '{"work_item_id":"wi_previous"}', 'success'),
+                (2, 'kba_entrypoint', '{"failure":{"kind":"schema_or_parse_error"}}', 'failed'),
+                (3, 'kba_entrypoint', '{}', 'failed'),
+            ],
+        )
+    argv = [
+        '--slack-db', str(slack_db), '--kba-db', str(kba_db),
+        '--trace-db', str(tmp_path / 'missing-trace.db'),
+        '--slack-health', str(tmp_path / 'missing-health.json'),
+        '--channel-id', 'C1', '--request-ts', '100.2',
+    ]
+    assert collector.main(argv) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert [row['id'] for row in report['agent_runs']] == [2]
+    assert report['slack_record']['work_item_id'] == 'wi_previous'
+    assert report['slack_record']['execution_attempt_id'] == 2
+    assert report['verdict'] == 'FAIL'
+    # An operator-supplied exact run remains stronger than inferred linkage.
+    assert collector.main([*argv, '--agent-run-id', '3']) == 0
+    assert [row['id'] for row in json.loads(capsys.readouterr().out)['agent_runs']] == [3]
+
+
+def test_slack_entry_link_requires_positive_integer():
+    for invalid in (None, 0, -1, True, '2', 2.5, {'id': 2}):
+        row = collector._slack_record_summary({
+            'telemetry_json': {'failure': {'execution_attempt_id': invalid}},
+        })
+        assert row['execution_attempt_id'] is None
